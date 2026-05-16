@@ -1,0 +1,12 @@
+[package]
+name        = "nod-driver"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+description = "NewOpenDylan compiler driver (CLI entrypoint)."
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }

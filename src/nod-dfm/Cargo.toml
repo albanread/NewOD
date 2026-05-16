@@ -1,0 +1,9 @@
+[package]
+name        = "nod-dfm"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+description = "NewOpenDylan: nod-dfm (Sprint 01 stub)."
+
+[lints]
+workspace = true

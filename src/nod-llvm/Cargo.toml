@@ -1,0 +1,9 @@
+[package]
+name        = "nod-llvm"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+description = "NewOpenDylan: nod-llvm (Sprint 01 stub)."
+
+[lints]
+workspace = true
