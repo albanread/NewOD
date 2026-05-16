@@ -1,8 +1,15 @@
-//! `nod-reader` — Sprint 01 stub.
+//! `nod-reader` — Dylan lexer and AST builder.
 //!
-//! See `SPRINTS.md` for when this crate gets its first real content.
-//! For now it exists only to lock the workspace crate layout.
+//! Sprint 02: lexer + source map. Parser (AST) lands in Sprint 03/04.
+//!
+//! See `specs/01-lexer.md` for the contract this crate implements.
 
-/// Placeholder so the crate compiles cleanly and rustdoc has a target.
-#[doc(hidden)]
-pub fn _placeholder() {}
+pub mod format;
+pub mod lexer;
+pub mod span;
+pub mod token;
+
+pub use format::format_tokens;
+pub use lexer::{Preamble, lex, scan_preamble};
+pub use span::{FileId, SourceMap, SourceMapError, Span};
+pub use token::{Token, TokenKind};

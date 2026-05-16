@@ -119,6 +119,7 @@ name = "nod-driver"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "nod-reader",
 ]
 
 [[package]]
@@ -164,6 +165,9 @@ version = "0.0.1"
 [[package]]
 name = "nod-tests"
 version = "0.0.1"
+dependencies = [
+ "nod-reader",
+]
 
 [[package]]
 name = "once_cell_polyfill"

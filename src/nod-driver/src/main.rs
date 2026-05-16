@@ -1,9 +1,10 @@
 //! NewOpenDylan compiler driver.
 //!
-//! Sprint 01: stub CLI. `--version` and `--help` work; `compile` and
-//! `repl` are recognised but do nothing yet. Real functionality lands
-//! in subsequent sprints (lexer 02 → parser 03/04 → namespace 05 → DFM
-//! IR 06 → LLVM codegen 07 → REPL loop 08 → …).
+//! Sprint 02: `dump-tokens` lights up. `compile` and `repl` are still
+//! stubs; they land in later sprints.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
@@ -31,34 +32,68 @@ enum Command {
     /// Compile a Dylan source file or LID-rooted library. Not yet implemented.
     Compile {
         /// Path to a `.dylan` file or a `.lid` library manifest.
-        input: Option<String>,
+        input: Option<PathBuf>,
     },
     /// Start an interactive REPL. Not yet implemented.
     Repl,
+    /// Lex a Dylan source file and print the token stream.
+    ///
+    /// Output format is fixed by `specs/01-lexer.md` §5 — line-oriented,
+    /// stable, suitable for diffing.
+    DumpTokens {
+        /// Path to a `.dylan` source file.
+        input: PathBuf,
+    },
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         None => {
-            // No subcommand: print a one-line banner that proves the
-            // build is reachable. Matches the Sprint 01 acceptance
-            // criterion for plain `nod-driver` (and is roughly what a
-            // future bare `nod-driver` invocation will print before
-            // dropping into the REPL).
             println!(
                 "nod-driver {} (LLVM {LLVM_VERSION})",
                 env!("CARGO_PKG_VERSION")
             );
+            ExitCode::SUCCESS
         }
         Some(Command::Compile { input }) => {
-            let target = input.as_deref().unwrap_or("<no input>");
+            let target = input
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<no input>".into());
             eprintln!("nod-driver compile: not yet implemented (input: {target})");
-            std::process::exit(2);
+            ExitCode::from(2)
         }
         Some(Command::Repl) => {
             eprintln!("nod-driver repl: not yet implemented (see Sprint 08).");
-            std::process::exit(2);
+            ExitCode::from(2)
         }
+        Some(Command::DumpTokens { input }) => run_dump_tokens(&input),
     }
+}
+
+fn run_dump_tokens(input: &std::path::Path) -> ExitCode {
+    use nod_reader::{SourceMap, format_tokens, lex};
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "nod-driver dump-tokens: failed to read {}: {e}",
+                input.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut sm = SourceMap::new();
+    let id = match sm.add(input.to_path_buf(), src.clone()) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("nod-driver dump-tokens: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let tokens = lex(&src, id);
+    let dump = format_tokens(&tokens, id, &sm);
+    print!("{dump}");
+    ExitCode::SUCCESS
 }
