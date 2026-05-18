@@ -1,8 +1,26 @@
 # NewOpenDylan
 
+> ⚠️ **Work in progress — not a usable Dylan implementation yet.**
+> Roughly Sprint 20 of ~32 planned sprints have landed (see
+> [docs/SPRINTS.md](docs/SPRINTS.md)). Each sprint is nominally two
+> weeks, but real-world ratios on the sister projects say plan for
+> **several more years** before NewOpenDylan reaches a state a Dylan
+> programmer can actually rely on. Treat this repo as a design diary
+> with running code, not a release.
+>
+> ⚠️ **The GC is not yet correct.** The collector runs Sprint 16's
+> Richards bench end-to-end, but it's still the Sprint 11 "option (b)"
+> design: synchronous, only triggered at Rust-side allocation sites,
+> with **no JIT-side safepoint polls and no precise stack roots via
+> `gc.statepoint`**. That work — Sprint 11d — is queued but not in
+> tree. The implication: any JIT'd Dylan code that holds a tagged
+> reference in a register across a triggering allocation can lose it,
+> and any program large enough to fragment the young space will
+> eventually surface this. Don't put real data through it.
+
 A from-scratch Rust + LLVM JIT for the [Dylan programming language](https://opendylan.org), with a graphical IDE, live inspection, and live incremental compilation. Windows-first; macOS second. 64-bit only.
 
-This is a **true revival** — not a port, not a fork, not a preservation effort. We keep the language as the Dylan Reference Manual defines it; we replace the implementation, the IDE, the GC, the runtime, and the build chain. See [MANIFESTO.md](../MANIFESTO.md) for the design commitments we won't move.
+This is a **true revival** — not a port, not a fork, not a preservation effort. We keep the language as the Dylan Reference Manual defines it; we replace the implementation, the IDE, the GC, the runtime, and the build chain. See [docs/MANIFESTO.md](docs/MANIFESTO.md) for the design commitments we won't move.
 
 ## Where to start
 
@@ -52,9 +70,50 @@ NewOpenDylan/
     └── nod-od-suite/       # OpenDylan-compatibility test runner
 ```
 
-## Current status
+## Current status — WIP checkpoint through Sprint 20b
 
-**Sprint 01 — Workspace Skeleton.** `cargo build --workspace` is green; `cargo run -p nod-driver -- --version` prints the banner. No real functionality yet — every crate is a placeholder. See [docs/SPRINTS.md](docs/SPRINTS.md) for what each subsequent sprint adds.
+The workspace is real code, not placeholders. Roughly 30 kLOC of Rust
+across the crates. What's in tree today, by area:
+
+**Front end** (`nod-reader`, `nod-namespace`, `nod-macro`).
+Lexer + AST (Sprint 02), fragment-based infix parser (Sprint 03),
+definition forms + body parser (Sprint 04), LID files + library /
+module dependency graph (Sprint 05), pattern-rule macro expander +
+the twelve most-common macro shapes (Sprint 17-18). Approximately
+6.2 kLOC reader, 0.7 kLOC namespace, 1.8 kLOC macro.
+
+**Semantic analysis** (`nod-sema`). Classes + slots, single dispatch
+placeholder (Sprint 12), multiple-inheritance slot layout (Sprint 14),
+sealing analysis + compile-time dispatch resolution (Sprint 15),
+forward-iteration protocol scaffolding (Sprint 20). ~5.9 kLOC.
+
+**IR + codegen** (`nod-dfm`, `nod-llvm`). Dylan Flow Machine typed
+SSA IR (Sprint 06) with dispatch nodes (Sprint 13); thin-slice LLVM
+codegen (Sprint 07). ~1.6 kLOC IR, ~3.1 kLOC codegen.
+
+**Runtime** (`nod-runtime`). Boxed `<integer>`, strings, symbols,
+vectors (Sprints 09-10); generational copying collector (Sprint 11 —
+see warning above); method-lookup runtime (Sprint 13); make
+dispatch (Sprint 12); conditions + non-local exit skeleton
+(Sprint 19); core collection types (Sprint 20). ~10.5 kLOC.
+
+**Driver / REPL** (`nod-driver`). REPL loop, `dump-tokens`,
+`dump-ast`, `dump-graph`, `dump-dfm`, `dump-llvm`, `eval`.
+
+**What's not yet in tree:** `gc.statepoint` precise-roots emission
+(Sprint 11d), `<table>` + hashing + string conformance (Sprint 21),
+full restart semantics (Sprint 22), C FFI port (Sprints 23-23b),
+`format` / `print` / `streams` (Sprint 24), kernel library port
+(Sprint 25), the Dylan-side IDE (Sprints 26+), `common-dylan` library
+(Sprint 27), multi-threaded mutator (Sprint 28), AOT mode
+(Sprint 30), Mac port (Sprint 32).
+
+Day-to-day: `cargo build --workspace` is green, `cargo run -p
+nod-driver -- dump-tokens hello.dylan` works, and Sprint 16's
+`simple-richards` benchmark subset runs end-to-end. See
+[docs/SPRINTS.md](docs/SPRINTS.md) for the full per-sprint plan
+and [bench/richards.md](bench/richards.md) for the Richards
+sealing-vs-open performance trajectory.
 
 ## Sibling-compiler portfolio
 
