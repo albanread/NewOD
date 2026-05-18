@@ -3,7 +3,18 @@ name        = "nod-llvm"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
-description = "NewOpenDylan: nod-llvm (Sprint 01 stub)."
+description = "NewOpenDylan: DFM -> LLVM IR codegen + JIT engine."
+
+[dependencies]
+nod-dfm     = { path = "../nod-dfm" }
+nod-runtime = { path = "../nod-runtime" }
+# Match `newm2-llvm`'s inkwell feature set: defaults off, only the host
+# x86 target wrappers compiled in. Static libs for other targets stay
+# linked via `llvm-sys`'s `force-static`. Re-declared locally (not
+# `workspace = true`) so the override is per-crate. Version pinned to
+# the workspace root.
+inkwell     = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
+llvm-sys    = { version = "=221.0.1", default-features = false, features = ["force-static"] }
 
 [lints]
 workspace = true

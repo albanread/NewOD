@@ -5,3 +5,4 @@ Cargo.lock.bak
 .vscode/
 .idea/
 *.swp
+tests/nod-tests/fixtures/_tmp/

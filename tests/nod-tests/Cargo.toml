@@ -13,3 +13,9 @@ workspace = true
 
 [dev-dependencies]
 nod-reader = { path = "../../src/nod-reader" }
+nod-macro = { path = "../../src/nod-macro" }
+nod-namespace = { path = "../../src/nod-namespace" }
+nod-dfm = { path = "../../src/nod-dfm" }
+nod-sema = { path = "../../src/nod-sema" }
+nod-runtime = { path = "../../src/nod-runtime" }
+serial_test = "3"

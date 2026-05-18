@@ -3,7 +3,13 @@ name        = "nod-runtime"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
-description = "NewOpenDylan: nod-runtime (Sprint 01 stub)."
+description = "NewOpenDylan: tagged-pointer ABI, wrapper headers, bump heap, class metadata."
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

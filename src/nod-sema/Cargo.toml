@@ -3,7 +3,16 @@ name        = "nod-sema"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
-description = "NewOpenDylan: nod-sema (Sprint 01 stub)."
+description = "NewOpenDylan: AST -> DFM lowering, type estimates, sealing analysis."
+
+[dependencies]
+nod-reader  = { path = "../nod-reader" }
+nod-macro   = { path = "../nod-macro" }
+nod-dfm     = { path = "../nod-dfm" }
+nod-llvm    = { path = "../nod-llvm" }
+nod-runtime = { path = "../nod-runtime" }
+# See `nod-llvm/Cargo.toml` for the inkwell feature override rationale.
+inkwell    = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
 
 [lints]
 workspace = true

@@ -1,8 +1,25 @@
-//! `nod-dfm` — Sprint 01 stub.
+//! `nod-dfm` — Dylan Flow Machine SSA IR.
 //!
-//! See `SPRINTS.md` for when this crate gets its first real content.
-//! For now it exists only to lock the workspace crate layout.
+//! Sprint 06: kernel-subset IR shape — `Function` owns `Block`s which own
+//! `Computation`s. SSA: each `TempId` has exactly one defining computation
+//! (or is a function parameter). Every block ends in exactly one
+//! `Terminator` — there is no fall-through.
+//!
+//! The shape is deliberately small. Sprint 13 adds `Dispatch` for generic
+//! call resolution; Sprints 10-13 will grow `Computation` with slot
+//! access, allocation, and exit machinery. This module is the layer the
+//! IDE inspector (MANIFESTO "Live inspection") will introspect — keep
+//! it inspectable by keeping fields public and printable.
 
-/// Placeholder so the crate compiles cleanly and rustdoc has a target.
-#[doc(hidden)]
-pub fn _placeholder() {}
+mod format;
+mod ir;
+mod liveness;
+mod verify;
+
+pub use format::{format_dfm, format_dfm_module};
+pub use ir::{
+    Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp, SlotTypeKind,
+    Temporary, TempId, Terminator, TypeEstimate,
+};
+pub use liveness::{SafepointError, populate_safepoint_roots, verify_safepoint_roots};
+pub use verify::{VerifyError, verify};

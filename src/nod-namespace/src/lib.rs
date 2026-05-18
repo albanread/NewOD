@@ -1,8 +1,16 @@
-//! `nod-namespace` — Sprint 01 stub.
+//! `nod-namespace` — LID/`dylan-package.json` parsers and library/module graph.
 //!
-//! See `SPRINTS.md` for when this crate gets its first real content.
-//! For now it exists only to lock the workspace crate layout.
+//! Sprint 05 deliverable. See `specs/05-library-module-graph.md`.
 
-/// Placeholder so the crate compiles cleanly and rustdoc has a target.
-#[doc(hidden)]
-pub fn _placeholder() {}
+pub mod dump_graph;
+pub mod graph;
+pub mod lid;
+pub mod package_json;
+
+pub use dump_graph::dump_graph;
+pub use graph::{
+    BindingId, Graph, Library, LibraryId, LibraryRef, LibraryUse, Module, ModuleId, ModuleRef,
+    ModuleUse, Symbol, SymbolInterner,
+};
+pub use lid::{Diagnostic, Lid, TargetType, load_lid_chain, parse_lid, parse_lid_str};
+pub use package_json::{Package, PackageDep, parse_package_json, parse_package_json_str};

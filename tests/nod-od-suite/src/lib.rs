@@ -1,12 +1,12 @@
-//! `nod-od-suite` — Sprint 01 placeholder.
+//! `nod-od-suite` — curated OpenDylan-flavoured fixture regression suite.
 //!
-//! - `nod-tests` will host end-to-end JIT regression tests
-//!   (mirror of NewM2 `newm2-tests` / NCL `ncl-tests`).
-//! - `nod-od-suite` will host the OpenDylan-compatibility test
-//!   runner driving fixtures under
-//!   `../opendylan-tests/sources/`.
+//! The actual fixtures live in `fixtures/` and the runner lives in
+//! `tests/run.rs`. This library crate exists only so Cargo treats
+//! `tests/run.rs` as an integration test target.
 //!
-//! No tests run yet — see SPRINTS.md.
-
-#[doc(hidden)]
-pub fn _placeholder() {}
+//! Each fixture is a small hand-written `.dylan` program in the spirit
+//! of `opendylan-tests/sources/`, restricted to language features the
+//! current compiler implements (no macros, no collections, no
+//! conditions — those land in Sprints 17, 20, 19 respectively). The
+//! curated set is intentionally narrow and is the substitute for
+//! self-hosting that PLAN.md §2.7 commits to.

@@ -1,8 +1,13 @@
-//! `nod-llvm` — Sprint 01 stub.
+//! `nod-llvm` — DFM -> LLVM IR codegen + MCJIT execution.
 //!
-//! See `SPRINTS.md` for when this crate gets its first real content.
-//! For now it exists only to lock the workspace crate layout.
+//! Sprint 07: kernel-subset codegen (i64 / f32 / f64 / bool arithmetic,
+//! branches, direct calls, returns) plus a thin JIT wrapper that hands
+//! back raw function pointers. No `gc.statepoint`, no opt passes — those
+//! land in Sprints 11 and 11/12 respectively.
 
-/// Placeholder so the crate compiles cleanly and rustdoc has a target.
-#[doc(hidden)]
-pub fn _placeholder() {}
+pub mod codegen;
+pub mod jit;
+pub mod jit_mm;
+
+pub use codegen::{CodegenError, CodegenOutput, FunctionMap, codegen_module};
+pub use jit::{Jit, JitError};

@@ -3,7 +3,10 @@ name        = "nod-namespace"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
-description = "NewOpenDylan: nod-namespace (Sprint 01 stub)."
+description = "NewOpenDylan: LID/dylan-package.json parsers and library/module graph."
+
+[dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

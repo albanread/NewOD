@@ -1,0 +1,3657 @@
+//! AST → DFM lowering.
+
+use std::collections::{HashMap, HashSet};
+
+use nod_dfm::{
+    Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp,
+    SlotTypeKind, TempId, Temporary, Terminator, TypeEstimate,
+};
+use nod_reader::{BinOp, Expr, Item, Module, Param, ReturnSig, Span, Statement, UnOp};
+use nod_runtime::{
+    ClassId, ClassMetadata, SlotDefault, SlotInfo, SlotType, Word, class_metadata_for,
+    class_metadata_ptr, find_class_id_by_name, register_mi_user_class,
+    register_simple_user_class,
+};
+
+use crate::c3::{C3Error, c3_linearise};
+
+type LocalEnv = HashMap<String, TempId>;
+
+/// Sprint 15: structured outcomes of the redefinition-refusal pass.
+/// Surfaced via `LoweringError` so the driver can display the
+/// diagnostic with span context.
+#[derive(Clone, Debug)]
+pub enum SealingViolation {
+    /// `define class <Sub> (<Sealed>)` where `<Sealed>` was sealed by
+    /// a prior compilation unit ("another library" in Sprint 15's
+    /// simulated-cross-library scope).
+    SealedClassExtendedAcrossBoundary { sealed_parent: String, child: String },
+    /// `add-method` against a generic whose `sealed` flag is set
+    /// from a prior compilation unit.
+    SealedGenericClosed { generic: String },
+}
+
+impl std::fmt::Display for SealingViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SealingViolation::SealedClassExtendedAcrossBoundary {
+                sealed_parent,
+                child,
+            } => write!(
+                f,
+                "sealed-class-extended-across-boundary: `{child}` cannot extend `{sealed_parent}` — sealed classes are closed against subclassing across library boundaries (Sprint 15 single-library scope)"
+            ),
+            SealingViolation::SealedGenericClosed { generic } => write!(
+                f,
+                "sealed-generic-closed: cannot add methods to `{generic}` — sealed against further additions (Sprint 15 single-library scope)"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LoweringError {
+    Unsupported { span: Span, message: String },
+    UndefinedIdent { span: Span, name: String },
+    TypeMismatch { span: Span, message: String },
+    /// Integer literal doesn't fit in the fixnum range
+    /// (`[FIXNUM_MIN, FIXNUM_MAX]` = 63-bit signed).
+    IntegerOverflow { span: Span, value: i128 },
+    /// Re-defining an existing class. Sprint 12 refuses class
+    /// redefinition; Sprint 28+ adds lazy migration.
+    ClassRedefinitionNotSupported { span: Span, class_name: String },
+    /// `class:` / `each-subclass:` / `virtual:` slots — Sprint 12 only
+    /// supports `instance:` allocation.
+    UnsupportedSlotAllocation { span: Span, class_name: String, slot_name: String, allocation: String },
+    /// The class's parent reference doesn't resolve to a known class.
+    UnknownSuperclass { span: Span, class_name: String, super_name: String },
+    /// Sprint 14: C3 linearisation failed — two parents impose
+    /// inconsistent orders on shared ancestors.
+    InconsistentInheritance { span: Span, class_name: String, detail: String },
+    /// Sprint 14: two parents independently define a slot with the same
+    /// name. Inheriting the same slot from a shared ancestor (diamond)
+    /// is fine; defining the same slot name in two unrelated parents
+    /// is an MI conflict the programmer must resolve.
+    SlotConflict {
+        span: Span,
+        class_name: String,
+        slot_name: String,
+        first_origin: String,
+        second_origin: String,
+    },
+    /// Sprint 15: a redefinition that would break a sealing assumption.
+    /// Single-library Sprint 15 scope: cross-library extension is
+    /// "simulated" as "another lowering call after the class is
+    /// sealed". Per-method violations are surfaced before any
+    /// runtime mutation runs.
+    SealingViolation { span: Span, violation: SealingViolation },
+}
+
+impl std::fmt::Display for LoweringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoweringError::Unsupported { span, message } => {
+                write!(f, "unsupported [{:?}]: {message}", span)
+            }
+            LoweringError::UndefinedIdent { span, name } => {
+                write!(f, "undefined ident `{name}` [{:?}]", span)
+            }
+            LoweringError::TypeMismatch { span, message } => {
+                write!(f, "type mismatch [{:?}]: {message}", span)
+            }
+            LoweringError::IntegerOverflow { span, value } => write!(
+                f,
+                "integer overflow [{:?}]: literal {value} out of fixnum range \
+                 (<big-integer> / <double-integer> not yet supported)",
+                span
+            ),
+            LoweringError::ClassRedefinitionNotSupported { span, class_name } => write!(
+                f,
+                "class redefinition refused [{:?}]: `{class_name}` already exists; Sprint 12 forbids redefinition",
+                span
+            ),
+            LoweringError::UnsupportedSlotAllocation { span, class_name, slot_name, allocation } => write!(
+                f,
+                "slot allocation `{allocation}` not supported [{:?}]: in `{class_name}` slot `{slot_name}` (only `instance:` is supported in Sprint 12)",
+                span
+            ),
+            LoweringError::UnknownSuperclass { span, class_name, super_name } => write!(
+                f,
+                "unknown superclass `{super_name}` [{:?}]: in `define class {class_name}`",
+                span
+            ),
+            LoweringError::InconsistentInheritance { span, class_name, detail } => write!(
+                f,
+                "inconsistent inheritance [{:?}]: in `define class {class_name}`: {detail}",
+                span
+            ),
+            LoweringError::SlotConflict {
+                span,
+                class_name,
+                slot_name,
+                first_origin,
+                second_origin,
+            } => write!(
+                f,
+                "slot conflict [{:?}]: `{class_name}` inherits slot `{slot_name}` from two unrelated parents (`{first_origin}` and `{second_origin}`); rename one slot to disambiguate",
+                span
+            ),
+            LoweringError::SealingViolation { span, violation } => write!(f, "{violation} [{:?}]", span),
+        }
+    }
+}
+
+impl LoweringError {
+    pub fn span(&self) -> Span {
+        match self {
+            LoweringError::Unsupported { span, .. }
+            | LoweringError::UndefinedIdent { span, .. }
+            | LoweringError::TypeMismatch { span, .. }
+            | LoweringError::IntegerOverflow { span, .. }
+            | LoweringError::ClassRedefinitionNotSupported { span, .. }
+            | LoweringError::UnsupportedSlotAllocation { span, .. }
+            | LoweringError::UnknownSuperclass { span, .. }
+            | LoweringError::InconsistentInheritance { span, .. }
+            | LoweringError::SlotConflict { span, .. }
+            | LoweringError::SealingViolation { span, .. } => *span,
+        }
+    }
+}
+
+/// A method registration captured during lowering and applied to the
+/// runtime dispatch table after JIT compilation. The driver / JIT glue
+/// resolves `body_fn_name` to a JIT'd function pointer, then calls
+/// `nod_runtime::add_method_full` with the full specialiser list.
+///
+/// Sprint 13 carries one `ClassId` per required parameter
+/// (`specialisers`); the legacy `receiver_class` field is kept as a
+/// convenience accessor for callers that only need the first
+/// position.
+#[derive(Clone, Debug)]
+pub struct MethodRegistration {
+    pub generic_name: String,
+    pub specialisers: Vec<ClassId>,
+    pub body_fn_name: String,
+    pub param_count: usize,
+}
+
+impl MethodRegistration {
+    /// First-parameter specialiser. Sprint 12 callers used this as
+    /// "the receiver class"; Sprint 13's multi-arg dispatch reads the
+    /// full vector.
+    pub fn receiver_class(&self) -> ClassId {
+        self.specialisers.first().copied().unwrap_or(ClassId::OBJECT)
+    }
+}
+
+/// Sprint 20b: a `%`-prefixed primitive callee lowers to a `DirectCall`
+/// against a `nod_*` runtime extern. The lowerer recognises the leading
+/// `%` and routes through `LOWER_PRIMITIVE_TABLE` below; the codegen
+/// layer (`nod-llvm/src/codegen.rs::emit_direct_call`) honours the
+/// `%`-prefix and emits the matching extern declaration.
+///
+/// Each entry: `(dylan-name, runtime-symbol, arity, return-type)`.
+///
+/// **Naming convention** — every primitive name starts with `%`. The
+/// runtime symbol is the `nod_*` C-ABI shim. Arity is the parameter
+/// count; the return type is the Dylan-side `TypeEstimate`.
+///
+/// Primitives wired here are intentionally low-level — they bridge
+/// Dylan source to the existing Sprint 20 runtime API. Higher-level
+/// generics (`size`, `concatenate`, `for-each`) live in
+/// `src/nod-dylan/dylan-sources/stdlib.dylan` and call these.
+const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
+    // Collection-class primitives (Sprint 20b — wraps the Rust Sprint 20 API).
+    ("%collection-size", "nod_collection_size", 1, TypeEstimate::Integer),
+    ("%collection-concatenate", "nod_collection_concatenate", 2, TypeEstimate::Top),
+    // <range> field accessors.
+    ("%range-from", "nod_range_from", 1, TypeEstimate::Integer),
+    ("%range-to", "nod_range_to", 1, TypeEstimate::Integer),
+    ("%range-by", "nod_range_by", 1, TypeEstimate::Integer),
+    // <simple-object-vector> primitives.
+    ("%vector-size", "nod_sov_size", 1, TypeEstimate::Integer),
+    ("%vector-element", "nod_sov_element", 2, TypeEstimate::Top),
+    ("%vector-element-setter", "nod_sov_element_setter", 3, TypeEstimate::Top),
+    // <stretchy-vector> primitives.
+    ("%stretchy-vector-size", "nod_stretchy_vector_size", 1, TypeEstimate::Integer),
+    ("%stretchy-vector-element", "nod_stretchy_vector_element", 2, TypeEstimate::Top),
+    (
+        "%stretchy-vector-element-setter",
+        "nod_stretchy_vector_element_setter",
+        3,
+        TypeEstimate::Top,
+    ),
+    ("%stretchy-vector-push", "nod_stretchy_vector_push", 2, TypeEstimate::Top),
+    // FIP primitives — drive the existing Rust iteration state.
+    ("%fip-init", "nod_fip_init", 1, TypeEstimate::Top),
+    ("%fip-finished?", "nod_fip_finished_p", 1, TypeEstimate::Boolean),
+    ("%fip-current-element", "nod_fip_current_element", 1, TypeEstimate::Top),
+    ("%fip-advance!", "nod_fip_advance", 1, TypeEstimate::Top),
+    // Allocators — for tests that exercise <range> and <stretchy-vector>
+    // from Dylan source without going through `make(<range>, …)` keyword
+    // dispatch.
+    ("%make-range", "nod_make_range", 3, TypeEstimate::Top),
+    ("%make-stretchy-vector", "nod_make_stretchy_vector", 1, TypeEstimate::Top),
+];
+
+fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {
+    LOWER_PRIMITIVE_TABLE
+        .iter()
+        .find(|(n, _, _, _)| *n == name)
+        .map(|(_, sym, ar, ty)| (*sym, *ar, *ty))
+}
+
+/// Sprint 16: the five `<pair>` / `<list>` builtins. Each lowers to a
+/// synthetic `%pair*` / `%nil` / `%empty?` callee that codegen turns
+/// into a call into the matching `nod_runtime` shim.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum ListBuiltin {
+    /// `pair(head, tail) -> <pair>`.
+    Pair,
+    /// `head(p :: <pair>) -> <object>`.
+    Head,
+    /// `tail(p :: <pair>) -> <object>`.
+    Tail,
+    /// `empty?(p) -> <boolean>`. Identity test against `nil`.
+    EmptyP,
+    /// `nil() -> <empty-list>`. Returns the pinned empty-list singleton.
+    Nil,
+}
+
+impl ListBuiltin {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "pair" => Some(ListBuiltin::Pair),
+            "head" => Some(ListBuiltin::Head),
+            "tail" => Some(ListBuiltin::Tail),
+            "empty?" => Some(ListBuiltin::EmptyP),
+            "nil" => Some(ListBuiltin::Nil),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ListBuiltin::Pair => "pair",
+            ListBuiltin::Head => "head",
+            ListBuiltin::Tail => "tail",
+            ListBuiltin::EmptyP => "empty?",
+            ListBuiltin::Nil => "nil",
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            ListBuiltin::Pair => 2,
+            ListBuiltin::Head | ListBuiltin::Tail | ListBuiltin::EmptyP => 1,
+            ListBuiltin::Nil => 0,
+        }
+    }
+
+    /// Synthetic callee symbol carried in the DFM `DirectCall` and
+    /// recognised by the codegen layer. Each one maps to a `nod_runtime`
+    /// extern shim with a fixed ABI.
+    fn callee_symbol(self) -> &'static str {
+        match self {
+            ListBuiltin::Pair => "%pair-alloc",
+            ListBuiltin::Head => "%pair-head",
+            ListBuiltin::Tail => "%pair-tail",
+            ListBuiltin::EmptyP => "%empty?",
+            ListBuiltin::Nil => "%nil",
+        }
+    }
+}
+
+/// Aggregated output of `lower_module_full`. Sprint 12 carries class
+/// and method registrations alongside the lowered function list so
+/// the JIT-glue (in `nod-sema::lib`) can install them. Sprint 15
+/// adds the per-library sealing facts captured during lowering so
+/// the dispatch resolver, `dump_sealed`, and the JIT-time installer
+/// can read them.
+#[derive(Default, Clone, Debug)]
+pub struct LoweredModule {
+    pub functions: Vec<Function>,
+    pub methods: Vec<MethodRegistration>,
+    /// Sprint 15 sealing facts collected from the parsed modifiers
+    /// and `define sealed domain` declarations.
+    pub sealing: crate::optimise::SealingFacts,
+    /// Sprint 15 dispatch resolution log — one entry per `Dispatch`
+    /// node the resolver inspected. Stored for `dump_dispatch`
+    /// annotations and as a diagnostic aid; not load-bearing for
+    /// codegen.
+    pub resolutions: Vec<crate::optimise::DispatchResolution>,
+    /// Sprint 19: every `block` form encountered during lowering.
+    /// Post-JIT the glue (`register_blocks`) resolves the lifted thunk
+    /// names to function pointers and registers them with the runtime
+    /// (`nod_runtime::register_block_fns`).
+    pub blocks: Vec<BlockRegistration>,
+}
+
+/// Sprint 19: one lifted-thunk set per `block` form in the source. The
+/// names refer to top-level functions present in `LoweredModule::functions`
+/// (each emitted with the canonical 8-captured-locals C ABI; handlers
+/// take an additional leading `condition` arg).
+#[derive(Clone, Debug)]
+pub struct BlockRegistration {
+    /// Runtime-allocated id (via `nod_runtime::allocate_block_id`).
+    /// Baked into the call site as a `WordBits` constant.
+    pub block_id: u64,
+    pub body_fn_name: String,
+    pub cleanup_fn_name: Option<String>,
+    pub afterwards_fn_name: Option<String>,
+    /// One entry per `exception` clause (source order).
+    pub handlers: Vec<BlockHandlerRegistration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockHandlerRegistration {
+    pub class_id: ClassId,
+    pub class_name: String,
+    pub body_fn_name: String,
+}
+
+pub fn lower_module(m: &Module) -> Result<Vec<Function>, Vec<LoweringError>> {
+    lower_module_full(m).map(|lm| lm.functions)
+}
+
+pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>> {
+    // Sprint 19: ensure the seed condition classes are registered
+    // before lowering starts so `<error>` / `<simple-error>` / etc.
+    // resolve via `find_class_id_by_name` during exception-clause
+    // lowering. Idempotent — repeated calls are cheap.
+    nod_runtime::ensure_conditions_registered();
+
+    let mut errors: Vec<LoweringError> = Vec::new();
+    let mut user_classes: HashMap<String, ClassId> = HashMap::new();
+
+    // Phase 1a: walk define-class items and register metadata. The
+    // sealing flag flip is deferred to Phase 1c so subclassing a
+    // sealed class WITHIN THIS SAME `lower_module_full` call is
+    // allowed (in-library subclassing — see spec 15 §6 table). The
+    // cross-library refusal in `register_class` checks `is_sealed()`,
+    // so an in-call subclass registration runs before the parent's
+    // sealed bit is flipped; a later separate `lower_module_full`
+    // call sees the flag and refuses.
+    for item in &m.items {
+        if let Item::DefineClass { name, supers, slots, span, .. } = item {
+            match register_class(name, supers, slots, *span) {
+                Ok(id) => {
+                    user_classes.insert(name.clone(), id);
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    // Phase 1c: flip sealed flags on classes + generics that bear the
+    // `sealed` modifier. Runs AFTER every class in this lowering call
+    // is registered (and after any in-library subclasses of a sealed
+    // parent are themselves registered), so the cross-library refusal
+    // in `register_class` doesn't fire for in-library use.
+    for item in &m.items {
+        if let Item::DefineClass { name, modifiers, .. } = item
+            && modifiers.contains(&nod_reader::Modifier::Sealed)
+            && let Some(&id) = user_classes.get(name)
+        {
+            let p = class_metadata_ptr(id);
+            if !p.is_null() {
+                // SAFETY: static-area metadata.
+                unsafe { (*p).mark_sealed() };
+            }
+        }
+        if let Item::DefineGeneric { name, modifiers, .. } = item
+            && modifiers.contains(&nod_reader::Modifier::Sealed)
+        {
+            let g = nod_runtime::get_or_create_generic(name);
+            g.mark_sealed();
+        }
+    }
+
+    // Phase 2: collect top-level function names (incl. auto-accessor
+    // names) and generic names.
+    let top_names = collect_top_level_names(m, &user_classes);
+    let generics = collect_generic_names(m);
+
+    let mut out: Vec<Function> = Vec::new();
+    let mut methods: Vec<MethodRegistration> = Vec::new();
+    // Sprint 19: a single `LiftSink` carries the FunctionId counter and
+    // any per-`block` lifted thunks the lowerer synthesises. Both the
+    // Phase 3 slot accessors and the Phase 4 user-item lowering allocate
+    // ids through it.
+    let mut lift_sink = LiftSink::default();
+    let alloc_id = |sink: &mut LiftSink| sink.alloc_fn_id();
+
+    // Phase 3: emit auto-generated slot accessors for every user class.
+    //
+    // For each slot in a class's merged layout:
+    //   * If the slot was introduced by THIS class (`slot_origin == self`),
+    //     emit the canonical `<C>-getter-x` / `<C>-setter-x` and register
+    //     them as methods on the slot's generic (`x` / `x-setter`).
+    //   * Else if the slot is inherited from an ancestor AND its offset
+    //     in this class differs from the offset it had in the defining
+    //     class's own layout, emit an override accessor that bakes the
+    //     new offset, and register it as an additional method on the
+    //     slot's generic specialised to this class. The Sprint 13
+    //     dispatcher picks the override when the receiver is an instance
+    //     of this class.
+    //   * If the slot is inherited and the offset matches the parent's
+    //     ("fixed-offset" case), no override is needed — the parent's
+    //     accessor method already handles the receiver via inheritance.
+    for item in &m.items {
+        let Item::DefineClass { name, slots, .. } = item else {
+            continue;
+        };
+        let Some(&class_id) = user_classes.get(name) else {
+            continue;
+        };
+        let md_ptr = nod_runtime::class_metadata_ptr(class_id);
+        if md_ptr.is_null() {
+            continue;
+        }
+        // SAFETY: registered above; static-area lifetime.
+        let metadata = unsafe { &*md_ptr };
+        for (idx, slot) in metadata.slots.iter().enumerate() {
+            let origin = metadata.slot_origin[idx];
+            if origin == class_id {
+                // Own slot — emit canonical accessors + register methods.
+                let getter_name = format!("{}-getter-{}", name, slot.name);
+                if !module_defines_function(m, &getter_name) {
+                    out.push(build_slot_getter(
+                        alloc_id(&mut lift_sink),
+                        &getter_name,
+                        slot.offset,
+                        slot_type_to_dfm_kind(slot.type_kind),
+                        slot_type_to_estimate(slot.type_kind),
+                    ));
+                    methods.push(MethodRegistration {
+                        generic_name: slot.name.clone(),
+                        specialisers: vec![class_id],
+                        body_fn_name: getter_name,
+                        param_count: 1,
+                    });
+                }
+                if slot.has_setter {
+                    let setter_name = format!("{}-setter-{}", name, slot.name);
+                    if !module_defines_function(m, &setter_name) {
+                        out.push(build_slot_setter(
+                            alloc_id(&mut lift_sink),
+                            &setter_name,
+                            slot.offset,
+                            slot_type_to_dfm_kind(slot.type_kind),
+                        ));
+                        methods.push(MethodRegistration {
+                            generic_name: format!("{}-setter", slot.name),
+                            specialisers: vec![class_id, ClassId::OBJECT],
+                            body_fn_name: setter_name,
+                            param_count: 2,
+                        });
+                    }
+                }
+                let _ = slots;
+            } else {
+                // Inherited slot — generate an override iff the offset
+                // shifts vs. the slot's defining class's own layout.
+                let origin_md_ptr = nod_runtime::class_metadata_ptr(origin);
+                if origin_md_ptr.is_null() {
+                    continue;
+                }
+                // SAFETY: static-area metadata.
+                let origin_md = unsafe { &*origin_md_ptr };
+                let origin_offset = origin_md
+                    .slots
+                    .iter()
+                    .find(|s| s.name == slot.name)
+                    .map(|s| s.offset)
+                    .unwrap_or(slot.offset);
+                if origin_offset == slot.offset {
+                    // Fixed-offset case — parent's accessor works as-is.
+                    continue;
+                }
+                // Override needed. Emit a fresh getter/setter that bakes
+                // the new offset, register it on the slot's generic
+                // specialised to this class.
+                let getter_name = format!("{}-override-getter-{}", name, slot.name);
+                if !module_defines_function(m, &getter_name) {
+                    out.push(build_slot_getter(
+                        alloc_id(&mut lift_sink),
+                        &getter_name,
+                        slot.offset,
+                        slot_type_to_dfm_kind(slot.type_kind),
+                        slot_type_to_estimate(slot.type_kind),
+                    ));
+                    methods.push(MethodRegistration {
+                        generic_name: slot.name.clone(),
+                        specialisers: vec![class_id],
+                        body_fn_name: getter_name,
+                        param_count: 1,
+                    });
+                }
+                if slot.has_setter {
+                    let setter_name = format!("{}-override-setter-{}", name, slot.name);
+                    if !module_defines_function(m, &setter_name) {
+                        out.push(build_slot_setter(
+                            alloc_id(&mut lift_sink),
+                            &setter_name,
+                            slot.offset,
+                            slot_type_to_dfm_kind(slot.type_kind),
+                        ));
+                        methods.push(MethodRegistration {
+                            generic_name: format!("{}-setter", slot.name),
+                            specialisers: vec![class_id, ClassId::OBJECT],
+                            body_fn_name: setter_name,
+                            param_count: 2,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 4: lower user-defined items.
+    let user_classes_snapshot = user_classes.clone();
+    for item in &m.items {
+        match item {
+            Item::DefineConstant { name, value, span, .. } => {
+                let mut b = FunctionBuilder::new(alloc_id(&mut lift_sink), name.clone(), *span);
+                let mut env = LocalEnv::new();
+                let ctx = LowerCtx {
+                    top_names: &top_names,
+                    generics: &generics,
+                    user_classes: &user_classes_snapshot,
+                };
+                match b.lower_expr(value, &mut env, &ctx) {
+                    Ok(t) => {
+                        let ty = b.func.temp_type(t);
+                        b.func.return_type = ty;
+                        b.terminate_current(Terminator::Return { value: Some(t) });
+                        out.push(b.finish());
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+            Item::DefineFunction {
+                name,
+                params,
+                body,
+                return_,
+                span,
+                ..
+            } => {
+                let ctx = LowerCtx {
+                    top_names: &top_names,
+                    generics: &generics,
+                    user_classes: &user_classes_snapshot,
+                };
+                match lower_function_inner(
+                    alloc_id(&mut lift_sink),
+                    name,
+                    params,
+                    return_.as_ref(),
+                    body,
+                    *span,
+                    &ctx,
+                    &mut lift_sink,
+                ) {
+                    Ok(f) => out.push(f),
+                    Err(e) => errors.push(e),
+                }
+            }
+            Item::DefineMethod {
+                name,
+                params,
+                body,
+                return_,
+                span,
+                ..
+            } => {
+                let ctx = LowerCtx {
+                    top_names: &top_names,
+                    generics: &generics,
+                    user_classes: &user_classes_snapshot,
+                };
+                match lower_method_item(
+                    alloc_id(&mut lift_sink),
+                    name,
+                    params,
+                    return_.as_ref(),
+                    body,
+                    *span,
+                    &ctx,
+                    &mut lift_sink,
+                ) {
+                    Ok(method) => {
+                        methods.push(method.registration);
+                        out.push(method.function);
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+            Item::DefineGeneric { .. } => {
+                // Sprint 12: `define generic` is informational —
+                // declares the name. We collected it in `generics`
+                // already; no lowering needed.
+            }
+            Item::DefineClass { .. } => {
+                // Already handled in Phase 1.
+            }
+            Item::DefineVariable { span, .. } => {
+                errors.push(LoweringError::Unsupported {
+                    span: *span,
+                    message: "define variable not lowered in Sprint 06".to_string(),
+                });
+            }
+            Item::DefineMacro { .. } => {
+                // WHY: Sprint 17 — macro definitions are collected and
+                // removed by `nod_macro::expand_module` before lowering.
+                // If one survives to here (direct `lower_module_full`
+                // call without expansion) it is inert; no codegen needed.
+            }
+            Item::DefineLibrary { .. } | Item::DefineModule { .. } => {}
+            Item::DefineOther { span, keyword, .. } => {
+                errors.push(LoweringError::Unsupported {
+                    span: *span,
+                    message: format!("`define {keyword}` not lowered in Sprint 06"),
+                });
+            }
+            Item::Expr(_) => {}
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    // Sprint 15 — sealing analysis + dispatch resolution. Runs BEFORE
+    // the precise-roots post-pass so any Dispatch → DirectCall (or
+    // SealedDirectCall) rewrite happens before liveness sees the
+    // call-shaped nodes; rewriting preserves the safepoint-roots
+    // discipline transparently because the new call-shaped nodes go
+    // through the same `safepoint_roots_mut()` accessor.
+    //
+    // Pre-register every method's specialiser tuple in the runtime
+    // dispatch table so the resolver can enumerate applicable methods.
+    // The body pointer is null at this stage — the JIT installs the
+    // real address later via `register_methods`. The resolver only
+    // reads `specialisers`; the resolver-side symbol name is
+    // recomputed from `(generic_name, specialisers)` independently.
+    for reg in &methods {
+        let g = nod_runtime::get_or_create_generic(&reg.generic_name);
+        // Skip if a method with these specialisers is already registered
+        // (a prior `lower_module_full` call may have done it).
+        let already = g
+            .methods
+            .read()
+            .expect("methods rwlock poisoned")
+            .iter()
+            .any(|m| m.specialisers == reg.specialisers);
+        if !already {
+            // Sprint 16: pre-register the JIT body symbol name so the
+            // dispatch resolver picks up the actual emitted symbol
+            // (slot accessors don't follow the canonical naming
+            // convention).
+            g.add_method(nod_runtime::Method {
+                specialisers: reg.specialisers.clone(),
+                body_fn_ptr: std::ptr::null(),
+                param_count: reg.param_count,
+                body_fn_name: reg.body_fn_name.clone(),
+            });
+        }
+    }
+    let sealing = crate::optimise::collect_sealing_facts(&m.items, &user_classes_snapshot);
+    crate::optimise::install_sealing_facts(&sealing);
+    let mut resolutions: Vec<crate::optimise::DispatchResolution> = Vec::new();
+    for f in &mut out {
+        let narrowed = crate::optimise::narrow_function(f);
+        let mut log = crate::optimise::resolve_dispatches(f, &narrowed, &sealing);
+        resolutions.append(&mut log);
+    }
+
+    // Sprint 11b — precise-roots post-pass. Compute the set of
+    // Sprint 19: drain any lifted-block thunks into the function list
+    // BEFORE the safepoint-roots post-pass runs so the lifted thunks
+    // also receive safepoint-roots populated.
+    out.append(&mut lift_sink.functions);
+    let blocks = std::mem::take(&mut lift_sink.blocks);
+
+    // pointer-shaped temps live across each potentially-allocating
+    // call, and stash the list on the call's `safepoint_roots` field.
+    // Codegen brackets the call with `nod_register_root` /
+    // `nod_unregister_root` pairs so the GC can rewrite the slots if
+    // it evacuates the objects mid-call.
+    for f in &mut out {
+        nod_dfm::populate_safepoint_roots(f);
+    }
+
+    Ok(LoweredModule {
+        functions: out,
+        methods,
+        sealing,
+        resolutions,
+        blocks,
+    })
+}
+
+// ─── Class registration ────────────────────────────────────────────────────
+
+fn register_class(
+    name: &str,
+    supers: &[Expr],
+    slots: &[nod_reader::SlotDef],
+    span: Span,
+) -> Result<ClassId, LoweringError> {
+    // Sprint 12 refuses redefinition.
+    if find_class_id_by_name(name).is_some() {
+        return Err(LoweringError::ClassRedefinitionNotSupported {
+            span,
+            class_name: name.to_string(),
+        });
+    }
+    // Resolve every super to a registered ClassId. Default to a
+    // singleton `[<object>]` when no supers were declared, per Dylan
+    // convention.
+    let parent_ids: Vec<ClassId> = if supers.is_empty() {
+        vec![ClassId::OBJECT]
+    } else {
+        let mut out = Vec::with_capacity(supers.len());
+        for super_expr in supers {
+            let super_name = match super_expr {
+                Expr::Ident(_, n) => n.clone(),
+                _ => {
+                    return Err(LoweringError::Unsupported {
+                        span,
+                        message: "superclass expression must be an identifier".to_string(),
+                    });
+                }
+            };
+            match find_class_id_by_name(&super_name) {
+                Some(id) => {
+                    // Sprint 15 cross-library refusal — if the parent
+                    // was already sealed by a prior lowering call, this
+                    // is an attempt to extend a sealed class from a
+                    // different "library". The check naturally allows
+                    // in-library subclassing because the parent's
+                    // `sealed` bit is flipped AFTER `register_class`
+                    // returns in this very same `lower_module_full`
+                    // call (Phase 1 vs the modifiers-acting loop).
+                    let p = class_metadata_ptr(id);
+                    if !p.is_null() {
+                        // SAFETY: static-area metadata.
+                        let sealed = unsafe { (*p).is_sealed() };
+                        if sealed {
+                            return Err(LoweringError::SealingViolation {
+                                span,
+                                violation: SealingViolation::SealedClassExtendedAcrossBoundary {
+                                    sealed_parent: super_name.clone(),
+                                    child: name.to_string(),
+                                },
+                            });
+                        }
+                    }
+                    out.push(id);
+                }
+                None => {
+                    return Err(LoweringError::UnknownSuperclass {
+                        span,
+                        class_name: name.to_string(),
+                        super_name,
+                    });
+                }
+            }
+        }
+        out
+    };
+
+    // Build SlotInfos for own slots (offsets get patched in
+    // `register_simple_user_class`).
+    let mut own_slots: Vec<SlotInfo> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if slot.allocation != nod_reader::SlotAllocation::Instance {
+            return Err(LoweringError::UnsupportedSlotAllocation {
+                span: slot.span,
+                class_name: name.to_string(),
+                slot_name: slot.name.clone(),
+                allocation: format!("{:?}", slot.allocation),
+            });
+        }
+        let type_kind = slot
+            .type_
+            .as_ref()
+            .map(slot_type_from_expr)
+            .unwrap_or(SlotType::Top);
+        let default_init = match (&slot.init_value, type_kind) {
+            (Some(Expr::Integer(_, n)), _) => {
+                // Try to encode as a fixnum literal.
+                match (*n).try_into() {
+                    Ok(i) => Word::from_fixnum(i)
+                        .map(SlotDefault::Value)
+                        .unwrap_or(SlotDefault::Unbound),
+                    Err(_) => SlotDefault::Unbound,
+                }
+            }
+            (Some(Expr::Bool(_, true)), _) => {
+                SlotDefault::Value(nod_runtime::literal_pool_immediates().true_)
+            }
+            (Some(Expr::Bool(_, false)), _) => {
+                SlotDefault::Value(nod_runtime::literal_pool_immediates().false_)
+            }
+            _ => SlotDefault::Unbound,
+        };
+        let has_setter = slot.setter.unwrap_or(true);
+        own_slots.push(SlotInfo {
+            name: slot.name.clone(),
+            offset: 0, // patched by registration helper.
+            type_kind,
+            init_keyword: slot.init_keyword.clone(),
+            required_init_keyword: slot.required_init_keyword,
+            default_init,
+            has_setter,
+        });
+    }
+
+    // Single-inheritance fast path — preserves Sprint 12 behaviour exactly.
+    if parent_ids.len() == 1 {
+        let parent_id = parent_ids[0];
+        let (id, _addr) =
+            register_simple_user_class(name, Some(parent_id), own_slots);
+        // Sprint 15: register `id` as a direct subclass of `parent_id`
+        // so the dispatch resolver can enumerate bounded subclass sets
+        // when the parent is sealed.
+        register_direct_subclass(parent_id, id);
+        return Ok(id);
+    }
+
+    // Multi-inheritance path (Sprint 14).
+    // 1. Resolve every parent's name (for C3 + diagnostics).
+    let parent_names: Vec<String> = parent_ids
+        .iter()
+        .map(|id| {
+            let md_ptr = class_metadata_ptr(*id);
+            if md_ptr.is_null() {
+                format!("<unknown:{}>", id.0)
+            } else {
+                // SAFETY: pointer is to static-area metadata.
+                unsafe { (*md_ptr).name.clone() }
+            }
+        })
+        .collect();
+    // 2. Run C3 on the parent CPLs (which are names, since that's what
+    //    c3.rs takes).
+    let parent_cpl_names: Vec<Vec<String>> = parent_ids
+        .iter()
+        .map(|id| {
+            let md = class_metadata_for(*id);
+            md.cpl
+                .iter()
+                .map(|c| {
+                    let p = class_metadata_ptr(*c);
+                    if p.is_null() {
+                        format!("<unknown:{}>", c.0)
+                    } else {
+                        // SAFETY: static area.
+                        unsafe { (*p).name.clone() }
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let parent_cpl_refs: Vec<&[String]> =
+        parent_cpl_names.iter().map(|v| v.as_slice()).collect();
+    let cpl_names = c3_linearise(name, &parent_names, &parent_cpl_refs).map_err(
+        |e| match e {
+            C3Error::InconsistentMerge { class_name } => {
+                LoweringError::InconsistentInheritance {
+                    span,
+                    class_name: class_name.clone(),
+                    detail: "C3 merge failed: parents impose conflicting orders on a shared ancestor".to_string(),
+                }
+            }
+            C3Error::UnresolvedParent { class_name, parent_name } => {
+                LoweringError::InconsistentInheritance {
+                    span,
+                    class_name,
+                    detail: format!("parent `{parent_name}` has no CPL yet (forward reference?)"),
+                }
+            }
+        },
+    )?;
+    // 3. Map names back to ClassIds. Sentinel `ClassId(u32::MAX)` for the
+    //    self entry at index 0; runtime patches after id minting.
+    let self_sentinel = ClassId(u32::MAX);
+    let mut cpl: Vec<ClassId> = Vec::with_capacity(cpl_names.len());
+    for (i, n) in cpl_names.iter().enumerate() {
+        if i == 0 {
+            cpl.push(self_sentinel);
+        } else {
+            match find_class_id_by_name(n) {
+                Some(id) => cpl.push(id),
+                None => {
+                    return Err(LoweringError::InconsistentInheritance {
+                        span,
+                        class_name: name.to_string(),
+                        detail: format!("C3-derived ancestor `{n}` is not a registered class"),
+                    });
+                }
+            }
+        }
+    }
+    // 4. Merge slot lists. Walk parents in declaration order (the
+    //    "most-specific-first append" policy from the brief): append
+    //    each parent's full slot list to the merged list, skipping
+    //    slots whose origin class is already present.
+    let mut merged_slots: Vec<SlotInfo> = Vec::new();
+    let mut merged_origin: Vec<ClassId> = Vec::new();
+    for parent_id in &parent_ids {
+        let pmd = class_metadata_for(*parent_id);
+        for (slot, origin) in pmd.slots.iter().zip(pmd.slot_origin.iter()) {
+            // If a slot with the same defining class is already in the
+            // merged list, skip it (diamond — same slot reached via two
+            // paths).
+            if merged_origin.contains(origin) {
+                // We already pulled in every slot from this origin via
+                // a different parent path; this iteration is a duplicate.
+                // But we still need to check slot name conflicts: if
+                // two different origins define the same slot NAME, that's
+                // an MI conflict.
+                continue;
+            }
+            // Conflict check: another origin already defined a slot with
+            // this name?
+            if let Some(idx) = merged_slots.iter().position(|s| s.name == slot.name) {
+                let prior_origin = merged_origin[idx];
+                if prior_origin != *origin {
+                    return Err(LoweringError::SlotConflict {
+                        span,
+                        class_name: name.to_string(),
+                        slot_name: slot.name.clone(),
+                        first_origin: class_name_of(prior_origin),
+                        second_origin: class_name_of(*origin),
+                    });
+                }
+            }
+            merged_slots.push(slot.clone());
+            merged_origin.push(*origin);
+        }
+    }
+    let inherited_slot_count = merged_slots.len();
+    // 5. Append this class's own slots (mark with self-sentinel — runtime
+    //    patches after id minting).
+    for slot in own_slots {
+        // Reject conflict with an inherited slot name.
+        if merged_slots.iter().any(|s| s.name == slot.name) {
+            return Err(LoweringError::SlotConflict {
+                span,
+                class_name: name.to_string(),
+                slot_name: slot.name.clone(),
+                first_origin: "(an ancestor)".to_string(),
+                second_origin: name.to_string(),
+            });
+        }
+        merged_slots.push(slot);
+        merged_origin.push(self_sentinel);
+    }
+    let own_slot_count = merged_slots.len() - inherited_slot_count;
+    // 6. Patch every slot's offset to its position in the merged list.
+    for (i, slot) in merged_slots.iter_mut().enumerate() {
+        slot.offset = std::mem::size_of::<nod_runtime::Wrapper>() + i * 8;
+    }
+    let (id, _addr) = register_mi_user_class(
+        name,
+        parent_ids.clone(),
+        cpl,
+        merged_slots,
+        merged_origin,
+        own_slot_count,
+        inherited_slot_count,
+    );
+    // Sprint 15: record this class as a direct subclass of every
+    // declared parent.
+    for parent_id in &parent_ids {
+        register_direct_subclass(*parent_id, id);
+    }
+    Ok(id)
+}
+
+/// Sprint 15: append `child` to `parent`'s `direct_subclasses` list.
+/// No-op if either id has no metadata (defensive against the seed
+/// path's tests).
+fn register_direct_subclass(parent: ClassId, child: ClassId) {
+    let p = class_metadata_ptr(parent);
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: pointer is to static-area metadata (process-lived).
+    unsafe { (*p).register_subclass(child) };
+}
+
+fn class_name_of(id: ClassId) -> String {
+    let p = class_metadata_ptr(id);
+    if p.is_null() {
+        format!("<unknown:{}>", id.0)
+    } else {
+        // SAFETY: static area.
+        unsafe { (*p).name.clone() }
+    }
+}
+
+fn slot_type_from_expr(e: &Expr) -> SlotType {
+    if let Expr::Ident(_, n) = e {
+        match n.as_str() {
+            "<integer>" => SlotType::Integer,
+            "<single-float>" | "<double-float>" | "<float>" => SlotType::DoubleFloat,
+            "<boolean>" => SlotType::Boolean,
+            "<character>" => SlotType::Character,
+            "<string>" | "<byte-string>" => SlotType::String,
+            "<symbol>" => SlotType::Symbol,
+            "<simple-object-vector>" | "<vector>" => SlotType::Vector,
+            "<object>" | "<top>" => SlotType::Top,
+            other => {
+                // User class? If registered, narrow.
+                if let Some(id) = find_class_id_by_name(other) {
+                    SlotType::Class(id)
+                } else {
+                    SlotType::Top
+                }
+            }
+        }
+    } else {
+        SlotType::Top
+    }
+}
+
+fn slot_type_to_dfm_kind(t: SlotType) -> SlotTypeKind {
+    match t {
+        SlotType::Integer | SlotType::Character => SlotTypeKind::Integer,
+        _ => SlotTypeKind::Object,
+    }
+}
+
+fn slot_type_to_estimate(t: SlotType) -> TypeEstimate {
+    match t {
+        SlotType::Integer => TypeEstimate::Integer,
+        SlotType::DoubleFloat => TypeEstimate::DoubleFloat,
+        SlotType::Boolean => TypeEstimate::Boolean,
+        SlotType::Character => TypeEstimate::Character,
+        SlotType::String => TypeEstimate::String,
+        _ => TypeEstimate::Top,
+    }
+}
+
+fn module_defines_function(m: &Module, name: &str) -> bool {
+    m.items.iter().any(|it| match it {
+        Item::DefineFunction { name: n, .. } | Item::DefineMethod { name: n, .. } => n == name,
+        _ => false,
+    })
+}
+
+// ─── Slot-accessor synthesis ───────────────────────────────────────────────
+
+fn build_slot_getter(
+    id: FunctionId,
+    name: &str,
+    offset: usize,
+    slot_type: SlotTypeKind,
+    return_type: TypeEstimate,
+) -> Function {
+    let span = Span {
+        file_id: nod_reader::FileId(0),
+        lo: 0,
+        hi: 0,
+    };
+    let entry = BlockId(0);
+    let self_temp = TempId(0);
+    let result_temp = TempId(1);
+    Function {
+        id,
+        name: name.to_string(),
+        params: vec![self_temp],
+        entry,
+        blocks: vec![Block {
+            id: entry,
+            label: "entry".to_string(),
+            params: Vec::new(),
+            computations: vec![Computation::LoadSlot {
+                dst: result_temp,
+                instance: self_temp,
+                offset,
+                slot_type,
+            }],
+            terminator: Terminator::Return {
+                value: Some(result_temp),
+            },
+        }],
+        temps: vec![
+            Temporary {
+                id: self_temp,
+                type_estimate: TypeEstimate::Top,
+            },
+            Temporary {
+                id: result_temp,
+                type_estimate: return_type,
+            },
+        ],
+        return_type,
+        span,
+    }
+}
+
+fn build_slot_setter(
+    id: FunctionId,
+    name: &str,
+    offset: usize,
+    slot_type: SlotTypeKind,
+) -> Function {
+    let span = Span {
+        file_id: nod_reader::FileId(0),
+        lo: 0,
+        hi: 0,
+    };
+    let entry = BlockId(0);
+    let self_temp = TempId(0);
+    let value_temp = TempId(1);
+    let result_temp = TempId(2);
+    Function {
+        id,
+        name: name.to_string(),
+        params: vec![self_temp, value_temp],
+        entry,
+        blocks: vec![Block {
+            id: entry,
+            label: "entry".to_string(),
+            params: Vec::new(),
+            computations: vec![Computation::StoreSlot {
+                dst: result_temp,
+                instance: self_temp,
+                offset,
+                value: value_temp,
+                slot_type,
+            }],
+            terminator: Terminator::Return {
+                value: Some(result_temp),
+            },
+        }],
+        temps: vec![
+            Temporary {
+                id: self_temp,
+                type_estimate: TypeEstimate::Top,
+            },
+            Temporary {
+                id: value_temp,
+                type_estimate: TypeEstimate::Top,
+            },
+            Temporary {
+                id: result_temp,
+                type_estimate: TypeEstimate::Top,
+            },
+        ],
+        return_type: TypeEstimate::Top,
+        span,
+    }
+}
+
+// ─── Method lowering ───────────────────────────────────────────────────────
+
+struct LoweredMethod {
+    function: Function,
+    registration: MethodRegistration,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_method_item(
+    id: FunctionId,
+    name: &str,
+    params: &[Param],
+    return_sig: Option<&ReturnSig>,
+    body: &[Statement],
+    span: Span,
+    ctx: &LowerCtx,
+    sink: &mut LiftSink,
+) -> Result<LoweredMethod, LoweringError> {
+    if params.is_empty() {
+        return Err(LoweringError::Unsupported {
+            span,
+            message: "define method requires at least one parameter".to_string(),
+        });
+    }
+    // Sprint 13: collect ONE specialiser per required parameter. An
+    // unannotated parameter is `<object>` per Dylan convention.
+    let mut specialisers: Vec<ClassId> = Vec::with_capacity(params.len());
+    for p in params {
+        let cls = match &p.type_ {
+            Some(Expr::Ident(_, cls)) => match find_class_id_by_name(cls) {
+                Some(id) => id,
+                None => {
+                    return Err(LoweringError::UndefinedIdent {
+                        span: p.span,
+                        name: cls.clone(),
+                    });
+                }
+            },
+            _ => ClassId::OBJECT,
+        };
+        specialisers.push(cls);
+    }
+    let receiver_class = specialisers[0];
+    // Encode all specialisers in the body fn name so distinct
+    // multi-arg methods don't collide at codegen.
+    let suffix = specialisers
+        .iter()
+        .map(|c| c.0.to_string())
+        .collect::<Vec<_>>()
+        .join("_");
+    let body_fn_name = format!("{name}${suffix}");
+    let function =
+        lower_function_inner(id, &body_fn_name, params, return_sig, body, span, ctx, sink)?;
+    let _ = receiver_class;
+    let registration = MethodRegistration {
+        generic_name: name.to_string(),
+        specialisers,
+        body_fn_name: body_fn_name.clone(),
+        param_count: params.len(),
+    };
+    Ok(LoweredMethod {
+        function,
+        registration,
+    })
+}
+
+pub fn lower_function(
+    name: &str,
+    params: &[Param],
+    body: &[Statement],
+) -> Result<Function, LoweringError> {
+    let span = body
+        .first()
+        .map(Statement::span)
+        .or_else(|| params.first().map(|p| p.span))
+        .unwrap_or(Span {
+            file_id: nod_reader::FileId(0),
+            lo: 0,
+            hi: 0,
+        });
+    let top_names = TopNames::empty();
+    let generics: HashSet<String> = HashSet::new();
+    let user_classes: HashMap<String, ClassId> = HashMap::new();
+    let ctx = LowerCtx {
+        top_names: &top_names,
+        generics: &generics,
+        user_classes: &user_classes,
+    };
+    let mut sink = LiftSink::default();
+    lower_function_inner(FunctionId(0), name, params, None, body, span, &ctx, &mut sink)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_function_inner(
+    id: FunctionId,
+    name: &str,
+    params: &[Param],
+    return_sig: Option<&ReturnSig>,
+    body: &[Statement],
+    span: Span,
+    ctx: &LowerCtx,
+    sink: &mut LiftSink,
+) -> Result<Function, LoweringError> {
+    let mut b = FunctionBuilder::new(id, name.to_string(), span);
+    let mut env = LocalEnv::new();
+
+    for p in params {
+        let pty = type_from_expr(p.type_.as_ref());
+        let t = b.fresh_temp(pty);
+        b.func.params.push(t);
+        env.insert(p.name.clone(), t);
+    }
+
+    let declared_ret = return_sig
+        .and_then(|r| r.values.first().and_then(|v| v.type_.as_ref()))
+        .map(|e| type_from_expr(Some(e)));
+
+    let last_idx = body.len().saturating_sub(1);
+    let mut final_temp: Option<TempId> = None;
+    for (i, stmt) in body.iter().enumerate() {
+        let is_last = i == last_idx;
+        match stmt {
+            Statement::Expr(e) => {
+                let t = b.lower_expr(e, &mut env, ctx)?;
+                if is_last {
+                    final_temp = Some(t);
+                }
+            }
+            Statement::Let {
+                binders,
+                rest,
+                value,
+                span,
+            } => {
+                if rest.is_some() || binders.len() != 1 {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "Sprint 06 lowers single-binder `let` only".to_string(),
+                    });
+                }
+                let bname = &binders[0].name;
+                let t = b.lower_expr(value, &mut env, ctx)?;
+                env.insert(bname.clone(), t);
+                if is_last {
+                    final_temp = Some(t);
+                }
+            }
+            Statement::Local { span, .. } => {
+                return Err(LoweringError::Unsupported {
+                    span: *span,
+                    message: "`local method` not lowered in Sprint 06".to_string(),
+                });
+            }
+            Statement::While { cond, body: wbody, .. } => {
+                // Sprint 18: `while (cond) body end`. Three-block CFG
+                // with a back-edge: header → loop_body → header / exit.
+                // The header block evaluates the condition each
+                // iteration; loop_body runs the user statements then
+                // unconditionally jumps back to header.
+                b.lower_while_like(cond, wbody, false, &mut env, ctx)?;
+                if is_last {
+                    final_temp = None; // while statements have no value
+                }
+            }
+            Statement::Until { cond, body: wbody, .. } => {
+                // Sprint 18: `until (cond) body end`. Same shape as
+                // `while` but the condition is negated at the header.
+                b.lower_while_like(cond, wbody, true, &mut env, ctx)?;
+                if is_last {
+                    final_temp = None;
+                }
+            }
+            Statement::For { span, .. } => {
+                return Err(LoweringError::Unsupported {
+                    span: *span,
+                    message: "`for` not lowered in Sprint 18 (use `for-range` macro or rewrite to `while`)".to_string(),
+                });
+            }
+            Statement::Block {
+                span,
+                exit_var,
+                body: blk_body,
+                handlers,
+                cleanup,
+                afterwards,
+            } => {
+                // Sprint 19: lower `block ... exception ... cleanup ...
+                // end` via lifted thunks + a runtime `nod_run_block`
+                // call. See `docs/CONDITIONS.md` for the design.
+                let t = lower_block_form(
+                    &mut b,
+                    sink,
+                    &mut env,
+                    ctx,
+                    *span,
+                    name,
+                    exit_var.as_deref(),
+                    blk_body,
+                    handlers,
+                    cleanup,
+                    afterwards,
+                )?;
+                if is_last {
+                    final_temp = Some(t);
+                }
+            }
+        }
+    }
+
+    let ret_ty = if let Some(declared) = declared_ret {
+        declared
+    } else if let Some(t) = final_temp {
+        b.func.temp_type(t)
+    } else {
+        TypeEstimate::Unit
+    };
+    b.func.return_type = ret_ty;
+
+    let term = if ret_ty == TypeEstimate::Unit {
+        Terminator::Return { value: None }
+    } else {
+        let t = final_temp.ok_or_else(|| LoweringError::Unsupported {
+            span,
+            message: "function with non-unit return has empty body".to_string(),
+        })?;
+        Terminator::Return { value: Some(t) }
+    };
+    b.terminate_current(term);
+
+    Ok(b.finish())
+}
+
+// ─── Top-level name set + lowering context ─────────────────────────────────
+
+pub struct TopNames {
+    fns: HashMap<String, TypeEstimate>,
+}
+
+impl TopNames {
+    pub fn empty() -> Self {
+        Self { fns: HashMap::new() }
+    }
+    pub fn contains(&self, name: &str) -> bool {
+        self.fns.contains_key(name)
+    }
+    pub fn return_type(&self, name: &str) -> Option<TypeEstimate> {
+        self.fns.get(name).copied()
+    }
+}
+
+struct LowerCtx<'a> {
+    top_names: &'a TopNames,
+    generics: &'a HashSet<String>,
+    user_classes: &'a HashMap<String, ClassId>,
+}
+
+/// Sprint 19: accumulator for the lifted thunks each `block` form
+/// produces. Threaded through `lower_function_inner` and `FunctionBuilder`
+/// so a deeply-nested `block` can deposit its synthesised top-level
+/// functions back into the enclosing `lower_module_full` pass.
+///
+/// `next_fn_id` mirrors the counter `lower_module_full` uses for user
+/// `define function`s; lifted thunks get fresh ids in the same space.
+/// `name_seed` lets us append a counter to lift-thunk names so two
+/// `block` forms in the same parent function don't collide.
+#[derive(Default)]
+pub struct LiftSink {
+    pub functions: Vec<Function>,
+    pub blocks: Vec<BlockRegistration>,
+    pub next_fn_id: u32,
+    pub thunk_counter: u32,
+}
+
+impl LiftSink {
+    fn alloc_fn_id(&mut self) -> FunctionId {
+        let id = FunctionId(self.next_fn_id);
+        self.next_fn_id += 1;
+        id
+    }
+    fn alloc_thunk_suffix(&mut self) -> u32 {
+        let n = self.thunk_counter;
+        self.thunk_counter += 1;
+        n
+    }
+}
+
+fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) -> TopNames {
+    let mut fns = HashMap::new();
+    for item in &m.items {
+        if let Item::DefineFunction { name, return_, .. } = item {
+            let ret = return_
+                .as_ref()
+                .and_then(|r| r.values.first().and_then(|v| v.type_.as_ref()))
+                .map(|e| type_from_expr(Some(e)))
+                .unwrap_or(TypeEstimate::Top);
+            fns.insert(name.clone(), ret);
+        }
+    }
+    // Slot accessors are emitted as top-level functions too; record
+    // them so `<C>-getter-foo(p)` resolves to a DirectCall. For MI
+    // override accessors (`<C>-override-getter-foo`) — also include
+    // them.
+    for item in &m.items {
+        let Item::DefineClass { name, .. } = item else {
+            continue;
+        };
+        let Some(&class_id) = user_classes.get(name) else {
+            continue;
+        };
+        let md_ptr = nod_runtime::class_metadata_ptr(class_id);
+        if md_ptr.is_null() {
+            continue;
+        }
+        // SAFETY: registered class, static-area metadata.
+        let metadata = unsafe { &*md_ptr };
+        for (idx, slot) in metadata.slots.iter().enumerate() {
+            let origin = metadata.slot_origin[idx];
+            if origin == class_id {
+                let getter = format!("{}-getter-{}", name, slot.name);
+                fns.insert(getter, slot_type_to_estimate(slot.type_kind));
+                if slot.has_setter {
+                    let setter = format!("{}-setter-{}", name, slot.name);
+                    fns.insert(setter, TypeEstimate::Top);
+                }
+            } else {
+                // Inherited slot — if Phase 3 will generate an override
+                // (offset differs vs. defining-class layout), the
+                // override function needs to be in `top_names` too.
+                let origin_md_ptr = nod_runtime::class_metadata_ptr(origin);
+                if origin_md_ptr.is_null() {
+                    continue;
+                }
+                // SAFETY: static-area metadata.
+                let origin_md = unsafe { &*origin_md_ptr };
+                let origin_offset = origin_md
+                    .slots
+                    .iter()
+                    .find(|s| s.name == slot.name)
+                    .map(|s| s.offset)
+                    .unwrap_or(slot.offset);
+                if origin_offset != slot.offset {
+                    let getter = format!("{}-override-getter-{}", name, slot.name);
+                    fns.insert(getter, slot_type_to_estimate(slot.type_kind));
+                    if slot.has_setter {
+                        let setter = format!("{}-override-setter-{}", name, slot.name);
+                        fns.insert(setter, TypeEstimate::Top);
+                    }
+                }
+            }
+        }
+    }
+    TopNames { fns }
+}
+
+fn collect_generic_names(m: &Module) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for item in &m.items {
+        match item {
+            Item::DefineGeneric { name, .. } => {
+                out.insert(name.clone());
+            }
+            Item::DefineMethod { name, .. } => {
+                out.insert(name.clone());
+            }
+            Item::DefineClass { name, .. } => {
+                // Auto-generated slot accessors are generics (registered
+                // by name into the dispatch table). Adding them here
+                // ensures `x(p)` lowers to Dispatch when the function
+                // table isn't sufficient (e.g. cross-class methods).
+                //
+                // For MI: every slot — own or inherited — belongs to a
+                // generic with the slot's name. The dispatch picks the
+                // right per-class method (override or parent's).
+                if let Some(class_id) = find_class_id_by_name(name) {
+                    let md_ptr = nod_runtime::class_metadata_ptr(class_id);
+                    if !md_ptr.is_null() {
+                        // SAFETY: registered class.
+                        let metadata = unsafe { &*md_ptr };
+                        for slot in &metadata.slots {
+                            out.insert(slot.name.clone());
+                            if slot.has_setter {
+                                out.insert(format!("{}-setter", slot.name));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// ─── Type-expr → TypeEstimate ────────────────────────────────────────────
+
+fn type_from_expr(ty: Option<&Expr>) -> TypeEstimate {
+    let Some(ty) = ty else { return TypeEstimate::Top };
+    match ty {
+        Expr::Ident(_, n) => match n.as_str() {
+            "<integer>" => TypeEstimate::Integer,
+            "<single-float>" => TypeEstimate::SingleFloat,
+            "<double-float>" | "<float>" => TypeEstimate::DoubleFloat,
+            "<boolean>" => TypeEstimate::Boolean,
+            "<character>" => TypeEstimate::Character,
+            "<string>" | "<byte-string>" => TypeEstimate::String,
+            "<object>" | "<top>" => TypeEstimate::Top,
+            // Sprint 15 method-specialiser narrowing: a `<foo>`-shaped
+            // type ident that resolves to a registered class lights up
+            // as `Class(<foo>)`. The dispatch resolver consults this
+            // alongside the sealing facts to pick sealed-direct.
+            //
+            // For unregistered classes we fall back to `Top` (the
+            // parameter type is informational only — codegen lowers
+            // it as a tagged Word regardless of estimate). The
+            // narrowing pass / resolver simply skips temps with `Top`.
+            other if other.starts_with('<') && other.ends_with('>') => {
+                match find_class_id_by_name(other) {
+                    Some(id) => TypeEstimate::Class(id.0),
+                    None => TypeEstimate::Top,
+                }
+            }
+            _ => TypeEstimate::Top,
+        },
+        _ => TypeEstimate::Top,
+    }
+}
+
+// ─── Function builder ────────────────────────────────────────────────────
+
+struct FunctionBuilder {
+    func: Function,
+    current: usize,
+    next_temp: u32,
+    next_block: u32,
+    /// Sprint 19: last value-producing temp in this function, used by
+    /// `lower_statements_into` (the block-lifting helper) to know what
+    /// to return from a lifted thunk. Updated as statements lower.
+    /// `None` after a statement that produces no value (loops).
+    last_temp: Option<TempId>,
+}
+
+impl FunctionBuilder {
+    fn new(id: FunctionId, name: String, span: Span) -> Self {
+        let entry = BlockId(0);
+        let func = Function {
+            id,
+            name,
+            params: Vec::new(),
+            entry,
+            blocks: vec![Block {
+                id: entry,
+                label: "entry".to_string(),
+                params: Vec::new(),
+                computations: Vec::new(),
+                terminator: Terminator::Return { value: None },
+            }],
+            temps: Vec::new(),
+            return_type: TypeEstimate::Unit,
+            span,
+        };
+        Self {
+            func,
+            current: 0,
+            next_temp: 0,
+            next_block: 1,
+            last_temp: None,
+        }
+    }
+
+    fn finish(self) -> Function {
+        self.func
+    }
+
+    fn last_temp(&self) -> Option<TempId> {
+        self.last_temp
+    }
+
+    fn set_last_temp(&mut self, t: TempId) {
+        self.last_temp = Some(t);
+    }
+
+    fn clear_last_temp(&mut self) {
+        self.last_temp = None;
+    }
+
+    fn fresh_temp(&mut self, ty: TypeEstimate) -> TempId {
+        let id = TempId(self.next_temp);
+        self.next_temp += 1;
+        self.func.temps.push(Temporary {
+            id,
+            type_estimate: ty,
+        });
+        id
+    }
+
+    fn new_block(&mut self, label: String) -> BlockId {
+        let id = BlockId(self.next_block);
+        self.next_block += 1;
+        self.func.blocks.push(Block {
+            id,
+            label,
+            params: Vec::new(),
+            computations: Vec::new(),
+            terminator: Terminator::Return { value: None },
+        });
+        id
+    }
+
+    fn block_mut(&mut self, id: BlockId) -> &mut Block {
+        self.func
+            .blocks
+            .iter_mut()
+            .find(|b| b.id == id)
+            .expect("block not found")
+    }
+
+    fn switch_to(&mut self, id: BlockId) {
+        self.current = self
+            .func
+            .blocks
+            .iter()
+            .position(|b| b.id == id)
+            .expect("block not found");
+    }
+
+    fn push(&mut self, c: Computation) {
+        self.func.blocks[self.current].computations.push(c);
+    }
+
+    fn terminate_current(&mut self, t: Terminator) {
+        self.func.blocks[self.current].terminator = t;
+    }
+
+    fn add_block_param(&mut self, block: BlockId, ty: TypeEstimate) -> TempId {
+        let t = self.fresh_temp(ty);
+        self.block_mut(block).params.push(t);
+        t
+    }
+
+    // ─── Expression lowering ────────────────────────────────────────────
+
+    fn lower_expr(
+        &mut self,
+        e: &Expr,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        match e {
+            Expr::Integer(span, v) => {
+                const FIXNUM_MIN_I128: i128 = -(1_i128 << 62);
+                const FIXNUM_MAX_I128: i128 = (1_i128 << 62) - 1;
+                if *v < FIXNUM_MIN_I128 || *v > FIXNUM_MAX_I128 {
+                    return Err(LoweringError::IntegerOverflow {
+                        span: *span,
+                        value: *v,
+                    });
+                }
+                let t = self.fresh_temp(TypeEstimate::Integer);
+                self.push(Computation::Const {
+                    dst: t,
+                    value: ConstValue::Integer(*v),
+                });
+                Ok(t)
+            }
+            Expr::Float(_, v) => {
+                let t = self.fresh_temp(TypeEstimate::DoubleFloat);
+                self.push(Computation::Const {
+                    dst: t,
+                    value: ConstValue::Float(*v),
+                });
+                Ok(t)
+            }
+            Expr::Bool(_, v) => {
+                let t = self.fresh_temp(TypeEstimate::Boolean);
+                self.push(Computation::Const {
+                    dst: t,
+                    value: ConstValue::Bool(*v),
+                });
+                Ok(t)
+            }
+            Expr::String(_, raw) => {
+                let decoded = decode_dylan_string_literal(raw);
+                let t = self.fresh_temp(TypeEstimate::String);
+                self.push(Computation::Const {
+                    dst: t,
+                    value: ConstValue::String(decoded),
+                });
+                Ok(t)
+            }
+            Expr::Char(_, c) => {
+                let t = self.fresh_temp(TypeEstimate::Character);
+                self.push(Computation::Const {
+                    dst: t,
+                    value: ConstValue::Char(*c),
+                });
+                Ok(t)
+            }
+            Expr::Symbol(span, _) => Err(LoweringError::Unsupported {
+                span: *span,
+                message: "symbol literals not lowered in Sprint 06".to_string(),
+            }),
+            Expr::Ident(span, name) => {
+                if let Some(t) = env.get(name) {
+                    return Ok(*t);
+                }
+                // Sprint 12: a `<foo>`-shaped ident may refer to a
+                // registered class. Lower as a constant pointer to
+                // the class metadata (i.e. a tagged Word).
+                if name.starts_with('<')
+                    && name.ends_with('>')
+                    && let Some(class_id) = ctx.user_classes.get(name).copied().or_else(|| find_class_id_by_name(name))
+                {
+                    return Ok(self.emit_class_ref(class_id));
+                }
+                if ctx.top_names.contains(name) {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: format!(
+                            "first-class reference to top-level function `{name}` not lowered in Sprint 06"
+                        ),
+                    });
+                }
+                Err(LoweringError::UndefinedIdent {
+                    span: *span,
+                    name: name.clone(),
+                })
+            }
+            Expr::Paren { inner, .. } => self.lower_expr(inner, env, ctx),
+            Expr::BinOp { op, lhs, rhs, span } => {
+                if *op == BinOp::Assign {
+                    return self.lower_assign(lhs, rhs, *span, env, ctx);
+                }
+                let l = self.lower_expr(lhs, env, ctx)?;
+                let r = self.lower_expr(rhs, env, ctx)?;
+                let lt = self.func.temp_type(l);
+                let rt = self.func.temp_type(r);
+                let op = select_binop(*op, lt, rt, *span)?;
+                let dst = self.fresh_temp(op.result_type());
+                self.push(Computation::PrimOp {
+                    dst,
+                    op,
+                    args: vec![l, r],
+                });
+                Ok(dst)
+            }
+            Expr::UnOp { op, operand, span } => {
+                let v = self.lower_expr(operand, env, ctx)?;
+                let vt = self.func.temp_type(v);
+                let op = select_unop(*op, vt, *span)?;
+                let dst = self.fresh_temp(op.result_type());
+                self.push(Computation::PrimOp {
+                    dst,
+                    op,
+                    args: vec![v],
+                });
+                Ok(dst)
+            }
+            Expr::If { cond, then_, else_, span } => {
+                let Some(else_) = else_ else {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "Sprint 06 lowers only `if`-expressions with an `else` arm"
+                            .to_string(),
+                    });
+                };
+                self.lower_if(cond, then_, else_, env, ctx)
+            }
+            Expr::Begin { body, span } => {
+                if body.is_empty() {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "empty `begin` block not lowered".to_string(),
+                    });
+                }
+                let last_idx = body.len() - 1;
+                let mut last = None;
+                for (i, e) in body.iter().enumerate() {
+                    let t = self.lower_expr(e, env, ctx)?;
+                    if i == last_idx {
+                        last = Some(t);
+                    }
+                }
+                Ok(last.expect("begin had body"))
+            }
+            Expr::Call { callee, args, span } => {
+                self.lower_call(callee, args, *span, env, ctx)
+            }
+            Expr::Let { binder, value, .. } => {
+                // Sprint 18: lower `let X = E` at expression position
+                // — used by macro-emitted `begin let i = … ; while … end end`
+                // and by Sprint 03's single-binder `let x = 41; x + 1 end`
+                // surface. Inserts the binder into the surrounding env
+                // and returns the value temp (so the expression evaluates
+                // to the bound value).
+                let t = self.lower_expr(value, env, ctx)?;
+                env.insert(binder.clone(), t);
+                Ok(t)
+            }
+            Expr::Unless { span, .. }
+            | Expr::Case { span, .. }
+            | Expr::LocalMethod { span, .. }
+            | Expr::Method { span, .. } => Err(LoweringError::Unsupported {
+                span: *span,
+                message: format!(
+                    "expression form `{}` not lowered in Sprint 06",
+                    expr_kind(e)
+                ),
+            }),
+            Expr::Stmt(s) => self.lower_stmt_as_expr(s, env, ctx),
+        }
+    }
+
+    /// Materialise a class reference as a Word constant pointing at
+    /// the class's `ClassMetadata` in the static area. We tag the
+    /// address with bit 0 = 1 (pointer tag); slot-load/store codegen
+    /// will untag.
+    fn emit_class_ref(&mut self, class_id: ClassId) -> TempId {
+        let addr = nod_runtime::class_metadata_ptr(class_id) as u64;
+        let tagged = addr | 1; // pointer tag.
+        let t = self.fresh_temp(TypeEstimate::Top);
+        // Use a Const with Integer to encode the bit pattern. The
+        // codegen path for `TypeEstimate::Top` integer-const lowers
+        // to a tagged Word — but we want the raw bits straight, not
+        // shifted. Use a special const-value form via String + cast?
+        // Simpler: encode as a tagged-Word `Integer` whose value, when
+        // run through the codegen's `(n << 1)` machinery, yields the
+        // right bits. We can't do that here because codegen shifts.
+        // Workaround: bake the raw bits via a `PrimOp::AddInt(zero,
+        // raw)` of integer zero? Still shifts.
+        //
+        // The right answer: introduce a `ConstValue::WordBits(u64)`
+        // that codegen lowers as a raw i64 constant. Add it now.
+        self.push(Computation::Const {
+            dst: t,
+            value: ConstValue::WordBits(tagged),
+        });
+        t
+    }
+
+    fn lower_assign(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        // Sprint 18: `local := value` reassigns a local-variable binding
+        // in-place. We don't have proper mutable cells — we just rebind
+        // the name to the new value's temp in `env`. This makes the
+        // post-assignment SSA temp visible to subsequent reads in the
+        // same scope; `lower_while_like` snapshots names at the back
+        // edge to thread them through the header phi.
+        if let Expr::Ident(_, name) = lhs {
+            if env.contains_key(name) {
+                let t = self.lower_expr(rhs, env, ctx)?;
+                env.insert(name.clone(), t);
+                return Ok(t);
+            }
+            return Err(LoweringError::UndefinedIdent {
+                span,
+                name: name.clone(),
+            });
+        }
+        // Sprint 12: only `slot-getter(obj) := value` is supported.
+        // I.e. lhs is `Call(Ident(name), [obj])`. We rewrite to a
+        // setter dispatch.
+        let Expr::Call { callee, args, .. } = lhs else {
+            return Err(LoweringError::Unsupported {
+                span,
+                message: "Sprint 12 only supports `slot-getter(obj) := value` assignment".to_string(),
+            });
+        };
+        let Expr::Ident(_, slot_name) = callee.as_ref() else {
+            return Err(LoweringError::Unsupported {
+                span,
+                message: "Sprint 12 assign-call: callee must be an identifier".to_string(),
+            });
+        };
+        if args.len() != 1 {
+            return Err(LoweringError::Unsupported {
+                span,
+                message: "Sprint 12 setter: only unary slot setters supported".to_string(),
+            });
+        }
+        let obj_temp = self.lower_expr(&args[0], env, ctx)?;
+        let value_temp = self.lower_expr(rhs, env, ctx)?;
+        if let Some(offset) = self.try_resolve_slot_offset(obj_temp, slot_name, ctx) {
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::StoreSlot {
+                dst,
+                instance: obj_temp,
+                offset,
+                value: value_temp,
+                slot_type: SlotTypeKind::Object,
+            });
+            return Ok(dst);
+        }
+        let dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::Dispatch {
+            dst,
+            generic_name: format!("{slot_name}-setter"),
+            args: vec![obj_temp, value_temp],
+            safepoint_roots: Vec::new(),
+        });
+        Ok(dst)
+    }
+
+    /// If `obj_temp` carries a user-class type estimate (or its declared
+    /// parameter type is one), and `slot_name` is one of that class's
+    /// slots, return the byte offset. Otherwise `None`.
+    fn try_resolve_slot_offset(
+        &self,
+        _obj_temp: TempId,
+        _slot_name: &str,
+        _ctx: &LowerCtx,
+    ) -> Option<usize> {
+        // Sprint 12: the SSA type lattice doesn't carry user class ids
+        // directly. Always go through Dispatch for slot access. The
+        // direct LoadSlot path lights up when we add a class-aware
+        // type estimate (Sprint 13).
+        None
+    }
+
+    fn lower_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        // `instance?(v, <class>)` intrinsic.
+        if let Expr::Ident(_, name) = callee
+            && name == "instance?"
+            && args.len() == 2
+        {
+            return self.lower_instance_check(&args[0], &args[1], env, ctx, span);
+        }
+        // `make(<class>, kw: v, ...)` intrinsic.
+        if let Expr::Ident(_, name) = callee
+            && name == "make"
+        {
+            return self.lower_make(args, env, ctx, span);
+        }
+        // Sprint 14: `next-method()` and `next-method?()` intrinsics.
+        // Lower to DirectCall against the runtime shim. Explicit-args
+        // form `(next-method x y)` is Sprint 17 macro territory; today
+        // only the no-args form is supported (the shim re-uses the
+        // parent method's args via the thread-local chain frame).
+        if let Expr::Ident(_, name) = callee
+            && name == "next-method"
+        {
+            if !args.is_empty() {
+                return Err(LoweringError::Unsupported {
+                    span,
+                    message: "Sprint 14: `next-method` with explicit arguments is Sprint 17 macro work; use the no-args form".to_string(),
+                });
+            }
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "nod_next_method".to_string(),
+                args: Vec::new(),
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
+        if let Expr::Ident(_, name) = callee
+            && name == "next-method?"
+            && args.is_empty()
+        {
+            let dst = self.fresh_temp(TypeEstimate::Boolean);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "nod_has_next_method".to_string(),
+                args: Vec::new(),
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
+        // Sprint 16: `<pair>` / `<list>` builtins. `pair`, `head`,
+        // `tail`, `empty?`, `nil` lower to direct calls into the runtime
+        // shims. The codegen layer recognises the `%pair*` / `%nil` /
+        // `%empty?` prefixes and emits the right extern declarations +
+        // call sites. Estimates carry `Class(<pair>)` for the allocating
+        // form so the dispatch resolver can narrow `<pair>`-typed args.
+        if let Expr::Ident(_, name) = callee
+            && let Some(builtin) = ListBuiltin::from_name(name)
+        {
+            return self.lower_list_builtin(builtin, args, env, ctx, span);
+        }
+        // Sprint 20b: `#(a, b, c)` literal lists. The parser emits
+        // `Call(Ident("#list"), [a, b, c])`; we lower as a right-nested
+        // chain of `pair(elt, tail)` calls bottoming out at `nil`.
+        if let Expr::Ident(_, name) = callee
+            && name == "#list"
+        {
+            // Empty list literal: just `nil`.
+            if args.is_empty() {
+                let dst = self.fresh_temp(TypeEstimate::Class(
+                    nod_runtime::ClassId::EMPTY_LIST.0,
+                ));
+                self.push(Computation::DirectCall {
+                    dst,
+                    callee: "%nil".to_string(),
+                    args: Vec::new(),
+                    safepoint_roots: Vec::new(),
+                });
+                return Ok(dst);
+            }
+            // Lower each element to a temp, then build the chain
+            // right-to-left.
+            let elem_temps: Vec<TempId> = args
+                .iter()
+                .map(|a| self.lower_expr(a, env, ctx))
+                .collect::<Result<_, _>>()?;
+            let mut tail = self.fresh_temp(TypeEstimate::Class(
+                nod_runtime::ClassId::EMPTY_LIST.0,
+            ));
+            self.push(Computation::DirectCall {
+                dst: tail,
+                callee: "%nil".to_string(),
+                args: Vec::new(),
+                safepoint_roots: Vec::new(),
+            });
+            for elt in elem_temps.into_iter().rev() {
+                let pair_dst = self.fresh_temp(TypeEstimate::Class(
+                    nod_runtime::ClassId::PAIR.0,
+                ));
+                self.push(Computation::DirectCall {
+                    dst: pair_dst,
+                    callee: "%pair-alloc".to_string(),
+                    args: vec![elt, tail],
+                    safepoint_roots: Vec::new(),
+                });
+                tail = pair_dst;
+            }
+            return Ok(tail);
+        }
+        // Sprint 20b: `%`-prefixed primitive ops. Each entry in
+        // `LOWER_PRIMITIVE_TABLE` lowers to a `DirectCall` against a
+        // `nod_*` runtime shim. Args are type-checked for arity only;
+        // the runtime tolerates Word inputs of the wrong shape (e.g.
+        // non-fixnum to `%range-from` returns 0).
+        if let Expr::Ident(_, name) = callee
+            && name.starts_with('%')
+            && let Some((sym, arity, ret_ty)) = lookup_primitive(name)
+        {
+            if args.len() != arity {
+                return Err(LoweringError::Unsupported {
+                    span,
+                    message: format!(
+                        "primitive `{name}` expects {arity} argument(s), got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let arg_temps: Vec<TempId> = args
+                .iter()
+                .map(|a| self.lower_expr(a, env, ctx))
+                .collect::<Result<_, _>>()?;
+            let dst = self.fresh_temp(ret_ty);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: sym.to_string(),
+                args: arg_temps,
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
+        // Sprint 19: `signal(c)` / `condition-message(c)` builtins.
+        if let Expr::Ident(_, name) = callee
+            && name == "signal"
+            && args.len() == 1
+        {
+            let a = self.lower_expr(&args[0], env, ctx)?;
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "%signal".to_string(),
+                args: vec![a],
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
+        if let Expr::Ident(_, name) = callee
+            && name == "condition-message"
+            && args.len() == 1
+        {
+            let a = self.lower_expr(&args[0], env, ctx)?;
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "%condition-message".to_string(),
+                args: vec![a],
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
+        // Sprint 19: if the callee is a local binding that refers to an
+        // exit procedure (i.e. the `k` in `block (k) ... k(v) ... end`),
+        // lower as `%invoke-exit(k, v)`. Detecting the case statically
+        // is hard because env doesn't carry "this is an exit-procedure"
+        // type info; we can't tell apart from a regular call. Sprint 19
+        // simplification: if a name is in env AND is being called with
+        // exactly one arg AND we're inside a lifted block thunk whose
+        // env binds that name from `exit_var`, treat it as invoke-exit.
+        //
+        // We use a simple naming convention: the `exit_var` name is
+        // stored verbatim in env. To unambiguously trigger
+        // `%invoke-exit`, the lowerer special-cases names that resolve
+        // to an env entry AND aren't otherwise a known function. The
+        // codegen-level `%invoke-exit` handler takes the env-bound Word
+        // (the `<exit-procedure>` instance) and the value Word and
+        // invokes the runtime shim.
+        //
+        // Heuristic: if the callee is an ident in `env`, NOT in
+        // top_names, and there's exactly one argument, treat as
+        // invoke-exit. This is safe for Sprint 19 because the parser /
+        // earlier lowering doesn't yet support first-class function
+        // values in env; the only env-bound callable values are exit
+        // procedures.
+        if let Expr::Ident(_, name) = callee
+            && env.contains_key(name)
+            && !ctx.top_names.contains(name)
+            && !ctx.generics.contains(name)
+            && args.len() == 1
+        {
+            let k = *env.get(name).expect("env entry checked");
+            let v = self.lower_expr(&args[0], env, ctx)?;
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "%invoke-exit".to_string(),
+                args: vec![k, v],
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
+        // Strip kw-arg wrapper for non-make calls (the parser wraps
+        // `name: value` arguments as Call(%kw-arg, [Symbol, Value]).
+        // For Sprint 12 we treat them as positional values for direct
+        // calls. Generic dispatch + make have their own kw handling.
+        let mut positional_args: Vec<&Expr> = Vec::with_capacity(args.len());
+        for a in args {
+            if let Expr::Call { callee: c, args: kwargs, .. } = a
+                && let Expr::Ident(_, n) = c.as_ref()
+                && n == "%kw-arg"
+                && kwargs.len() == 2
+            {
+                positional_args.push(&kwargs[1]);
+            } else {
+                positional_args.push(a);
+            }
+        }
+        let arg_temps: Vec<TempId> = positional_args
+            .iter()
+            .map(|a| self.lower_expr(a, env, ctx))
+            .collect::<Result<_, _>>()?;
+        if let Expr::Ident(_, name) = callee {
+            // Sprint 12: prefer dispatch when the name is a known
+            // generic AND the receiver's type estimate doesn't statically
+            // resolve. For known top-level functions (slot accessors
+            // emitted as Functions), DirectCall wins so the JIT inlines
+            // straight to the LoadSlot body.
+            if ctx.top_names.contains(name) {
+                let ret = ctx
+                    .top_names
+                    .return_type(name)
+                    .unwrap_or(TypeEstimate::Top);
+                let dst = self.fresh_temp(ret);
+                self.push(Computation::DirectCall {
+                    dst,
+                    callee: name.clone(),
+                    args: arg_temps,
+                    safepoint_roots: Vec::new(),
+                });
+                return Ok(dst);
+            }
+            if ctx.generics.contains(name) || nod_runtime::is_generic_defined(name) {
+                let dst = self.fresh_temp(TypeEstimate::Top);
+                self.push(Computation::Dispatch {
+                    dst,
+                    generic_name: name.clone(),
+                    args: arg_temps,
+                    safepoint_roots: Vec::new(),
+                });
+                return Ok(dst);
+            }
+            if env.contains_key(name) {
+                return Err(LoweringError::Unsupported {
+                    span,
+                    message: format!(
+                        "calling local binding `{name}` not lowered in Sprint 06"
+                    ),
+                });
+            }
+            // Unknown ident callee — emit DirectCall against the name.
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: name.clone(),
+                args: arg_temps,
+                safepoint_roots: Vec::new(),
+            });
+            Ok(dst)
+        } else {
+            Err(LoweringError::Unsupported {
+                span,
+                message: "call against a non-ident callee not lowered in Sprint 06".to_string(),
+            })
+        }
+    }
+
+    fn lower_make(
+        &mut self,
+        args: &[Expr],
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+        span: Span,
+    ) -> Result<TempId, LoweringError> {
+        if args.is_empty() {
+            return Err(LoweringError::Unsupported {
+                span,
+                message: "make: missing class argument".to_string(),
+            });
+        }
+        // First arg: class. Expect an identifier resolving to a
+        // registered class.
+        let class_id = match &args[0] {
+            Expr::Ident(_, name) => match ctx
+                .user_classes
+                .get(name)
+                .copied()
+                .or_else(|| find_class_id_by_name(name))
+            {
+                Some(id) => id,
+                None => {
+                    return Err(LoweringError::UndefinedIdent {
+                        span: args[0].span(),
+                        name: name.clone(),
+                    });
+                }
+            },
+            _ => {
+                return Err(LoweringError::Unsupported {
+                    span: args[0].span(),
+                    message: "make: first argument must be a class name".to_string(),
+                });
+            }
+        };
+        let class_word_temp = self.emit_class_metadata_ptr_const(class_id);
+        // Remaining args: kw: value pairs (parser-wrapped as
+        // `Call(%kw-arg, [Symbol("kw:"), value])`).
+        let mut make_args = vec![class_word_temp];
+        for a in &args[1..] {
+            let (kw_name, value_expr) = match a {
+                Expr::Call { callee, args: kwargs, .. }
+                    if matches!(callee.as_ref(), Expr::Ident(_, n) if n == "%kw-arg")
+                        && kwargs.len() == 2 =>
+                {
+                    let raw_name = match &kwargs[0] {
+                        Expr::Symbol(_, s) => s.trim_end_matches(':').to_string(),
+                        _ => {
+                            return Err(LoweringError::Unsupported {
+                                span: a.span(),
+                                message: "make: kw-arg name must be a keyword".to_string(),
+                            });
+                        }
+                    };
+                    (raw_name, &kwargs[1])
+                }
+                _ => {
+                    return Err(LoweringError::Unsupported {
+                        span: a.span(),
+                        message: "make: arguments after the class must be `kw: value` pairs"
+                            .to_string(),
+                    });
+                }
+            };
+            let name_temp = self.emit_symbol_literal(&kw_name);
+            let value_temp = self.lower_expr(value_expr, env, ctx)?;
+            make_args.push(name_temp);
+            make_args.push(value_temp);
+        }
+        let dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst,
+            callee: "%make".to_string(),
+            args: make_args,
+            safepoint_roots: Vec::new(),
+        });
+        Ok(dst)
+    }
+
+    /// Sprint 16: lower one of the `<pair>` / `<list>` builtins to a
+    /// runtime-shim DirectCall. Each builtin lowers to a `%pair*` /
+    /// `%nil` / `%empty?` synthetic callee that codegen recognises.
+    /// Result temps carry the narrowest sound estimate so the dispatch
+    /// resolver can pick sealed-direct on subsequent calls — `pair`
+    /// returns `Class(<pair>)`, `head`/`tail` return `Top`, `empty?`
+    /// returns `Boolean`, `nil` returns `Class(<empty-list>)`.
+    fn lower_list_builtin(
+        &mut self,
+        builtin: ListBuiltin,
+        args: &[Expr],
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+        span: Span,
+    ) -> Result<TempId, LoweringError> {
+        // Validate arity up front so the diagnostic points at the call,
+        // not at codegen.
+        let expected = builtin.arity();
+        if args.len() != expected {
+            return Err(LoweringError::Unsupported {
+                span,
+                message: format!(
+                    "Sprint 16 builtin `{}` expects {} argument(s), got {}",
+                    builtin.name(),
+                    expected,
+                    args.len(),
+                ),
+            });
+        }
+        let arg_temps: Vec<TempId> = args
+            .iter()
+            .map(|a| self.lower_expr(a, env, ctx))
+            .collect::<Result<_, _>>()?;
+        let pair_cid = nod_runtime::ClassId::PAIR.0;
+        let empty_cid = nod_runtime::ClassId::EMPTY_LIST.0;
+        let result_ty = match builtin {
+            ListBuiltin::Pair => TypeEstimate::Class(pair_cid),
+            ListBuiltin::Head | ListBuiltin::Tail => TypeEstimate::Top,
+            ListBuiltin::EmptyP => TypeEstimate::Boolean,
+            ListBuiltin::Nil => TypeEstimate::Class(empty_cid),
+        };
+        let dst = self.fresh_temp(result_ty);
+        self.push(Computation::DirectCall {
+            dst,
+            callee: builtin.callee_symbol().to_string(),
+            args: arg_temps,
+            safepoint_roots: Vec::new(),
+        });
+        Ok(dst)
+    }
+
+    fn emit_class_metadata_ptr_const(&mut self, class_id: ClassId) -> TempId {
+        // The class-metadata pointer is the raw address of the
+        // `ClassMetadata` struct in the static area — NOT a tagged
+        // Word. `nod_make`'s first param is a raw pointer.
+        let addr = nod_runtime::class_metadata_ptr(class_id) as u64;
+        let t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::Const {
+            dst: t,
+            value: ConstValue::WordBits(addr),
+        });
+        t
+    }
+
+    fn emit_symbol_literal(&mut self, name: &str) -> TempId {
+        // Symbol literal: pin `:name` in the literal pool's static
+        // area and bake the tagged Word.
+        let sym_word = nod_runtime::intern_symbol_literal(name);
+        let t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::Const {
+            dst: t,
+            value: ConstValue::WordBits(sym_word.raw()),
+        });
+        t
+    }
+
+    fn lower_instance_check(
+        &mut self,
+        value: &Expr,
+        class: &Expr,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+        span: Span,
+    ) -> Result<TempId, LoweringError> {
+        let v = self.lower_expr(value, env, ctx)?;
+        let check = match class {
+            Expr::Ident(_, name) => match name.as_str() {
+                "<integer>" => ClassCheck::Integer,
+                "<boolean>" => ClassCheck::Boolean,
+                "<string>" | "<byte-string>" => ClassCheck::String,
+                "<symbol>" => ClassCheck::Symbol,
+                "<simple-object-vector>" | "<vector>" => ClassCheck::Vector,
+                "<character>" => ClassCheck::Character,
+                "<empty-list>" => ClassCheck::EmptyList,
+                _ => {
+                    let cid = ctx
+                        .user_classes
+                        .get(name)
+                        .copied()
+                        .or_else(|| find_class_id_by_name(name));
+                    match cid {
+                        Some(id) => ClassCheck::UserClass {
+                            id: id.0,
+                            name: name.clone(),
+                        },
+                        None => ClassCheck::Unsupported {
+                            name: static_class_name(name),
+                        },
+                    }
+                }
+            },
+            _ => {
+                return Err(LoweringError::Unsupported {
+                    span,
+                    message: "second argument to `instance?` must be a class name literal"
+                        .to_string(),
+                });
+            }
+        };
+        let dst = self.fresh_temp(TypeEstimate::Boolean);
+        self.push(Computation::TypeCheck {
+            dst,
+            value: v,
+            class: check,
+        });
+        Ok(dst)
+    }
+
+    fn lower_if(
+        &mut self,
+        cond: &Expr,
+        then_: &Expr,
+        else_: &Expr,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        let cond_t = self.lower_expr(cond, env, ctx)?;
+
+        let then_idx = self.next_block;
+        let else_idx = self.next_block + 1;
+        let join_idx = self.next_block + 2;
+        let then_b = self.new_block(format!("then{then_idx}"));
+        let else_b = self.new_block(format!("else{else_idx}"));
+        let join_b = self.new_block(format!("join{join_idx}"));
+
+        self.terminate_current(Terminator::If {
+            cond: cond_t,
+            then_block: then_b,
+            else_block: else_b,
+        });
+
+        self.switch_to(then_b);
+        let then_v = self.lower_expr(then_, env, ctx)?;
+        let then_ty = self.func.temp_type(then_v);
+        self.terminate_current(Terminator::Jump {
+            target: join_b,
+            args: vec![then_v],
+        });
+
+        self.switch_to(else_b);
+        let else_v = self.lower_expr(else_, env, ctx)?;
+        let else_ty = self.func.temp_type(else_v);
+        self.terminate_current(Terminator::Jump {
+            target: join_b,
+            args: vec![else_v],
+        });
+
+        let joined_ty = then_ty.join(else_ty);
+        let join_param = self.add_block_param(join_b, joined_ty);
+        self.switch_to(join_b);
+        Ok(join_param)
+    }
+
+    /// Sprint 18: lower `while (cond) body end` / `until (cond) body end`
+    /// into a three-block CFG with a back-edge.
+    ///
+    /// ```text
+    ///   entry → header(phi_i, phi_total, …)
+    ///   header:
+    ///     cond_t = eval(cond)
+    ///     if cond_t (or !cond_t for until) → loop_body else exit
+    ///   loop_body:
+    ///     eval(body…)                 (updates env for loop vars)
+    ///     jump header(new_i, new_total, …)   ← back-edge
+    ///   exit:
+    ///     (fall-through; caller continues here)
+    /// ```
+    ///
+    /// Loop variables — names assigned (`:=`) inside `body` or assigned
+    /// by a nested `let` after they were established outside — become
+    /// block parameters on `header`. Their initial values come from the
+    /// pre-loop env; the back-edge re-supplies the post-body values.
+    /// Names that are only *read* inside the loop body need no param.
+    ///
+    /// `invert_cond` flips the header branch (for `until`).
+    fn lower_while_like(
+        &mut self,
+        cond: &Expr,
+        body: &[Statement],
+        invert_cond: bool,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<(), LoweringError> {
+        let header_idx = self.next_block;
+        let body_idx = self.next_block + 1;
+        let exit_idx = self.next_block + 2;
+        let header_b = self.new_block(format!("loop_header{header_idx}"));
+        let body_b = self.new_block(format!("loop_body{body_idx}"));
+        let exit_b = self.new_block(format!("loop_exit{exit_idx}"));
+
+        // Pre-scan: which names get assigned inside the body? Each one
+        // becomes a header block-param so the back-edge can re-supply
+        // the updated value.
+        let assigned_names = collect_assigned_names_in_stmts(body, env);
+
+        // Snapshot pre-loop temps for each assigned name. Create block
+        // params on `header` for them; the entry-side jump carries the
+        // pre-loop temps as args, the back-edge carries the post-body
+        // temps.
+        let mut loop_var_order: Vec<String> = assigned_names.into_iter().collect();
+        loop_var_order.sort(); // deterministic param ordering
+        let mut pre_loop_temps: Vec<TempId> = Vec::with_capacity(loop_var_order.len());
+        let mut header_params: Vec<TempId> = Vec::with_capacity(loop_var_order.len());
+        for n in &loop_var_order {
+            // WHY: every loop var must already be in env (introduced by
+            // a `let` before the loop); lowering errors out earlier if
+            // an unbound name is referenced.
+            let outer = *env.get(n).ok_or_else(|| LoweringError::Unsupported {
+                span: cond.span(),
+                message: format!(
+                    "loop variable `{n}` not bound before loop entry (Sprint 18)"
+                ),
+            })?;
+            pre_loop_temps.push(outer);
+            let ty = self.func.temp_type(outer);
+            let phi = self.add_block_param(header_b, ty);
+            header_params.push(phi);
+        }
+
+        // Entry-side jump → header with pre-loop temps as initial args.
+        self.terminate_current(Terminator::Jump {
+            target: header_b,
+            args: pre_loop_temps.clone(),
+        });
+
+        // Update env so the header / body see the header-block params
+        // when reading the loop vars.
+        for (n, phi) in loop_var_order.iter().zip(header_params.iter()) {
+            env.insert(n.clone(), *phi);
+        }
+
+        // ─── header ─── evaluate cond, branch.
+        self.switch_to(header_b);
+        let cond_t = self.lower_expr(cond, env, ctx)?;
+        let (then_block, else_block) = if invert_cond {
+            (exit_b, body_b)
+        } else {
+            (body_b, exit_b)
+        };
+        self.terminate_current(Terminator::If {
+            cond: cond_t,
+            then_block,
+            else_block,
+        });
+
+        // ─── loop_body ─── lower each body stmt, then jump back to
+        // header with the post-body temps.
+        self.switch_to(body_b);
+        for s in body {
+            self.lower_loop_body_stmt(s, env, ctx)?;
+        }
+        let back_args: Vec<TempId> = loop_var_order
+            .iter()
+            .map(|n| *env.get(n).expect("loop var lost"))
+            .collect();
+        self.terminate_current(Terminator::Jump {
+            target: header_b,
+            args: back_args,
+        });
+
+        // ─── exit ─── caller continues here. The env's mapping for
+        // each loop var should reflect the header's phi (since after
+        // the loop, control reaches exit ONLY from the header's false
+        // branch, where the latest cond-checked value is the header
+        // phi). Restore env to the header param mapping.
+        for (n, phi) in loop_var_order.iter().zip(header_params.iter()) {
+            env.insert(n.clone(), *phi);
+        }
+        self.switch_to(exit_b);
+        Ok(())
+    }
+
+    /// Sprint 18: lower a single body statement inside a `while`/`until`
+    /// loop. Mirrors the function-body statement loop but never sets
+    /// `final_temp` (the loop's value is discarded) and recognises the
+    /// nested-loop case by recursing into `lower_while_like`.
+    fn lower_loop_body_stmt(
+        &mut self,
+        s: &Statement,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<(), LoweringError> {
+        match s {
+            Statement::Expr(e) => {
+                self.lower_expr(e, env, ctx)?;
+                Ok(())
+            }
+            Statement::Let {
+                binders, rest, value, span,
+            } => {
+                if rest.is_some() || binders.len() != 1 {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "Sprint 18 lowers single-binder `let` only inside loops".to_string(),
+                    });
+                }
+                let bname = &binders[0].name;
+                let t = self.lower_expr(value, env, ctx)?;
+                env.insert(bname.clone(), t);
+                Ok(())
+            }
+            Statement::While { cond, body, .. } => {
+                self.lower_while_like(cond, body, false, env, ctx)
+            }
+            Statement::Until { cond, body, .. } => {
+                self.lower_while_like(cond, body, true, env, ctx)
+            }
+            Statement::For { span, .. } => Err(LoweringError::Unsupported {
+                span: *span,
+                message: "`for` inside loop body not lowered (Sprint 25)".to_string(),
+            }),
+            Statement::Block { span, .. } => Err(LoweringError::Unsupported {
+                span: *span,
+                message: "`block` inside loop body not lowered (Sprint 19)".to_string(),
+            }),
+            Statement::Local { span, .. } => Err(LoweringError::Unsupported {
+                span: *span,
+                message: "`local method` inside loop body not lowered".to_string(),
+            }),
+        }
+    }
+
+    /// Sprint 18: lower an `Expr::Stmt(s)` — used when a macro expansion
+    /// produces a statement-shaped form inside an expression position
+    /// (e.g. a `Begin` body containing `Expr::Stmt(While {…})`). Returns
+    /// a fresh Unit temp; the macro's expansion is in service of side
+    /// effects, not a value.
+    fn lower_stmt_as_expr(
+        &mut self,
+        s: &Statement,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        match s {
+            Statement::While { cond, body, .. } => {
+                self.lower_while_like(cond, body, false, env, ctx)?;
+                Ok(self.unit_temp())
+            }
+            Statement::Until { cond, body, .. } => {
+                self.lower_while_like(cond, body, true, env, ctx)?;
+                Ok(self.unit_temp())
+            }
+            Statement::Let {
+                binders, rest, value, span,
+            } => {
+                if rest.is_some() || binders.len() != 1 {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "Sprint 18 lowers single-binder `let` only".to_string(),
+                    });
+                }
+                let bname = &binders[0].name;
+                let t = self.lower_expr(value, env, ctx)?;
+                env.insert(bname.clone(), t);
+                Ok(t)
+            }
+            Statement::Expr(e) => self.lower_expr(e, env, ctx),
+            Statement::For { span, .. }
+            | Statement::Local { span, .. }
+            | Statement::Block { span, .. } => Err(LoweringError::Unsupported {
+                span: *span,
+                message: "statement form not lowerable inside an expression context".to_string(),
+            }),
+        }
+    }
+
+    /// Sprint 18: produce a fresh `<unit>`-typed temp materialised as a
+    /// `Const(Bool(false))` so the SSA verifier sees a definition. Used
+    /// when a loop/`Expr::Stmt` lowering needs a placeholder value for
+    /// expression-context callers. The temp's `type_estimate` is `Unit`
+    /// so the surrounding context knows the value is meaningless.
+    fn unit_temp(&mut self) -> TempId {
+        let t = self.fresh_temp(TypeEstimate::Unit);
+        self.push(Computation::Const {
+            dst: t,
+            value: ConstValue::Bool(false),
+        });
+        t
+    }
+}
+
+/// Sprint 18: walk a loop body and collect every local-variable name
+/// reassigned via `:=` (or shadowed by an inner `let`). Used by
+/// [`FunctionBuilder::lower_while_like`] to drive the loop-header phi
+/// params: any name in this set needs a header block param so the
+/// back-edge can re-supply the post-body value.
+///
+/// Only names that EXIST in `env` (i.e. are introduced before the loop)
+/// qualify — fresh-bound names inside the loop body are scoped to the
+/// body and don't need phi participation.
+fn collect_assigned_names_in_stmts(
+    body: &[Statement],
+    env: &LocalEnv,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for s in body {
+        collect_assigned_in_stmt(s, env, &mut out);
+    }
+    out
+}
+
+fn collect_assigned_in_stmt(s: &Statement, env: &LocalEnv, out: &mut HashSet<String>) {
+    match s {
+        Statement::Expr(e) => collect_assigned_in_expr(e, env, out),
+        Statement::Let { value, binders, .. } => {
+            collect_assigned_in_expr(value, env, out);
+            // Sprint 18: a `let X = …` inside a loop body shadows X if
+            // X was bound outside; treat the outer X as loop-mutable.
+            for b in binders {
+                if env.contains_key(&b.name) {
+                    out.insert(b.name.clone());
+                }
+            }
+        }
+        Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
+            collect_assigned_in_expr(cond, env, out);
+            for s2 in body {
+                collect_assigned_in_stmt(s2, env, out);
+            }
+        }
+        Statement::For { .. } | Statement::Block { .. } | Statement::Local { .. } => {}
+    }
+}
+
+fn collect_assigned_in_expr(e: &Expr, env: &LocalEnv, out: &mut HashSet<String>) {
+    match e {
+        Expr::BinOp { op: BinOp::Assign, lhs, rhs, .. } => {
+            if let Expr::Ident(_, name) = lhs.as_ref()
+                && env.contains_key(name)
+            {
+                out.insert(name.clone());
+            }
+            collect_assigned_in_expr(rhs, env, out);
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_assigned_in_expr(lhs, env, out);
+            collect_assigned_in_expr(rhs, env, out);
+        }
+        Expr::UnOp { operand, .. } => collect_assigned_in_expr(operand, env, out),
+        Expr::Paren { inner, .. } => collect_assigned_in_expr(inner, env, out),
+        Expr::Call { callee, args, .. } => {
+            collect_assigned_in_expr(callee, env, out);
+            for a in args {
+                collect_assigned_in_expr(a, env, out);
+            }
+        }
+        Expr::If { cond, then_, else_, .. } => {
+            collect_assigned_in_expr(cond, env, out);
+            collect_assigned_in_expr(then_, env, out);
+            if let Some(b) = else_ {
+                collect_assigned_in_expr(b, env, out);
+            }
+        }
+        Expr::Begin { body, .. } => {
+            for b in body {
+                collect_assigned_in_expr(b, env, out);
+            }
+        }
+        Expr::Let { binder, value, .. } => {
+            collect_assigned_in_expr(value, env, out);
+            // Sprint 18: same shadowing rule as the Statement::Let arm.
+            if env.contains_key(binder) {
+                out.insert(binder.clone());
+            }
+        }
+        Expr::Stmt(s) => collect_assigned_in_stmt(s, env, out),
+        Expr::Unless { cond, body, .. } => {
+            collect_assigned_in_expr(cond, env, out);
+            collect_assigned_in_expr(body, env, out);
+        }
+        Expr::Case { arms, otherwise, .. } => {
+            for a in arms {
+                collect_assigned_in_expr(&a.cond, env, out);
+                for b in &a.body {
+                    collect_assigned_in_expr(b, env, out);
+                }
+            }
+            if let Some(o) = otherwise {
+                collect_assigned_in_expr(o, env, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Strip surrounding `"`s and decode the minimal escape set. Supports
+/// `\n`, `\r`, `\t`, `\\`, `\"`, `\0`. Unknown escapes are emitted as
+/// the literal escape char so behaviour matches Dylan's tolerant lexer.
+fn decode_dylan_string_literal(raw: &str) -> String {
+    let s = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('0') => out.push('\0'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn static_class_name(name: &str) -> &'static str {
+    match name {
+        "<object>" => "<object>",
+        "<integer>" => "<integer>",
+        "<single-float>" => "<single-float>",
+        "<double-float>" => "<double-float>",
+        "<boolean>" => "<boolean>",
+        "<character>" => "<character>",
+        "<symbol>" => "<symbol>",
+        "<string>" => "<string>",
+        "<byte-string>" => "<byte-string>",
+        "<simple-object-vector>" => "<simple-object-vector>",
+        "<vector>" => "<vector>",
+        "<empty-list>" => "<empty-list>",
+        _ => "<unknown>",
+    }
+}
+
+fn expr_kind(e: &Expr) -> &'static str {
+    match e {
+        Expr::Integer(..) => "integer",
+        Expr::Float(..) => "float",
+        Expr::String(..) => "string",
+        Expr::Char(..) => "char",
+        Expr::Bool(..) => "bool",
+        Expr::Symbol(..) => "symbol",
+        Expr::Ident(..) => "ident",
+        Expr::Call { .. } => "call",
+        Expr::BinOp { .. } => "binop",
+        Expr::UnOp { .. } => "unop",
+        Expr::Paren { .. } => "paren",
+        Expr::If { .. } => "if",
+        Expr::Unless { .. } => "unless",
+        Expr::Case { .. } => "case",
+        Expr::Begin { .. } => "begin",
+        Expr::Let { .. } => "let",
+        Expr::LocalMethod { .. } => "local-method",
+        Expr::Method { .. } => "method",
+        Expr::Stmt(_) => "stmt",
+    }
+}
+
+// ─── BinOp / UnOp resolution ─────────────────────────────────────────────
+
+fn select_binop(
+    op: BinOp,
+    lt: TypeEstimate,
+    rt: TypeEstimate,
+    span: Span,
+) -> Result<PrimOp, LoweringError> {
+    let both_int = lt.is_integer() && rt.is_integer();
+    let any_float = lt.is_float() || rt.is_float();
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Rem => {
+            if both_int {
+                Ok(match op {
+                    BinOp::Add => PrimOp::AddInt,
+                    BinOp::Sub => PrimOp::SubInt,
+                    BinOp::Mul => PrimOp::MulInt,
+                    BinOp::Div => PrimOp::DivInt,
+                    BinOp::Mod => PrimOp::ModInt,
+                    BinOp::Rem => PrimOp::RemInt,
+                    _ => unreachable!(),
+                })
+            } else if any_float
+                && !matches!(op, BinOp::Mod | BinOp::Rem)
+                && (lt.is_float() || lt == TypeEstimate::Top)
+                && (rt.is_float() || rt == TypeEstimate::Top)
+            {
+                Ok(match op {
+                    BinOp::Add => PrimOp::AddFloat,
+                    BinOp::Sub => PrimOp::SubFloat,
+                    BinOp::Mul => PrimOp::MulFloat,
+                    BinOp::Div => PrimOp::DivFloat,
+                    _ => unreachable!(),
+                })
+            } else if lt == TypeEstimate::Top && rt == TypeEstimate::Top {
+                Ok(match op {
+                    BinOp::Add => PrimOp::AddInt,
+                    BinOp::Sub => PrimOp::SubInt,
+                    BinOp::Mul => PrimOp::MulInt,
+                    BinOp::Div => PrimOp::DivInt,
+                    BinOp::Mod => PrimOp::ModInt,
+                    BinOp::Rem => PrimOp::RemInt,
+                    _ => unreachable!(),
+                })
+            } else if lt.is_integer() && rt == TypeEstimate::Top {
+                // Sprint 12: a slot getter return (Top) + an integer
+                // local → assume the slot was integer-typed. Choose
+                // the integer path. This handles the `<point>` case
+                // where `x(p) * x(p)` has Dispatch-typed temps.
+                Ok(match op {
+                    BinOp::Add => PrimOp::AddInt,
+                    BinOp::Sub => PrimOp::SubInt,
+                    BinOp::Mul => PrimOp::MulInt,
+                    BinOp::Div => PrimOp::DivInt,
+                    BinOp::Mod => PrimOp::ModInt,
+                    BinOp::Rem => PrimOp::RemInt,
+                    _ => unreachable!(),
+                })
+            } else if lt == TypeEstimate::Top && rt.is_integer() {
+                Ok(match op {
+                    BinOp::Add => PrimOp::AddInt,
+                    BinOp::Sub => PrimOp::SubInt,
+                    BinOp::Mul => PrimOp::MulInt,
+                    BinOp::Div => PrimOp::DivInt,
+                    BinOp::Mod => PrimOp::ModInt,
+                    BinOp::Rem => PrimOp::RemInt,
+                    _ => unreachable!(),
+                })
+            } else {
+                Err(LoweringError::TypeMismatch {
+                    span,
+                    message: format!(
+                        "mixed int+float operand types ({} {} {}) — explicit coercion not lowered",
+                        lt.name(),
+                        op.name(),
+                        rt.name()
+                    ),
+                })
+            }
+        }
+        BinOp::Eq | BinOp::EqEq | BinOp::Ne | BinOp::NeEq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+            let is_float_cmp = any_float;
+            let p = match (op, is_float_cmp) {
+                (BinOp::Eq | BinOp::EqEq, false) => PrimOp::EqInt,
+                (BinOp::Ne | BinOp::NeEq, false) => PrimOp::NeInt,
+                (BinOp::Lt, false) => PrimOp::LtInt,
+                (BinOp::Gt, false) => PrimOp::GtInt,
+                (BinOp::Le, false) => PrimOp::LeInt,
+                (BinOp::Ge, false) => PrimOp::GeInt,
+                (BinOp::Eq | BinOp::EqEq, true) => PrimOp::EqFloat,
+                (BinOp::Lt, true) => PrimOp::LtFloat,
+                (BinOp::Gt, true) => PrimOp::GtFloat,
+                (BinOp::Le, true) => PrimOp::LeFloat,
+                (BinOp::Ge, true) => PrimOp::GeFloat,
+                (BinOp::Ne | BinOp::NeEq, true) => {
+                    return Err(LoweringError::Unsupported {
+                        span,
+                        message: "float-`~=` not lowered (no NeFloat PrimOp in Sprint 06)"
+                            .to_string(),
+                    });
+                }
+                _ => unreachable!(),
+            };
+            Ok(p)
+        }
+        BinOp::And => Ok(PrimOp::BoolAnd),
+        BinOp::Or => Ok(PrimOp::BoolOr),
+        BinOp::Pow | BinOp::Assign => Err(LoweringError::Unsupported {
+            span,
+            message: format!("BinOp `{}` not lowered in Sprint 06", op.name()),
+        }),
+    }
+}
+
+fn select_unop(op: UnOp, vt: TypeEstimate, span: Span) -> Result<PrimOp, LoweringError> {
+    match op {
+        UnOp::Neg => match vt {
+            TypeEstimate::Integer | TypeEstimate::Top => Ok(PrimOp::NegInt),
+            TypeEstimate::SingleFloat | TypeEstimate::DoubleFloat => Ok(PrimOp::NegFloat),
+            _ => Err(LoweringError::TypeMismatch {
+                span,
+                message: format!("unary `-` on non-numeric {}", vt.name()),
+            }),
+        },
+        UnOp::Not => Ok(PrimOp::BoolNot),
+    }
+}
+
+/// Dump every registered class to a multi-line string. Used by the
+/// driver's (eventual) `dump-classes` subcommand and by the Sprint 12
+/// acceptance tests.
+///
+/// Sprint 14 extends the per-slot row with an MI-aware annotation:
+///   - `[own]` for slots introduced by this class.
+///   - `[inherited from <C>, fixed-offset]` for inherited slots whose
+///     offset matches the defining class's layout.
+///   - `[inherited from <C>, override @N→@M]` for inherited slots
+///     whose offset shifted vs. the defining class. The lowering pass
+///     generated an override accessor method bound to this receiver
+///     class; dispatch picks it.
+///
+/// The class-header line now lists `parents=[...]` instead of a single
+/// `parent=` field.
+pub fn dump_classes() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut entries: Vec<&'static ClassMetadata> = Vec::new();
+    nod_runtime::for_each_class(|md| entries.push(md));
+    entries.sort_by_key(|m| m.id.0);
+    for md in entries {
+        let parents_disp = if md.parents.is_empty() {
+            "[]".to_string()
+        } else {
+            let names: Vec<String> = md
+                .parents
+                .iter()
+                .map(|p| {
+                    let ptr = nod_runtime::class_metadata_ptr(*p);
+                    if ptr.is_null() {
+                        format!("<unknown:{}>", p.0)
+                    } else {
+                        // SAFETY: static-area metadata.
+                        unsafe { (*ptr).name.clone() }
+                    }
+                })
+                .collect();
+            format!("[{}]", names.join(", "))
+        };
+        let cpl_disp = {
+            let names: Vec<String> = md
+                .cpl
+                .iter()
+                .map(|c| {
+                    let ptr = nod_runtime::class_metadata_ptr(*c);
+                    if ptr.is_null() {
+                        format!("<unknown:{}>", c.0)
+                    } else {
+                        // SAFETY: static-area metadata.
+                        unsafe { (*ptr).name.clone() }
+                    }
+                })
+                .collect();
+            format!("[{}]", names.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "{} (id={}, parents={parents_disp}, cpl={cpl_disp}, slots={}, size={}B)",
+            md.name,
+            md.id.0,
+            md.slots.len(),
+            md.instance_size
+        );
+        for (idx, slot) in md.slots.iter().enumerate() {
+            // slot_origin may be shorter than slots in legacy callers;
+            // default to "self" if absent.
+            let origin = md.slot_origin.get(idx).copied().unwrap_or(md.id);
+            let annotation = if origin == md.id {
+                "[own]".to_string()
+            } else {
+                let origin_md_ptr = nod_runtime::class_metadata_ptr(origin);
+                if origin_md_ptr.is_null() {
+                    format!("[inherited from <unknown:{}>]", origin.0)
+                } else {
+                    // SAFETY: static-area metadata.
+                    let origin_md = unsafe { &*origin_md_ptr };
+                    let origin_offset = origin_md
+                        .slots
+                        .iter()
+                        .find(|s| s.name == slot.name)
+                        .map(|s| s.offset)
+                        .unwrap_or(slot.offset);
+                    if origin_offset == slot.offset {
+                        format!("[inherited from {}, fixed-offset]", origin_md.name)
+                    } else {
+                        format!(
+                            "[inherited from {}, override @{}→@{}]",
+                            origin_md.name, origin_offset, slot.offset
+                        )
+                    }
+                }
+            };
+            let _ = writeln!(
+                out,
+                "    slot {} @{}  {:?}  init-keyword={:?}  has-setter={}  {}",
+                slot.name, slot.offset, slot.type_kind, slot.init_keyword, slot.has_setter, annotation
+            );
+        }
+    }
+    out
+}
+
+// ─── Sprint 19: `block` / `exception` / `cleanup` lowering ─────────────────
+//
+// See `docs/CONDITIONS.md` §"block lowering" for the full design. In
+// short: we lift the body, each handler body, the cleanup body, and the
+// afterwards body into top-level Dylan functions and emit a single
+// runtime call (`%run-block`) at the original `block` site. The runtime
+// (`nod_runtime::nod_run_block`) drives the protocol: push handlers,
+// `catch_unwind` the body, run cleanup on every exit path (including
+// unwound exits), run afterwards on normal exit, pop handlers.
+//
+// **Captured locals**: we close over every name in the current `env` at
+// the moment the `block` form opens. Each lifted thunk receives those
+// values as positional `u64` parameters. We cap the total at
+// `MAX_BLOCK_CAPTURED` (8); attempting to capture more is rejected
+// with a clear "Sprint 19 limitation" error.
+//
+// **`block (k)` capture**: the exit-procedure `k` is materialised
+// up-front via `%make-exit-procedure(block_id)` (a runtime shim) and
+// passed as the first captured slot when `exit_var` is present.
+//
+// **No mutation across the boundary**: Dylan locals in this codebase
+// are immutable bindings (`let` always rebinds); the lowerer doesn't
+// implement `:=` against captured names. If the lifted body's lowering
+// emits an `Assign` against a captured name it surfaces as an
+// `Unsupported` (the new function's env would treat the param as a
+// fresh binding; mutating it wouldn't write back). The acceptance
+// fixtures don't exercise this case.
+
+const BLOCK_RUN_CALLEE: &str = "%run-block";
+const BLOCK_MAKE_EXIT_CALLEE: &str = "%make-exit-procedure";
+
+/// One captured local entry: the source name (so lifted bodies can
+/// rebind it) and the temp in the enclosing function.
+#[derive(Clone)]
+struct CapturedLocal {
+    name: String,
+    outer_temp: TempId,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_block_form(
+    b: &mut FunctionBuilder,
+    sink: &mut LiftSink,
+    env: &mut LocalEnv,
+    ctx: &LowerCtx,
+    span: Span,
+    parent_name: &str,
+    exit_var: Option<&str>,
+    body: &[Statement],
+    handlers: &[nod_reader::ExceptionClause],
+    cleanup: &[Statement],
+    afterwards: &[Statement],
+) -> Result<TempId, LoweringError> {
+    use nod_runtime::MAX_BLOCK_CAPTURED;
+
+    // Collect captured locals from the enclosing function's env (every
+    // currently-visible binding). The order is the iteration order of
+    // the HashMap — for stability we sort by name so a given source
+    // produces deterministic captured ordering across runs.
+    let mut captured: Vec<CapturedLocal> = env
+        .iter()
+        .map(|(name, &outer_temp)| CapturedLocal {
+            name: name.clone(),
+            outer_temp,
+        })
+        .collect();
+    captured.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // If the block introduces an exit-procedure, reserve slot 0 for it.
+    let exit_slot_used = exit_var.is_some();
+    let total_captured = captured.len() + if exit_slot_used { 1 } else { 0 };
+    if total_captured > MAX_BLOCK_CAPTURED {
+        return Err(LoweringError::Unsupported {
+            span,
+            message: format!(
+                "Sprint 19 limitation: `block` captures {total_captured} locals (max = {MAX_BLOCK_CAPTURED}); reduce surrounding bindings or restructure"
+            ),
+        });
+    }
+
+    let block_id = nod_runtime::allocate_block_id();
+    let thunk_seq = sink.alloc_thunk_suffix();
+
+    // ─── Lift each stage to a top-level function ────────────────────
+    //
+    // Lifted-function name shape: `<parent>$$blk<N>$<stage>`. The `$$`
+    // separator + `blk` prefix is a marker the dumps + `:handlers`
+    // output uses to spot lifted thunks.
+
+    let stage_name = |stage: &str| format!("{parent_name}$$blk{thunk_seq}${stage}");
+
+    let body_fn_name = stage_name("body");
+    let cleanup_fn_name = if cleanup.is_empty() {
+        None
+    } else {
+        Some(stage_name("cleanup"))
+    };
+    let afterwards_fn_name = if afterwards.is_empty() {
+        None
+    } else {
+        Some(stage_name("afterwards"))
+    };
+
+    let body_fn = lift_block_stage(
+        sink.alloc_fn_id(),
+        &body_fn_name,
+        &captured,
+        exit_var,
+        body,
+        span,
+        ctx,
+        sink,
+        false,
+    )?;
+    sink.functions.push(body_fn);
+
+    if let Some(name) = &cleanup_fn_name {
+        let f = lift_block_stage(
+            sink.alloc_fn_id(),
+            name,
+            &captured,
+            exit_var,
+            cleanup,
+            span,
+            ctx,
+            sink,
+            false,
+        )?;
+        sink.functions.push(f);
+    }
+    if let Some(name) = &afterwards_fn_name {
+        let f = lift_block_stage(
+            sink.alloc_fn_id(),
+            name,
+            &captured,
+            exit_var,
+            afterwards,
+            span,
+            ctx,
+            sink,
+            false,
+        )?;
+        sink.functions.push(f);
+    }
+
+    let mut handler_regs: Vec<BlockHandlerRegistration> = Vec::with_capacity(handlers.len());
+    for (i, h) in handlers.iter().enumerate() {
+        let class_id = match &h.class {
+            Expr::Ident(_, n) => ctx
+                .user_classes
+                .get(n)
+                .copied()
+                .or_else(|| find_class_id_by_name(n))
+                .ok_or_else(|| LoweringError::UndefinedIdent {
+                    span: h.span,
+                    name: n.clone(),
+                })?,
+            _ => {
+                return Err(LoweringError::Unsupported {
+                    span: h.span,
+                    message: "exception clause: class must be a bare identifier".to_string(),
+                });
+            }
+        };
+        let class_name = match &h.class {
+            Expr::Ident(_, n) => n.clone(),
+            _ => unreachable!("guarded by Ident match above"),
+        };
+        let fn_name = stage_name(&format!("h{i}"));
+        let handler_fn = lift_block_stage_handler(
+            sink.alloc_fn_id(),
+            &fn_name,
+            &captured,
+            exit_var,
+            h.var.as_deref(),
+            &h.body,
+            h.span,
+            ctx,
+            sink,
+        )?;
+        sink.functions.push(handler_fn);
+        handler_regs.push(BlockHandlerRegistration {
+            class_id,
+            class_name,
+            body_fn_name: fn_name,
+        });
+    }
+
+    // Record the block for post-JIT registration.
+    sink.blocks.push(BlockRegistration {
+        block_id,
+        body_fn_name: body_fn_name.clone(),
+        cleanup_fn_name: cleanup_fn_name.clone(),
+        afterwards_fn_name: afterwards_fn_name.clone(),
+        handlers: handler_regs,
+    });
+
+    // ─── Emit the call site in the enclosing function ───────────────
+    //
+    // Args to `%run-block`: [block_id_const, c0..c7]. Unused slots are
+    // zero-filled.
+
+    // Block-id constant.
+    let bid_temp = b.fresh_temp(TypeEstimate::Top);
+    b.push(Computation::Const {
+        dst: bid_temp,
+        value: ConstValue::WordBits(block_id),
+    });
+    let zero_temp = b.fresh_temp(TypeEstimate::Top);
+    b.push(Computation::Const {
+        dst: zero_temp,
+        value: ConstValue::WordBits(0),
+    });
+
+    // Optional exit procedure (slot 0 if present): call %make-exit-procedure(block_id).
+    let mut capture_temps: Vec<TempId> = Vec::with_capacity(MAX_BLOCK_CAPTURED);
+    if exit_slot_used {
+        let ep_temp = b.fresh_temp(TypeEstimate::Top);
+        b.push(Computation::DirectCall {
+            dst: ep_temp,
+            callee: BLOCK_MAKE_EXIT_CALLEE.to_string(),
+            args: vec![bid_temp],
+            safepoint_roots: Vec::new(),
+        });
+        capture_temps.push(ep_temp);
+    }
+    for c in &captured {
+        capture_temps.push(c.outer_temp);
+    }
+    while capture_temps.len() < MAX_BLOCK_CAPTURED {
+        capture_temps.push(zero_temp);
+    }
+
+    let dst = b.fresh_temp(TypeEstimate::Top);
+    let mut args = Vec::with_capacity(1 + MAX_BLOCK_CAPTURED);
+    args.push(bid_temp);
+    args.extend(capture_temps);
+    b.push(Computation::DirectCall {
+        dst,
+        callee: BLOCK_RUN_CALLEE.to_string(),
+        args,
+        safepoint_roots: Vec::new(),
+    });
+
+    // The block's result type is intentionally `Top` — Sprint 19
+    // doesn't attempt to type-merge the body/handler branches.
+    let _ = exit_var;
+    Ok(dst)
+}
+
+/// Lift one "straight" stage (body / cleanup / afterwards) of a `block`
+/// form into a fresh top-level Dylan function. The new function takes
+/// `MAX_BLOCK_CAPTURED` positional `u64` params (the captured locals,
+/// padded with zeros). Its body is the supplied `stmts` lowered with
+/// the captured names bound to the param temps.
+#[allow(clippy::too_many_arguments)]
+fn lift_block_stage(
+    id: FunctionId,
+    fn_name: &str,
+    captured: &[CapturedLocal],
+    exit_var: Option<&str>,
+    stmts: &[Statement],
+    span: Span,
+    ctx: &LowerCtx,
+    sink: &mut LiftSink,
+    _is_handler: bool,
+) -> Result<Function, LoweringError> {
+    use nod_runtime::MAX_BLOCK_CAPTURED;
+    let mut b = FunctionBuilder::new(id, fn_name.to_string(), span);
+    let mut env = LocalEnv::new();
+    // Build params: slot 0 = exit-procedure (if any), then captures, padded to 8.
+    let mut slot_names: Vec<Option<String>> = Vec::with_capacity(MAX_BLOCK_CAPTURED);
+    if let Some(ev) = exit_var {
+        slot_names.push(Some(ev.to_string()));
+    }
+    for c in captured {
+        slot_names.push(Some(c.name.clone()));
+    }
+    while slot_names.len() < MAX_BLOCK_CAPTURED {
+        slot_names.push(None);
+    }
+    for slot_name in &slot_names {
+        let t = b.fresh_temp(TypeEstimate::Top);
+        b.func.params.push(t);
+        if let Some(n) = slot_name {
+            env.insert(n.clone(), t);
+        }
+    }
+
+    lower_statements_into(&mut b, &mut env, ctx, sink, stmts)?;
+    b.func.return_type = TypeEstimate::Top;
+    // Terminate the current block with a return of the last temp (or
+    // zero if the stage was empty). `lower_statements_into` left
+    // `current_block`'s terminator as the default `Return None`; we
+    // overwrite to surface the final value.
+    if let Some(t) = b.last_temp() {
+        // SSA: emit the return explicitly.
+        let cur_block_id = b.func.blocks[b.current].id;
+        let _ = cur_block_id;
+        b.terminate_current(Terminator::Return { value: Some(t) });
+    } else {
+        // Empty stage — return zero (which the runtime interprets as
+        // the unit Word for cleanup/afterwards, and the body's value
+        // for a body stage; an empty body returns 0).
+        let z = b.fresh_temp(TypeEstimate::Top);
+        b.push(Computation::Const {
+            dst: z,
+            value: ConstValue::WordBits(0),
+        });
+        b.terminate_current(Terminator::Return { value: Some(z) });
+    }
+    Ok(b.finish())
+}
+
+/// Lift one handler clause. Signature: 1 condition Word arg + 8
+/// captured-locals slots. The handler's bound condition variable (the
+/// `c` in `exception (c :: <error>)`) is bound to the first param.
+#[allow(clippy::too_many_arguments)]
+fn lift_block_stage_handler(
+    id: FunctionId,
+    fn_name: &str,
+    captured: &[CapturedLocal],
+    exit_var: Option<&str>,
+    handler_var: Option<&str>,
+    stmts: &[Statement],
+    span: Span,
+    ctx: &LowerCtx,
+    sink: &mut LiftSink,
+) -> Result<Function, LoweringError> {
+    use nod_runtime::MAX_BLOCK_CAPTURED;
+    let mut b = FunctionBuilder::new(id, fn_name.to_string(), span);
+    let mut env = LocalEnv::new();
+
+    // Param 0: the condition Word. The handler may omit the variable;
+    // we always emit a param but only bind it in env when named.
+    let cond_temp = b.fresh_temp(TypeEstimate::Top);
+    b.func.params.push(cond_temp);
+    if let Some(v) = handler_var {
+        env.insert(v.to_string(), cond_temp);
+    }
+
+    // Params 1..=8: captured locals, same layout as the body thunk
+    // (exit-procedure in slot 0 if present, then captures, padded with
+    // zeros).
+    let mut slot_names: Vec<Option<String>> = Vec::with_capacity(MAX_BLOCK_CAPTURED);
+    if let Some(ev) = exit_var {
+        slot_names.push(Some(ev.to_string()));
+    }
+    for c in captured {
+        slot_names.push(Some(c.name.clone()));
+    }
+    while slot_names.len() < MAX_BLOCK_CAPTURED {
+        slot_names.push(None);
+    }
+    for slot_name in &slot_names {
+        let t = b.fresh_temp(TypeEstimate::Top);
+        b.func.params.push(t);
+        if let Some(n) = slot_name {
+            env.insert(n.clone(), t);
+        }
+    }
+
+    lower_statements_into(&mut b, &mut env, ctx, sink, stmts)?;
+    b.func.return_type = TypeEstimate::Top;
+    if let Some(t) = b.last_temp() {
+        b.terminate_current(Terminator::Return { value: Some(t) });
+    } else {
+        let z = b.fresh_temp(TypeEstimate::Top);
+        b.push(Computation::Const {
+            dst: z,
+            value: ConstValue::WordBits(0),
+        });
+        b.terminate_current(Terminator::Return { value: Some(z) });
+    }
+    Ok(b.finish())
+}
+
+/// Inline-lower a sequence of statements into the current block of
+/// `b`. Returns Ok(()) on success. Used by the block-stage lifting
+/// helpers so the lifted thunk can itself contain `let`, `if`,
+/// `while`, nested `block`, etc.
+fn lower_statements_into(
+    b: &mut FunctionBuilder,
+    env: &mut LocalEnv,
+    ctx: &LowerCtx,
+    sink: &mut LiftSink,
+    stmts: &[Statement],
+) -> Result<(), LoweringError> {
+    for stmt in stmts {
+        match stmt {
+            Statement::Expr(e) => {
+                let _t = b.lower_expr(e, env, ctx)?;
+                b.set_last_temp(_t);
+            }
+            Statement::Let {
+                binders,
+                rest,
+                value,
+                span,
+            } => {
+                if rest.is_some() || binders.len() != 1 {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "Sprint 06 lowers single-binder `let` only".to_string(),
+                    });
+                }
+                let bname = &binders[0].name;
+                let t = b.lower_expr(value, env, ctx)?;
+                env.insert(bname.clone(), t);
+                b.set_last_temp(t);
+            }
+            Statement::Local { span, .. } => {
+                return Err(LoweringError::Unsupported {
+                    span: *span,
+                    message: "`local method` not lowered in Sprint 06".to_string(),
+                });
+            }
+            Statement::While { cond, body, .. } => {
+                b.lower_while_like(cond, body, false, env, ctx)?;
+                b.clear_last_temp();
+            }
+            Statement::Until { cond, body, .. } => {
+                b.lower_while_like(cond, body, true, env, ctx)?;
+                b.clear_last_temp();
+            }
+            Statement::For { span, .. } => {
+                return Err(LoweringError::Unsupported {
+                    span: *span,
+                    message: "`for` not lowered in Sprint 18".to_string(),
+                });
+            }
+            Statement::Block {
+                span,
+                exit_var,
+                body,
+                handlers,
+                cleanup,
+                afterwards,
+            } => {
+                // Nested block. The parent function is the lifted thunk
+                // we're currently building.
+                let parent_name = b.func.name.clone();
+                let t = lower_block_form(
+                    b,
+                    sink,
+                    env,
+                    ctx,
+                    *span,
+                    &parent_name,
+                    exit_var.as_deref(),
+                    body,
+                    handlers,
+                    cleanup,
+                    afterwards,
+                )?;
+                b.set_last_temp(t);
+            }
+        }
+    }
+    Ok(())
+}

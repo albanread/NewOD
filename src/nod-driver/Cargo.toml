@@ -9,5 +9,7 @@ description = "NewOpenDylan compiler driver (CLI entrypoint)."
 workspace = true
 
 [dependencies]
-clap       = { workspace = true }
-nod-reader = { path = "../nod-reader" }
+clap          = { workspace = true }
+nod-reader    = { path = "../nod-reader" }
+nod-namespace = { path = "../nod-namespace" }
+nod-sema      = { path = "../nod-sema" }
