@@ -6,11 +6,12 @@ This is a **true revival** — not a port, not a fork, not a preservation effort
 
 ## Where to start
 
-- **[MANIFESTO.md](../MANIFESTO.md)** — design constraints. Read this first.
-- **[PLAN.md](../PLAN.md)** — language survey + 12-phase implementation plan.
-- **[SPRINTS.md](../SPRINTS.md)** — two-week sprint breakdown with deliverables, acceptance criteria, and demos.
-- **[../opendylan-tests/INVENTORY.md](../opendylan-tests/INVENTORY.md)** — copied upstream test corpus, with bootstrap-validation candidates flagged.
-- **[../specs/](../specs/)** — per-sprint design specs as they get drafted ahead of implementation.
+- **[docs/MANIFESTO.md](docs/MANIFESTO.md)** — design constraints. Read this first.
+- **[docs/PLAN.md](docs/PLAN.md)** — language survey + 12-phase implementation plan.
+- **[docs/SPRINTS.md](docs/SPRINTS.md)** — two-week sprint breakdown with deliverables, acceptance criteria, and demos.
+- **[docs/DEFERRED.md](docs/DEFERRED.md)** — features explicitly out of scope (with rationale).
+- **[docs/NCL_GC_FEEDBACK.md](docs/NCL_GC_FEEDBACK.md)** — cross-project notes on GC design feeding back from NewCormanLisp.
+- **[docs/specs/](docs/specs/)** — per-sprint design specs drafted ahead of implementation (lexer, library/module graph, REPL, sealing/dispatch, …).
 
 ## Workspace layout
 
@@ -20,10 +21,20 @@ NewOpenDylan/
 ├── .cargo/config.toml      # LLVM 22.1 env (activated in Sprint 06)
 ├── .github/workflows/ci.yml
 ├── docs/
-│   ├── GC.md               # GC design (full doc by Sprint 11)
-│   ├── DFM.md              # IR design (full doc by Sprint 06)
-│   ├── SEALING.md          # sealing analysis (full doc by Sprint 14)
-│   └── MACROS.md           # macro expander (full doc by Sprint 17)
+│   ├── MANIFESTO.md        # design constraints (read first)
+│   ├── PLAN.md             # 12-phase implementation plan
+│   ├── SPRINTS.md          # 2-week sprint breakdown
+│   ├── DEFERRED.md         # explicitly out-of-scope features
+│   ├── NCL_GC_FEEDBACK.md  # cross-project GC notes from NewCormanLisp
+│   ├── GC.md               # GC design notes (full doc by Sprint 11)
+│   ├── DFM.md              # IR design notes (full doc by Sprint 06)
+│   ├── SEALING.md          # sealing notes (full doc by Sprint 14)
+│   ├── MACROS.md           # macro expander notes (full doc by Sprint 17)
+│   └── specs/              # per-sprint design specs
+│       ├── 01-lexer.md
+│       ├── 05-library-module-graph.md
+│       ├── 08-repl-and-live-bindings.md
+│       └── 15-sealing-and-dispatch-resolution.md
 ├── src/
 │   ├── nod-driver/         # CLI + REPL entrypoint
 │   ├── nod-reader/         # lexer + AST
@@ -43,7 +54,7 @@ NewOpenDylan/
 
 ## Current status
 
-**Sprint 01 — Workspace Skeleton.** `cargo build --workspace` is green; `cargo run -p nod-driver -- --version` prints the banner. No real functionality yet — every crate is a placeholder. See [SPRINTS.md](../SPRINTS.md) for what each subsequent sprint adds.
+**Sprint 01 — Workspace Skeleton.** `cargo build --workspace` is green; `cargo run -p nod-driver -- --version` prints the banner. No real functionality yet — every crate is a placeholder. See [docs/SPRINTS.md](docs/SPRINTS.md) for what each subsequent sprint adds.
 
 ## Sibling-compiler portfolio
 
