@@ -69,6 +69,58 @@ define function concatenate (c1, c2) => (result)
   %collection-concatenate(c1, c2)
 end function;
 
+// ─── reduce ────────────────────────────────────────────────────────────────
+//
+// Sprint 21: now Dylan-defined. `fn` is a `<function>` first-class
+// value; the inner combiner call lowers to `nod_funcall2(fn, acc, x)`
+// because `fn` is an env-bound name that isn't a top-level function or
+// generic. FIP-driven so this body is identical for every concrete
+// collection class registered with `forward-iteration-protocol`.
+
+define function reduce (fn, init, c) => (result)
+  let state = %fip-init(c);
+  let acc = init;
+  until (%fip-finished?(state))
+    acc := %funcall2(fn, acc, %fip-current-element(state));
+    %fip-advance!(state)
+  end;
+  acc
+end function;
+
+// ─── map ───────────────────────────────────────────────────────────────────
+//
+// Sprint 21: returns a fresh `<simple-object-vector>` of length
+// `size(c)`. Shape-preserving variants (return a `<list>` when input
+// is a `<list>`, etc.) land alongside the rest of the stdlib
+// collection methods in Sprint 22+.
+
+define function map (fn, c) => (result)
+  let n = %collection-size(c);
+  let result = %make-sov(n);
+  let state = %fip-init(c);
+  let i = 0;
+  until (%fip-finished?(state))
+    %vector-element-setter(%funcall1(fn, %fip-current-element(state)), result, i);
+    i := i + 1;
+    %fip-advance!(state)
+  end;
+  result
+end function;
+
+// ─── do ────────────────────────────────────────────────────────────────────
+//
+// Sprint 21: invoke `fn` on each element of `c` for side effects.
+// Returns `#f`.
+
+define function do (fn, c) => (result)
+  let state = %fip-init(c);
+  until (%fip-finished?(state))
+    %funcall1(fn, %fip-current-element(state));
+    %fip-advance!(state)
+  end;
+  #f
+end function;
+
 // ─── for-each macro ────────────────────────────────────────────────────────
 //
 // Sugar over the FIP primitives. Expands to a `let state = %fip-init(c);

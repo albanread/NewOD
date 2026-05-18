@@ -48,7 +48,7 @@ use nod_macro::MacroTable;
 use nod_reader::{Item, Param, ReturnSig, Span};
 
 use crate::lower::{MethodRegistration, lower_module_full};
-use crate::{register_blocks, register_methods};
+use crate::{register_blocks, register_methods, register_top_level_functions};
 
 /// Static-area for the stdlib LLVM context + JIT. Leaking the
 /// engine is deliberate — Sprint 20b doesn't reclaim it, and the
@@ -201,6 +201,14 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
         crate::EvalError::NoEntry(n) => LoadError::NoEntry(n),
         crate::EvalError::Jit(e) => LoadError::Jit(e),
         other => LoadError::NoEntry(format!("stdlib block registration: {other}")),
+    })?;
+    // Sprint 21: register every stdlib `define function` body in the
+    // process-global function-ref registry so `\size`, `\reduce`, etc.
+    // are reachable as first-class function values from user code.
+    register_top_level_functions(&jit, &lm).map_err(|e| match e {
+        crate::EvalError::NoEntry(n) => LoadError::NoEntry(n),
+        crate::EvalError::Jit(e) => LoadError::Jit(e),
+        other => LoadError::NoEntry(format!("stdlib top-level fn registration: {other}")),
     })?;
 
     // Leak the Jit so engine + emitted code live forever. The

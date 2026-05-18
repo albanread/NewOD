@@ -29,6 +29,7 @@ mod collections;
 mod conditions;
 mod dispatch;
 mod format_out;
+mod functions;
 mod heap;
 mod heap_common;
 mod immediates;
@@ -100,6 +101,15 @@ pub use make::{
 pub use format_out::{
     install_test_writer, nod_format_out, take_test_writer, uninstall_test_writer,
 };
+pub use functions::{
+    MAX_APPLY_ARITY, _reset_function_registry_for_tests,
+    ensure_operator_shims_registered, ensure_registered as ensure_functions_registered,
+    function_arity, function_class_id, function_code_ptr, function_name, is_function,
+    make_function, make_function_ref, make_wrong_number_of_arguments_error, nod_apply,
+    nod_funcall1, nod_funcall2, nod_make_function_ref, nod_op_eq, nod_op_gt, nod_op_lt,
+    nod_op_minus, nod_op_plus, nod_op_times, register_jit_function, register_rust_function,
+    wrong_number_of_arguments_error_class_id,
+};
 pub use heap::{
     DEFAULT_OLD_BYTES, DEFAULT_RESERVATION_BYTES, DEFAULT_YOUNG_BYTES, GcConfig, HEAP_ALIGN, Heap,
     HeapRanges, for_each_root, register_root as heap_register_root, root_count as heap_root_count,
@@ -117,8 +127,8 @@ pub use strings::{ByteString, try_byte_string};
 pub use symbols::{Symbol, SymbolTable, try_symbol};
 pub use tracer::{HeapObjectInfo, HeapTrace, trace_heap};
 pub use vectors::{
-    SimpleObjectVector, nod_make_sov_literal, nod_sov_element, nod_sov_element_setter,
-    nod_sov_size, try_simple_object_vector, try_simple_object_vector_mut,
+    SimpleObjectVector, nod_make_sov_len, nod_make_sov_literal, nod_sov_element,
+    nod_sov_element_setter, nod_sov_size, try_simple_object_vector, try_simple_object_vector_mut,
 };
 pub use word::{FIXNUM_MAX, FIXNUM_MIN, FixnumOverflow, Word};
 pub use wrapper::{GcBit, Wrapper};
@@ -276,11 +286,19 @@ pub fn register_user_class_metadata(spec: UserClassSpec) -> (ClassId, *const Cla
 /// automatically (own slots appended after the parent's). Sprint 14:
 /// for multi-parent classes, use `register_mi_user_class` which takes
 /// the merged slot list directly.
+///
+/// Sprint 21: a `parent = None` arg is reinterpreted as `parent =
+/// Some(<object>)` so the CPL chain reaches `<object>` and
+/// `is_subclass(c, <object>)` holds for every user-registered class.
+/// This restores the Dylan semantics that every class is implicitly a
+/// subclass of `<object>` — required for stdlib methods declared as
+/// `(p :: <object>)` to dispatch on user-class instances.
 pub fn register_simple_user_class(
     name: &str,
     parent: Option<ClassId>,
     own_slots: Vec<SlotInfo>,
 ) -> (ClassId, *const ClassMetadata) {
+    let parent = parent.or(Some(ClassId::OBJECT));
     let parents: Vec<ClassId> = parent.into_iter().collect();
     register_mi_user_class_simple(name, parent, &parents, own_slots)
 }

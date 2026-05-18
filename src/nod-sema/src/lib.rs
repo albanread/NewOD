@@ -208,6 +208,7 @@ pub fn eval_expr_to_string(expr_src: &str) -> Result<String, EvalError> {
     jit.add_module(out).map_err(EvalError::Jit)?;
     register_methods(&jit, &lm.methods)?;
     register_blocks(&jit, &lm.blocks)?;
+    register_top_level_functions(&jit, &lm)?;
 
     // SAFETY: the JIT'd function takes no params; we transmute to the
     // exact signature dictated by `return_type` and call once. The JIT
@@ -259,6 +260,7 @@ pub fn run_function_to_i64(
     jit.add_module(out).map_err(EvalError::Jit)?;
     register_methods(&jit, &lm.methods)?;
     register_blocks(&jit, &lm.blocks)?;
+    register_top_level_functions(&jit, &lm)?;
 
     let ptr = unsafe { jit.get_function_ptr(entry_name) }
         .ok_or_else(|| EvalError::NoEntry(entry_name.to_string()))?;
@@ -282,6 +284,90 @@ pub fn run_function_to_i64(
 /// Sprint 13 passes the full specialiser list to
 /// `nod_runtime::add_method_full` so multi-argument dispatch
 /// (`intersect(<rect>, <circle>)` etc.) picks the right method.
+/// Sprint 21: register every top-level Dylan function in the lowered
+/// module with the runtime's function-ref registry, so that
+/// `nod_make_function_ref(name, arity)` resolves to the JIT-emitted
+/// address. Skips block-form lifted thunks (body / cleanup /
+/// afterwards / handler) — those have a different ABI and aren't
+/// callable from a `<function>` Word.
+pub fn register_top_level_functions(
+    jit: &Jit<'_>,
+    lm: &LoweredModule,
+) -> Result<(), EvalError> {
+    // Build the set of names belonging to block-form lifted thunks
+    // (the only Dylan-level functions that DON'T match the regular
+    // `(u64, ..., u64) -> u64` calling convention; their leading
+    // params are the captured-locals slots, not user args). Sprint 19
+    // emits these with predictable names — we read them out of the
+    // `blocks` registration list.
+    let mut block_thunk_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for b in &lm.blocks {
+        block_thunk_names.insert(b.body_fn_name.clone());
+        if let Some(n) = &b.cleanup_fn_name {
+            block_thunk_names.insert(n.clone());
+        }
+        if let Some(n) = &b.afterwards_fn_name {
+            block_thunk_names.insert(n.clone());
+        }
+        for h in &b.handlers {
+            block_thunk_names.insert(h.body_fn_name.clone());
+        }
+    }
+    // Auto-generated slot accessors and method bodies belong to
+    // generics; we register THEIR names ALSO so `\size` on a method-
+    // name resolves to the generic dispatcher. But since those are
+    // already in `lm.methods` and registered into the dispatch table
+    // with `add_method_named`, we can rely on the generic registry
+    // instead — `nod_make_function_ref` won't need a separate entry
+    // for `size`.
+    //
+    // Sprint 21 simplification: register EVERY top-level function
+    // whose name isn't a block thunk. The function-ref registry is
+    // keyed on `(name, arity)`, so collisions are impossible across
+    // arities.
+    // Names whose addresses we register under the SOURCE name (vs the
+    // mangled body symbol). For methods, the source name lives in
+    // `lm.methods[i].generic_name` and the body name in
+    // `lm.methods[i].body_fn_name`. Build a map from body name to
+    // source name so the function pass below can register under both.
+    let mut body_to_source: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for m in &lm.methods {
+        body_to_source
+            .entry(m.body_fn_name.clone())
+            .or_insert_with(|| m.generic_name.clone());
+    }
+    for f in &lm.functions {
+        if block_thunk_names.contains(&f.name) {
+            continue;
+        }
+        // Skip the synthetic `<eval-entry>` so it isn't reachable via
+        // `\<eval-entry>` from inside the evaluated body.
+        if f.name == "<eval-entry>" {
+            continue;
+        }
+        let arity = f.params.len();
+        // SAFETY: get_function_ptr returns a valid JIT'd address;
+        // the JIT engine outlives the registration (callers leak it).
+        let ptr = unsafe { jit.get_function_ptr(&f.name) }.ok_or_else(|| {
+            EvalError::NoEntry(format!("top-level function `{}` not JIT'd", f.name))
+        })?;
+        // SAFETY: ptr is JIT-emitted, signature `(u64*arity) -> u64`.
+        unsafe {
+            nod_runtime::register_jit_function(&f.name, arity, ptr as *const u8);
+            // If this function is a method body (e.g. stdlib's
+            // `size$<object>` body), also register under the
+            // generic-source name so `\size` resolves.
+            if let Some(src) = body_to_source.get(&f.name)
+                && src != &f.name
+            {
+                nod_runtime::register_jit_function(src, arity, ptr as *const u8);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn register_methods(
     jit: &Jit<'_>,
     methods: &[MethodRegistration],
@@ -482,7 +568,56 @@ fn format_pointer_word(w: nod_runtime::Word) -> String {
             };
         }
     }
+    // Sprint 21: `<simple-object-vector>` prints as `#(elt0, elt1, …)`
+    // matching Dylan's source-literal form. Used by the
+    // `dylan_map_squares_three_element_list` headline test, which
+    // produces an SOV via `map(...)`.
+    if wrap.class() == nod_runtime::ClassId::SIMPLE_OBJECT_VECTOR {
+        // SAFETY: class match implies SOV layout.
+        if let Some(sov) = unsafe {
+            nod_runtime::try_simple_object_vector(w, nod_runtime::ClassId::SIMPLE_OBJECT_VECTOR)
+        } {
+            // SAFETY: sov points at live allocation.
+            let slots = unsafe { sov.slots() };
+            let parts: Vec<String> = slots.iter().map(|s| format_element(*s)).collect();
+            return format!("#({})", parts.join(", "));
+        }
+    }
+    // Sprint 21: `<pair>` / `<empty-list>` cons-cell list pretty-print.
+    if wrap.class() == nod_runtime::ClassId::PAIR
+        || wrap.class() == nod_runtime::ClassId::EMPTY_LIST
+    {
+        return format_list(w);
+    }
     format!("<{:?} @ {:#x}>", wrap.class(), w.raw() & !1)
+}
+
+/// Helper: render a single Word as it appears INSIDE a collection
+/// literal. Fixnums print as their decimal value; pointer-tagged
+/// values recurse through `format_pointer_word`.
+fn format_element(w: nod_runtime::Word) -> String {
+    if let Some(n) = w.as_fixnum() {
+        return n.to_string();
+    }
+    format_pointer_word(w)
+}
+
+/// Render a `<pair>` / `<empty-list>` chain as `#(elt0, elt1, …)`.
+fn format_list(w: nod_runtime::Word) -> String {
+    let imm = nod_runtime::literal_pool_immediates();
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = w;
+    while cur != imm.nil {
+        // SAFETY: walking a Sprint 16 cons-cell chain; `try_pair` checks
+        // the wrapper class and returns `None` if `cur` isn't a pair.
+        let Some(p) = (unsafe { nod_runtime::try_pair(cur, nod_runtime::ClassId::PAIR) })
+        else {
+            break;
+        };
+        parts.push(format_element(p.head));
+        cur = p.tail;
+    }
+    format!("#({})", parts.join(", "))
 }
 
 #[derive(Debug)]

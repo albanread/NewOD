@@ -232,6 +232,13 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // dispatch.
     ("%make-range", "nod_make_range", 3, TypeEstimate::Top),
     ("%make-stretchy-vector", "nod_make_stretchy_vector", 1, TypeEstimate::Top),
+    // Sprint 21: first-class function dispatch primitives.
+    ("%funcall1", "nod_funcall1", 2, TypeEstimate::Top),
+    ("%funcall2", "nod_funcall2", 3, TypeEstimate::Top),
+    ("%apply", "nod_apply", 2, TypeEstimate::Top),
+    // Sprint 21: allocate a zero-filled `<simple-object-vector>` of the
+    // given length. Mirrors `collection_map`'s allocator path.
+    ("%make-sov", "nod_make_sov_len", 1, TypeEstimate::Top),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {
@@ -239,6 +246,18 @@ fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {
         .iter()
         .find(|(n, _, _, _)| *n == name)
         .map(|(_, sym, ar, ty)| (*sym, *ar, *ty))
+}
+
+/// Sprint 21: a Dylan-source operator name (`+`, `-`, `*`, `=`, `<`,
+/// `>`) used as a first-class function reference (`\+` etc.) has a
+/// fixed runtime-shim arity. The shims live in `nod-runtime::functions`
+/// and are pre-registered in the function-ref registry by
+/// `ensure_operator_shims_registered`.
+fn operator_arity(name: &str) -> Option<usize> {
+    match name {
+        "+" | "-" | "*" | "=" | "<" | ">" => Some(2),
+        _ => None,
+    }
 }
 
 /// Sprint 16: the five `<pair>` / `<list>` builtins. Each lowers to a
@@ -360,6 +379,23 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // resolve via `find_class_id_by_name` during exception-clause
     // lowering. Idempotent — repeated calls are cheap.
     nod_runtime::ensure_conditions_registered();
+    // Sprint 21: ensure the `<function>` / `<wrong-number-of-arguments-error>`
+    // classes + operator shim registrations are alive before lowering
+    // touches `\name` / anonymous-method expressions.
+    nod_runtime::ensure_functions_registered();
+
+    // Sprint 21 pre-pass: rewrite every `Expr::Method` in expression
+    // position to a synthetic `Expr::Ident(__anon-method-NNNN)` and
+    // emit a matching `Item::DefineFunction` at the top level. The
+    // normal lowering path then handles the lifted thunks as ordinary
+    // top-level functions and the call sites as ordinary `\name`
+    // references.
+    let mut m_owned: Module = m.clone();
+    let lift_errors = lift_anonymous_methods(&mut m_owned);
+    if !lift_errors.is_empty() {
+        return Err(lift_errors);
+    }
+    let m: &Module = &m_owned;
 
     let mut errors: Vec<LoweringError> = Vec::new();
     let mut user_classes: HashMap<String, ClassId> = HashMap::new();
@@ -1427,17 +1463,31 @@ fn lower_function_inner(
 
 pub struct TopNames {
     fns: HashMap<String, TypeEstimate>,
+    /// Sprint 21: arity per top-level function. Populated alongside
+    /// `fns` by `collect_top_level_names`. Used to bake the right
+    /// arity into `nod_make_function_ref` call sites for `\name`
+    /// references. Slot accessors (`<C>-getter-x`) have arity 1;
+    /// setters (`<C>-setter-x`) arity 2; user `define function`s
+    /// follow their param count.
+    fn_arity: HashMap<String, usize>,
 }
 
 impl TopNames {
     pub fn empty() -> Self {
-        Self { fns: HashMap::new() }
+        Self {
+            fns: HashMap::new(),
+            fn_arity: HashMap::new(),
+        }
     }
     pub fn contains(&self, name: &str) -> bool {
         self.fns.contains_key(name)
     }
     pub fn return_type(&self, name: &str) -> Option<TypeEstimate> {
         self.fns.get(name).copied()
+    }
+    /// Sprint 21: arity for a registered top-level function, if known.
+    pub fn arity(&self, name: &str) -> Option<usize> {
+        self.fn_arity.get(name).copied()
     }
 }
 
@@ -1477,16 +1527,463 @@ impl LiftSink {
     }
 }
 
+// ─── Sprint 21: anonymous-method lifting pre-pass ─────────────────────────
+//
+// Walks every Item's body, every Expr nested inside, and replaces
+// `Expr::Method { params, body }` with an `Expr::Ident` referencing a
+// synthesised top-level name. Each replacement also appends an
+// `Item::DefineFunction` to the module so the normal lowering flow
+// emits the lifted thunk as an ordinary top-level function.
+//
+// Free-variable check: every name an anonymous method's body references
+// must resolve EITHER to one of the method's own params OR to a
+// top-level name (top function / generic / registered class). Any other
+// reference is a free variable; Sprint 21 errors out with a clear
+// "closures land in Sprint 24" diagnostic — there is no implicit env
+// capture in Sprint 21.
+
+/// Pre-pass entry point. Mutates `module` in place. Returns a list of
+/// `LoweringError::Unsupported` if any anonymous method captures a free
+/// variable.
+fn lift_anonymous_methods(module: &mut Module) -> Vec<LoweringError> {
+    // Collect the set of top-level names so the free-variable check
+    // can distinguish "captured local" from "module-scope reference".
+    // Top-level names include `define function` / `define method` /
+    // `define generic` / `define constant` / `define variable` /
+    // `define class`. Registered seed / runtime classes (`<integer>`,
+    // `<error>`, ...) are also OK because they resolve via
+    // `find_class_id_by_name`.
+    let mut top_level_names: HashSet<String> = HashSet::new();
+    for item in &module.items {
+        match item {
+            Item::DefineFunction { name, .. }
+            | Item::DefineMethod { name, .. }
+            | Item::DefineGeneric { name, .. }
+            | Item::DefineConstant { name, .. }
+            | Item::DefineVariable { name, .. }
+            | Item::DefineClass { name, .. } => {
+                top_level_names.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+    // Process each existing item in turn. Replacements append to the
+    // module's items via `new_items`.
+    let mut new_items: Vec<Item> = Vec::new();
+    let mut counter: u32 = 0;
+    let mut errors: Vec<LoweringError> = Vec::new();
+    let mut items = std::mem::take(&mut module.items);
+    for mut item in items.drain(..) {
+        lift_item(
+            &mut item,
+            &top_level_names,
+            &mut counter,
+            &mut new_items,
+            &mut errors,
+        );
+        new_items.push(item);
+    }
+    module.items = new_items;
+    errors
+}
+
+fn lift_item(
+    item: &mut Item,
+    top: &HashSet<String>,
+    counter: &mut u32,
+    new_items: &mut Vec<Item>,
+    errors: &mut Vec<LoweringError>,
+) {
+    match item {
+        Item::DefineFunction { params, body, .. } | Item::DefineMethod { params, body, .. } => {
+            let mut in_scope: HashSet<String> = top.clone();
+            for p in params.iter() {
+                in_scope.insert(p.name.clone());
+            }
+            for s in body.iter_mut() {
+                lift_statement(s, &mut in_scope, top, counter, new_items, errors);
+            }
+        }
+        Item::DefineConstant { value, .. } | Item::DefineVariable { value, .. } => {
+            let mut in_scope: HashSet<String> = top.clone();
+            lift_expr(value, &mut in_scope, top, counter, new_items, errors);
+        }
+        Item::Expr(e) => {
+            let mut in_scope: HashSet<String> = top.clone();
+            lift_expr(e, &mut in_scope, top, counter, new_items, errors);
+        }
+        // DefineClass: nested exprs in supers / slot defaults aren't
+        // currently supported as expression-position method literals;
+        // skip. DefineGeneric / DefineLibrary / DefineModule /
+        // DefineMacro / DefineOther — no expression bodies to lift.
+        _ => {}
+    }
+}
+
+fn lift_statement(
+    s: &mut Statement,
+    in_scope: &mut HashSet<String>,
+    top: &HashSet<String>,
+    counter: &mut u32,
+    new_items: &mut Vec<Item>,
+    errors: &mut Vec<LoweringError>,
+) {
+    match s {
+        Statement::Expr(e) => {
+            lift_expr(e, in_scope, top, counter, new_items, errors);
+        }
+        Statement::Let { binders, value, .. } => {
+            lift_expr(value, in_scope, top, counter, new_items, errors);
+            for b in binders {
+                in_scope.insert(b.name.clone());
+            }
+        }
+        Statement::Local { methods, .. } => {
+            // Local methods bind their name in scope; their bodies are
+            // closed over the enclosing scope. Sprint 21 doesn't ship
+            // closures, so we leave the body unprocessed (the existing
+            // lowering errors on local methods with the Sprint 06
+            // Unsupported diagnostic).
+            for m in methods {
+                in_scope.insert(m.name.clone());
+            }
+        }
+        Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
+            lift_expr(cond, in_scope, top, counter, new_items, errors);
+            let saved = in_scope.clone();
+            for sub in body {
+                lift_statement(sub, in_scope, top, counter, new_items, errors);
+            }
+            *in_scope = saved;
+        }
+        Statement::For { .. } => {
+            // For statements aren't lowered in Sprint 18; leave alone.
+        }
+        Statement::Block {
+            exit_var,
+            body,
+            handlers,
+            cleanup,
+            afterwards,
+            ..
+        } => {
+            let saved = in_scope.clone();
+            if let Some(ev) = exit_var {
+                in_scope.insert(ev.clone());
+            }
+            for sub in body {
+                lift_statement(sub, in_scope, top, counter, new_items, errors);
+            }
+            for h in handlers {
+                let mut h_scope = in_scope.clone();
+                if let Some(v) = &h.var {
+                    h_scope.insert(v.clone());
+                }
+                for sub in &mut h.body {
+                    lift_statement(sub, &mut h_scope, top, counter, new_items, errors);
+                }
+            }
+            for sub in cleanup {
+                lift_statement(sub, in_scope, top, counter, new_items, errors);
+            }
+            for sub in afterwards {
+                lift_statement(sub, in_scope, top, counter, new_items, errors);
+            }
+            *in_scope = saved;
+        }
+    }
+}
+
+fn lift_expr(
+    e: &mut Expr,
+    in_scope: &mut HashSet<String>,
+    top: &HashSet<String>,
+    counter: &mut u32,
+    new_items: &mut Vec<Item>,
+    errors: &mut Vec<LoweringError>,
+) {
+    match e {
+        Expr::Integer(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::String(..)
+        | Expr::Char(..)
+        | Expr::Symbol(..)
+        | Expr::Ident(..) => {}
+        Expr::Paren { inner, .. } => {
+            lift_expr(inner, in_scope, top, counter, new_items, errors);
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            lift_expr(lhs, in_scope, top, counter, new_items, errors);
+            lift_expr(rhs, in_scope, top, counter, new_items, errors);
+        }
+        Expr::UnOp { operand, .. } => {
+            lift_expr(operand, in_scope, top, counter, new_items, errors);
+        }
+        Expr::If { cond, then_, else_, .. } => {
+            lift_expr(cond, in_scope, top, counter, new_items, errors);
+            lift_expr(then_, in_scope, top, counter, new_items, errors);
+            if let Some(e2) = else_ {
+                lift_expr(e2, in_scope, top, counter, new_items, errors);
+            }
+        }
+        Expr::Begin { body, .. } => {
+            let saved = in_scope.clone();
+            for sub in body {
+                lift_expr(sub, in_scope, top, counter, new_items, errors);
+            }
+            *in_scope = saved;
+        }
+        Expr::Call { callee, args, .. } => {
+            lift_expr(callee, in_scope, top, counter, new_items, errors);
+            for a in args {
+                lift_expr(a, in_scope, top, counter, new_items, errors);
+            }
+        }
+        Expr::Let { binder, value, .. } => {
+            lift_expr(value, in_scope, top, counter, new_items, errors);
+            in_scope.insert(binder.clone());
+        }
+        Expr::Unless { .. } | Expr::Case { .. } | Expr::LocalMethod { .. } => {
+            // Not lowered; leave the unsupported diagnostic to the
+            // main lowering pass.
+        }
+        Expr::Stmt(s) => {
+            lift_statement(s, in_scope, top, counter, new_items, errors);
+        }
+        Expr::Method { span, params, body } => {
+            // Check free variables first. Every Ident referenced inside
+            // the method body that isn't (a) one of the method's own
+            // params, (b) a top-level name, (c) a fresh `let` binder
+            // introduced in the body, OR (d) one of Sprint 21's
+            // operator names (`+`, `-`, ...) is a free variable from
+            // the enclosing scope — i.e. a closure.
+            let mut inner_scope: HashSet<String> = top.clone();
+            for p in params.iter() {
+                inner_scope.insert(p.name.clone());
+            }
+            let mut free: Vec<(Span, String)> = Vec::new();
+            for sub in body.iter() {
+                check_free_vars(sub, &mut inner_scope, in_scope, top, &mut free);
+            }
+            if let Some((bad_span, bad_name)) = free.into_iter().next() {
+                errors.push(LoweringError::Unsupported {
+                    span: bad_span,
+                    message: format!(
+                        "Sprint 21: anonymous method captures free variable `{bad_name}` \
+                         from the enclosing scope; closures land in Sprint 24"
+                    ),
+                });
+                return;
+            }
+            // Synthesise a fresh top-level name for the lifted body.
+            let lifted_name = format!("__anon-method-{}", *counter);
+            *counter += 1;
+            let body_stmts: Vec<Statement> =
+                body.iter().cloned().map(Statement::Expr).collect();
+            new_items.push(Item::DefineFunction {
+                span: *span,
+                modifiers: Vec::new(),
+                name: lifted_name.clone(),
+                params: params.clone(),
+                return_: None,
+                body: body_stmts,
+            });
+            // Also lift any nested anonymous methods inside the body
+            // we just stuffed into a synthetic DefineFunction. We do
+            // this by recursively running the pre-pass on the new
+            // item we just appended. Simpler: lift_item the new item
+            // in place.
+            let mut tmp_new_items: Vec<Item> = Vec::new();
+            let last_idx = new_items.len() - 1;
+            // Take ownership briefly.
+            let mut taken = std::mem::replace(
+                &mut new_items[last_idx],
+                Item::Expr(Expr::Bool(*span, false)),
+            );
+            lift_item(&mut taken, top, counter, &mut tmp_new_items, errors);
+            new_items[last_idx] = taken;
+            new_items.append(&mut tmp_new_items);
+            // Replace the original Method expression with an ident
+            // reference to the lifted thunk.
+            *e = Expr::Ident(*span, lifted_name);
+        }
+    }
+}
+
+/// Free-variable walk used inside `lift_expr`'s `Expr::Method` branch.
+/// Pushes `(span, name)` into `free` for every Ident in `e` that
+/// resolves to a name in `outer_scope` but NOT in `inner_scope` or
+/// `top`.
+///
+/// `inner_scope` starts as `top + method-params` and grows as `let`
+/// binders are introduced inside the body.
+fn check_free_vars(
+    e: &Expr,
+    inner_scope: &mut HashSet<String>,
+    outer_scope: &HashSet<String>,
+    top: &HashSet<String>,
+    free: &mut Vec<(Span, String)>,
+) {
+    match e {
+        Expr::Integer(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::String(..)
+        | Expr::Char(..)
+        | Expr::Symbol(..) => {}
+        Expr::Ident(span, name) => {
+            // Sprint 21 free-var check: any Ident NOT in inner_scope
+            // AND that exists in outer_scope is a capture. Idents that
+            // resolve to a registered class / runtime generic stay OK.
+            if inner_scope.contains(name) || top.contains(name) {
+                return;
+            }
+            // Operator shims (`+`, `-`, ...) are always available.
+            if operator_arity(name).is_some() {
+                return;
+            }
+            // Registered classes (`<integer>`, `<error>`, ...).
+            if name.starts_with('<') && name.ends_with('>') {
+                return;
+            }
+            // Registered runtime generics (stdlib `size`, ...).
+            if nod_runtime::is_generic_defined(name) {
+                return;
+            }
+            if outer_scope.contains(name) {
+                free.push((*span, name.clone()));
+            }
+            // If neither inner_scope nor outer_scope binds it, leave
+            // the diagnostic to the main lowering pass (it'll surface
+            // an UndefinedIdent).
+        }
+        Expr::Paren { inner, .. } => check_free_vars(inner, inner_scope, outer_scope, top, free),
+        Expr::BinOp { lhs, rhs, .. } => {
+            check_free_vars(lhs, inner_scope, outer_scope, top, free);
+            check_free_vars(rhs, inner_scope, outer_scope, top, free);
+        }
+        Expr::UnOp { operand, .. } => {
+            check_free_vars(operand, inner_scope, outer_scope, top, free);
+        }
+        Expr::If { cond, then_, else_, .. } => {
+            check_free_vars(cond, inner_scope, outer_scope, top, free);
+            check_free_vars(then_, inner_scope, outer_scope, top, free);
+            if let Some(e2) = else_ {
+                check_free_vars(e2, inner_scope, outer_scope, top, free);
+            }
+        }
+        Expr::Begin { body, .. } => {
+            let saved = inner_scope.clone();
+            for sub in body {
+                check_free_vars(sub, inner_scope, outer_scope, top, free);
+            }
+            *inner_scope = saved;
+        }
+        Expr::Call { callee, args, .. } => {
+            check_free_vars(callee, inner_scope, outer_scope, top, free);
+            for a in args {
+                check_free_vars(a, inner_scope, outer_scope, top, free);
+            }
+        }
+        Expr::Let { binder, value, .. } => {
+            check_free_vars(value, inner_scope, outer_scope, top, free);
+            inner_scope.insert(binder.clone());
+        }
+        Expr::Unless { .. } | Expr::Case { .. } | Expr::LocalMethod { .. } => {}
+        Expr::Method { params, body, .. } => {
+            // Nested anonymous method: its own params extend the inner
+            // scope; the outer scope is unchanged for the recursive walk
+            // (the nested method's free variables vs its enclosing
+            // method's scope is what we want — same outer_scope).
+            let mut nested_inner = inner_scope.clone();
+            for p in params {
+                nested_inner.insert(p.name.clone());
+            }
+            for sub in body {
+                check_free_vars(sub, &mut nested_inner, outer_scope, top, free);
+            }
+        }
+        Expr::Stmt(s) => check_free_vars_in_stmt(s, inner_scope, outer_scope, top, free),
+    }
+}
+
+fn check_free_vars_in_stmt(
+    s: &Statement,
+    inner_scope: &mut HashSet<String>,
+    outer_scope: &HashSet<String>,
+    top: &HashSet<String>,
+    free: &mut Vec<(Span, String)>,
+) {
+    match s {
+        Statement::Expr(e) => check_free_vars(e, inner_scope, outer_scope, top, free),
+        Statement::Let { binders, value, .. } => {
+            check_free_vars(value, inner_scope, outer_scope, top, free);
+            for b in binders {
+                inner_scope.insert(b.name.clone());
+            }
+        }
+        Statement::Local { methods, .. } => {
+            for m in methods {
+                inner_scope.insert(m.name.clone());
+            }
+        }
+        Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
+            check_free_vars(cond, inner_scope, outer_scope, top, free);
+            let saved = inner_scope.clone();
+            for sub in body {
+                check_free_vars_in_stmt(sub, inner_scope, outer_scope, top, free);
+            }
+            *inner_scope = saved;
+        }
+        Statement::For { .. } => {}
+        Statement::Block {
+            exit_var,
+            body,
+            handlers,
+            cleanup,
+            afterwards,
+            ..
+        } => {
+            let saved = inner_scope.clone();
+            if let Some(ev) = exit_var {
+                inner_scope.insert(ev.clone());
+            }
+            for sub in body {
+                check_free_vars_in_stmt(sub, inner_scope, outer_scope, top, free);
+            }
+            for h in handlers {
+                let mut h_scope = inner_scope.clone();
+                if let Some(v) = &h.var {
+                    h_scope.insert(v.clone());
+                }
+                for sub in &h.body {
+                    check_free_vars_in_stmt(sub, &mut h_scope, outer_scope, top, free);
+                }
+            }
+            for sub in cleanup {
+                check_free_vars_in_stmt(sub, inner_scope, outer_scope, top, free);
+            }
+            for sub in afterwards {
+                check_free_vars_in_stmt(sub, inner_scope, outer_scope, top, free);
+            }
+            *inner_scope = saved;
+        }
+    }
+}
+
 fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) -> TopNames {
     let mut fns = HashMap::new();
+    let mut fn_arity: HashMap<String, usize> = HashMap::new();
     for item in &m.items {
-        if let Item::DefineFunction { name, return_, .. } = item {
+        if let Item::DefineFunction { name, params, return_, .. } = item {
             let ret = return_
                 .as_ref()
                 .and_then(|r| r.values.first().and_then(|v| v.type_.as_ref()))
                 .map(|e| type_from_expr(Some(e)))
                 .unwrap_or(TypeEstimate::Top);
             fns.insert(name.clone(), ret);
+            fn_arity.insert(name.clone(), params.len());
         }
     }
     // Slot accessors are emitted as top-level functions too; record
@@ -1510,10 +2007,12 @@ fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) 
             let origin = metadata.slot_origin[idx];
             if origin == class_id {
                 let getter = format!("{}-getter-{}", name, slot.name);
-                fns.insert(getter, slot_type_to_estimate(slot.type_kind));
+                fns.insert(getter.clone(), slot_type_to_estimate(slot.type_kind));
+                fn_arity.insert(getter, 1);
                 if slot.has_setter {
                     let setter = format!("{}-setter-{}", name, slot.name);
-                    fns.insert(setter, TypeEstimate::Top);
+                    fns.insert(setter.clone(), TypeEstimate::Top);
+                    fn_arity.insert(setter, 2);
                 }
             } else {
                 // Inherited slot — if Phase 3 will generate an override
@@ -1533,16 +2032,18 @@ fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) 
                     .unwrap_or(slot.offset);
                 if origin_offset != slot.offset {
                     let getter = format!("{}-override-getter-{}", name, slot.name);
-                    fns.insert(getter, slot_type_to_estimate(slot.type_kind));
+                    fns.insert(getter.clone(), slot_type_to_estimate(slot.type_kind));
+                    fn_arity.insert(getter, 1);
                     if slot.has_setter {
                         let setter = format!("{}-override-setter-{}", name, slot.name);
-                        fns.insert(setter, TypeEstimate::Top);
+                        fns.insert(setter.clone(), TypeEstimate::Top);
+                        fn_arity.insert(setter, 2);
                     }
                 }
             }
         }
     }
-    TopNames { fns }
+    TopNames { fns, fn_arity }
 }
 
 fn collect_generic_names(m: &Module) -> HashSet<String> {
@@ -1805,13 +2306,39 @@ impl FunctionBuilder {
                 {
                     return Ok(self.emit_class_ref(class_id));
                 }
+                // Sprint 21: first-class function references.
+                //
+                // An ident in expression position that resolves to a
+                // registered function (top-level / slot accessor / stdlib
+                // method / operator shim) lowers to
+                // `nod_make_function_ref(name, arity)`.
+                //
+                // Arity resolution priority:
+                //   1. `top_names::arity(name)` — user functions and
+                //      slot accessors in THIS module.
+                //   2. operator shims — fixed arity-2.
+                //   3. generics — pick the first registered method's
+                //      param count via the dispatch table.
+                if let Some(arity) = ctx.top_names.arity(name) {
+                    return Ok(self.emit_make_function_ref(name, arity));
+                }
+                if let Some(arity) = operator_arity(name) {
+                    return Ok(self.emit_make_function_ref(name, arity));
+                }
+                if ctx.generics.contains(name) || nod_runtime::is_generic_defined(name) {
+                    // Read the arity from the first method registered
+                    // under this generic, if any. For stdlib methods
+                    // rewritten as `f (x :: <object>, …)`, the param
+                    // count IS the arity.
+                    let arity = nod_runtime::find_generic(name)
+                        .and_then(|g| g.first_method_param_count())
+                        .unwrap_or(1);
+                    return Ok(self.emit_make_function_ref(name, arity));
+                }
                 if ctx.top_names.contains(name) {
-                    return Err(LoweringError::Unsupported {
-                        span: *span,
-                        message: format!(
-                            "first-class reference to top-level function `{name}` not lowered in Sprint 06"
-                        ),
-                    });
+                    // Should be reachable only if arity lookup somehow
+                    // failed; fall back to arity 1 so we don't crash.
+                    return Ok(self.emit_make_function_ref(name, 1));
                 }
                 Err(LoweringError::UndefinedIdent {
                     span: *span,
@@ -1889,10 +2416,25 @@ impl FunctionBuilder {
                 env.insert(binder.clone(), t);
                 Ok(t)
             }
+            Expr::Method { span, .. } => {
+                // Sprint 21: `method (...) ... end` in expression
+                // position should have been rewritten to a synthetic
+                // `Expr::Ident(__anon-method-NNNN)` by
+                // `lift_anonymous_methods` in the lowering pre-pass
+                // (see `lift_anonymous_methods` below). If we got here,
+                // the lifting pass missed a Method form — surface as an
+                // unsupported diagnostic so the bug is loud.
+                Err(LoweringError::Unsupported {
+                    span: *span,
+                    message: "anonymous method survived the Sprint 21 lift pre-pass — \
+                              please report; expected every Expr::Method in expression \
+                              position to be rewritten to an ident reference"
+                        .to_string(),
+                })
+            }
             Expr::Unless { span, .. }
             | Expr::Case { span, .. }
-            | Expr::LocalMethod { span, .. }
-            | Expr::Method { span, .. } => Err(LoweringError::Unsupported {
+            | Expr::LocalMethod { span, .. } => Err(LoweringError::Unsupported {
                 span: *span,
                 message: format!(
                     "expression form `{}` not lowered in Sprint 06",
@@ -1901,6 +2443,41 @@ impl FunctionBuilder {
             }),
             Expr::Stmt(s) => self.lower_stmt_as_expr(s, env, ctx),
         }
+    }
+
+    /// Sprint 21: emit a `nod_make_function_ref(name_bytestring,
+    /// arity_fixnum)` call. The result is a pointer-tagged `<function>`
+    /// Word; the underlying instance lives in the static area so the
+    /// address is stable. Codegen turns this into a DirectCall to the
+    /// runtime shim.
+    fn emit_make_function_ref(&mut self, name: &str, arity: usize) -> TempId {
+        let name_word = self.emit_string_literal(name);
+        let arity_temp = self.fresh_temp(TypeEstimate::Integer);
+        self.push(Computation::Const {
+            dst: arity_temp,
+            value: ConstValue::Integer(arity as i128),
+        });
+        let dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst,
+            callee: "nod_make_function_ref".to_string(),
+            args: vec![name_word, arity_temp],
+            safepoint_roots: Vec::new(),
+        });
+        dst
+    }
+
+    /// Emit a `<byte-string>` literal Word for the supplied Rust `&str`.
+    /// The bake goes through the static-area-pinned literal pool so the
+    /// address is stable across GC.
+    fn emit_string_literal(&mut self, s: &str) -> TempId {
+        let w = nod_runtime::intern_string_literal(s);
+        let t = self.fresh_temp(TypeEstimate::String);
+        self.push(Computation::Const {
+            dst: t,
+            value: ConstValue::WordBits(w.raw()),
+        });
+        t
     }
 
     /// Materialise a class reference as a Word constant pointing at
@@ -2214,19 +2791,43 @@ impl FunctionBuilder {
         // earlier lowering doesn't yet support first-class function
         // values in env; the only env-bound callable values are exit
         // procedures.
+        // Sprint 21: env-bound callable Word — could be a `<function>`
+        // (introduced via `\name` or `method (...) ... end`) OR an
+        // `<exit-procedure>` (the `k` in `block (k) ... end`). Both
+        // route through the `nod_funcall_N` trampoline which dispatches
+        // on the heap class at runtime. The arity is fixed by the call
+        // shape; Sprint 21 supports up to arity-2 directly and uses
+        // `nod_apply` for higher arities (deferred).
         if let Expr::Ident(_, name) = callee
             && env.contains_key(name)
             && !ctx.top_names.contains(name)
             && !ctx.generics.contains(name)
-            && args.len() == 1
         {
-            let k = *env.get(name).expect("env entry checked");
-            let v = self.lower_expr(&args[0], env, ctx)?;
+            let f = *env.get(name).expect("env entry checked");
+            let arg_temps: Vec<TempId> = args
+                .iter()
+                .map(|a| self.lower_expr(a, env, ctx))
+                .collect::<Result<_, _>>()?;
+            let funcall_sym = match arg_temps.len() {
+                1 => "nod_funcall1",
+                2 => "nod_funcall2",
+                n => {
+                    return Err(LoweringError::Unsupported {
+                        span,
+                        message: format!(
+                            "Sprint 21: calling a local <function>/<exit-procedure> binding `{name}` with arity {n} not supported (only 1 or 2 args); higher-arity apply is deferred"
+                        ),
+                    });
+                }
+            };
+            let mut call_args = Vec::with_capacity(arg_temps.len() + 1);
+            call_args.push(f);
+            call_args.extend(arg_temps);
             let dst = self.fresh_temp(TypeEstimate::Top);
             self.push(Computation::DirectCall {
                 dst,
-                callee: "%invoke-exit".to_string(),
-                args: vec![k, v],
+                callee: funcall_sym.to_string(),
+                args: call_args,
                 safepoint_roots: Vec::new(),
             });
             return Ok(dst);

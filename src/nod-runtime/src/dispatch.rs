@@ -254,6 +254,15 @@ impl GenericFunction {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Sprint 21: param count for the first registered method (used by
+    /// the `\name` first-class function-reference path to determine the
+    /// arity to bake into the `<function>` Word). Returns `None` if no
+    /// methods are registered yet.
+    pub fn first_method_param_count(&self) -> Option<usize> {
+        let methods = self.methods.read().ok()?;
+        methods.first().map(|m| m.param_count)
+    }
+
     /// Register `m`. If a method with identical specialisers already
     /// exists, it is replaced. Always bumps the generation counter.
     ///

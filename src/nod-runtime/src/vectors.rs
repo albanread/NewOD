@@ -264,6 +264,19 @@ pub unsafe extern "C" fn nod_make_sov_literal(
     v.raw()
 }
 
+/// Sprint 21: allocate a zero-filled `<simple-object-vector>` of the
+/// requested length. The fixnum-tagged length Word is decoded; out-of-
+/// range values clamp to 0.
+///
+/// # Safety
+///
+/// `len_raw` must be a fixnum-tagged Dylan Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_make_sov_len(len_raw: u64) -> u64 {
+    let len = Word::from_raw(len_raw).as_fixnum().unwrap_or(0).max(0) as usize;
+    crate::with_literal_pool(|pool| pool.heap.alloc_simple_object_vector(len, &pool.classes)).raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

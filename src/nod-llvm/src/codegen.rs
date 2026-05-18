@@ -170,6 +170,23 @@ pub const NOD_FIP_ADVANCE_SYMBOL: &str = "nod_fip_advance";
 pub const NOD_MAKE_RANGE_SYMBOL: &str = "nod_make_range";
 pub const NOD_MAKE_STRETCHY_VECTOR_SYMBOL: &str = "nod_make_stretchy_vector";
 
+// ─── Sprint 21 — first-class function values ──────────────────────────────
+//
+// `nod_make_function_ref(name_bytestring, arity_fixnum) -> <function>`
+// allocates (or returns the cached) `<function>` Word for the supplied
+// Dylan-source name. The codegen emits a call to this shim whenever the
+// lowerer sees an `Expr::Ident` resolving to a registered function used
+// in expression (not call-head) position.
+//
+// `nod_funcall1`, `nod_funcall2`, `nod_apply` are the trampolines for
+// invoking a `<function>` Word. See `nod-runtime::functions` for the
+// implementation.
+pub const NOD_MAKE_FUNCTION_REF_SYMBOL: &str = "nod_make_function_ref";
+pub const NOD_FUNCALL1_SYMBOL: &str = "nod_funcall1";
+pub const NOD_FUNCALL2_SYMBOL: &str = "nod_funcall2";
+pub const NOD_APPLY_SYMBOL: &str = "nod_apply";
+pub const NOD_MAKE_SOV_LEN_SYMBOL: &str = "nod_make_sov_len";
+
 /// Sprint 20b: `(dylan-name-as-emitted-by-lower, runtime-symbol, arity)`.
 /// The lower pass emits the LHS name as the DirectCall callee; codegen
 /// matches it here and emits a call into the RHS extern.
@@ -196,6 +213,12 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_fip_advance", NOD_FIP_ADVANCE_SYMBOL, 1),
     ("nod_make_range", NOD_MAKE_RANGE_SYMBOL, 3),
     ("nod_make_stretchy_vector", NOD_MAKE_STRETCHY_VECTOR_SYMBOL, 1),
+    // Sprint 21 — first-class function values.
+    ("nod_make_function_ref", NOD_MAKE_FUNCTION_REF_SYMBOL, 2),
+    ("nod_funcall1", NOD_FUNCALL1_SYMBOL, 2),
+    ("nod_funcall2", NOD_FUNCALL2_SYMBOL, 3),
+    ("nod_apply", NOD_APPLY_SYMBOL, 2),
+    ("nod_make_sov_len", NOD_MAKE_SOV_LEN_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

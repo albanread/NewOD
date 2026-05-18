@@ -53,9 +53,13 @@ fn collection_hierarchy_registers() {
     assert!(is_subclass(range, seq));
     assert!(is_subclass(sv, mut_seq));
     assert!(is_subclass(sv, seq));
-    // <iteration-state> is its own root in Sprint 20 (parent = <object>).
+    // <iteration-state>'s parent is `<object>` — Sprint 21 made every
+    // `parent = None` registration implicitly subclass of `<object>` so
+    // stdlib methods declared on `(p :: <object>)` dispatch on user-
+    // class receivers. Pre-Sprint-21 this returned `None`; the
+    // semantics match Dylan ("every class is a subclass of <object>").
     let iter_md = class_metadata_for(iter);
-    assert_eq!(iter_md.parent, None);
+    assert_eq!(iter_md.parent, Some(ClassId::OBJECT));
     // <out-of-range-error> inherits from <error>.
     let oore_md = class_metadata_for(oore);
     assert!(
@@ -544,9 +548,11 @@ fn dylan_fip_until_loop_sums_range_one_to_ten() {
 
 #[test]
 #[serial]
-#[ignore = "Sprint 20b residue — `reduce(\\+, 0, range(from: 1, to: 100))` requires first-class function values in the JIT ABI (Sprint 21). The FIP-form `dylan_fip_reduce_range_one_to_one_hundred_is_5050` below exercises the same machinery via Dylan source today."]
 fn dylan_reduce_plus_zero_range_one_to_hundred_is_5050() {
     setup();
+    // Sprint 21 headline: `\+` lowers to a `<function>` Word; `reduce`
+    // is the Dylan-defined stdlib method that drives the FIP loop and
+    // calls the combiner via `%funcall2`.
     let s = nod_sema::eval_expr_to_string("reduce(\\+, 0, %make-range(1, 100, 1))")
         .expect("eval `reduce(\\+, 0, range(1, 100, 1))`");
     assert_eq!(s, "5050");
@@ -554,9 +560,12 @@ fn dylan_reduce_plus_zero_range_one_to_hundred_is_5050() {
 
 #[test]
 #[serial]
-#[ignore = "Sprint 20b residue — `map(method (x) x * x end, …)` requires anonymous-method lifting + first-class function values (Sprint 21). The Rust-API equivalent `map_squares_three_element_list` above remains green and exercises the same FIP machinery."]
 fn dylan_map_squares_three_element_list() {
     setup();
+    // Sprint 21 headline: the anonymous method is lifted to a top-
+    // level synthetic name (`__anon-method-0`) by the pre-pass; the
+    // call site becomes `\__anon-method-0` -> `<function>` Word; map
+    // walks via the FIP and calls back through `%funcall1`.
     let s = nod_sema::eval_expr_to_string("map(method (x) x * x end, #(1, 2, 3))")
         .expect("eval `map(method (x) x * x end, #(1, 2, 3))`");
     assert_eq!(s, "#(1, 4, 9)");
