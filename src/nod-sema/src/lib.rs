@@ -358,8 +358,20 @@ pub fn register_top_level_functions(
             // If this function is a method body (e.g. stdlib's
             // `size$<object>` body), also register under the
             // generic-source name so `\size` resolves.
+            //
+            // Sprint 22 fix: only register under the generic source name
+            // if no entry exists yet — otherwise a later method body
+            // (e.g. `size$<table>`) would overwrite the earlier
+            // `<object>` body, and `\size` would call the wrong method
+            // for non-table arguments. The first-registered method body
+            // tends to be the most-general one (loader processes
+            // `define function size` before `define method size(t ::
+            // <table>)`), so first-wins matches "most general fallback".
+            // The proper fix — generic-dispatcher trampoline — lands
+            // when first-class dispatch wraps a `<function>` (DEFERRED).
             if let Some(src) = body_to_source.get(&f.name)
                 && src != &f.name
+                && nod_runtime::lookup_function_code(src, arity).is_none()
             {
                 nod_runtime::register_jit_function(src, arity, ptr as *const u8);
             }

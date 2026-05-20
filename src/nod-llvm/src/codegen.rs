@@ -187,6 +187,18 @@ pub const NOD_FUNCALL2_SYMBOL: &str = "nod_funcall2";
 pub const NOD_APPLY_SYMBOL: &str = "nod_apply";
 pub const NOD_MAKE_SOV_LEN_SYMBOL: &str = "nod_make_sov_len";
 
+// ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
+pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
+pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
+pub const NOD_TABLE_ELEMENT_SYMBOL: &str = "nod_table_element";
+pub const NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL: &str = "nod_table_element_or_default";
+pub const NOD_TABLE_ELEMENT_SETTER_SYMBOL: &str = "nod_table_element_setter";
+pub const NOD_TABLE_REMOVE_KEY_SYMBOL: &str = "nod_table_remove_key";
+pub const NOD_TABLE_KEYS_SYMBOL: &str = "nod_table_keys";
+pub const NOD_TABLE_VALUES_SYMBOL: &str = "nod_table_values";
+pub const NOD_OBJECT_HASH_SYMBOL: &str = "nod_object_hash";
+pub const NOD_OBJECT_EQUAL_P_SYMBOL: &str = "nod_object_equal_p";
+
 /// Sprint 20b: `(dylan-name-as-emitted-by-lower, runtime-symbol, arity)`.
 /// The lower pass emits the LHS name as the DirectCall callee; codegen
 /// matches it here and emits a call into the RHS extern.
@@ -219,6 +231,17 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_funcall2", NOD_FUNCALL2_SYMBOL, 3),
     ("nod_apply", NOD_APPLY_SYMBOL, 2),
     ("nod_make_sov_len", NOD_MAKE_SOV_LEN_SYMBOL, 1),
+    // Sprint 22 — <table> + hashing.
+    ("nod_make_table", NOD_MAKE_TABLE_SYMBOL, 1),
+    ("nod_table_size", NOD_TABLE_SIZE_SYMBOL, 1),
+    ("nod_table_element", NOD_TABLE_ELEMENT_SYMBOL, 2),
+    ("nod_table_element_or_default", NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL, 3),
+    ("nod_table_element_setter", NOD_TABLE_ELEMENT_SETTER_SYMBOL, 3),
+    ("nod_table_remove_key", NOD_TABLE_REMOVE_KEY_SYMBOL, 2),
+    ("nod_table_keys", NOD_TABLE_KEYS_SYMBOL, 1),
+    ("nod_table_values", NOD_TABLE_VALUES_SYMBOL, 1),
+    ("nod_object_hash", NOD_OBJECT_HASH_SYMBOL, 1),
+    ("nod_object_equal_p", NOD_OBJECT_EQUAL_P_SYMBOL, 2),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

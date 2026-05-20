@@ -40,6 +40,7 @@ mod stack_map;
 mod static_area;
 mod strings;
 mod symbols;
+mod tables;
 mod tracer;
 mod vectors;
 mod word;
@@ -105,8 +106,8 @@ pub use functions::{
     MAX_APPLY_ARITY, _reset_function_registry_for_tests,
     ensure_operator_shims_registered, ensure_registered as ensure_functions_registered,
     function_arity, function_class_id, function_code_ptr, function_name, is_function,
-    make_function, make_function_ref, make_wrong_number_of_arguments_error, nod_apply,
-    nod_funcall1, nod_funcall2, nod_make_function_ref, nod_op_eq, nod_op_gt, nod_op_lt,
+    lookup_function_code, make_function, make_function_ref, make_wrong_number_of_arguments_error,
+    nod_apply, nod_funcall1, nod_funcall2, nod_make_function_ref, nod_op_eq, nod_op_gt, nod_op_lt,
     nod_op_minus, nod_op_plus, nod_op_times, register_jit_function, register_rust_function,
     wrong_number_of_arguments_error_class_id,
 };
@@ -125,6 +126,13 @@ pub use stack_map::{LiveSlot, ParkedFrame, StackMap, StackMapEntry, walk_parked_
 pub use static_area::StaticArea;
 pub use strings::{ByteString, try_byte_string};
 pub use symbols::{Symbol, SymbolTable, try_symbol};
+pub use tables::{
+    ensure_registered as ensure_tables_registered, is_table, make_not_hashable_error, make_table,
+    nod_make_table, nod_object_equal_p, nod_object_hash, nod_table_element,
+    nod_table_element_or_default, nod_table_element_setter, nod_table_keys, nod_table_remove_key,
+    nod_table_size, nod_table_values, not_hashable_error_class_id, table_class_id, table_element,
+    table_element_setter, table_keys, table_remove_key, table_size, table_values,
+};
 pub use tracer::{HeapObjectInfo, HeapTrace, trace_heap};
 pub use vectors::{
     SimpleObjectVector, nod_make_sov_len, nod_make_sov_literal, nod_sov_element,

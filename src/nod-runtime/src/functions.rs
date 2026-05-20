@@ -543,7 +543,7 @@ pub unsafe fn register_jit_function(name: &str, arity: usize, code_ptr: *const u
     }
 }
 
-fn lookup_function_code(name: &str, arity: usize) -> Option<*const u8> {
+pub fn lookup_function_code(name: &str, arity: usize) -> Option<*const u8> {
     let rust = RUST_FUNCTION_REGISTRY
         .lock()
         .expect("rust function registry poisoned");

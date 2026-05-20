@@ -153,6 +153,7 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
     // misses and lowering fails. `ensure_*_registered` is idempotent.
     nod_runtime::ensure_conditions_registered();
     nod_runtime::ensure_collections_registered();
+    nod_runtime::ensure_tables_registered();
 
     let src = include_str!("../../nod-dylan/dylan-sources/stdlib.dylan");
     let mut sm = nod_reader::SourceMap::new();

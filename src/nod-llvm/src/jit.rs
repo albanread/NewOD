@@ -28,6 +28,11 @@ use crate::codegen::{
     NOD_SOV_ELEMENT_SETTER_SYMBOL, NOD_SOV_ELEMENT_SYMBOL, NOD_SOV_SIZE_SYMBOL,
     NOD_STRETCHY_VECTOR_ELEMENT_SETTER_SYMBOL, NOD_STRETCHY_VECTOR_ELEMENT_SYMBOL,
     NOD_STRETCHY_VECTOR_PUSH_SYMBOL, NOD_STRETCHY_VECTOR_SIZE_SYMBOL, NOD_UNREGISTER_ROOT_SYMBOL,
+    // Sprint 22 — <table> + hashing.
+    NOD_MAKE_TABLE_SYMBOL, NOD_OBJECT_EQUAL_P_SYMBOL, NOD_OBJECT_HASH_SYMBOL,
+    NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL, NOD_TABLE_ELEMENT_SETTER_SYMBOL, NOD_TABLE_ELEMENT_SYMBOL,
+    NOD_TABLE_KEYS_SYMBOL, NOD_TABLE_REMOVE_KEY_SYMBOL, NOD_TABLE_SIZE_SYMBOL,
+    NOD_TABLE_VALUES_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -206,6 +211,47 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_MAKE_SOV_LEN_SYMBOL),
                 nod_runtime::nod_make_sov_len as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 22 — <table> + hashing.
+            (
+                module.get_function(NOD_MAKE_TABLE_SYMBOL),
+                nod_runtime::nod_make_table as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_SIZE_SYMBOL),
+                nod_runtime::nod_table_size as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_ELEMENT_SYMBOL),
+                nod_runtime::nod_table_element as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL),
+                nod_runtime::nod_table_element_or_default as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_ELEMENT_SETTER_SYMBOL),
+                nod_runtime::nod_table_element_setter as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_REMOVE_KEY_SYMBOL),
+                nod_runtime::nod_table_remove_key as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_KEYS_SYMBOL),
+                nod_runtime::nod_table_keys as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_TABLE_VALUES_SYMBOL),
+                nod_runtime::nod_table_values as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_OBJECT_HASH_SYMBOL),
+                nod_runtime::nod_object_hash as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_OBJECT_EQUAL_P_SYMBOL),
+                nod_runtime::nod_object_equal_p as *const () as *mut std::ffi::c_void,
             ),
         ];
 

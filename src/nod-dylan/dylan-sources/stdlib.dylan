@@ -121,6 +121,54 @@ define function do (fn, c) => (result)
   #f
 end function;
 
+// ─── <table> generics (Sprint 22) ──────────────────────────────────────────
+//
+// `<table>` is a `<explicit-key-collection>` registered as a seed class
+// by `nod_runtime::tables`. The runtime owns the heap layout + the
+// open-addressing hash machinery + the `object-hash` /
+// `object-equal?` fast path; this file owns the user-visible generic
+// surface.
+//
+// The methods below specialise on `<table>` so they outrank the
+// `<object>` rewrites of `size` / `concatenate` / etc. for tables.
+
+define method size (t :: <table>) => (n :: <integer>)
+  %table-size(t)
+end method;
+
+define method element (t :: <table>, key) => (value)
+  %table-element-or-default(t, key, #f)
+end method;
+
+define method element-setter (value, t :: <table>, key) => (value)
+  %table-element-setter(value, t, key)
+end method;
+
+define method remove-key! (t :: <table>, key) => (t)
+  %table-remove-key(t, key)
+end method;
+
+define method keys (t :: <table>) => (ks)
+  %table-keys(t)
+end method;
+
+define method values (t :: <table>) => (vs)
+  %table-values(t)
+end method;
+
+// `object-hash` and `object-equal?` are exposed as Dylan-side generics
+// so user code can call them and (eventually) add methods for new key
+// types. The Rust fast path still drives table probes — these methods
+// just surface the primitive to user code.
+
+define method object-hash (x) => (h :: <integer>)
+  %object-hash(x)
+end method;
+
+define method object-equal? (a, b) => (eq :: <boolean>)
+  %object-equal?(a, b)
+end method;
+
 // ─── for-each macro ────────────────────────────────────────────────────────
 //
 // Sugar over the FIP primitives. Expands to a `let state = %fip-init(c);

@@ -239,6 +239,17 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // Sprint 21: allocate a zero-filled `<simple-object-vector>` of the
     // given length. Mirrors `collection_map`'s allocator path.
     ("%make-sov", "nod_make_sov_len", 1, TypeEstimate::Top),
+    // Sprint 22 — <table> + hashing.
+    ("%make-table", "nod_make_table", 1, TypeEstimate::Top),
+    ("%table-size", "nod_table_size", 1, TypeEstimate::Integer),
+    ("%table-element", "nod_table_element", 2, TypeEstimate::Top),
+    ("%table-element-or-default", "nod_table_element_or_default", 3, TypeEstimate::Top),
+    ("%table-element-setter", "nod_table_element_setter", 3, TypeEstimate::Top),
+    ("%table-remove-key", "nod_table_remove_key", 2, TypeEstimate::Top),
+    ("%table-keys", "nod_table_keys", 1, TypeEstimate::Top),
+    ("%table-values", "nod_table_values", 1, TypeEstimate::Top),
+    ("%object-hash", "nod_object_hash", 1, TypeEstimate::Integer),
+    ("%object-equal?", "nod_object_equal_p", 2, TypeEstimate::Boolean),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {
@@ -2289,10 +2300,24 @@ impl FunctionBuilder {
                 });
                 Ok(t)
             }
-            Expr::Symbol(span, _) => Err(LoweringError::Unsupported {
-                span: *span,
-                message: "symbol literals not lowered in Sprint 06".to_string(),
-            }),
+            Expr::Symbol(_, raw) => {
+                // Sprint 22: symbol literals. The parser delivers the
+                // raw token text. Three surface forms to normalise:
+                //   * `#"foo"` → `"foo"`
+                //   * `#:foo`  → `"foo"`
+                //   * `foo:`   → `"foo"`
+                let name = if let Some(s) = raw
+                    .strip_prefix("#\"")
+                    .and_then(|s| s.strip_suffix('"'))
+                {
+                    s.to_string()
+                } else if let Some(s) = raw.strip_prefix("#:") {
+                    s.to_string()
+                } else {
+                    raw.trim_end_matches(':').to_string()
+                };
+                Ok(self.emit_symbol_literal(&name))
+            }
             Expr::Ident(span, name) => {
                 if let Some(t) = env.get(name) {
                     return Ok(*t);
@@ -2547,19 +2572,31 @@ impl FunctionBuilder {
                 message: "Sprint 12 assign-call: callee must be an identifier".to_string(),
             });
         };
-        if args.len() != 1 {
+        if args.is_empty() {
             return Err(LoweringError::Unsupported {
                 span,
-                message: "Sprint 12 setter: only unary slot setters supported".to_string(),
+                message: "setter: callee must have at least one argument".to_string(),
             });
         }
-        let obj_temp = self.lower_expr(&args[0], env, ctx)?;
+        // Sprint 22: N-ary setters. For `f(a0, a1, …) := v`, lower to
+        // `Dispatch("f-setter", [v, a0, a1, …])` — Dylan's setter
+        // calling convention puts the new value first. The unary case
+        // (Sprint 12: `slot(obj) := value` → `Dispatch("slot-setter",
+        // [obj, value])`) is preserved as a special case below for
+        // back-compat with slot-getter rewrites.
+        let obj_temps: Vec<TempId> = args
+            .iter()
+            .map(|a| self.lower_expr(a, env, ctx))
+            .collect::<Result<_, _>>()?;
         let value_temp = self.lower_expr(rhs, env, ctx)?;
-        if let Some(offset) = self.try_resolve_slot_offset(obj_temp, slot_name, ctx) {
+        if obj_temps.len() == 1
+            && let Some(offset) =
+                self.try_resolve_slot_offset(obj_temps[0], slot_name, ctx)
+        {
             let dst = self.fresh_temp(TypeEstimate::Top);
             self.push(Computation::StoreSlot {
                 dst,
-                instance: obj_temp,
+                instance: obj_temps[0],
                 offset,
                 value: value_temp,
                 slot_type: SlotTypeKind::Object,
@@ -2567,12 +2604,26 @@ impl FunctionBuilder {
             return Ok(dst);
         }
         let dst = self.fresh_temp(TypeEstimate::Top);
-        self.push(Computation::Dispatch {
-            dst,
-            generic_name: format!("{slot_name}-setter"),
-            args: vec![obj_temp, value_temp],
-            safepoint_roots: Vec::new(),
-        });
+        if obj_temps.len() == 1 {
+            // Sprint 12 shape: `slot-setter(obj, value)`.
+            self.push(Computation::Dispatch {
+                dst,
+                generic_name: format!("{slot_name}-setter"),
+                args: vec![obj_temps[0], value_temp],
+                safepoint_roots: Vec::new(),
+            });
+        } else {
+            // Sprint 22 N-ary shape: `f-setter(value, a0, a1, …)`.
+            let mut all = Vec::with_capacity(1 + obj_temps.len());
+            all.push(value_temp);
+            all.extend(obj_temps);
+            self.push(Computation::Dispatch {
+                dst,
+                generic_name: format!("{slot_name}-setter"),
+                args: all,
+                safepoint_roots: Vec::new(),
+            });
+        }
         Ok(dst)
     }
 
@@ -2944,6 +2995,34 @@ impl FunctionBuilder {
                 });
             }
         };
+        // Sprint 22: `make(<table>, ...)` requires custom initialisation
+        // (the backing buckets SOV has to be allocated and installed
+        // before any insertion). The generic keyword-init path can't do
+        // that, so we redirect to the `%make-table` primitive. The
+        // optional `capacity:` keyword threads through; everything else
+        // is silently ignored (Sprint 22 has no other table options).
+        if find_class_id_by_name("<table>").map(|c| c == class_id).unwrap_or(false) {
+            let mut capacity_temp: Option<TempId> = None;
+            for a in &args[1..] {
+                if let Expr::Call { callee, args: kwargs, .. } = a
+                    && matches!(callee.as_ref(), Expr::Ident(_, n) if n == "%kw-arg")
+                    && kwargs.len() == 2
+                    && let Expr::Symbol(_, s) = &kwargs[0]
+                    && s.trim_end_matches(':') == "capacity"
+                {
+                    capacity_temp = Some(self.lower_expr(&kwargs[1], env, ctx)?);
+                }
+            }
+            let cap = capacity_temp.unwrap_or_else(|| self.emit_fixnum_const(0));
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "nod_make_table".to_string(),
+                args: vec![cap],
+                safepoint_roots: Vec::new(),
+            });
+            return Ok(dst);
+        }
         let class_word_temp = self.emit_class_metadata_ptr_const(class_id);
         // Remaining args: kw: value pairs (parser-wrapped as
         // `Call(%kw-arg, [Symbol("kw:"), value])`).
@@ -3037,6 +3116,18 @@ impl FunctionBuilder {
             safepoint_roots: Vec::new(),
         });
         Ok(dst)
+    }
+
+    fn emit_fixnum_const(&mut self, n: i64) -> TempId {
+        // Sprint 22 helper — emit a small fixnum constant as a temp.
+        let w = nod_runtime::Word::from_fixnum(n)
+            .expect("emit_fixnum_const value fits in fixnum range");
+        let t = self.fresh_temp(TypeEstimate::Integer);
+        self.push(Computation::Const {
+            dst: t,
+            value: ConstValue::WordBits(w.raw()),
+        });
+        t
     }
 
     fn emit_class_metadata_ptr_const(&mut self, class_id: ClassId) -> TempId {
