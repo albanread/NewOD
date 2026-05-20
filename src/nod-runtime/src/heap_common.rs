@@ -1,5 +1,15 @@
 //! Heap helpers shared by the semispace generational design.
 //!
+//! Sprint 23: `StartBits` and the start-bit primitives are only used
+//! by the legacy semispace backend; under the default `newgc-backend`
+//! the page heap supplies its own atomic-OR start-bit handling. The
+//! `CardTable` type is still publicly used (the `HeapStats` snapshot
+//! exposes a card-table interface and the JIT-side write barrier
+//! marks cards through the page heap's `mark_card_at`), so we keep
+//! the type definitions unconditional and gate only the unused
+//! semispace-side helpers.
+#![cfg_attr(not(feature = "semispace-backend"), allow(dead_code))]
+//!
 //! Lifted from NCL's `ncl-runtime/src/heap_common.rs`:
 //!
 //!   - `CardTable` — soft-card write-barrier bookkeeping. One byte per

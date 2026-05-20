@@ -11,6 +11,13 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Sprint 23: forward GC backend selection from `nod-runtime` via
+# `nod-sema`. Default activates `newgc-backend`.
+default = ["newgc-backend"]
+newgc-backend = ["nod-sema/newgc-backend"]
+semispace-backend = ["nod-sema/semispace-backend"]
+
 [dev-dependencies]
-nod-sema = { path = "../../src/nod-sema" }
+nod-sema = { path = "../../src/nod-sema", default-features = false }
 serial_test = "3"

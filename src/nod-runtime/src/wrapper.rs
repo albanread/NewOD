@@ -157,6 +157,22 @@ impl Wrapper {
     pub const fn forwarding_addr(self) -> usize {
         (self.raw & ADDR_MASK_48) as usize
     }
+
+    /// Raw-bits helper: is this 64-bit word a forwarding marker?
+    /// Sprint 23: used by `DylanLayout::classify` on the `newgc-core`
+    /// hot path so we don't have to materialise a `Wrapper` to test
+    /// the bit. Inlined to a single mask-and-test in release.
+    #[inline(always)]
+    pub const fn raw_is_forwarded(raw: u64) -> bool {
+        (raw >> GC_SHIFT) & (GcBit::Forwarded as u64) != 0
+    }
+
+    /// Raw-bits helper: decode the forwarding target encoded by
+    /// [`forward_to`]. Caller must check `raw_is_forwarded` first.
+    #[inline(always)]
+    pub const fn raw_forward_target(raw: u64) -> usize {
+        (raw & ADDR_MASK_48) as usize
+    }
 }
 
 impl std::fmt::Debug for Wrapper {

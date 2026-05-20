@@ -8,8 +8,16 @@ description = "NewOpenDylan compiler driver (CLI entrypoint)."
 [lints]
 workspace = true
 
+[features]
+# Sprint 23: forward GC backend selection from `nod-runtime` via
+# `nod-sema`. Same shape as the other crates that depend on
+# `nod-runtime`.
+default = ["newgc-backend"]
+newgc-backend = ["nod-sema/newgc-backend"]
+semispace-backend = ["nod-sema/semispace-backend"]
+
 [dependencies]
 clap          = { workspace = true }
 nod-reader    = { path = "../nod-reader" }
 nod-namespace = { path = "../nod-namespace" }
-nod-sema      = { path = "../nod-sema" }
+nod-sema      = { path = "../nod-sema", default-features = false }

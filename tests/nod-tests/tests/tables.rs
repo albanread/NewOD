@@ -264,8 +264,18 @@ fn table_survives_gc_across_insertions() {
     // GC stress: insert 100 keys, force GC, then read them all back.
     // This exercises that the buckets SOV and the table header both
     // survive a minor collection mid-stream.
+    //
+    // Sprint 23: `t` MUST be registered as a precise root or the
+    // collector moves the table out from under us. The Sprint 22
+    // baseline (semispace) failed this test in the original form
+    // for a different reason (the buckets-SOV pointer dangled after
+    // the table header moved); NewGC turned the same hidden bug
+    // into a different observable failure. Registering `t` as a
+    // root fixes the test under both backends — the fix is in the
+    // *test*, not the GC.
     setup();
     let t = nod_runtime::make_table(0);
+    nod_runtime::heap_register_root(&t as *const nod_runtime::Word);
     for i in 0..50i64 {
         let k = nod_runtime::Word::from_fixnum(i).unwrap();
         let v = nod_runtime::Word::from_fixnum(i * 7).unwrap();
@@ -278,6 +288,9 @@ fn table_survives_gc_across_insertions() {
         nod_runtime::table_element_setter(v, t, k);
     }
     nod_runtime::collect_minor();
+    // Read `t` back through the rooted slot — the collector may
+    // have rewritten it.
+    let t = unsafe { *(&t as *const nod_runtime::Word) };
     assert_eq!(nod_runtime::table_size(t), 100);
     for i in 0..100i64 {
         let k = nod_runtime::Word::from_fixnum(i).unwrap();
@@ -288,4 +301,5 @@ fn table_survives_gc_across_insertions() {
         );
         assert_eq!(got.as_fixnum(), Some(i * 7), "post-GC key {i}");
     }
+    nod_runtime::heap_unregister_root(&t as *const nod_runtime::Word);
 }

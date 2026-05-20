@@ -24,10 +24,24 @@
 //! JIT-side safepoint polls. Threading the JIT into the parking
 //! protocol is Sprint 11b.
 
+// Sprint 23: feature-gated GC backend. Exactly one must be enabled.
+#[cfg(all(feature = "newgc-backend", feature = "semispace-backend"))]
+compile_error!(
+    "nod-runtime: features `newgc-backend` and `semispace-backend` are mutually exclusive. \
+     The default activates `newgc-backend`; pass `--no-default-features --features semispace-backend` \
+     to use the legacy escape-hatch semispace heap."
+);
+#[cfg(not(any(feature = "newgc-backend", feature = "semispace-backend")))]
+compile_error!(
+    "nod-runtime: one of `newgc-backend` (default) or `semispace-backend` must be enabled."
+);
+
 mod classes;
 mod collections;
 mod conditions;
 mod dispatch;
+#[cfg(feature = "newgc-backend")]
+mod dylan_layout;
 mod format_out;
 mod functions;
 mod heap;
@@ -47,10 +61,10 @@ mod word;
 mod wrapper;
 
 pub use classes::{
-    ClassId, ClassMetadata, ClassTable, ScanFn, SizeFn, SlotDefault, SlotInfo, SlotType,
-    _reset_user_classes_for_tests, allocate_user_class_id, class_metadata_for,
+    ClassId, ClassMetadata, ClassTable, LayoutFn, ScanFn, SizeFn, SlotDefault, SlotInfo,
+    SlotType, _reset_user_classes_for_tests, allocate_user_class_id, class_metadata_for,
     class_metadata_ptr, find_class_id_by_name, for_each_class, is_subclass,
-    register_user_class, user_class_scan_fn, user_class_size_fn,
+    register_user_class, user_class_layout_fn, user_class_scan_fn, user_class_size_fn,
 };
 pub use collections::{
     FipKind, IterStateSnapshot, OutOfRange, collection_class_id, collection_concatenate,
@@ -275,6 +289,8 @@ pub fn register_user_class_metadata(spec: UserClassSpec) -> (ClassId, *const Cla
         instance_size,
         scan: user_class_scan_fn(),
         size_of: user_class_size_fn(),
+        layout: user_class_layout_fn(),
+        is_byte_payload: false,
         // Sprint 15: every class starts open; the lowering pass flips
         // `sealed = true` post-registration when the source carries the
         // `sealed` modifier. The atomic store there pairs with reads on
@@ -482,10 +498,19 @@ pub fn gc_stats() -> GcStats {
             last_minor_pause_ns: s.last_minor_pause_ns,
             last_major_pause_ns: s.last_major_pause_ns,
             last_pinned_objects: s.last_pinned_objects,
-            heap_backend: "semispace",
+            heap_backend: HEAP_BACKEND_NAME,
         }
     })
 }
+
+/// Backend-name string surfaced by `gc_stats().heap_backend`. Sprint 23:
+/// `"page-mark-evacuate"` under the default `newgc-backend` feature;
+/// `"semispace"` under the `--no-default-features --features
+/// semispace-backend` escape hatch.
+#[cfg(feature = "newgc-backend")]
+const HEAP_BACKEND_NAME: &str = "page-mark-evacuate";
+#[cfg(feature = "semispace-backend")]
+const HEAP_BACKEND_NAME: &str = "semispace";
 
 /// Trigger a minor GC of the process-global heap. Used by `:gc-stats`,
 /// stress tests, and `--gc-trace` callers.

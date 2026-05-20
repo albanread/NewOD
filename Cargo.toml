@@ -34,3 +34,8 @@ serde_json  = "1"
 # Sprint 06 will activate these:
 inkwell     = { version = "=0.9.0", features = ["llvm22-1"] }
 llvm-sys    = { version = "=221.0.1", features = ["force-static"] }
+# Sprint 23: NewGC page-based mark-evacuate generational collector,
+# bound into nod-runtime via the `HeapLayout` trait. `default-features
+# = false` drops the conservative-pin scanner — Dylan is a precise-
+# roots client via the Sprint 11c lock-free root registry.
+newgc-core  = { path = "../../NewGC/crates/newgc-core", default-features = false }

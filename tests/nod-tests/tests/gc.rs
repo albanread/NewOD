@@ -74,6 +74,12 @@ fn minor_gc_reclaims_young_with_no_roots() {
 
 // ─── (3) Minor GC promotes root-held survivors ───────────────────────────
 
+// Sprint 23: semispace-specific — NewGC's first minor cycle does
+// within-G0 evacuation, not G0→old promotion (promotion fires on
+// cycle `G0_PROMOTION_THRESHOLD = 3`). The semantic assertion this
+// test makes — "young is empty post-minor" — is exactly what
+// NewGC's age-based cohort promotion was designed to NOT do.
+#[cfg(feature = "semispace-backend")]
 #[test]
 fn minor_gc_promotes_survivors_into_old() {
     let heap = Heap::new();
@@ -109,6 +115,12 @@ fn minor_gc_promotes_survivors_into_old() {
 
 // ─── (4) Major GC reclaims old ────────────────────────────────────────────
 
+// Sprint 23: semispace-specific — same "every survivor tenures on
+// first minor" assumption as `minor_gc_promotes_survivors_into_old`
+// above. NewGC keeps cohorts in G0 for 3 minor cycles before
+// promotion, so `old_with_roots > 0` after a single minor is false
+// by design.
+#[cfg(feature = "semispace-backend")]
 #[test]
 fn major_gc_reclaims_old_after_roots_drop() {
     let heap = Heap::new();
@@ -178,6 +190,11 @@ fn forwarding_preserves_byte_string_content() {
 
 // ─── (6) Conservative stack pin smoke test ───────────────────────────────
 
+// Sprint 23: semispace-specific — NewGC is compiled without the
+// conservative-pin Cargo feature (we're a precise-roots-only client
+// via Sprint 11c's lock-free registry). `pin_stack_range` is a
+// no-op on the newgc-backend, returning 0 unconditionally.
+#[cfg(feature = "semispace-backend")]
 #[test]
 fn conservative_stack_pin_keeps_object_alive() {
     let heap = Heap::new();
@@ -203,6 +220,13 @@ fn conservative_stack_pin_keeps_object_alive() {
 
 // ─── (7) Allocation stress triggers minor GCs ────────────────────────────
 
+// Sprint 23: semispace-specific — the semispace's 4MB young region
+// forces a minor cycle every ~250K small allocations; NewGC's 1GB
+// reservation has thousands of fresh pages, so 50K small allocations
+// never approach a page-shortage trigger. Sprint 24's
+// "should_collect_auto" wiring will give NewGC an allocation-budget
+// trigger that fires on a comparable cadence.
+#[cfg(feature = "semispace-backend")]
 #[test]
 fn many_allocations_trigger_minor_gcs() {
     let heap = Heap::with_capacity(2 * 1024 * 1024); // small heap → forces GC
@@ -294,8 +318,15 @@ fn literal_pool_string_address_stable_across_gcs() {
 /// SPRINTS.md acceptance criterion talks about "1M `<byte-string>`
 /// objects"; in practice we hit the same heap-cycling behaviour at
 /// 10× lower scale with much shorter test time.
+#[cfg(feature = "semispace-backend")]
 const STRESS_ALLOCATIONS: usize = 100_000;
 
+// Sprint 23: semispace-specific — relies on automatic minor-GC
+// triggering (same reasoning as `many_allocations_trigger_minor_gcs`).
+// Under NewGC the 100K allocations spread across the 1GB reservation
+// without any GC firing; the "process doesn't OOM" guarantee still
+// holds, but the "many minor GCs" assertion doesn't.
+#[cfg(feature = "semispace-backend")]
 #[test]
 fn allocation_stress_completes_without_oom() {
     // Small young capacity so GCs fire frequently within the test run.
@@ -359,7 +390,13 @@ fn gc_stats_report_includes_backend_and_counters() {
     let r = gc_stats_report();
     eprintln!("--- GC STATS REPORT ---\n{r}--- /GC STATS REPORT ---");
     assert!(r.contains("backend"), "report:\n{r}");
-    assert!(r.contains("semispace"), "report:\n{r}");
+    // Sprint 23: accept either backend name. Default build runs the
+    // NewGC `page-mark-evacuate` backend; the `--no-default-features
+    // --features semispace-backend` escape hatch keeps the old name.
+    assert!(
+        r.contains("page-mark-evacuate") || r.contains("semispace"),
+        "report:\n{r}"
+    );
     assert!(r.contains("minor collections"), "report:\n{r}");
     assert!(r.contains("major collections"), "report:\n{r}");
 }

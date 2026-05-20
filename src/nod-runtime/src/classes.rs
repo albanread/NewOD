@@ -71,6 +71,23 @@ pub type ScanFn = unsafe fn(addr: usize, visit: &mut dyn FnMut(*mut Word));
 /// Same precondition as `ScanFn`.
 pub type SizeFn = unsafe fn(addr: usize) -> usize;
 
+/// Sprint 23: pointer-cell range for the NewGC `HeapLayout` binding.
+///
+/// Reports `(total_cells, pointer_cells_start, pointer_cells_end)` — the
+/// same shape as `newgc_core::ObjectLayout`. `pointer_cells_start ==
+/// pointer_cells_end` means "no pointer cells" (opaque payload).
+///
+/// **Safe over-scanning**: contiguous ranges that include non-pointer
+/// fixnum slots (e.g. `<table>`'s capacity/size/tombstones) are fine —
+/// the GC's `classify` shunt skips immediates and gates obvious-junk
+/// pointers via the page-of-reservation check. The range only needs to
+/// be *correct as a superset* of the real pointer-bearing slots.
+///
+/// # Safety
+///
+/// Same precondition as `ScanFn`.
+pub type LayoutFn = unsafe fn(addr: usize) -> (usize, usize, usize);
+
 // ─── Slot model (Sprint 12) ─────────────────────────────────────────────────
 
 /// Slot value-type estimate. Drives the GC scan decision (pointer-shaped
@@ -200,6 +217,21 @@ pub struct ClassMetadata {
     pub instance_size: usize,
     pub scan: ScanFn,
     pub size_of: SizeFn,
+    /// Sprint 23 NewGC binding. Returns the same
+    /// `(total_cells, pointer_cells_start, pointer_cells_end)` tuple
+    /// that `newgc_core::ObjectLayout` expects, but expressed as a
+    /// per-class function pointer so the GC can scan without going
+    /// through the trait-object-shaped `ScanFn` callback. Defaults to
+    /// a wrapper-derived layout for seed classes; user classes get a
+    /// generated `user_class_layout` that walks the slot list.
+    pub layout: LayoutFn,
+    /// Sprint 23: when `true`, the payload after the wrapper is raw
+    /// bytes (UTF-8 for `<byte-string>`, opaque for any future byte-
+    /// vector classes), not tagged Words. The GC's `header_layout`
+    /// reports an opaque payload so it doesn't try to interpret the
+    /// bytes as pointers. The existing `scan: ScanFn` is independent
+    /// and stays a no-op for byte-payload classes.
+    pub is_byte_payload: bool,
     /// Sprint 15: this class is sealed against subclassing across
     /// library boundaries. `AtomicBool` because Sprint 15 sets this
     /// AFTER the metadata is pinned in the static area — the lowering
@@ -300,6 +332,108 @@ unsafe fn noop_scan(_addr: usize, _visit: &mut dyn FnMut(*mut Word)) {}
 /// `addr` must point at a live `Wrapper`-headed object.
 unsafe fn wrapper_only_size(_addr: usize) -> usize {
     size_of::<Wrapper>()
+}
+
+// ── Sprint 23 layout fns (NewGC HeapLayout binding) ─────────────────────────
+//
+// One per shape. All take a heap object's start address; return
+// `(total_cells, pointer_cells_start, pointer_cells_end)`.
+
+/// `<integer>`, `<single-float>`, `<double-float>`, `<boolean>`,
+/// `<character>`, `<empty-list>` — single-cell wrapper, no payload.
+///
+/// # Safety
+///
+/// `addr` must point at a live `Wrapper`-headed object.
+unsafe fn wrapper_only_layout(_addr: usize) -> (usize, usize, usize) {
+    // 1 cell total, no pointer cells.
+    (1, 0, 0)
+}
+
+/// `<byte-string>` — wrapper + len-word + N bytes padded to 8.
+///
+/// # Safety
+///
+/// `addr` must point at a live `<byte-string>`.
+unsafe fn byte_string_layout(addr: usize) -> (usize, usize, usize) {
+    // SAFETY: caller's precondition.
+    let bs = unsafe { &*(addr as *const ByteString) };
+    let total_bytes =
+        (size_of::<ByteString>() + bs.len as usize).next_multiple_of(8);
+    let total_cells = total_bytes / 8;
+    // Opaque payload — GC must not scan the byte run as Words.
+    (total_cells, 0, 0)
+}
+
+/// `<symbol>` — wrapper(0) + hash/pad(1) + name Word(2) = 3 cells.
+///
+/// # Safety
+///
+/// `addr` must point at a live `<symbol>`.
+unsafe fn symbol_layout(_addr: usize) -> (usize, usize, usize) {
+    // Only cell 2 (`name`) is a heap-pointer Word; cell 1 is
+    // hash/pad and must NOT be over-scanned (a 32-bit hash could
+    // land on bit 0 = 1 and fool classify into thinking it's a
+    // pointer; the page_of gate would catch it but precise is
+    // better).
+    (3, 2, 3)
+}
+
+/// `<simple-object-vector>` — wrapper(0) + len(1) + N Word slots.
+///
+/// # Safety
+///
+/// `addr` must point at a live `<simple-object-vector>`.
+unsafe fn vector_layout(addr: usize) -> (usize, usize, usize) {
+    // SAFETY: caller's precondition.
+    let v = unsafe { &*(addr as *const SimpleObjectVector) };
+    let n = v.len as usize;
+    // Payload starts at cell 2 (cell 1 is the length u64, not a Word).
+    (2 + n, 2, 2 + n)
+}
+
+/// `<pair>` — wrapper(0) + head(1) + tail(2) = 3 cells, both Words.
+///
+/// # Safety
+///
+/// `addr` must point at a live `<pair>`.
+unsafe fn pair_layout(_addr: usize) -> (usize, usize, usize) {
+    (3, 1, 3)
+}
+
+/// User-class instance. All slots laid out contiguously at offsets
+/// 8, 16, 24, … (one cell each). We report `(total, 1, total)` —
+/// i.e. *every* payload cell is scanned. Non-pointer slots (`Integer`,
+/// `Character`) hold tagged fixnums whose low bit is 0, so the GC's
+/// classify returns `Immediate` and the cell is skipped harmlessly.
+/// This is the "safe over-scanning" policy from Sprint 23's brief.
+///
+/// # Safety
+///
+/// `addr` must point at a live user-class instance whose wrapper's
+/// `ClassId` is registered.
+unsafe fn user_class_layout(addr: usize) -> (usize, usize, usize) {
+    // SAFETY: caller asserts wrapper-first layout.
+    let wrapper = unsafe { *(addr as *const Wrapper) };
+    if wrapper.is_forwarded() {
+        // Forwarded wrappers shouldn't be classified through layout —
+        // the GC's `classify` short-circuits on Forwarded before
+        // calling header_layout. Defensive fallback: pretend the
+        // object is just the wrapper.
+        return (1, 0, 0);
+    }
+    let metadata_ptr = class_metadata_ptr(wrapper.class());
+    if metadata_ptr.is_null() {
+        return (1, 0, 0);
+    }
+    // SAFETY: metadata is in the static area and lives forever.
+    let metadata = unsafe { &*metadata_ptr };
+    let total_cells = metadata.instance_size / 8;
+    if total_cells <= 1 {
+        (total_cells, 0, 0)
+    } else {
+        (total_cells, 1, total_cells)
+    }
 }
 
 /// # Safety
@@ -434,23 +568,25 @@ struct SeedSpec {
     parent: Option<ClassId>,
     scan: ScanFn,
     size_of_fn: SizeFn,
+    layout_fn: LayoutFn,
     instance_size: usize,
+    is_byte_payload: bool,
 }
 
 fn seed_specs() -> [SeedSpec; 12] {
     [
-        SeedSpec { id: ClassId::OBJECT, name: "<object>", parent: None, scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::INTEGER, name: "<integer>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::SINGLE_FLOAT, name: "<single-float>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::DOUBLE_FLOAT, name: "<double-float>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::BOOLEAN, name: "<boolean>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::CHARACTER, name: "<character>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::SYMBOL, name: "<symbol>", parent: Some(ClassId::OBJECT), scan: symbol_scan, size_of_fn: symbol_size, instance_size: size_of::<Symbol>() },
-        SeedSpec { id: ClassId::STRING, name: "<string>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::BYTE_STRING, name: "<byte-string>", parent: Some(ClassId::STRING), scan: noop_scan, size_of_fn: byte_string_size, instance_size: size_of::<ByteString>() },
-        SeedSpec { id: ClassId::SIMPLE_OBJECT_VECTOR, name: "<simple-object-vector>", parent: Some(ClassId::OBJECT), scan: vector_scan, size_of_fn: vector_size, instance_size: size_of::<SimpleObjectVector>() },
-        SeedSpec { id: ClassId::EMPTY_LIST, name: "<empty-list>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, instance_size: size_of::<Wrapper>() },
-        SeedSpec { id: ClassId::PAIR, name: "<pair>", parent: Some(ClassId::OBJECT), scan: pair_scan, size_of_fn: pair_size, instance_size: size_of::<Pair>() },
+        SeedSpec { id: ClassId::OBJECT, name: "<object>", parent: None, scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::INTEGER, name: "<integer>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::SINGLE_FLOAT, name: "<single-float>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::DOUBLE_FLOAT, name: "<double-float>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::BOOLEAN, name: "<boolean>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::CHARACTER, name: "<character>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::SYMBOL, name: "<symbol>", parent: Some(ClassId::OBJECT), scan: symbol_scan, size_of_fn: symbol_size, layout_fn: symbol_layout, instance_size: size_of::<Symbol>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::STRING, name: "<string>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::BYTE_STRING, name: "<byte-string>", parent: Some(ClassId::STRING), scan: noop_scan, size_of_fn: byte_string_size, layout_fn: byte_string_layout, instance_size: size_of::<ByteString>(), is_byte_payload: true },
+        SeedSpec { id: ClassId::SIMPLE_OBJECT_VECTOR, name: "<simple-object-vector>", parent: Some(ClassId::OBJECT), scan: vector_scan, size_of_fn: vector_size, layout_fn: vector_layout, instance_size: size_of::<SimpleObjectVector>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::EMPTY_LIST, name: "<empty-list>", parent: Some(ClassId::OBJECT), scan: noop_scan, size_of_fn: wrapper_only_size, layout_fn: wrapper_only_layout, instance_size: size_of::<Wrapper>(), is_byte_payload: false },
+        SeedSpec { id: ClassId::PAIR, name: "<pair>", parent: Some(ClassId::OBJECT), scan: pair_scan, size_of_fn: pair_size, layout_fn: pair_layout, instance_size: size_of::<Pair>(), is_byte_payload: false },
     ]
 }
 
@@ -506,6 +642,8 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
                 instance_size: spec.instance_size,
                 scan: spec.scan,
                 size_of: spec.size_of_fn,
+                layout: spec.layout_fn,
+                is_byte_payload: spec.is_byte_payload,
                 sealed: AtomicBool::new(false),
                 direct_subclasses: RwLock::new(Vec::new()),
             }));
@@ -629,6 +767,13 @@ pub fn user_class_scan_fn() -> ScanFn {
 /// Size function for user classes.
 pub fn user_class_size_fn() -> SizeFn {
     user_class_size
+}
+
+/// Sprint 23: layout function for user classes — over-scans every
+/// slot from cell 1 to `instance_size / 8`. Fixnum-tagged Words skip
+/// at `classify` time so the over-scan is safe.
+pub fn user_class_layout_fn() -> LayoutFn {
+    user_class_layout
 }
 
 // ─── `ClassTable`: the seed-only convenience handle ────────────────────────

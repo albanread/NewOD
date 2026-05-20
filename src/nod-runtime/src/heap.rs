@@ -59,15 +59,23 @@
 //! all parked threads — see DEFERRED.md.
 
 use std::cell::RefCell;
+
+#[cfg(feature = "semispace-backend")]
 use std::sync::Mutex;
 
-use crate::classes::{ClassId, ClassTable, class_metadata_for};
+use crate::classes::ClassId;
+#[cfg(feature = "semispace-backend")]
+use crate::classes::{ClassTable, class_metadata_for};
+#[cfg(feature = "semispace-backend")]
 use crate::heap_common::{
     CARD_SIZE_BYTES, CARD_SIZE_CELLS, CardTable, StartBits, clear_start_bit,
     clear_start_bits_below, for_each_start, is_start_bit, new_start_bits, set_start_bit,
 };
 use crate::word::Word;
+#[cfg(feature = "semispace-backend")]
 use crate::wrapper::{GcBit, Wrapper};
+#[cfg(feature = "newgc-backend")]
+use crate::wrapper::Wrapper;
 
 /// Default young-generation capacity (4 MB).
 pub const DEFAULT_YOUNG_BYTES: usize = 4 * 1024 * 1024;
@@ -100,8 +108,9 @@ impl Default for GcConfig {
     }
 }
 
-// -- Semispace ---------------------------------------------------------------
+// -- Semispace (Sprint 23: semispace-backend feature gate) -------------------
 
+#[cfg(feature = "semispace-backend")]
 /// A bump-allocated cell-aligned region with a start-bit bitmap.
 pub(crate) struct Semispace {
     cells: Box<[u64]>,
@@ -109,6 +118,7 @@ pub(crate) struct Semispace {
     top: usize,
 }
 
+#[cfg(feature = "semispace-backend")]
 impl Semispace {
     fn new(size_bytes: usize) -> Self {
         let n_cells = size_bytes / 8;
@@ -246,12 +256,14 @@ impl Semispace {
 
 // -- OldGen ------------------------------------------------------------------
 
+#[cfg(feature = "semispace-backend")]
 /// Old generation: two semispaces that swap on full GC.
 pub(crate) struct OldGen {
     live: Semispace,
     scratch: Semispace,
 }
 
+#[cfg(feature = "semispace-backend")]
 impl OldGen {
     fn new(per_space_bytes: usize) -> Self {
         OldGen {
@@ -267,6 +279,7 @@ impl OldGen {
 
 // -- Heap --------------------------------------------------------------------
 
+#[cfg(feature = "semispace-backend")]
 pub(crate) struct HeapInner {
     young: Semispace,
     old: OldGen,
@@ -283,6 +296,12 @@ pub(crate) struct HeapStats {
     pub young_bytes_allocated: u64,
     pub last_minor_pause_ns: u64,
     pub last_major_pause_ns: u64,
+    /// Conservative-pin scanner stat. Sprint 11b's pinner populated
+    /// this; Sprint 23's NewGC backend is a precise-roots client and
+    /// always reports 0. Kept in the struct (and surfaced via
+    /// `HeapStatsSnapshot`) so the `gc_stats_report` shape stays
+    /// identical across backends.
+    #[allow(dead_code)]
     pub last_pinned_objects: u64,
 }
 
@@ -299,6 +318,7 @@ pub(crate) struct HeapStatsSnapshot {
     pub last_pinned_objects: u64,
 }
 
+#[cfg(feature = "semispace-backend")]
 /// Sprint 11 generational copying heap. Sprint 11c moved the root
 /// registry out into a thread-local; the heap struct itself only
 /// guards the moveable regions through `inner`.
@@ -312,7 +332,9 @@ pub struct Heap {
 // so cross-thread `Heap` references can't race on it. See the
 // "Sprint 11c thread-confinement note" below for the Sprint 28
 // multi-mutator caveat.
+#[cfg(feature = "semispace-backend")]
 unsafe impl Send for Heap {}
+#[cfg(feature = "semispace-backend")]
 unsafe impl Sync for Heap {}
 
 // -- Sprint 11c: lock-free root registry --------------------------------------
@@ -353,6 +375,20 @@ thread_local! {
 /// cycle and rewrites the pointed-at Word if it evacuates.
 ///
 /// O(1); no mutex acquisition.
+///
+/// **CRITICAL:** the memory at `slot` must remain at the SAME ADDRESS
+/// for the entire lifetime of the registration (i.e. until
+/// `unregister_root(slot)` is called). A stack-local `Word` inside a
+/// `Vec` that subsequently `push`es will have its backing buffer
+/// moved, invalidating any pointer registered into it. The collector
+/// then writes the rewritten Word to a stale address; subsequent
+/// reads through the Vec see the pre-GC pointer.
+///
+/// Safe patterns: a `&Word` to a stack slot whose function frame
+/// outlives the registration; a `Box<UnsafeCell<Word>>` (heap
+/// allocation that never moves); a pre-sized `Box<[UnsafeCell<Word>]>`
+/// slab. Unsafe pattern: register `cell.get()` of a freshly-constructed
+/// `UnsafeCell` and then `vec.push(cell)` — DON'T do this.
 pub fn register_root(slot: *const Word) {
     ROOT_STACK.with(|s| s.borrow_mut().push(slot));
 }
@@ -401,6 +437,7 @@ pub fn for_each_root<F: FnMut(*const Word)>(mut f: F) {
     });
 }
 
+#[cfg(feature = "semispace-backend")]
 impl Heap {
     pub fn new() -> Self {
         Self::with_config(GcConfig::default())
@@ -648,6 +685,7 @@ impl Heap {
     }
 }
 
+#[cfg(feature = "semispace-backend")]
 impl Default for Heap {
     fn default() -> Self {
         Self::new()
@@ -662,6 +700,7 @@ pub struct HeapRanges {
 
 // -- Collector ---------------------------------------------------------------
 
+#[cfg(feature = "semispace-backend")]
 impl Heap {
     /// Minor collection: young → old.live. Surviving young objects are
     /// copied into old.live (full promotion — every survivor tenures),
@@ -716,6 +755,7 @@ impl Heap {
 // overlap", and the GC's data shape requires exactly that. Every
 // unsafe block here documents the heap-mutex invariant.
 
+#[cfg(feature = "semispace-backend")]
 struct CollectorCtx {
     young_base: usize,
     young_end: usize,
@@ -729,6 +769,7 @@ struct CollectorCtx {
     cards_ptr: *const CardTable,
 }
 
+#[cfg(feature = "semispace-backend")]
 unsafe fn run_minor(inner: &mut HeapInner, roots: &[*const Word]) -> usize {
     let young_base = inner.young.base_addr();
     let young_end = young_base + inner.young.capacity_bytes();
@@ -904,6 +945,7 @@ unsafe fn run_minor(inner: &mut HeapInner, roots: &[*const Word]) -> usize {
 /// # Safety
 ///
 /// Heap mutex must be held by the caller.
+#[cfg(feature = "semispace-backend")]
 unsafe fn ctx_try_alloc_old(ctx: &CollectorCtx, total_bytes: usize) -> Option<usize> {
     let aligned = total_bytes.next_multiple_of(HEAP_ALIGN);
     let cells_needed = aligned / 8;
@@ -932,6 +974,7 @@ unsafe fn ctx_try_alloc_old(ctx: &CollectorCtx, total_bytes: usize) -> Option<us
 /// Heap mutex held; `slot` must be a writable `*mut Word` inside a
 /// region the collector can mutate (any heap region during GC, plus
 /// any explicitly registered root slot).
+#[cfg(feature = "semispace-backend")]
 unsafe fn minor_forward_word(ctx: &CollectorCtx, slot: *mut Word, w: Word) {
     if !w.is_pointer() {
         return;
@@ -992,6 +1035,7 @@ unsafe fn minor_forward_word(ctx: &CollectorCtx, slot: *mut Word, w: Word) {
 /// # Safety
 ///
 /// Heap mutex held.
+#[cfg(feature = "semispace-backend")]
 unsafe fn scan_card_range_minor(ctx: &CollectorCtx, card_cell_lo: usize, card_cell_hi: usize) {
     // SAFETY: heap mutex held.
     let starts = unsafe { &*ctx.old_live_starts_ptr };
@@ -1025,6 +1069,7 @@ unsafe fn scan_card_range_minor(ctx: &CollectorCtx, card_cell_lo: usize, card_ce
 
 // -- Full GC -----------------------------------------------------------------
 
+#[cfg(feature = "semispace-backend")]
 struct FullCtx {
     young_base: usize,
     young_end: usize,
@@ -1036,6 +1081,7 @@ struct FullCtx {
     scratch_capacity_cells: usize,
 }
 
+#[cfg(feature = "semispace-backend")]
 unsafe fn run_full(inner: &mut HeapInner, roots: &[*const Word]) {
     let ctx = FullCtx {
         young_base: inner.young.base_addr(),
@@ -1103,6 +1149,7 @@ unsafe fn run_full(inner: &mut HeapInner, roots: &[*const Word]) {
 /// # Safety
 ///
 /// Heap mutex held.
+#[cfg(feature = "semispace-backend")]
 unsafe fn ctx_try_alloc_scratch(ctx: &FullCtx, total_bytes: usize) -> Option<usize> {
     let aligned = total_bytes.next_multiple_of(HEAP_ALIGN);
     let cells_needed = aligned / 8;
@@ -1126,6 +1173,7 @@ unsafe fn ctx_try_alloc_scratch(ctx: &FullCtx, total_bytes: usize) -> Option<usi
 /// # Safety
 ///
 /// Heap mutex held; `slot` writable.
+#[cfg(feature = "semispace-backend")]
 unsafe fn full_forward_word(ctx: &FullCtx, slot: *mut Word, w: Word) {
     if !w.is_pointer() {
         return;
@@ -1176,10 +1224,438 @@ unsafe fn full_forward_word(ctx: &FullCtx, slot: *mut Word, w: Word) {
 }
 
 // Suppress unused warnings for trait-required imports.
+#[cfg(feature = "semispace-backend")]
 const _: fn() = || {
     let _ = ClassTable::new();
     let _ = CARD_SIZE_BYTES;
 };
+
+// ─── Sprint 23: NewGC backend ──────────────────────────────────────────────
+//
+// `PageHeap<DylanLayout>` from `newgc-core`. Page-based mark-evacuate
+// generational collector replacing the Sprint 11 semispace heap.
+//
+// API parity with the semispace `Heap` above. Where the semispace
+// took `&self` and locked an internal Mutex, NewGC takes `&mut self`
+// — we wrap a `Mutex<PageHeap<DylanLayout>>` to preserve the
+// `&self` shape callers expect.
+
+#[cfg(feature = "newgc-backend")]
+mod newgc_backend {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use newgc_core::page_heap::page_desc::Generation;
+    use newgc_core::PageHeap;
+
+    use crate::classes::ClassId;
+    use crate::dylan_layout::DylanLayout;
+    use crate::word::Word;
+    use crate::wrapper::Wrapper;
+
+    use super::{
+        GcConfig, HeapRanges, HeapStats, HeapStatsSnapshot, snapshot_roots, HEAP_ALIGN,
+    };
+
+    /// Inner state for the NewGC backend.
+    pub(super) struct NewGcInner {
+        pub(super) heap: PageHeap<DylanLayout>,
+        pub(super) stats: HeapStats,
+        pub(super) cumulative_objects: u64,
+        /// Reservation base (in bytes). Cached so `live_bytes`,
+        /// `wrapper_of`, `mark_card_for`, and `ranges` can answer
+        /// without locking the page heap.
+        pub(super) base_addr: usize,
+        /// Reservation size in bytes (page_count * 64 KB).
+        pub(super) reservation_bytes: usize,
+    }
+
+    pub(super) struct HeapImpl {
+        pub(super) inner: Mutex<NewGcInner>,
+    }
+
+    impl HeapImpl {
+        pub(super) fn with_config(cfg: GcConfig) -> Self {
+            // NewGC `PageHeap::new(young_bytes, old_bytes)` rounds up
+            // to a whole number of 64 KB pages, with a 4-page minimum.
+            // The `young_bytes` arg becomes the soft G0-page cap.
+            let heap = PageHeap::<DylanLayout>::new(cfg.young_bytes, cfg.old_bytes);
+            let base_addr = heap.base_ptr() as usize;
+            let reservation_bytes = heap.reserved_bytes();
+            HeapImpl {
+                inner: Mutex::new(NewGcInner {
+                    heap,
+                    stats: HeapStats::default(),
+                    cumulative_objects: 0,
+                    base_addr,
+                    reservation_bytes,
+                }),
+            }
+        }
+
+        /// Allocate `payload_bytes` of payload preceded by an 8-byte
+        /// `Wrapper`. Returns a pointer-tagged Word. Payload zeroed.
+        pub(super) fn alloc_object(&self, class: ClassId, payload_bytes: usize) -> Word {
+            let total_bytes =
+                (size_of::<Wrapper>() + payload_bytes).next_multiple_of(HEAP_ALIGN);
+            let n_cells = total_bytes / 8;
+            let addr = self.alloc_raw(n_cells);
+            // SAFETY: alloc_raw returned a freshly-allocated chunk
+            // (acquire_free_page zeroes recycled pages); we install
+            // the wrapper and the payload is already zero.
+            unsafe {
+                let header_ptr = addr as *mut Wrapper;
+                header_ptr.write(Wrapper::new(class));
+            }
+            Word::from_ptr(addr as *const u8)
+        }
+
+        /// Bump `n_cells` cells of heap, triggering minor/major GC if
+        /// the allocator can't satisfy the request directly.
+        fn alloc_raw(&self, n_cells: usize) -> usize {
+            // Attempt 1: fast path.
+            {
+                let mut inner = self.inner.lock().expect("heap mutex poisoned");
+                if let Some(p) = inner.heap.try_alloc_boxed_in(Generation::G0, n_cells) {
+                    inner.cumulative_objects += 1;
+                    inner.stats.young_bytes_allocated += (n_cells * 8) as u64;
+                    return p.as_ptr() as usize;
+                }
+            }
+            // Attempt 2: minor GC, retry.
+            self.collect_minor();
+            {
+                let mut inner = self.inner.lock().expect("heap mutex poisoned");
+                if let Some(p) = inner.heap.try_alloc_boxed_in(Generation::G0, n_cells) {
+                    inner.cumulative_objects += 1;
+                    inner.stats.young_bytes_allocated += (n_cells * 8) as u64;
+                    return p.as_ptr() as usize;
+                }
+            }
+            // Attempt 3: major GC, retry.
+            self.collect_full();
+            let mut inner = self.inner.lock().expect("heap mutex poisoned");
+            if let Some(p) = inner.heap.try_alloc_boxed_in(Generation::G0, n_cells) {
+                inner.cumulative_objects += 1;
+                inner.stats.young_bytes_allocated += (n_cells * 8) as u64;
+                return p.as_ptr() as usize;
+            }
+            // Allocation in G0 still failed. Try G1 / Tenured as a
+            // last resort — useful for the 4-MB-young default
+            // when a stress test spams allocations between GCs.
+            if let Some(p) = inner.heap.try_alloc_boxed_in(Generation::Tenured, n_cells) {
+                inner.cumulative_objects += 1;
+                return p.as_ptr() as usize;
+            }
+            let stats = inner.heap.stats();
+            panic!(
+                "heap exhausted: request {} cells ({} bytes); g0={} g1={} tenured={} free_pages={}",
+                n_cells,
+                n_cells * 8,
+                stats.g0_used_bytes,
+                stats.g1_used_bytes,
+                stats.tenured_used_bytes,
+                stats.free_pages,
+            );
+        }
+
+        pub(super) fn wrapper_of(&self, w: Word) -> Option<Wrapper> {
+            let ptr = w.as_ptr::<Wrapper>()?;
+            let addr = ptr as usize;
+            let inner = self.inner.lock().ok()?;
+            if addr < inner.base_addr
+                || addr >= inner.base_addr + inner.reservation_bytes
+            {
+                return None;
+            }
+            // SAFETY: addr is inside the page-heap reservation and
+            // `w` is a Dylan-tagged pointer that came out of
+            // `alloc_object`; the first 8 bytes are a Wrapper.
+            Some(unsafe { *ptr })
+        }
+
+        pub(super) fn live_bytes(&self) -> usize {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            let s = inner.heap.stats();
+            s.g0_used_bytes + s.g1_used_bytes + s.tenured_used_bytes
+        }
+
+        pub(super) fn object_count(&self) -> usize {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.cumulative_objects as usize
+        }
+
+        pub(super) fn young_used_bytes(&self) -> usize {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.heap.stats().g0_used_bytes
+        }
+
+        pub(super) fn old_used_bytes(&self) -> usize {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            let s = inner.heap.stats();
+            s.g1_used_bytes + s.tenured_used_bytes
+        }
+
+        pub(super) fn capacity_bytes(&self) -> usize {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.reservation_bytes
+        }
+
+        pub(super) fn mark_card_for(&self, dst_ptr: *const Word) {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.heap.mark_card_at(dst_ptr as *const u8);
+        }
+
+        pub(super) fn dirty_card_count(&self) -> usize {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.heap.cards().dirty_count()
+        }
+
+        pub(super) fn minor_collection_count(&self) -> u64 {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.stats.minor_collections
+        }
+
+        pub(super) fn major_collection_count(&self) -> u64 {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.stats.major_collections
+        }
+
+        pub(super) fn ranges(&self) -> HeapRanges {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            // Page-heap doesn't split into young/old address ranges
+            // — every page can be any generation. Report the whole
+            // reservation as both. Callers that need precise gen
+            // info should hit `stats_snapshot` instead.
+            let lo = inner.base_addr;
+            let hi = lo + inner.reservation_bytes;
+            HeapRanges {
+                young: (lo, hi),
+                old: (lo, hi),
+            }
+        }
+
+        pub(super) fn stats_snapshot(&self) -> HeapStatsSnapshot {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            let gs = inner.heap.stats();
+            HeapStatsSnapshot {
+                minor_collections: inner.stats.minor_collections,
+                major_collections: inner.stats.major_collections,
+                young_bytes_allocated: inner.stats.young_bytes_allocated,
+                young_bytes_live: gs.g0_used_bytes as u64,
+                old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
+                last_minor_pause_ns: inner.stats.last_minor_pause_ns,
+                last_major_pause_ns: inner.stats.last_major_pause_ns,
+                last_pinned_objects: 0,
+            }
+        }
+
+        pub(super) fn collect_minor(&self) {
+            let start = Instant::now();
+            let roots = snapshot_roots();
+            {
+                let mut inner = self.inner.lock().expect("heap mutex poisoned");
+                inner.heap.collect_minor(|evac| visit_roots(evac, &roots));
+            }
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            let mut inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.stats.minor_collections += 1;
+            inner.stats.last_minor_pause_ns = elapsed_ns;
+        }
+
+        pub(super) fn collect_full(&self) {
+            let start = Instant::now();
+            let roots = snapshot_roots();
+            {
+                let mut inner = self.inner.lock().expect("heap mutex poisoned");
+                inner.heap.collect_major(|evac| visit_roots(evac, &roots));
+            }
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            let mut inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.stats.major_collections += 1;
+            inner.stats.last_major_pause_ns = elapsed_ns;
+        }
+
+        /// Sprint 11 conservative-pin façade. NewGC is compiled
+        /// `--no-default-features` (no `conservative-pin` feature) so
+        /// the page heap doesn't have a `pin_pointers_in_ranges`
+        /// method. We're a precise-roots client via Sprint 11c's
+        /// lock-free root registry; this is a no-op kept for API
+        /// shape parity with the semispace backend.
+        ///
+        /// # Safety
+        ///
+        /// `lo..hi` must be a readable, 8-byte-aligned range.
+        pub(super) unsafe fn pin_stack_range(&self, _lo: usize, _hi: usize) -> usize {
+            0
+        }
+
+        pub(super) fn clear_pinned(&self) {
+            // No pin scanner in the NewGC backend — see
+            // `pin_stack_range`. This is a no-op.
+        }
+    }
+
+    /// Walk the snapshotted root list and hand each slot to the
+    /// `PageEvacuator::visit` call. The nod-runtime `Word` and
+    /// `newgc_core::Word` are both `#[repr(transparent)] u64`, so
+    /// reinterpreting `*mut Word` as `&mut newgc_core::Word` is
+    /// layout-sound — see the SAFETY block.
+    fn visit_roots(
+        evac: &mut newgc_core::page_heap::PageEvacuator<'_, DylanLayout>,
+        roots: &[*const Word],
+    ) {
+        for &slot in roots.iter() {
+            // SAFETY: `slot` is a registered root — the caller's
+            // contract is that it remains writable until
+            // `unregister_root`. We reinterpret it as
+            // `*mut newgc_core::Word`: both types are
+            // `#[repr(transparent)] u64`, so the layout is
+            // identical. The evacuator only reads the raw bits via
+            // `L::classify(w.raw())` and writes back through
+            // `L::rewrite_pointer_addr(...)` — both Dylan-defined.
+            // No interpretation of the Word type's fields beyond
+            // `raw()` happens.
+            unsafe {
+                let ngc_slot =
+                    slot as *mut newgc_core::Word;
+                evac.visit(&mut *ngc_slot);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "newgc-backend")]
+/// Sprint 23 NewGC-backed `Heap`. Same public API as the legacy
+/// semispace `Heap` — see the `#[cfg(feature = "semispace-backend")]`
+/// definition above for method docs.
+pub struct Heap {
+    inner: newgc_backend::HeapImpl,
+}
+
+#[cfg(feature = "newgc-backend")]
+// SAFETY: `Heap`'s state is `Mutex<NewGcInner>` (Send + Sync via the
+// Mutex) plus thread-local root state. The lock-free root registry
+// is per-thread (the Sprint 11c contract); concurrent access from
+// other threads goes through the `inner` mutex.
+unsafe impl Send for Heap {}
+#[cfg(feature = "newgc-backend")]
+unsafe impl Sync for Heap {}
+
+#[cfg(feature = "newgc-backend")]
+impl Heap {
+    pub fn new() -> Self {
+        Self::with_config(GcConfig::default())
+    }
+
+    pub fn with_capacity(capacity_bytes: usize) -> Self {
+        let young = capacity_bytes / 4;
+        let old = capacity_bytes - young;
+        Self::with_config(GcConfig {
+            young_bytes: young,
+            old_bytes: old,
+        })
+    }
+
+    pub fn with_config(cfg: GcConfig) -> Self {
+        Heap {
+            inner: newgc_backend::HeapImpl::with_config(cfg),
+        }
+    }
+
+    pub fn alloc_object(&self, class: ClassId, payload_bytes: usize) -> Word {
+        self.inner.alloc_object(class, payload_bytes)
+    }
+
+    pub fn wrapper_of(&self, w: Word) -> Option<Wrapper> {
+        self.inner.wrapper_of(w)
+    }
+
+    pub fn live_bytes(&self) -> usize {
+        self.inner.live_bytes()
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.inner.object_count()
+    }
+
+    pub fn young_used_bytes(&self) -> usize {
+        self.inner.young_used_bytes()
+    }
+
+    pub fn old_used_bytes(&self) -> usize {
+        self.inner.old_used_bytes()
+    }
+
+    pub fn capacity_bytes(&self) -> usize {
+        self.inner.capacity_bytes()
+    }
+
+    pub fn register_root(&self, root: *const Word) {
+        register_root(root);
+    }
+
+    pub fn unregister_root(&self, root: *const Word) {
+        unregister_root(root);
+    }
+
+    pub fn root_count(&self) -> usize {
+        root_count()
+    }
+
+    pub fn mark_card_for(&self, dst_ptr: *const Word) {
+        self.inner.mark_card_for(dst_ptr);
+    }
+
+    /// # Safety
+    ///
+    /// NewGC backend ignores this — see [`Heap::pin_stack_range`]
+    /// doc on the semispace backend. The argument range is unused.
+    pub unsafe fn pin_stack_range(&self, lo: usize, hi: usize) -> usize {
+        // SAFETY: no reads through `lo..hi`; the implementation
+        // discards the args entirely.
+        unsafe { self.inner.pin_stack_range(lo, hi) }
+    }
+
+    pub fn clear_pinned(&self) {
+        self.inner.clear_pinned();
+    }
+
+    pub fn dirty_card_count(&self) -> usize {
+        self.inner.dirty_card_count()
+    }
+
+    pub fn minor_collection_count(&self) -> u64 {
+        self.inner.minor_collection_count()
+    }
+
+    pub fn major_collection_count(&self) -> u64 {
+        self.inner.major_collection_count()
+    }
+
+    pub fn ranges(&self) -> HeapRanges {
+        self.inner.ranges()
+    }
+
+    pub(crate) fn stats_snapshot(&self) -> HeapStatsSnapshot {
+        self.inner.stats_snapshot()
+    }
+
+    pub fn collect_minor(&self) {
+        self.inner.collect_minor();
+    }
+
+    pub fn collect_full(&self) {
+        self.inner.collect_full();
+    }
+}
+
+#[cfg(feature = "newgc-backend")]
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {

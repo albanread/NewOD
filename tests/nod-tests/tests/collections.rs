@@ -157,7 +157,15 @@ fn list_do_walks_elements_in_order() {
 #[serial]
 fn stretchy_vector_push_grows_and_survives_minor_gc() {
     setup();
+    // Sprint 23: register `sv` as a precise root so the collector
+    // rewrites our local slot when it moves the vector. The Sprint
+    // 22 semispace baseline passed this test "by luck" — the heap
+    // mutex was held across `collect_minor` and the local stack
+    // slot happened to escape pinning visibility; NewGC's precise
+    // collector relocates unconditionally, exposing the missing
+    // root registration.
     let sv = make_stretchy_vector(4);
+    nod_runtime::heap_register_root(&sv as *const Word);
     // Push 100 fixnums (forces multiple grows past the initial cap of 4).
     for i in 0..100 {
         stretchy_vector_push(sv, Word::from_fixnum(i).unwrap());
@@ -171,6 +179,9 @@ fn stretchy_vector_push_grows_and_survives_minor_gc() {
     );
     // Force a minor GC and re-check.
     nod_runtime::collect_minor();
+    // Re-read `sv` through the root slot — the collector may have
+    // rewritten it.
+    let sv = unsafe { *(&sv as *const Word) };
     let (length_after, _, _) =
         stretchy_vector_fields(sv).expect("sv survives minor GC");
     assert_eq!(length_after, 100);
@@ -179,6 +190,7 @@ fn stretchy_vector_push_grows_and_survives_minor_gc() {
     let last = collection_element(sv, 99, None).expect("element 99");
     assert_eq!(first.as_fixnum(), Some(0));
     assert_eq!(last.as_fixnum(), Some(99));
+    nod_runtime::heap_unregister_root(&sv as *const Word);
 }
 
 // ─── element out of range → Err with bounds info ───────────────────────────

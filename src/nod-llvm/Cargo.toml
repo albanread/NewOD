@@ -5,9 +5,17 @@ edition.workspace     = true
 license.workspace     = true
 description = "NewOpenDylan: DFM -> LLVM IR codegen + JIT engine."
 
+[features]
+# Sprint 23: forward GC backend selection from `nod-runtime`. Default
+# is `newgc-backend`; pass `--no-default-features --features
+# semispace-backend` from a workspace command to reach the escape hatch.
+default = ["newgc-backend"]
+newgc-backend = ["nod-runtime/newgc-backend"]
+semispace-backend = ["nod-runtime/semispace-backend"]
+
 [dependencies]
 nod-dfm     = { path = "../nod-dfm" }
-nod-runtime = { path = "../nod-runtime" }
+nod-runtime = { path = "../nod-runtime", default-features = false }
 # Match `newm2-llvm`'s inkwell feature set: defaults off, only the host
 # x86 target wrappers compiled in. Static libs for other targets stay
 # linked via `llvm-sys`'s `force-static`. Re-declared locally (not

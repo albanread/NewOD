@@ -5,6 +5,24 @@ edition.workspace     = true
 license.workspace     = true
 description = "NewOpenDylan: tagged-pointer ABI, wrapper headers, bump heap, class metadata."
 
+[features]
+# Sprint 23: GC backend selection.
+#
+# - `newgc-backend` (default): `PageHeap<DylanLayout>` from
+#   `newgc-core`. Page-based mark-evacuate generational collector.
+# - `semispace-backend`: the pre-Sprint-23 lifted-from-NCL semispace
+#   heap. Kept as an escape hatch for one sprint per the
+#   Sprint 23 brief; Sprint 24 will delete it if NewGC sticks.
+#
+# Exactly one must be enabled. Selecting both or neither is a
+# `compile_error!` at the top of `lib.rs`.
+default = ["newgc-backend"]
+newgc-backend = ["dep:newgc-core"]
+semispace-backend = []
+
+[dependencies]
+newgc-core = { workspace = true, optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foundation"] }
 
