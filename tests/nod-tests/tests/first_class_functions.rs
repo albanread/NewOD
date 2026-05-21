@@ -112,24 +112,19 @@ fn top_level_user_function_ref() {
 
 #[test]
 #[serial]
-fn closure_capture_errors_with_sprint24_diagnostic() {
-    // `let n = 10; let add-n = method (x) x + n end; add-n(5)` should
-    // error at lowering time with the "free variable capture" diagnostic.
+fn closure_capture_works() {
+    // Sprint 24: `let n = 10; let add-n = method (x) x + n end; add-n(5)`
+    // → "15". The Sprint 21 deferral diagnostic is replaced by the
+    // cell-conversion machinery: `n` is promoted to a `<cell>`, the
+    // anonymous method captures a pointer to that cell via an
+    // `<environment>`, and the closure body reads the cell at call
+    // time.
     setup();
-    let result =
-        nod_sema::eval_expr_to_string("let n = 10; let add-n = method (x) x + n end; add-n(5) end");
-    match result {
-        Ok(s) => panic!(
-            "expected Sprint 21 closure-capture diagnostic, got Ok({s:?})"
-        ),
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("free variable") || msg.contains("closure"),
-                "expected free-variable diagnostic; got: {msg}"
-            );
-        }
-    }
+    let s = nod_sema::eval_expr_to_string(
+        "let n = 10; let add-n = method (x) x + n end; add-n(5) end",
+    )
+    .expect("eval `let n = 10; let add-n = method (x) x + n end; add-n(5)`");
+    assert_eq!(s, "15");
 }
 
 #[test]

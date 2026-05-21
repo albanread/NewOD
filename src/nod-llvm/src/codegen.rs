@@ -187,6 +187,14 @@ pub const NOD_FUNCALL2_SYMBOL: &str = "nod_funcall2";
 pub const NOD_APPLY_SYMBOL: &str = "nod_apply";
 pub const NOD_MAKE_SOV_LEN_SYMBOL: &str = "nod_make_sov_len";
 
+// ─── Sprint 24 — closures: <cell> and <environment> ───────────────────────
+pub const NOD_MAKE_CELL_SYMBOL: &str = "nod_make_cell";
+pub const NOD_CELL_GET_SYMBOL: &str = "nod_cell_get";
+pub const NOD_CELL_SET_SYMBOL: &str = "nod_cell_set";
+pub const NOD_ENV_CELL_SYMBOL: &str = "nod_env_cell";
+pub const NOD_MAKE_ENVIRONMENT_SYMBOL: &str = "nod_make_environment";
+pub const NOD_MAKE_CLOSURE_SYMBOL: &str = "nod_make_closure";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -242,6 +250,13 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_table_values", NOD_TABLE_VALUES_SYMBOL, 1),
     ("nod_object_hash", NOD_OBJECT_HASH_SYMBOL, 1),
     ("nod_object_equal_p", NOD_OBJECT_EQUAL_P_SYMBOL, 2),
+    // Sprint 24 — closures.
+    ("nod_make_cell", NOD_MAKE_CELL_SYMBOL, 1),
+    ("nod_cell_get", NOD_CELL_GET_SYMBOL, 1),
+    ("nod_cell_set", NOD_CELL_SET_SYMBOL, 2),
+    ("nod_env_cell", NOD_ENV_CELL_SYMBOL, 2),
+    ("nod_make_environment", NOD_MAKE_ENVIRONMENT_SYMBOL, 1),
+    ("nod_make_closure", NOD_MAKE_CLOSURE_SYMBOL, 3),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

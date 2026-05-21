@@ -37,6 +37,7 @@ compile_error!(
 );
 
 mod classes;
+mod closures;
 mod collections;
 mod conditions;
 mod dispatch;
@@ -65,6 +66,11 @@ pub use classes::{
     SlotType, _reset_user_classes_for_tests, allocate_user_class_id, class_metadata_for,
     class_metadata_ptr, find_class_id_by_name, for_each_class, is_subclass,
     register_user_class, user_class_layout_fn, user_class_scan_fn, user_class_size_fn,
+};
+pub use closures::{
+    cell_class_id, ensure_registered as ensure_closures_registered, environment_class_id,
+    is_cell, is_environment, make_cell, make_environment, nod_cell_get, nod_cell_set,
+    nod_env_cell, nod_make_cell, nod_make_environment,
 };
 pub use collections::{
     FipKind, IterStateSnapshot, OutOfRange, collection_class_id, collection_concatenate,
@@ -119,10 +125,11 @@ pub use format_out::{
 pub use functions::{
     MAX_APPLY_ARITY, _reset_function_registry_for_tests,
     ensure_operator_shims_registered, ensure_registered as ensure_functions_registered,
-    function_arity, function_class_id, function_code_ptr, function_name, is_function,
-    lookup_function_code, make_function, make_function_ref, make_wrong_number_of_arguments_error,
-    nod_apply, nod_funcall1, nod_funcall2, nod_make_function_ref, nod_op_eq, nod_op_gt, nod_op_lt,
-    nod_op_minus, nod_op_plus, nod_op_times, register_jit_function, register_rust_function,
+    function_arity, function_class_id, function_code_ptr, function_env_ptr, function_name,
+    is_function, lookup_function_code, make_function, make_function_ref,
+    make_wrong_number_of_arguments_error, nod_apply, nod_funcall1, nod_funcall2,
+    nod_make_closure, nod_make_function_ref, nod_op_eq, nod_op_gt, nod_op_lt, nod_op_minus,
+    nod_op_plus, nod_op_times, register_jit_function, register_rust_function,
     wrong_number_of_arguments_error_class_id,
 };
 pub use heap::{

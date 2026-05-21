@@ -733,52 +733,60 @@ Run `reduce` + `map` at the REPL; profile shows the iterator inlined via sealing
 
 ---
 
-## Sprints 21–30 — Sketches (phases 7+ continuations and 8–12)
+## Sprints 21–32 — Sketches (phases 7+ continuations and 8–12)
 
 > Detail level intentionally lower: each is 2-3 sentences. Concrete
-> deliverables are decided after Sprint 20 retrospective.
+> deliverables are decided after Sprint 20 retrospective. Sprints
+> 21–24 have **landed** and carry retrospective notes in place of the
+> original sketch; downstream sprints have slid forward to make room.
 
-### Sprint 21 — `<table>`, hashing, `<string>` collection conformance
-Hash-table implementation with open addressing. `<string>` joins the collection protocol. Tests: `opendylan-tests/sources/collections/tests/`.
+### Sprint 21 — First-class function values (landed)
+Shipped: `<function>` heap class + `<wrong-number-of-arguments-error>`, anonymous-method lifting pass, `nod_funcall_N` / `nod_apply` trampolines, operator-shim registry (`\+`, `\-`, …), top-level / JIT / generic function-ref resolution. `\name` and `method (…) … end` in expression position work as first-class values. Free-variable capture (closures) explicitly deferred to Sprint 24.
 
-### Sprint 22 — Full restart semantics + the rest of the condition system
-Multiple bound restarts per dynamic extent, restart inheritance, `with-restart`, condition-class slots. Brings condition behaviour to DRM parity.
+### Sprint 22 — `<table>` + hashing (landed)
+Shipped: `<table>` heap class with open-addressing buckets, FNV-1a hash + `==` equality machinery via `%object-hash` / `%object-equal?`, `%make-table` / `%table-element` / `%table-element-setter` / `%table-keys` / `%table-values` / `%table-remove-key` primitives wired through the lowerer, stdlib generics over `<table>`. `<not-hashable-error>` lands as a Sprint 19-shaped condition. `<string>` collection conformance slides to a later sprint.
 
-### Sprint 23 — `c-ffi` library port — first cut
+### Sprint 23 — NewGC swap-out (landed)
+Replaced the bespoke semispace `Heap` with the sibling-project `PageHeap<DylanLayout>` from `E:\NewGC`. Default feature `newgc-backend`; escape hatch `semispace-backend` keeps the old heap reachable for one sprint of cohabitation. `DylanLayout` binds Dylan's class-driven scan/size machinery to NewGC's `HeapLayout` trait via per-class `LayoutFn` pointers stored on `ClassMetadata`. Card-marking write barrier and root-set discipline unchanged.
+
+### Sprint 24 — Closures (free-variable capture) — landed
+Shipped: `<cell>` and `<environment>` heap classes (`nod-runtime/src/closures.rs`), a cell-conversion pass in `nod-sema/src/lower.rs` that promotes captured locals to heap cells and wires per-closure environments through the existing `<function>` `env-ptr` slot, and an env-ptr-conditional dispatch in `nod_funcall_N` / `nod_apply` (ABI choice 1 from the brief — closure bodies grow a synthetic env first parameter; top-level functions keep their Sprint 21 ABI unchanged). The canonical Dylan idiom `let m = 10; map(method (x) x * m end, #(1, 2, 3))` returns `"#(10, 20, 30)"`. By-reference capture: `:=` inside a closure body mutates the underlying cell, and the outer scope reads through the same cell — the textbook ML/Scheme semantics. Captured parameters are cell-promoted alongside captured `let` bindings (so curried `method (a) method (b) a + b end end` works). Test count moves from 410 / 0 / 5 to 421 / 0 / 5 under the `newgc-backend` default; the `semispace-backend` escape hatch stays green. Deferred to follow-up: closure-body arity-0 calls (Sprint 21's `anonymous_method_zero_args` limitation still bites — covered by writing dummy-arg variants in the meantime), env-sharing between sibling closures created in the same scope (each currently allocates its own env even if the capture sets overlap exactly), and deep nesting beyond two levels (works in practice but no explicit acceptance test).
+
+### Sprint 25 — `c-ffi` library port — first cut
 `define interface` for C type marshalling: scalars, pointers, structs, callbacks, `__stdcall`/`__cdcall`. Lift from NewM2's FFI machinery. Demo: call a Win32 API from Dylan.
 
-### Sprint 23b — Windows FFI runtime stack (borrowed from NewCormanLisp)
+### Sprint 25b — Windows FFI runtime stack (borrowed from NewCormanLisp)
 Port NCL's Windows FFI design (`E:\CL\NewCormanLisp\docs\WINDOWS_FFI.md`, phases 1–6) into `nod-runtime`: surface bootstrap, `%ffi-call` calling-convention dispatcher, Windows API metadata pack loader, foreign-buffer primitives, callback bridge. Files lift nearly verbatim: `win_ffi.rs`, `win_callback.rs`, `win_buffer.rs`, `win_surface.rs`, `win_metadata.rs`. Demo: `define interface user32, function CreateWindowExW … end` from Dylan and successfully open a Win32 window from REPL code.
 
-### Sprint 24 — `format` + `print` + `streams` (`io` library kernel)
+### Sprint 26 — `format` + `print` + `streams` (`io` library kernel)
 Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
-### Sprint 25 — Kernel library port: arithmetic, characters, symbols
+### Sprint 27 — Kernel library port: arithmetic, characters, symbols
 Port enough of `sources/dylan/` (`number.dylan`, `character.dylan`, `symbol.dylan`, `boolean.dylan`) that the runtime stops providing these directly and the language defines them in itself.
 
-### Sprint 26 — Dylan-side IDE bring-up: window, message pump, editor surface
-First IDE sprint. **All Dylan code**, written against the Sprint 23b Windows FFI stack. Module `nod-dylan/ide-shell` registers a top-level window class, runs the message pump, hosts a single editable text pane and a REPL transcript pane. No syntax colouring yet, no menus — just "the compiler can open a window and let you type into it". Re-implements the scaffolding of `E:\opendylan\sources\environment\framework\` in Dylan.
+### Sprint 28 — Dylan-side IDE bring-up: window, message pump, editor surface
+First IDE sprint. **All Dylan code**, written against the Sprint 25b Windows FFI stack. Module `nod-dylan/ide-shell` registers a top-level window class, runs the message pump, hosts a single editable text pane and a REPL transcript pane. No syntax colouring yet, no menus — just "the compiler can open a window and let you type into it". Re-implements the scaffolding of `E:\opendylan\sources\environment\framework\` in Dylan.
 
-### Sprint 26b — Dylan-side inspector + dispatch visualisation
+### Sprint 28b — Dylan-side inspector + dispatch visualisation
 With the IDE shell up, port the existing `:inspect` / `:dispatch-stats` / `:classes` REPL commands into IDE panels written in Dylan. Inspector handles every kernel class. Time-travel REPL prototype.
 
-### Sprint 27 — `common-dylan` library port
+### Sprint 29 — `common-dylan` library port
 Port `byte-vector`, `simple-format`, `simple-io`, `simple-random`, `transcendentals`, `threads/`. Run `opendylan-tests/sources/common-dylan/tests/`.
 
-### Sprint 28 — Multi-threaded mutator + cooperative GC across threads
+### Sprint 30 — Multi-threaded mutator + cooperative GC across threads
 Thread-local TLABs, parking protocol, lock primitives in Dylan-side code. Run `opendylan-tests/sources/app/thread-test/`.
 
-### Sprint 29 — Library-merge optimisation (v2 candidate moved up if cheap)
+### Sprint 31 — Library-merge optimisation (v2 candidate moved up if cheap)
 DFM serialisation, cache-key extension with downstream library hashes, cross-library inlining gated on sealing. May slip to post-v1.
 
-### Sprint 30 — AOT mode — emit a standalone Windows executable
+### Sprint 32 — AOT mode — emit a standalone Windows executable
 JIT artefacts written out as a PE binary plus a shipped `nod-runtime` static lib. Cache key already covers it; mostly a packaging exercise.
 
-### Sprint 31 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
+### Sprint 33 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
 All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.
 
-### Sprint 32 — macOS port (aarch64-apple-darwin first)
-The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 23b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.
+### Sprint 34 — macOS port (aarch64-apple-darwin first)
+The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 25b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.
 
 ---
 

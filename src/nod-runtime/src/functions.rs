@@ -34,17 +34,32 @@
 //!   return-type : <integer>       (encoded TypeEstimate; 0 for now)
 //! ```
 //!
-//! **All slots are typed `SlotType::Integer`** so the GC's class-driven
-//! scanner treats them as opaque bits. `name` is in practice a
-//! pointer-tagged `<byte-string>` interned in the static area — but
-//! since the static area is the same place every other immutable string
-//! literal lives, the conservative-Integer typing here is fine: the
-//! collector won't follow the slot, and the static-area target is
-//! pinned for the process lifetime regardless. (We could relax to
-//! `SlotType::String` later when `<function>` instances themselves move
-//! out of the static area; today every Sprint 21 instance is allocated
-//! in the static area via `make_function`, so the slot value is also a
-//! permanent pointer and scanning is moot.)
+//! ## Slot typing
+//!
+//! Sprint 21 typed every slot as `SlotType::Integer` because every
+//! `<function>` instance lived in the static area and the `name` slot
+//! held a static-area-pinned `<byte-string>` — the GC could safely
+//! skip the entire object.
+//!
+//! Sprint 24 introduces **closure `<function>` instances** that live in
+//! the moveable heap with an `env-ptr` slot pointing at an
+//! `<environment>` (also moveable). The GC must follow the env-ptr to
+//! relocate the environment when it evacuates.
+//!
+//! The slot retypings:
+//!
+//!   * `env-ptr` → `SlotType::Object` (pointer-shaped). For top-level
+//!     `<function>`s the slot value is `Word::from_raw(0)` — fixnum
+//!     zero — which the GC's classify shunt correctly skips. For
+//!     closures the slot holds the env's pointer-tagged Word.
+//!   * `name` → `SlotType::String`. Always pointer-tagged
+//!     `<byte-string>`, sometimes static-area-pinned (top-level),
+//!     sometimes pointing at a heap-allocated literal. The GC trivially
+//!     handles both via the page-of-reservation gate.
+//!
+//! The remaining slots (`arity`, `code-ptr`, `kind-tag`, `return-type`)
+//! stay `Integer`-typed — they encode 64-bit-bit-pattern host values,
+//! not tagged Words.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -88,11 +103,14 @@ pub fn ensure_registered() {
             "<function>",
             Some(ClassId::OBJECT),
             vec![
-                slot_int("name", "function-name"),
+                // `name` and `env-ptr` are pointer-shaped (Sprint 24)
+                // — the GC must trace them. The other slots are opaque
+                // 64-bit-bit-pattern values (host pointers / fixnums).
+                slot_pointer("name", "function-name", SlotType::String),
                 slot_int("arity", "arity"),
                 slot_int("code-ptr", "code-ptr"),
                 slot_int("kind-tag", "kind-tag"),
-                slot_int("env-ptr", "env-ptr"),
+                slot_pointer("env-ptr", "env-ptr", SlotType::Object),
                 slot_int("return-type", "return-type"),
             ],
         );
@@ -123,11 +141,25 @@ fn slot_int(name: &str, init_kw: &str) -> SlotInfo {
     SlotInfo {
         name: name.to_string(),
         offset: 0,
-        // Integer-typed — the GC scanner skips these slots. See module
-        // docs for the rationale (Sprint 21 keeps code-ptr / env-ptr /
-        // arity / return-type as opaque host bits, and `name` as a
-        // pointer to a pinned static-area `<byte-string>`).
+        // Integer-typed — the GC scanner skips these slots. Used for
+        // host-pointer / raw-bit-pattern slots that aren't tagged Dylan
+        // Words (`arity`, `code-ptr`, `kind-tag`, `return-type`).
         type_kind: SlotType::Integer,
+        init_keyword: Some(init_kw.to_string()),
+        required_init_keyword: false,
+        default_init: SlotDefault::Unbound,
+        has_setter: false,
+    }
+}
+
+/// Sprint 24: pointer-shaped slot — the GC scans the slot on every
+/// collection. Used for `name` (a `<byte-string>` pointer) and
+/// `env-ptr` (an `<environment>` pointer or zero for non-closures).
+fn slot_pointer(name: &str, init_kw: &str, kind: SlotType) -> SlotInfo {
+    SlotInfo {
+        name: name.to_string(),
+        offset: 0,
+        type_kind: kind,
         init_keyword: Some(init_kw.to_string()),
         required_init_keyword: false,
         default_init: SlotDefault::Unbound,
@@ -224,6 +256,20 @@ pub fn function_arity(f: Word) -> Option<usize> {
     // SAFETY: same as `function_code_ptr`.
     let raw = unsafe { *((p as usize + offset) as *const u64) };
     Some(raw as usize)
+}
+
+/// Sprint 24: read the `env-ptr` slot from a `<function>` Word. Returns
+/// `0` for top-level (non-closure) functions; a non-zero `u64` is a
+/// raw `Word::raw()` whose pointer payload identifies the closure's
+/// `<environment>` instance.
+pub fn function_env_ptr(f: Word) -> Option<u64> {
+    let md = classes().function_md;
+    let p = f.as_ptr::<u8>()?;
+    let offset = md.slot_offset("env-ptr")?;
+    // SAFETY: same as `function_code_ptr`. Slot stores a tagged Word
+    // (zero for non-closures, pointer-tagged <environment> for closures).
+    let raw = unsafe { *((p as usize + offset) as *const u64) };
+    Some(raw)
 }
 
 /// Read the `name` slot of a `<function>` instance as a Rust `String`.
@@ -326,12 +372,20 @@ fn code_ptr_or_panic(f: Word) -> *const u8 {
 /// uniformly: the same lowering path drives `\foo(x)` AND
 /// `block (k) ... k(v) ... end`.
 ///
+/// Sprint 24: dispatches on the `<function>`'s `env-ptr` slot. A zero
+/// env-ptr means a plain top-level function whose body's actual
+/// signature is `fn(u64) -> u64`. A non-zero env-ptr means a closure
+/// whose body's actual signature is `fn(env_word, u64) -> u64` — the
+/// environment is passed as the synthetic first argument that the
+/// lowerer threads through.
+///
 /// # Safety
 ///
 /// `f_raw` must be a pointer-tagged Dylan Word; `a` is any Dylan Word.
 /// If `f` is a `<function>`, its `code-ptr` must point at an
-/// `extern "C-unwind" fn(u64) -> u64`. If `f` is an `<exit-procedure>`,
-/// the call diverges via NLX.
+/// `extern "C-unwind" fn(u64) -> u64` (no env) or
+/// `extern "C-unwind" fn(u64, u64) -> u64` (with env) per the env-ptr
+/// slot. If `f` is an `<exit-procedure>`, the call diverges via NLX.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn nod_funcall1(f_raw: u64, a: u64) -> u64 {
     let f = Word::from_raw(f_raw);
@@ -344,24 +398,43 @@ pub unsafe extern "C-unwind" fn nod_funcall1(f_raw: u64, a: u64) -> u64 {
     }
     let _ = check_arity_or_signal(f, 1);
     let code = code_ptr_or_panic(f);
-    // SAFETY: caller asserts the callee at `code` matches arity-1 ABI.
-    let f1: Arity1Fn = unsafe { std::mem::transmute(code) };
-    f1(a)
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
+    if env_ptr == 0 {
+        // SAFETY: env-less function, callee matches arity-1 ABI.
+        let f1: Arity1Fn = unsafe { std::mem::transmute(code) };
+        f1(a)
+    } else {
+        // SAFETY: closure body, callee matches (env, arity-1) ABI.
+        let f2: Arity2Fn = unsafe { std::mem::transmute(code) };
+        f2(env_ptr, a)
+    }
 }
 
 /// `nod_funcall2(f, a, b) -> r` — invoke `f` with two args.
 ///
+/// Sprint 24: as `nod_funcall1`, dispatches on the `env-ptr` slot to
+/// pick between `(u64, u64) -> u64` (no env) and
+/// `(env, u64, u64) -> u64` (closure) body signatures.
+///
 /// # Safety
 ///
-/// See `nod_funcall1`; callee must match arity-2 ABI.
+/// See `nod_funcall1`; callee must match arity-2 ABI (no env) or
+/// arity-3 ABI (with env).
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn nod_funcall2(f_raw: u64, a: u64, b: u64) -> u64 {
     let f = Word::from_raw(f_raw);
     let _ = check_arity_or_signal(f, 2);
     let code = code_ptr_or_panic(f);
-    // SAFETY: arity matched; callee matches arity-2 ABI.
-    let f2: Arity2Fn = unsafe { std::mem::transmute(code) };
-    f2(a, b)
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
+    if env_ptr == 0 {
+        // SAFETY: env-less function, callee matches arity-2 ABI.
+        let f2: Arity2Fn = unsafe { std::mem::transmute(code) };
+        f2(a, b)
+    } else {
+        // SAFETY: closure body, callee matches (env, arity-2) ABI.
+        let f3: Arity3Fn = unsafe { std::mem::transmute(code) };
+        f3(env_ptr, a, b)
+    }
 }
 
 /// `nod_apply(f, args_vector) -> r` — variadic dispatch via a
@@ -404,6 +477,7 @@ pub unsafe extern "C-unwind" fn nod_apply(f_raw: u64, args_raw: u64) -> u64 {
         );
     }
     let code = code_ptr_or_panic(f);
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
     // SAFETY: sov has at least `n` element slots; reading each as a u64
     // matches the `<simple-object-vector>` element layout (tagged Word
     // per slot).
@@ -412,28 +486,60 @@ pub unsafe extern "C-unwind" fn nod_apply(f_raw: u64, args_raw: u64) -> u64 {
     for i in 0..n {
         a[i] = slots[i].raw();
     }
+    // Sprint 24: closures get an env-pointer threaded as the synthetic
+    // first arg. Plain top-level functions get the args verbatim.
+    //
     // SAFETY: arity-N callee ABI; we already verified `n == arity` and
-    // `n <= MAX_APPLY_ARITY`.
+    // `n <= MAX_APPLY_ARITY`. The env-ptr branch transmutes to a
+    // signature one wider than the closure-less branch.
     unsafe {
-        match n {
-            0 => (std::mem::transmute::<*const u8, Arity0Fn>(code))(),
-            1 => (std::mem::transmute::<*const u8, Arity1Fn>(code))(a[0]),
-            2 => (std::mem::transmute::<*const u8, Arity2Fn>(code))(a[0], a[1]),
-            3 => (std::mem::transmute::<*const u8, Arity3Fn>(code))(a[0], a[1], a[2]),
-            4 => (std::mem::transmute::<*const u8, Arity4Fn>(code))(a[0], a[1], a[2], a[3]),
-            5 => (std::mem::transmute::<*const u8, Arity5Fn>(code))(
-                a[0], a[1], a[2], a[3], a[4],
-            ),
-            6 => (std::mem::transmute::<*const u8, Arity6Fn>(code))(
-                a[0], a[1], a[2], a[3], a[4], a[5],
-            ),
-            7 => (std::mem::transmute::<*const u8, Arity7Fn>(code))(
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6],
-            ),
-            8 => (std::mem::transmute::<*const u8, Arity8Fn>(code))(
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-            ),
-            _ => unreachable!("clamped by the n > MAX_APPLY_ARITY check above"),
+        if env_ptr == 0 {
+            match n {
+                0 => (std::mem::transmute::<*const u8, Arity0Fn>(code))(),
+                1 => (std::mem::transmute::<*const u8, Arity1Fn>(code))(a[0]),
+                2 => (std::mem::transmute::<*const u8, Arity2Fn>(code))(a[0], a[1]),
+                3 => (std::mem::transmute::<*const u8, Arity3Fn>(code))(a[0], a[1], a[2]),
+                4 => (std::mem::transmute::<*const u8, Arity4Fn>(code))(a[0], a[1], a[2], a[3]),
+                5 => (std::mem::transmute::<*const u8, Arity5Fn>(code))(
+                    a[0], a[1], a[2], a[3], a[4],
+                ),
+                6 => (std::mem::transmute::<*const u8, Arity6Fn>(code))(
+                    a[0], a[1], a[2], a[3], a[4], a[5],
+                ),
+                7 => (std::mem::transmute::<*const u8, Arity7Fn>(code))(
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+                ),
+                8 => (std::mem::transmute::<*const u8, Arity8Fn>(code))(
+                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                ),
+                _ => unreachable!("clamped by the n > MAX_APPLY_ARITY check above"),
+            }
+        } else {
+            // Closure body: env-ptr is the synthetic first arg.
+            match n {
+                0 => (std::mem::transmute::<*const u8, Arity1Fn>(code))(env_ptr),
+                1 => (std::mem::transmute::<*const u8, Arity2Fn>(code))(env_ptr, a[0]),
+                2 => (std::mem::transmute::<*const u8, Arity3Fn>(code))(env_ptr, a[0], a[1]),
+                3 => (std::mem::transmute::<*const u8, Arity4Fn>(code))(
+                    env_ptr, a[0], a[1], a[2],
+                ),
+                4 => (std::mem::transmute::<*const u8, Arity5Fn>(code))(
+                    env_ptr, a[0], a[1], a[2], a[3],
+                ),
+                5 => (std::mem::transmute::<*const u8, Arity6Fn>(code))(
+                    env_ptr, a[0], a[1], a[2], a[3], a[4],
+                ),
+                6 => (std::mem::transmute::<*const u8, Arity7Fn>(code))(
+                    env_ptr, a[0], a[1], a[2], a[3], a[4], a[5],
+                ),
+                7 => (std::mem::transmute::<*const u8, Arity8Fn>(code))(
+                    env_ptr, a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+                ),
+                _ => panic!(
+                    "nod_apply: closure with arity {n} exceeds Sprint 24 cap of {} (env adds 1 to the runtime ABI arity)",
+                    MAX_APPLY_ARITY - 1
+                ),
+            }
         }
     }
 }
@@ -626,6 +732,60 @@ pub unsafe extern "C-unwind" fn nod_make_function_ref(name_raw: u64, arity_raw: 
     f.raw()
 }
 
+/// Sprint 24: build a closure `<function>` Word bound to a specific
+/// environment. The body's symbol must already be registered (the
+/// lifter / `register_top_level_functions` machinery does this); we
+/// look up the JIT'd address through the same registry the
+/// `nod_make_function_ref` path uses.
+///
+/// Returns the freshly-allocated closure Word (lives in the moveable
+/// heap, so the GC can scan its `env-ptr` slot and relocate the
+/// environment).
+///
+/// The body's runtime ABI is `extern "C-unwind" fn(env_word, args...) -> u64`
+/// — one wider than the closure-less Sprint 21 ABI. The lowering pass
+/// must emit the body with a synthetic first parameter.
+///
+/// # Safety
+///
+/// `name_raw` must be a pointer-tagged `<byte-string>` Word identifying
+/// the body's symbol; `arity_raw` is a fixnum (the surface arity of
+/// the closure, NOT counting the env); `env_raw` is a pointer-tagged
+/// `<environment>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_make_closure(
+    name_raw: u64,
+    arity_raw: u64,
+    env_raw: u64,
+) -> u64 {
+    let name_word = Word::from_raw(name_raw);
+    let bs = unsafe { crate::try_byte_string(name_word, ClassId::BYTE_STRING) }
+        .expect("nod_make_closure: name is not a <byte-string> Word");
+    // SAFETY: bs points at a live <byte-string>.
+    let name = unsafe { bs.as_str() }
+        .expect("nod_make_closure: <byte-string> name not UTF-8")
+        .to_string();
+    let arity = Word::from_raw(arity_raw)
+        .as_fixnum()
+        .expect("nod_make_closure: arity is not a fixnum") as usize;
+    // Root the env Word across the allocation in case make_function
+    // triggers a minor GC that evacuates it.
+    let env_word = Word::from_raw(env_raw);
+    let _env_guard = crate::make::RootGuard::new(&env_word);
+    let code = lookup_function_code(&name, arity).unwrap_or_else(|| {
+        panic!(
+            "nod_make_closure: no registered closure body `{name}` with arity {arity}"
+        )
+    });
+    // Allocate a fresh <function> in the moveable heap, parameterised
+    // with this site's environment. Different from `make_function_ref`
+    // which caches one Word per (name, arity) in the static area; a
+    // closure must be a unique Word per creation site so the env-ptr
+    // is per-instance.
+    let f = make_function(&name, arity, code, /*kind_tag=*/ 2, env_word.raw());
+    f.raw()
+}
+
 /// Test helper: clear both function registries and the ref cache.
 #[doc(hidden)]
 pub fn _reset_function_registry_for_tests() {
@@ -772,8 +932,16 @@ mod tests {
         assert_eq!(md.name, "<function>");
         // Six slots: name, arity, code-ptr, kind-tag, env-ptr, return-type.
         assert_eq!(md.slots.len(), 6);
+        // Sprint 24: `name` is `String`-typed and `env-ptr` is `Object`-
+        // typed (pointer-shaped — the GC must scan them); the other four
+        // slots stay `Integer`-typed (opaque host bits).
         for s in &md.slots {
-            assert_eq!(s.type_kind, SlotType::Integer);
+            let expected = match s.name.as_str() {
+                "name" => SlotType::String,
+                "env-ptr" => SlotType::Object,
+                _ => SlotType::Integer,
+            };
+            assert_eq!(s.type_kind, expected, "slot `{}` type", s.name);
         }
     }
 

@@ -33,6 +33,9 @@ use crate::codegen::{
     NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL, NOD_TABLE_ELEMENT_SETTER_SYMBOL, NOD_TABLE_ELEMENT_SYMBOL,
     NOD_TABLE_KEYS_SYMBOL, NOD_TABLE_REMOVE_KEY_SYMBOL, NOD_TABLE_SIZE_SYMBOL,
     NOD_TABLE_VALUES_SYMBOL,
+    // Sprint 24 — closures.
+    NOD_CELL_GET_SYMBOL, NOD_CELL_SET_SYMBOL, NOD_ENV_CELL_SYMBOL,
+    NOD_MAKE_CELL_SYMBOL, NOD_MAKE_CLOSURE_SYMBOL, NOD_MAKE_ENVIRONMENT_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -252,6 +255,31 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_OBJECT_EQUAL_P_SYMBOL),
                 nod_runtime::nod_object_equal_p as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 24 — closures.
+            (
+                module.get_function(NOD_MAKE_CELL_SYMBOL),
+                nod_runtime::nod_make_cell as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_CELL_GET_SYMBOL),
+                nod_runtime::nod_cell_get as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_CELL_SET_SYMBOL),
+                nod_runtime::nod_cell_set as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_ENV_CELL_SYMBOL),
+                nod_runtime::nod_env_cell as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_MAKE_ENVIRONMENT_SYMBOL),
+                nod_runtime::nod_make_environment as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_MAKE_CLOSURE_SYMBOL),
+                nod_runtime::nod_make_closure as *const () as *mut std::ffi::c_void,
             ),
         ];
 

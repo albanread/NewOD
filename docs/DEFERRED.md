@@ -1440,3 +1440,66 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   access. Runner in `tests/run.rs` drives each through `nod-sema::
   run_function_to_i64`. Richards (Sprint 16) will land alongside the
   remaining iteration-protocol pieces.
+
+## Carry-over from Sprint 21 (first-class function values) — closes
+
+- **:closed: free-variable capture / closures** — Sprint 21 → Sprint 24.
+  Sprint 21 erred on any anonymous method that referenced a name bound
+  in the enclosing scope, with the `Sprint 21: anonymous method
+  captures free variable …; closures land in Sprint 24` diagnostic.
+  Sprint 24 lands the cell-conversion machinery (`<cell>` +
+  `<environment>` heap classes, AST-level capture-set discovery,
+  cell-promotion of captured locals at the IR-lowering level,
+  `%make-closure` + env-ptr-conditional dispatch in
+  `nod_funcall_N`). The Sprint 21 deferral test
+  (`closure_capture_errors_with_sprint24_diagnostic`) is replaced by
+  the positive test `closure_capture_works`.
+
+## Carry-over from Sprint 24 (closures)
+
+- **:open: Closure-body arity-0 calls** — Sprint 21 → Sprint 24
+  retrospective → Sprint 25 (or whenever apply-0 lands). The
+  Sprint 21 `anonymous_method_zero_args` test recorded that calling a
+  `method () … end` with zero args isn't lowered through
+  `nod_funcall_N` (which only has `nod_funcall1` / `nod_funcall2`
+  trampolines). Sprint 24 hits the same gate from closures: a
+  mutable-state closure built as `method () count := count + 1 end` is
+  expressible but unreachable through the funcall path. Sprint 24's
+  `closure_writes_captured_variable` test uses a dummy-arg variant
+  (`method (dummy) … end`) to exercise the cell-set! plumbing without
+  tripping the arity-0 limitation. Fix: add `nod_funcall0` (one-liner)
+  or route arity-0 through `nod_apply` with an empty args vector.
+- **:open: Env-sharing between sibling closures** — Sprint 24 → v1.x
+  optimisation. Two anonymous methods defined in the same enclosing
+  scope with the SAME capture set currently allocate two separate
+  `<environment>` instances. A peephole pass in the lifter could
+  detect the duplicate capture set and reuse the same env Word at both
+  closure-creation sites; cleanest implemented as a sema-level
+  canonicalisation before the lifter emits `%make-closure`. Not a
+  correctness issue — only a footprint win.
+- **:open: Deep nesting beyond 1 level** — Sprint 24 → Sprint 25b. The
+  curried `method (a) method (b) a + b end end` shape (one level deep)
+  works because `a` is captured directly by the inner method. Three
+  levels deep (`method (a) method (b) method (c) a + b + c end end
+  end`) is *expected* to work — the lift-pass recursion threads
+  `cell_locals_per_function` through each lifted body — but there's
+  no explicit acceptance test. Add one as a regression guard.
+- **:open: Mutating a captured binding through a different inner
+  method while another inner closure holds the cell** — Sprint 24 →
+  Sprint 25b. Two closures over the same binding observe a shared
+  cell, but the brief doesn't carry an acceptance test for two
+  closures over the same binding that mutate from different sites.
+  Add one alongside the deep-nesting test.
+- **:open: Closure GC stress** — Sprint 24 → Sprint 25b. The
+  `closure_survives_gc` test exercises a single closure across a
+  single forced full GC. A stress variant — 10k closures, each over a
+  unique captured `<byte-string>`, with periodic minor GCs in between
+  — would harden the `<function>::env-ptr` scanning under churn. Add
+  to `tests/nod-tests/tests/gc_stress.rs`.
+- **:open: `nod-driver` `dump-closures` meta-command** — Sprint 24 →
+  Sprint 26 (REPL surface). The Sprint 24 closure registry exposes
+  `closure_for(lifted_name)` and `cell_locals_for(fn_name)` — useful
+  diagnostic data the IDE will want to surface. A
+  `:dump-closures` REPL command (and a corresponding
+  `nod-driver dump-closures` subcommand) is the natural Sprint 26
+  add.

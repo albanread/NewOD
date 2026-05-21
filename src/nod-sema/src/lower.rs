@@ -239,6 +239,26 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // Sprint 21: allocate a zero-filled `<simple-object-vector>` of the
     // given length. Mirrors `collection_map`'s allocator path.
     ("%make-sov", "nod_make_sov_len", 1, TypeEstimate::Top),
+    // Sprint 24: closures — `<cell>` and `<environment>` primitives.
+    // `%make-cell(v) -> <cell>`. Allocate a one-slot box.
+    ("%make-cell", "nod_make_cell", 1, TypeEstimate::Top),
+    // `%cell-get(c) -> <object>`. Load the cell's value slot.
+    ("%cell-get", "nod_cell_get", 1, TypeEstimate::Top),
+    // `%cell-set!(v, c) -> v`. Store through the GC write barrier.
+    ("%cell-set!", "nod_cell_set", 2, TypeEstimate::Top),
+    // `%env-cell(env, idx) -> <cell>`. Read a cell pointer out of an
+    // environment by index. The caller follows up with `%cell-get` /
+    // `%cell-set!` to actually read/write the captured variable.
+    ("%env-cell", "nod_env_cell", 2, TypeEstimate::Top),
+    // `%make-environment(cells_vec) -> <environment>`. Wrap a pre-built
+    // SOV of cell-Words into an environment record.
+    ("%make-environment", "nod_make_environment", 1, TypeEstimate::Top),
+    // `%make-closure(name, arity, env) -> <function>`. Allocate a fresh
+    // closure `<function>` Word in the moveable heap whose body is the
+    // already-registered `name` symbol and whose env-ptr slot points at
+    // `env`. The lowerer emits this at every closure-creation site that
+    // captures at least one variable.
+    ("%make-closure", "nod_make_closure", 3, TypeEstimate::Top),
     // Sprint 22 — <table> + hashing.
     ("%make-table", "nod_make_table", 1, TypeEstimate::Top),
     ("%table-size", "nod_table_size", 1, TypeEstimate::Integer),
@@ -355,6 +375,11 @@ pub struct LoweredModule {
     /// names to function pointers and registers them with the runtime
     /// (`nod_runtime::register_block_fns`).
     pub blocks: Vec<BlockRegistration>,
+    /// Sprint 24: closure metadata produced by `lift_anonymous_methods`.
+    /// The `register_top_level_functions` glue consults this to
+    /// register closure bodies under their *source* arity (the body's
+    /// JIT signature carries a hidden env parameter on top).
+    pub closures: ClosureRegistry,
 }
 
 /// Sprint 19: one lifted-thunk set per `block` form in the source. The
@@ -394,6 +419,11 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // classes + operator shim registrations are alive before lowering
     // touches `\name` / anonymous-method expressions.
     nod_runtime::ensure_functions_registered();
+    // Sprint 24: ensure `<cell>` and `<environment>` are registered
+    // before any closure-creation site lowers. The runtime exports
+    // `nod_make_cell` / `nod_cell_get` / … as `extern "C-unwind"` symbols
+    // already; this just lights up the class table.
+    nod_runtime::ensure_closures_registered();
 
     // Sprint 21 pre-pass: rewrite every `Expr::Method` in expression
     // position to a synthetic `Expr::Ident(__anon-method-NNNN)` and
@@ -402,7 +432,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // top-level functions and the call sites as ordinary `\name`
     // references.
     let mut m_owned: Module = m.clone();
-    let lift_errors = lift_anonymous_methods(&mut m_owned);
+    let (closure_registry, lift_errors) = lift_anonymous_methods(&mut m_owned);
     if !lift_errors.is_empty() {
         return Err(lift_errors);
     }
@@ -608,6 +638,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     top_names: &top_names,
                     generics: &generics,
                     user_classes: &user_classes_snapshot,
+                    closures: Some(&closure_registry),
                 };
                 match b.lower_expr(value, &mut env, &ctx) {
                     Ok(t) => {
@@ -631,6 +662,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     top_names: &top_names,
                     generics: &generics,
                     user_classes: &user_classes_snapshot,
+                    closures: Some(&closure_registry),
                 };
                 match lower_function_inner(
                     alloc_id(&mut lift_sink),
@@ -658,6 +690,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     top_names: &top_names,
                     generics: &generics,
                     user_classes: &user_classes_snapshot,
+                    closures: Some(&closure_registry),
                 };
                 match lower_method_item(
                     alloc_id(&mut lift_sink),
@@ -778,6 +811,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         sealing,
         resolutions,
         blocks,
+        closures: closure_registry,
     })
 }
 
@@ -1325,6 +1359,7 @@ pub fn lower_function(
         top_names: &top_names,
         generics: &generics,
         user_classes: &user_classes,
+        closures: None,
     };
     let mut sink = LiftSink::default();
     lower_function_inner(FunctionId(0), name, params, None, body, span, &ctx, &mut sink)
@@ -1344,11 +1379,57 @@ fn lower_function_inner(
     let mut b = FunctionBuilder::new(id, name.to_string(), span);
     let mut env = LocalEnv::new();
 
+    // Sprint 24: closure-body bring-up. If `name` is the lifted body of
+    // a closure with non-empty captures, install the env parameter as a
+    // synthetic FIRST parameter (matching the runtime ABI in
+    // `nod_funcall_N`). The lowerer redirects reads / writes of
+    // captured names through `%env-cell` + `%cell-get` / `%cell-set!`.
+    let closure_info: Option<&ClosureInfo> = ctx
+        .closures
+        .and_then(|reg| reg.closure_for(name))
+        .filter(|info| !info.captured.is_empty());
+    if let Some(info) = closure_info {
+        let env_temp = b.fresh_temp(TypeEstimate::Top);
+        b.func.params.push(env_temp);
+        let mut index_of: HashMap<String, usize> = HashMap::new();
+        for (i, c) in info.captured.iter().enumerate() {
+            index_of.insert(c.clone(), i);
+        }
+        b.cell_ctx.env_captures = Some(EnvCaptures { env_temp, index_of });
+    }
+
+    // Sprint 24: cell-promotion locals for this body. Any local in
+    // `cell_locals` whose `let` binding is encountered while lowering
+    // becomes a `<cell>` allocation; subsequent reads / writes go
+    // through the cell.
+    if let Some(reg) = ctx.closures
+        && let Some(cells) = reg.cell_locals_for(name)
+    {
+        b.cell_ctx.cell_locals = cells.clone();
+    }
+
     for p in params {
         let pty = type_from_expr(p.type_.as_ref());
         let t = b.fresh_temp(pty);
         b.func.params.push(t);
-        env.insert(p.name.clone(), t);
+        // Sprint 24: if this param is itself captured by an inner
+        // closure, promote it to a cell so the inner closure (which
+        // accesses it through the env) and the outer scope see the
+        // same storage. The cell-promoted name maps to the cell-Word
+        // in `env`; subsequent reads/writes of `p.name` go through
+        // `%cell-get` / `%cell-set!`.
+        if b.cell_ctx.cell_locals.contains(&p.name) {
+            let cell = b.fresh_temp(TypeEstimate::Top);
+            b.push(Computation::DirectCall {
+                dst: cell,
+                callee: "nod_make_cell".to_string(),
+                args: vec![t],
+                safepoint_roots: Vec::new(),
+            });
+            env.insert(p.name.clone(), cell);
+        } else {
+            env.insert(p.name.clone(), t);
+        }
     }
 
     let declared_ret = return_sig
@@ -1380,7 +1461,21 @@ fn lower_function_inner(
                 }
                 let bname = &binders[0].name;
                 let t = b.lower_expr(value, &mut env, ctx)?;
-                env.insert(bname.clone(), t);
+                // Sprint 24: cell-promote the binding if any inner
+                // closure captures it.
+                let bound = if b.cell_ctx.cell_locals.contains(bname) {
+                    let cell = b.fresh_temp(TypeEstimate::Top);
+                    b.push(Computation::DirectCall {
+                        dst: cell,
+                        callee: "nod_make_cell".to_string(),
+                        args: vec![t],
+                        safepoint_roots: Vec::new(),
+                    });
+                    cell
+                } else {
+                    t
+                };
+                env.insert(bname.clone(), bound);
                 if is_last {
                     final_temp = Some(t);
                 }
@@ -1506,6 +1601,32 @@ struct LowerCtx<'a> {
     top_names: &'a TopNames,
     generics: &'a HashSet<String>,
     user_classes: &'a HashMap<String, ClassId>,
+    /// Sprint 24: closure registry produced by `lift_anonymous_methods`.
+    /// `None` when lowering is invoked outside of `lower_module_full`
+    /// (e.g. the `lower_function` test helper); in that case the
+    /// lowerer behaves exactly as it did in Sprint 21.
+    closures: Option<&'a ClosureRegistry>,
+}
+
+/// Sprint 24: per-body lowering state for cell-promotion + env access.
+/// Threaded alongside `LocalEnv` through every `lower_*` method. Holds:
+///
+///   * `cell_locals` — names of THIS body's local bindings that should
+///     be heap-allocated cells (because some inner closure captures them).
+///   * `env_captures` — when lowering a closure body, the synthetic
+///     env parameter's `TempId` and the captured-variable-name → env
+///     index map. `None` outside closure bodies.
+#[derive(Default, Clone, Debug)]
+struct CellCtx {
+    cell_locals: HashSet<String>,
+    env_captures: Option<EnvCaptures>,
+}
+
+#[derive(Clone, Debug)]
+struct EnvCaptures {
+    env_temp: TempId,
+    /// Captured-variable name -> index in the env's cells vector.
+    index_of: HashMap<String, usize>,
 }
 
 /// Sprint 19: accumulator for the lifted thunks each `block` form
@@ -1538,7 +1659,7 @@ impl LiftSink {
     }
 }
 
-// ─── Sprint 21: anonymous-method lifting pre-pass ─────────────────────────
+// ─── Sprint 21 / 24: anonymous-method lifting pre-pass ────────────────────
 //
 // Walks every Item's body, every Expr nested inside, and replaces
 // `Expr::Method { params, body }` with an `Expr::Ident` referencing a
@@ -1546,17 +1667,122 @@ impl LiftSink {
 // `Item::DefineFunction` to the module so the normal lowering flow
 // emits the lifted thunk as an ordinary top-level function.
 //
-// Free-variable check: every name an anonymous method's body references
-// must resolve EITHER to one of the method's own params OR to a
-// top-level name (top function / generic / registered class). Any other
-// reference is a free variable; Sprint 21 errors out with a clear
-// "closures land in Sprint 24" diagnostic — there is no implicit env
-// capture in Sprint 21.
+// Sprint 21 erred out on any free variable inside a method body with
+// "closures land in Sprint 24". Sprint 24 replaces that path with the
+// cell-conversion machinery:
+//
+//   * Compute the **captured set** per `Expr::Method` — names that
+//     reference a variable bound in an enclosing scope (and not a
+//     top-level / operator / class name).
+//   * For each captured local, the enclosing function's body promotes
+//     it to a heap-allocated `<cell>`: `let x = E` becomes
+//     `let x = %make-cell(E)`, and reads / writes go through
+//     `%cell-get` / `%cell-set!` (decided at lowering time via
+//     `cell_locals`).
+//   * The lifted method body grows a synthetic env parameter; reads /
+//     writes of captured names in the body become
+//     `%cell-get(%env-cell(env, i))` / `%cell-set!(v, %env-cell(env, i))`.
+//   * The closure-creation site (the original `Expr::Method` location)
+//     emits `%make-closure(name, arity, env)` where `env` is built by
+//     gathering the (cell-promoted) outer-scope variables.
+//
+// The lifter records all this in a `ClosureRegistry` consumed by the
+// lowerer. The registry is keyed by lifted-body-name; the
+// per-enclosing-function "which locals to promote" set is computed
+// separately and stored under the enclosing function's name.
 
-/// Pre-pass entry point. Mutates `module` in place. Returns a list of
-/// `LoweringError::Unsupported` if any anonymous method captures a free
-/// variable.
-fn lift_anonymous_methods(module: &mut Module) -> Vec<LoweringError> {
+/// Sprint 24: per-method closure metadata. The lifter produces one of
+/// these per `Expr::Method`. The lowerer consults the registry when it
+/// sees an `Expr::Ident(lifted_name)` to decide whether to emit a
+/// plain function-ref (no captures) or a `%make-closure` site (with
+/// captures).
+#[derive(Clone, Debug)]
+pub struct ClosureInfo {
+    pub lifted_name: String,
+    /// Captured variable names in stable order. The index into this
+    /// vector is the cell's slot index in the environment.
+    pub captured: Vec<String>,
+    pub arity: usize,
+    pub span: Span,
+}
+
+/// Sprint 24 registry built by the lift pre-pass.
+///
+/// Two pieces of information come out of the pre-pass:
+///
+///   * **Per-lifted-body**: a `ClosureInfo` describing the body's
+///     capture list. Used by the lowerer to (1) recognise that a
+///     synthesised `Expr::Ident(lifted_name)` is a closure-creation
+///     site, not a plain `\name` reference, and (2) compile the body
+///     itself with the synthetic env parameter and the
+///     captured-variable indexing scheme.
+///
+///   * **Per-enclosing-function** ("cell-promote sets"): for each
+///     top-level / lifted function in the module, the set of its OWN
+///     local-variable names that any inner closure captures. The
+///     lowerer's per-body environment management uses this set to
+///     cell-promote the matching `let` bindings AND to redirect reads
+///     / writes through `%cell-get` / `%cell-set!`.
+#[derive(Default, Clone, Debug)]
+pub struct ClosureRegistry {
+    /// `lifted_name -> ClosureInfo`.
+    pub by_lifted_name: HashMap<String, ClosureInfo>,
+    /// `enclosing_function_name -> set of locals captured by inner
+    /// closures`. Drives cell-promotion in the enclosing body's lowering.
+    pub cell_locals_per_function: HashMap<String, HashSet<String>>,
+}
+
+impl ClosureRegistry {
+    pub fn closure_for(&self, name: &str) -> Option<&ClosureInfo> {
+        self.by_lifted_name.get(name)
+    }
+    pub fn cell_locals_for(&self, function_name: &str) -> Option<&HashSet<String>> {
+        self.cell_locals_per_function.get(function_name)
+    }
+}
+
+/// Mutable threading state for the lift pre-pass. Carries the global
+/// counters and per-call-site capture metadata that bubble up through
+/// recursion.
+struct LiftState<'a> {
+    /// Set of module-level names (`define function`, classes, …) used
+    /// by `check_free_vars` to distinguish "captured local" from
+    /// "top-level reference".
+    top: &'a HashSet<String>,
+    /// Counter for `__anon-method-NNNN` synthetic names.
+    counter: u32,
+    /// Sink for lifted `Item::DefineFunction`s.
+    new_items: Vec<Item>,
+    /// Lift-time diagnostics.
+    errors: Vec<LoweringError>,
+    /// The Sprint 24 closure registry being built.
+    registry: ClosureRegistry,
+}
+
+/// Per-scope rewriting context for the lift pre-pass. Carries the
+/// set of names visible in the enclosing scope (so `check_free_vars`
+/// can identify captures) and **the name of the enclosing function**
+/// (so cell-promotion targets land in the right
+/// `cell_locals_per_function` bucket).
+struct LiftScope {
+    /// Names bound in this lexical scope or any enclosing scope inside
+    /// the current top-level function. Walks "outward" the same way
+    /// `check_free_vars` does.
+    in_scope: HashSet<String>,
+    /// Name of the enclosing function (the synthetic top-level name
+    /// for lifted bodies; the source name for user functions). The
+    /// lift pass deposits "this local must be cell-promoted" under
+    /// this name when an inner method captures it.
+    enclosing_fn: String,
+}
+
+/// Pre-pass entry point. Mutates `module` in place and produces a
+/// `ClosureRegistry` describing every closure site discovered. Returns
+/// `Err` only for genuine lifting failures (none currently — Sprint 24
+/// supports every capture shape Sprint 21 rejected).
+fn lift_anonymous_methods(
+    module: &mut Module,
+) -> (ClosureRegistry, Vec<LoweringError>) {
     // Collect the set of top-level names so the free-variable check
     // can distinguish "captured local" from "module-scope reference".
     // Top-level names include `define function` / `define method` /
@@ -1578,50 +1804,55 @@ fn lift_anonymous_methods(module: &mut Module) -> Vec<LoweringError> {
             _ => {}
         }
     }
+    let mut state = LiftState {
+        top: &top_level_names,
+        counter: 0,
+        new_items: Vec::new(),
+        errors: Vec::new(),
+        registry: ClosureRegistry::default(),
+    };
     // Process each existing item in turn. Replacements append to the
-    // module's items via `new_items`.
-    let mut new_items: Vec<Item> = Vec::new();
-    let mut counter: u32 = 0;
-    let mut errors: Vec<LoweringError> = Vec::new();
+    // module's items via `state.new_items`.
     let mut items = std::mem::take(&mut module.items);
     for mut item in items.drain(..) {
-        lift_item(
-            &mut item,
-            &top_level_names,
-            &mut counter,
-            &mut new_items,
-            &mut errors,
-        );
-        new_items.push(item);
+        lift_item(&mut item, &mut state);
+        state.new_items.push(item);
     }
-    module.items = new_items;
-    errors
+    module.items = std::mem::take(&mut state.new_items);
+    (state.registry, state.errors)
 }
 
-fn lift_item(
-    item: &mut Item,
-    top: &HashSet<String>,
-    counter: &mut u32,
-    new_items: &mut Vec<Item>,
-    errors: &mut Vec<LoweringError>,
-) {
+fn lift_item(item: &mut Item, st: &mut LiftState<'_>) {
     match item {
-        Item::DefineFunction { params, body, .. } | Item::DefineMethod { params, body, .. } => {
-            let mut in_scope: HashSet<String> = top.clone();
+        Item::DefineFunction { name, params, body, .. }
+        | Item::DefineMethod { name, params, body, .. } => {
+            let mut scope = LiftScope {
+                in_scope: st.top.clone(),
+                enclosing_fn: name.clone(),
+            };
             for p in params.iter() {
-                in_scope.insert(p.name.clone());
+                scope.in_scope.insert(p.name.clone());
             }
             for s in body.iter_mut() {
-                lift_statement(s, &mut in_scope, top, counter, new_items, errors);
+                lift_statement(s, &mut scope, st);
             }
         }
-        Item::DefineConstant { value, .. } | Item::DefineVariable { value, .. } => {
-            let mut in_scope: HashSet<String> = top.clone();
-            lift_expr(value, &mut in_scope, top, counter, new_items, errors);
+        Item::DefineConstant { value, name, .. }
+        | Item::DefineVariable { value, name, .. } => {
+            let mut scope = LiftScope {
+                in_scope: st.top.clone(),
+                enclosing_fn: name.clone(),
+            };
+            lift_expr(value, &mut scope, st);
         }
         Item::Expr(e) => {
-            let mut in_scope: HashSet<String> = top.clone();
-            lift_expr(e, &mut in_scope, top, counter, new_items, errors);
+            // Top-level expression — Sprint 12+ eval-entry uses
+            // "<eval-entry>" as the synthetic enclosing function name.
+            let mut scope = LiftScope {
+                in_scope: st.top.clone(),
+                enclosing_fn: "<eval-entry>".to_string(),
+            };
+            lift_expr(e, &mut scope, st);
         }
         // DefineClass: nested exprs in supers / slot defaults aren't
         // currently supported as expression-position method literals;
@@ -1633,39 +1864,34 @@ fn lift_item(
 
 fn lift_statement(
     s: &mut Statement,
-    in_scope: &mut HashSet<String>,
-    top: &HashSet<String>,
-    counter: &mut u32,
-    new_items: &mut Vec<Item>,
-    errors: &mut Vec<LoweringError>,
+    scope: &mut LiftScope,
+    st: &mut LiftState<'_>,
 ) {
     match s {
         Statement::Expr(e) => {
-            lift_expr(e, in_scope, top, counter, new_items, errors);
+            lift_expr(e, scope, st);
         }
         Statement::Let { binders, value, .. } => {
-            lift_expr(value, in_scope, top, counter, new_items, errors);
+            lift_expr(value, scope, st);
             for b in binders {
-                in_scope.insert(b.name.clone());
+                scope.in_scope.insert(b.name.clone());
             }
         }
         Statement::Local { methods, .. } => {
             // Local methods bind their name in scope; their bodies are
-            // closed over the enclosing scope. Sprint 21 doesn't ship
-            // closures, so we leave the body unprocessed (the existing
-            // lowering errors on local methods with the Sprint 06
-            // Unsupported diagnostic).
+            // not yet lifted (Sprint 06 lowering errors on local methods
+            // with `Unsupported`).
             for m in methods {
-                in_scope.insert(m.name.clone());
+                scope.in_scope.insert(m.name.clone());
             }
         }
         Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
-            lift_expr(cond, in_scope, top, counter, new_items, errors);
-            let saved = in_scope.clone();
+            lift_expr(cond, scope, st);
+            let saved = scope.in_scope.clone();
             for sub in body {
-                lift_statement(sub, in_scope, top, counter, new_items, errors);
+                lift_statement(sub, scope, st);
             }
-            *in_scope = saved;
+            scope.in_scope = saved;
         }
         Statement::For { .. } => {
             // For statements aren't lowered in Sprint 18; leave alone.
@@ -1678,40 +1904,38 @@ fn lift_statement(
             afterwards,
             ..
         } => {
-            let saved = in_scope.clone();
+            let saved = scope.in_scope.clone();
             if let Some(ev) = exit_var {
-                in_scope.insert(ev.clone());
+                scope.in_scope.insert(ev.clone());
             }
             for sub in body {
-                lift_statement(sub, in_scope, top, counter, new_items, errors);
+                lift_statement(sub, scope, st);
             }
             for h in handlers {
-                let mut h_scope = in_scope.clone();
+                let h_saved = scope.in_scope.clone();
                 if let Some(v) = &h.var {
-                    h_scope.insert(v.clone());
+                    scope.in_scope.insert(v.clone());
                 }
                 for sub in &mut h.body {
-                    lift_statement(sub, &mut h_scope, top, counter, new_items, errors);
+                    lift_statement(sub, scope, st);
                 }
+                scope.in_scope = h_saved;
             }
             for sub in cleanup {
-                lift_statement(sub, in_scope, top, counter, new_items, errors);
+                lift_statement(sub, scope, st);
             }
             for sub in afterwards {
-                lift_statement(sub, in_scope, top, counter, new_items, errors);
+                lift_statement(sub, scope, st);
             }
-            *in_scope = saved;
+            scope.in_scope = saved;
         }
     }
 }
 
 fn lift_expr(
     e: &mut Expr,
-    in_scope: &mut HashSet<String>,
-    top: &HashSet<String>,
-    counter: &mut u32,
-    new_items: &mut Vec<Item>,
-    errors: &mut Vec<LoweringError>,
+    scope: &mut LiftScope,
+    st: &mut LiftState<'_>,
 ) {
     match e {
         Expr::Integer(..)
@@ -1722,77 +1946,99 @@ fn lift_expr(
         | Expr::Symbol(..)
         | Expr::Ident(..) => {}
         Expr::Paren { inner, .. } => {
-            lift_expr(inner, in_scope, top, counter, new_items, errors);
+            lift_expr(inner, scope, st);
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            lift_expr(lhs, in_scope, top, counter, new_items, errors);
-            lift_expr(rhs, in_scope, top, counter, new_items, errors);
+            lift_expr(lhs, scope, st);
+            lift_expr(rhs, scope, st);
         }
         Expr::UnOp { operand, .. } => {
-            lift_expr(operand, in_scope, top, counter, new_items, errors);
+            lift_expr(operand, scope, st);
         }
         Expr::If { cond, then_, else_, .. } => {
-            lift_expr(cond, in_scope, top, counter, new_items, errors);
-            lift_expr(then_, in_scope, top, counter, new_items, errors);
+            lift_expr(cond, scope, st);
+            lift_expr(then_, scope, st);
             if let Some(e2) = else_ {
-                lift_expr(e2, in_scope, top, counter, new_items, errors);
+                lift_expr(e2, scope, st);
             }
         }
         Expr::Begin { body, .. } => {
-            let saved = in_scope.clone();
+            let saved = scope.in_scope.clone();
             for sub in body {
-                lift_expr(sub, in_scope, top, counter, new_items, errors);
+                lift_expr(sub, scope, st);
             }
-            *in_scope = saved;
+            scope.in_scope = saved;
         }
         Expr::Call { callee, args, .. } => {
-            lift_expr(callee, in_scope, top, counter, new_items, errors);
+            lift_expr(callee, scope, st);
             for a in args {
-                lift_expr(a, in_scope, top, counter, new_items, errors);
+                lift_expr(a, scope, st);
             }
         }
         Expr::Let { binder, value, .. } => {
-            lift_expr(value, in_scope, top, counter, new_items, errors);
-            in_scope.insert(binder.clone());
+            lift_expr(value, scope, st);
+            scope.in_scope.insert(binder.clone());
         }
         Expr::Unless { .. } | Expr::Case { .. } | Expr::LocalMethod { .. } => {
             // Not lowered; leave the unsupported diagnostic to the
             // main lowering pass.
         }
         Expr::Stmt(s) => {
-            lift_statement(s, in_scope, top, counter, new_items, errors);
+            lift_statement(s, scope, st);
         }
         Expr::Method { span, params, body } => {
-            // Check free variables first. Every Ident referenced inside
+            // Compute the captured set: every Ident referenced inside
             // the method body that isn't (a) one of the method's own
             // params, (b) a top-level name, (c) a fresh `let` binder
-            // introduced in the body, OR (d) one of Sprint 21's
-            // operator names (`+`, `-`, ...) is a free variable from
-            // the enclosing scope — i.e. a closure.
-            let mut inner_scope: HashSet<String> = top.clone();
+            // introduced inside the body, OR (d) an operator / class /
+            // generic name. Sprint 24 promotes these to cells; Sprint 21
+            // erred out here.
+            let mut inner_scope: HashSet<String> = st.top.clone();
             for p in params.iter() {
                 inner_scope.insert(p.name.clone());
             }
-            let mut free: Vec<(Span, String)> = Vec::new();
+            let mut free_seq: Vec<(Span, String)> = Vec::new();
             for sub in body.iter() {
-                check_free_vars(sub, &mut inner_scope, in_scope, top, &mut free);
+                check_free_vars(sub, &mut inner_scope, &scope.in_scope, st.top, &mut free_seq);
             }
-            if let Some((bad_span, bad_name)) = free.into_iter().next() {
-                errors.push(LoweringError::Unsupported {
-                    span: bad_span,
-                    message: format!(
-                        "Sprint 21: anonymous method captures free variable `{bad_name}` \
-                         from the enclosing scope; closures land in Sprint 24"
-                    ),
-                });
-                return;
+            // De-duplicate while preserving first-seen order. The order
+            // becomes the env-index assignment, so it must be stable.
+            let mut captured: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for (_, n) in &free_seq {
+                if seen.insert(n.clone()) {
+                    captured.push(n.clone());
+                }
             }
+
             // Synthesise a fresh top-level name for the lifted body.
-            let lifted_name = format!("__anon-method-{}", *counter);
-            *counter += 1;
+            let lifted_name = format!("__anon-method-{}", st.counter);
+            st.counter += 1;
+
+            // Record this closure's captured locals against the
+            // enclosing function so the lowerer cell-promotes them.
+            if !captured.is_empty() {
+                let bucket = st
+                    .registry
+                    .cell_locals_per_function
+                    .entry(scope.enclosing_fn.clone())
+                    .or_default();
+                for c in &captured {
+                    bucket.insert(c.clone());
+                }
+            }
+
+            // Build the lifted DefineFunction. For closures (non-empty
+            // capture set), prepend a synthetic `__env` parameter — the
+            // lowerer wires it in when it sees the `ClosureInfo` for
+            // this body. We do NOT add the param at AST level (keeps
+            // the AST stable for printing); instead, the lowerer reads
+            // `ClosureInfo::captured.len() > 0` and inserts the env
+            // parameter at the head of the body's params list before
+            // lowering proceeds.
             let body_stmts: Vec<Statement> =
                 body.iter().cloned().map(Statement::Expr).collect();
-            new_items.push(Item::DefineFunction {
+            st.new_items.push(Item::DefineFunction {
                 span: *span,
                 modifiers: Vec::new(),
                 name: lifted_name.clone(),
@@ -1800,23 +2046,38 @@ fn lift_expr(
                 return_: None,
                 body: body_stmts,
             });
-            // Also lift any nested anonymous methods inside the body
-            // we just stuffed into a synthetic DefineFunction. We do
-            // this by recursively running the pre-pass on the new
-            // item we just appended. Simpler: lift_item the new item
-            // in place.
-            let mut tmp_new_items: Vec<Item> = Vec::new();
-            let last_idx = new_items.len() - 1;
-            // Take ownership briefly.
+
+            // Register the closure in the registry. The lowerer
+            // consumes this to recognise `Expr::Ident(lifted_name)` as
+            // a closure-creation site and to wire the env parameter
+            // when lowering the body itself.
+            st.registry.by_lifted_name.insert(
+                lifted_name.clone(),
+                ClosureInfo {
+                    lifted_name: lifted_name.clone(),
+                    captured: captured.clone(),
+                    arity: params.len(),
+                    span: *span,
+                },
+            );
+
+            // Recursively lift any nested anonymous methods inside the
+            // body we just stuffed into the synthetic DefineFunction.
+            // Run the pre-pass on it in place; nested closures captured
+            // variables that the new enclosing function (lifted_name)
+            // owns now.
+            let last_idx = st.new_items.len() - 1;
             let mut taken = std::mem::replace(
-                &mut new_items[last_idx],
+                &mut st.new_items[last_idx],
                 Item::Expr(Expr::Bool(*span, false)),
             );
-            lift_item(&mut taken, top, counter, &mut tmp_new_items, errors);
-            new_items[last_idx] = taken;
-            new_items.append(&mut tmp_new_items);
+            lift_item(&mut taken, st);
+            st.new_items[last_idx] = taken;
+
             // Replace the original Method expression with an ident
-            // reference to the lifted thunk.
+            // reference to the lifted thunk. The lowerer consults the
+            // registry to decide whether to emit `nod_make_function_ref`
+            // (no captures) or `%make-closure` (with captures + env).
             *e = Expr::Ident(*span, lifted_name);
         }
     }
@@ -2142,6 +2403,13 @@ struct FunctionBuilder {
     /// to return from a lifted thunk. Updated as statements lower.
     /// `None` after a statement that produces no value (loops).
     last_temp: Option<TempId>,
+    /// Sprint 24: cell-promotion + closure-env context for this body.
+    /// Populated by `lower_function_inner` before any statement runs.
+    /// The `lower_expr` / `lower_assign` / `let`-statement paths
+    /// consult this to redirect captured-local reads/writes through
+    /// `%cell-get` / `%cell-set!` and to lower a `%env-cell` indirection
+    /// for variables that live in the enclosing environment.
+    cell_ctx: CellCtx,
 }
 
 impl FunctionBuilder {
@@ -2169,6 +2437,7 @@ impl FunctionBuilder {
             next_temp: 0,
             next_block: 1,
             last_temp: None,
+            cell_ctx: CellCtx::default(),
         }
     }
 
@@ -2319,8 +2588,29 @@ impl FunctionBuilder {
                 Ok(self.emit_symbol_literal(&name))
             }
             Expr::Ident(span, name) => {
-                if let Some(t) = env.get(name) {
-                    return Ok(*t);
+                // Sprint 24: closure body capture — an inner-method
+                // body that captures `name` from its outer scope reads
+                // it through `%cell-get(%env-cell(env, idx))`.
+                if let Some(ec) = self.cell_ctx.env_captures.clone()
+                    && let Some(&idx) = ec.index_of.get(name)
+                {
+                    return Ok(self.emit_captured_var_read(ec.env_temp, idx));
+                }
+                if let Some(t) = env.get(name).copied() {
+                    // Sprint 24: cell-promoted local — the env binds
+                    // the CELL Word. Insert a `%cell-get` to read the
+                    // underlying value.
+                    if self.cell_ctx.cell_locals.contains(name) {
+                        let dst = self.fresh_temp(TypeEstimate::Top);
+                        self.push(Computation::DirectCall {
+                            dst,
+                            callee: "nod_cell_get".to_string(),
+                            args: vec![t],
+                            safepoint_roots: Vec::new(),
+                        });
+                        return Ok(dst);
+                    }
+                    return Ok(t);
                 }
                 // Sprint 12: a `<foo>`-shaped ident may refer to a
                 // registered class. Lower as a constant pointer to
@@ -2330,6 +2620,35 @@ impl FunctionBuilder {
                     && let Some(class_id) = ctx.user_classes.get(name).copied().or_else(|| find_class_id_by_name(name))
                 {
                     return Ok(self.emit_class_ref(class_id));
+                }
+                // Sprint 24: closure-creation site. The lift pre-pass
+                // rewrites `method (...) ... end` to
+                // `Expr::Ident(__anon-method-NNNN)`; if that name is in
+                // the closure registry AND has a non-empty capture set,
+                // emit `%make-closure(name, arity, env)` here. The env
+                // is built from the captured locals — each one's
+                // cell-Word lives in the current `LocalEnv` as the
+                // result of cell-promotion at its `let` (or param)
+                // binding site.
+                if let Some(reg) = ctx.closures
+                    && let Some(info) = reg.closure_for(name)
+                    && !info.captured.is_empty()
+                {
+                    let mut captured_cells: Vec<TempId> = Vec::with_capacity(info.captured.len());
+                    for cap in &info.captured {
+                        // Cell lives in `env` because the enclosing
+                        // body's cell-promotion logic stored it there.
+                        // If for some reason it isn't found, fall
+                        // through to UndefinedIdent.
+                        let Some(&cell_t) = env.get(cap) else {
+                            return Err(LoweringError::UndefinedIdent {
+                                span: *span,
+                                name: cap.clone(),
+                            });
+                        };
+                        captured_cells.push(cell_t);
+                    }
+                    return Ok(self.emit_make_closure(name, info.arity, &captured_cells));
                 }
                 // Sprint 21: first-class function references.
                 //
@@ -2437,8 +2756,24 @@ impl FunctionBuilder {
                 // surface. Inserts the binder into the surrounding env
                 // and returns the value temp (so the expression evaluates
                 // to the bound value).
+                //
+                // Sprint 24: if `binder` is captured by an inner closure,
+                // promote it to a cell so reads / writes share storage
+                // with the env-cell the inner closure accesses.
                 let t = self.lower_expr(value, env, ctx)?;
-                env.insert(binder.clone(), t);
+                let bound = if self.cell_ctx.cell_locals.contains(binder) {
+                    let cell = self.fresh_temp(TypeEstimate::Top);
+                    self.push(Computation::DirectCall {
+                        dst: cell,
+                        callee: "nod_make_cell".to_string(),
+                        args: vec![t],
+                        safepoint_roots: Vec::new(),
+                    });
+                    cell
+                } else {
+                    t
+                };
+                env.insert(binder.clone(), bound);
                 Ok(t)
             }
             Expr::Method { span, .. } => {
@@ -2468,6 +2803,138 @@ impl FunctionBuilder {
             }),
             Expr::Stmt(s) => self.lower_stmt_as_expr(s, env, ctx),
         }
+    }
+
+    /// Sprint 24: emit the IR for reading a captured variable at index
+    /// `idx` from the closure body's synthetic env parameter. Expands
+    /// to two calls: `%env-cell(env, idx)` to fetch the cell, then
+    /// `%cell-get(cell)` to read its value.
+    fn emit_captured_var_read(&mut self, env_temp: TempId, idx: usize) -> TempId {
+        let idx_t = self.fresh_temp(TypeEstimate::Integer);
+        self.push(Computation::Const {
+            dst: idx_t,
+            value: ConstValue::Integer(idx as i128),
+        });
+        let cell_t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst: cell_t,
+            callee: "nod_env_cell".to_string(),
+            args: vec![env_temp, idx_t],
+            safepoint_roots: Vec::new(),
+        });
+        let val_t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst: val_t,
+            callee: "nod_cell_get".to_string(),
+            args: vec![cell_t],
+            safepoint_roots: Vec::new(),
+        });
+        val_t
+    }
+
+    /// Sprint 24: emit the IR for writing `value` into the captured
+    /// variable at index `idx` (in the closure body's env). Expands to
+    /// `%cell-set!(value, %env-cell(env, idx))`.
+    fn emit_captured_var_write(
+        &mut self,
+        env_temp: TempId,
+        idx: usize,
+        value: TempId,
+    ) -> TempId {
+        let idx_t = self.fresh_temp(TypeEstimate::Integer);
+        self.push(Computation::Const {
+            dst: idx_t,
+            value: ConstValue::Integer(idx as i128),
+        });
+        let cell_t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst: cell_t,
+            callee: "nod_env_cell".to_string(),
+            args: vec![env_temp, idx_t],
+            safepoint_roots: Vec::new(),
+        });
+        let dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst,
+            callee: "nod_cell_set".to_string(),
+            args: vec![value, cell_t],
+            safepoint_roots: Vec::new(),
+        });
+        dst
+    }
+
+    /// Sprint 24: emit a `%make-closure(name, arity, env)` call. The
+    /// `env` is built by gathering the captured locals' cell Words (each
+    /// already stored in the current `LocalEnv` as the result of
+    /// cell-promotion at the binding site) into a fresh SOV and
+    /// wrapping it in an `<environment>`.
+    fn emit_make_closure(
+        &mut self,
+        lifted_name: &str,
+        arity: usize,
+        captured_cells: &[TempId],
+    ) -> TempId {
+        // 1. Allocate the cells vector (len = captured.len()).
+        let len_t = self.fresh_temp(TypeEstimate::Integer);
+        self.push(Computation::Const {
+            dst: len_t,
+            value: ConstValue::Integer(captured_cells.len() as i128),
+        });
+        let sov_t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst: sov_t,
+            callee: "nod_make_sov_len".to_string(),
+            args: vec![len_t],
+            safepoint_roots: Vec::new(),
+        });
+        // 2. Fill the SOV slots with the captured cell Words.
+        for (i, &cell) in captured_cells.iter().enumerate() {
+            let i_t = self.fresh_temp(TypeEstimate::Integer);
+            self.push(Computation::Const {
+                dst: i_t,
+                value: ConstValue::Integer(i as i128),
+            });
+            let _ = self.emit_sov_element_setter(cell, sov_t, i_t);
+        }
+        // 3. Wrap the SOV in an `<environment>`.
+        let env_t = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst: env_t,
+            callee: "nod_make_environment".to_string(),
+            args: vec![sov_t],
+            safepoint_roots: Vec::new(),
+        });
+        // 4. Allocate the closure Word with this env.
+        let name_word = self.emit_string_literal(lifted_name);
+        let arity_t = self.fresh_temp(TypeEstimate::Integer);
+        self.push(Computation::Const {
+            dst: arity_t,
+            value: ConstValue::Integer(arity as i128),
+        });
+        let dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst,
+            callee: "nod_make_closure".to_string(),
+            args: vec![name_word, arity_t, env_t],
+            safepoint_roots: Vec::new(),
+        });
+        dst
+    }
+
+    fn emit_sov_element_setter(
+        &mut self,
+        value: TempId,
+        sov: TempId,
+        idx: TempId,
+    ) -> TempId {
+        let dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst,
+            callee: "nod_sov_element_setter".to_string(),
+            args: vec![value, sov, idx],
+            safepoint_roots: Vec::new(),
+        });
+        dst
     }
 
     /// Sprint 21: emit a `nod_make_function_ref(name_bytestring,
@@ -2546,8 +3013,34 @@ impl FunctionBuilder {
         // post-assignment SSA temp visible to subsequent reads in the
         // same scope; `lower_while_like` snapshots names at the back
         // edge to thread them through the header phi.
+        //
+        // Sprint 24: cell-promoted locals + captured variables route
+        // through the cell-set! / env-cell shims instead of an SSA
+        // rebind — the mutation is visible to inner closures (and the
+        // outer scope sees inner mutations too).
         if let Expr::Ident(_, name) = lhs {
+            // Closure body captured-var write.
+            if let Some(ec) = self.cell_ctx.env_captures.clone()
+                && let Some(&idx) = ec.index_of.get(name)
+            {
+                let v = self.lower_expr(rhs, env, ctx)?;
+                return Ok(self.emit_captured_var_write(ec.env_temp, idx, v));
+            }
             if env.contains_key(name) {
+                // Cell-promoted local: write through `%cell-set!`.
+                if self.cell_ctx.cell_locals.contains(name) {
+                    let v = self.lower_expr(rhs, env, ctx)?;
+                    let cell_t = *env.get(name).expect("env entry checked");
+                    let dst = self.fresh_temp(TypeEstimate::Top);
+                    self.push(Computation::DirectCall {
+                        dst,
+                        callee: "nod_cell_set".to_string(),
+                        args: vec![v, cell_t],
+                        safepoint_roots: Vec::new(),
+                    });
+                    return Ok(dst);
+                }
+                // Plain local: rebind the SSA temp.
                 let t = self.lower_expr(rhs, env, ctx)?;
                 env.insert(name.clone(), t);
                 return Ok(t);
@@ -2849,12 +3342,25 @@ impl FunctionBuilder {
         // on the heap class at runtime. The arity is fixed by the call
         // shape; Sprint 21 supports up to arity-2 directly and uses
         // `nod_apply` for higher arities (deferred).
+        //
+        // Sprint 24: if `name` is a cell-promoted local OR a captured
+        // env-variable, `lower_expr` already inserts the `%cell-get` /
+        // `%env-cell` indirection. We route through the regular
+        // `lower_expr` to get the unwrapped function Word.
+        let callee_name: Option<&str> = match callee {
+            Expr::Ident(_, n) => Some(n.as_str()),
+            _ => None,
+        };
+        let captured_in_env = match (self.cell_ctx.env_captures.as_ref(), callee_name) {
+            (Some(ec), Some(n)) => ec.index_of.contains_key(n),
+            _ => false,
+        };
         if let Expr::Ident(_, name) = callee
-            && env.contains_key(name)
+            && (env.contains_key(name) || captured_in_env)
             && !ctx.top_names.contains(name)
             && !ctx.generics.contains(name)
         {
-            let f = *env.get(name).expect("env entry checked");
+            let f = self.lower_expr(callee, env, ctx)?;
             let arg_temps: Vec<TempId> = args
                 .iter()
                 .map(|a| self.lower_expr(a, env, ctx))

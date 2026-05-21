@@ -34,8 +34,9 @@ use nod_dfm::TypeEstimate;
 use nod_llvm::{Jit, codegen_module};
 
 pub use lower::{
-    BlockHandlerRegistration, BlockRegistration, LoweredModule, LoweringError, MethodRegistration,
-    SealingViolation, dump_classes, lower_function, lower_module, lower_module_full,
+    BlockHandlerRegistration, BlockRegistration, ClosureInfo, ClosureRegistry, LoweredModule,
+    LoweringError, MethodRegistration, SealingViolation, dump_classes, lower_function,
+    lower_module, lower_module_full,
 };
 
 /// Sprint 17: parse + macro-expand + lower in one shot. Existing
@@ -346,7 +347,18 @@ pub fn register_top_level_functions(
         if f.name == "<eval-entry>" {
             continue;
         }
-        let arity = f.params.len();
+        // Sprint 24: closure body's JIT signature carries a hidden env
+        // parameter on top of the user arity. Register under the
+        // *source* arity so `\name` and `%make-closure(name, arity, env)`
+        // both resolve. The trampoline (`nod_funcall_N`) reads the
+        // env-ptr slot on the `<function>` Word to decide whether to
+        // pass env as a hidden first arg or not, so it doesn't need a
+        // separate registration arity.
+        let arity = if let Some(info) = lm.closures.closure_for(&f.name) {
+            info.arity
+        } else {
+            f.params.len()
+        };
         // SAFETY: get_function_ptr returns a valid JIT'd address;
         // the JIT engine outlives the registration (callers leak it).
         let ptr = unsafe { jit.get_function_ptr(&f.name) }.ok_or_else(|| {
