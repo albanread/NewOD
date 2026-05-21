@@ -75,10 +75,56 @@ fn get_tick_count_returns_increasing_value() {
          b - a",
     )
     .unwrap_or_else(|e| panic!("GetTickCount eval failed: {e:?}"));
-    // The result is a fixnum; non-negative (clock didn't go
-    // backwards), most likely > 0 after a 15ms Sleep.
+    // After Sleep(15) the elapsed wall time should be at least ~10ms
+    // (allow scheduler slop on a loaded machine) and at most ~5000ms
+    // (otherwise something is wrong — runaway test or marshaling
+    // returning garbage). This is a real value-correctness check, not
+    // just "non-negative".
     let n: i64 = s.parse().expect("integer return");
     assert!(n >= 0, "tick delta must be non-negative, got {n}");
+    assert!(
+        (10..=5000).contains(&n),
+        "tick delta after Sleep(15) should be 10..=5000ms, got {n}ms — marshaling may be corrupting the return"
+    );
+}
+
+// ─── 2b. GetTickCount64 — value-correctness proof of FFI ──────────────────
+//
+// More rigorous proof of FFI working than the audible Beep: the API
+// returns a verifiable value (system uptime in milliseconds), and we
+// assert it sits in a sensible range. If marshaling is broken, the
+// return would be zero, negative, or astronomical.
+
+#[test]
+#[serial]
+fn system_uptime_via_get_tick_count64_is_sensible() {
+    setup();
+    let s = eval_expr_with_items_to_string(
+        "\
+define c-function GetTickCount64 () => (ticks :: <c-ulonglong>);
+  library: \"kernel32.dll\";
+end;
+",
+        "GetTickCount64()",
+    )
+    .unwrap_or_else(|e| panic!("GetTickCount64 eval failed: {e:?}"));
+    let uptime_ms: i64 = s.parse().expect("integer return");
+
+    // Absolute-value assertions — these only pass if Win64 marshaling
+    // AND u64 reboxing both worked end-to-end:
+    //   * strictly positive: the machine has been up
+    //   * > 1 second: even a freshly-booted box clears this by the
+    //     time `cargo test` runs (no flake risk)
+    //   * < ~3 years: catches astronomical garbage from a broken
+    //     u64 → fixnum path
+    assert!(
+        uptime_ms > 1_000,
+        "uptime must be > 1 second, got {uptime_ms}ms — marshaling failed?"
+    );
+    assert!(
+        uptime_ms < 100_000_000_000,
+        "uptime must be < ~3 years, got {uptime_ms}ms — u64 reboxing returning garbage?"
+    );
 }
 
 // ─── 3. GetCurrentProcessId — non-zero, fits in u32 ───────────────────────

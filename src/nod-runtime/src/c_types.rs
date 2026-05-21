@@ -33,6 +33,8 @@ struct CTypeClasses {
     c_ushort: ClassId,
     c_long: ClassId,
     c_ulong: ClassId,
+    c_longlong: ClassId,
+    c_ulonglong: ClassId,
     c_dword: ClassId,
     c_word: ClassId,
     c_byte: ClassId,
@@ -58,6 +60,8 @@ pub fn ensure_registered() {
             c_ushort: mk("<c-ushort>"),
             c_long: mk("<c-long>"),
             c_ulong: mk("<c-ulong>"),
+            c_longlong: mk("<c-longlong>"),
+            c_ulonglong: mk("<c-ulonglong>"),
             c_dword: mk("<c-dword>"),
             c_word: mk("<c-word>"),
             c_byte: mk("<c-byte>"),
@@ -109,9 +113,10 @@ pub fn c_wide_string_class_id() -> ClassId {
 // Stub helpers to keep clippy happy — we'll grow them once Sprint 28
 // starts emitting actual marshaling code.
 #[allow(dead_code)]
-fn _silence_unused(c: &CTypeClasses) -> [ClassId; 14] {
+fn _silence_unused(c: &CTypeClasses) -> [ClassId; 16] {
     [
-        c.c_bool, c.c_int, c.c_uint, c.c_short, c.c_ushort, c.c_long, c.c_ulong, c.c_dword,
-        c.c_word, c.c_byte, c.c_pointer, c.c_handle, c.c_string, c.c_wide_string,
+        c.c_bool, c.c_int, c.c_uint, c.c_short, c.c_ushort, c.c_long, c.c_ulong,
+        c.c_longlong, c.c_ulonglong,
+        c.c_dword, c.c_word, c.c_byte, c.c_pointer, c.c_handle, c.c_string, c.c_wide_string,
     ]
 }
