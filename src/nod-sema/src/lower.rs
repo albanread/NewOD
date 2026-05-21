@@ -3118,6 +3118,33 @@ impl FunctionBuilder {
                     }
                     return Ok(t);
                 }
+                // Sprint 29: stdlib-curated integer constant. The
+                // `$MB-OK`, `$WM-PAINT`, … set (and any future stdlib
+                // `define constant N = <int>`) lives in a process-
+                // global map populated by the stdlib loader. Resolve
+                // it here BEFORE the function-ref fallback path so
+                // user code reads the constant as a literal integer,
+                // not a `<function>` Word.
+                //
+                // Local bindings shadow the stdlib constant (the
+                // `env.get` check above happens first), matching how
+                // every other resolution-order step behaves.
+                if let Some(v) = crate::stdlib::lookup_constant(name) {
+                    const FIXNUM_MIN_I128: i128 = -(1_i128 << 62);
+                    const FIXNUM_MAX_I128: i128 = (1_i128 << 62) - 1;
+                    if !(FIXNUM_MIN_I128..=FIXNUM_MAX_I128).contains(&v) {
+                        return Err(LoweringError::IntegerOverflow {
+                            span: *span,
+                            value: v,
+                        });
+                    }
+                    let t = self.fresh_temp(TypeEstimate::Integer);
+                    self.push(Computation::Const {
+                        dst: t,
+                        value: ConstValue::Integer(v),
+                    });
+                    return Ok(t);
+                }
                 // Sprint 12: a `<foo>`-shaped ident may refer to a
                 // registered class. Lower as a constant pointer to
                 // the class metadata (i.e. a tagged Word).

@@ -40,12 +40,13 @@
 //! `nod_runtime::add_method_named` reference the leaked JIT's
 //! memory, so dispatch finds them forever.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use inkwell::context::Context;
 use nod_llvm::{Jit, codegen_module};
 use nod_macro::MacroTable;
-use nod_reader::{Item, Param, ReturnSig, Span};
+use nod_reader::{Expr, Item, Module, Param, ReturnSig, Span};
 
 use crate::lower::{MethodRegistration, lower_module_full};
 use crate::{register_blocks, register_methods, register_top_level_functions};
@@ -77,6 +78,32 @@ pub struct StdlibArtefacts {
 /// `for-each`, etc.
 static STDLIB_MACROS: OnceLock<MacroTable> = OnceLock::new();
 
+/// Sprint 29: process-global table of integer constants curated
+/// in `data/win32_constants.txt` and surfaced via
+/// `win32-constants.dylan`. User-code lowering consults this map
+/// before falling through to the function-ref resolution path, so
+/// `$MB-OK` in source code becomes `ConstValue::Integer(0)` at
+/// lowering time. The map is populated once by `load_stdlib`; the
+/// stdlib JIT engine never sees these constants as functions.
+static STDLIB_CONSTANTS: OnceLock<HashMap<String, i128>> = OnceLock::new();
+
+/// Sprint 29: ordered list of stdlib source files the loader
+/// processes. Each entry must live under
+/// `src/nod-dylan/dylan-sources/`. The first file owns the macros
+/// (so `for-each` etc. remain reachable); subsequent files extend
+/// the process-global tables (constants, methods). Add new entries
+/// here when introducing a new stdlib facet.
+const STDLIB_FILES: &[(&str, &str)] = &[
+    (
+        "stdlib.dylan",
+        include_str!("../../nod-dylan/dylan-sources/stdlib.dylan"),
+    ),
+    (
+        "win32-constants.dylan",
+        include_str!("../../nod-dylan/dylan-sources/win32-constants.dylan"),
+    ),
+];
+
 /// Sprint 20b: macro entries the loader collected. User-side
 /// expansion merges these into the per-call `MacroTable`.
 pub(crate) fn stdlib_macros() -> &'static MacroTable {
@@ -84,6 +111,31 @@ pub(crate) fn stdlib_macros() -> &'static MacroTable {
         "stdlib_macros() called before ensure_loaded(); \
          the lib.rs entry points call ensure_loaded() first.",
     )
+}
+
+/// Sprint 29: integer-constant lookup. Returns `Some(value)` when
+/// `name` is one of the stdlib's curated Win32 constants (or any
+/// future stdlib `define constant`); `None` otherwise. The result
+/// is `i128` to match the lowering layer's `Expr::Integer` width
+/// (and so values like `#xFFFFFFFF` round-trip cleanly without
+/// premature i64 truncation), but every currently-curated value
+/// fits in i64.
+///
+/// User-code lowering (`Expr::Ident` resolution) calls this BEFORE
+/// the function-ref fallback so that a bare `$MB-OK` becomes the
+/// integer literal `0` and not a `<function>` Word. The stdlib
+/// loader must have run for the table to be present; callers
+/// outside `nod-sema` go through `eval_expr_to_string` /
+/// `lower_module` which call `ensure_loaded` already.
+pub fn lookup_constant(name: &str) -> Option<i128> {
+    STDLIB_CONSTANTS.get()?.get(name).copied()
+}
+
+/// Sprint 29: read-only access to the constants map (for tests
+/// and diagnostics). The first call after `ensure_loaded` is
+/// guaranteed to find an initialised table.
+pub fn constants_table() -> Option<&'static HashMap<String, i128>> {
+    STDLIB_CONSTANTS.get()
 }
 
 /// Top-level entry: parse + expand + lower + JIT `stdlib.dylan`
@@ -155,15 +207,31 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
     nod_runtime::ensure_collections_registered();
     nod_runtime::ensure_tables_registered();
 
-    let src = include_str!("../../nod-dylan/dylan-sources/stdlib.dylan");
+    // Sprint 29: parse every file in `STDLIB_FILES` and merge their
+    // items into a single module. The first file (stdlib.dylan)
+    // also carries the module preamble (`Module: dylan`, etc.);
+    // subsequent files contribute items only — their preambles
+    // are accepted but discarded.
     let mut sm = nod_reader::SourceMap::new();
-    let file_id = sm.add("<stdlib>", src.to_string()).map_err(LoadError::SourceMap)?;
-    let toks = nod_reader::lex(src, file_id);
-    let pre = nod_reader::scan_preamble(src);
-    let mut module = nod_reader::parse_module(src, &toks, pre.as_ref()).map_err(LoadError::Parse)?;
+    let mut merged: Option<Module> = None;
+    for (label, src) in STDLIB_FILES {
+        let file_id = sm
+            .add(format!("<stdlib:{label}>"), (*src).to_string())
+            .map_err(LoadError::SourceMap)?;
+        let toks = nod_reader::lex(src, file_id);
+        let pre = nod_reader::scan_preamble(src);
+        let mut parsed =
+            nod_reader::parse_module(src, &toks, pre.as_ref()).map_err(LoadError::Parse)?;
+        match &mut merged {
+            None => merged = Some(parsed),
+            Some(m) => m.items.append(&mut parsed.items),
+        }
+    }
+    let mut module =
+        merged.expect("STDLIB_FILES must be non-empty so the merged module exists");
 
-    // Collect macros from stdlib INTO the process-global table.
-    // Don't expand stdlib's own macro uses here — Sprint 20b's
+    // Collect macros from the merged module INTO the process-global
+    // table. Don't expand stdlib's own macro uses here — Sprint 20b's
     // stdlib doesn't call its own macros internally, so the table
     // population is the only side effect we need.
     let mut macro_table = MacroTable::default();
@@ -173,6 +241,29 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
     module.items.retain(|it| !matches!(it, Item::DefineMacro { .. }));
     let macro_names: Vec<String> = macro_table.defs.keys().cloned().collect();
     let _ = STDLIB_MACROS.set(macro_table);
+
+    // Sprint 29: harvest integer constants (`define constant N = <int>`)
+    // into the process-global constants table and STRIP them from the
+    // module before lowering. Otherwise each would become a 0-arg
+    // stdlib function — unreachable from user code's separate JIT
+    // engine, and wasteful. User-code lowering will see these names
+    // through `lookup_constant`.
+    let mut constants_map: HashMap<String, i128> = HashMap::new();
+    module.items.retain(|it| match it {
+        Item::DefineConstant {
+            name,
+            value: Expr::Integer(_, n),
+            ..
+        } => {
+            // Last-writer-wins on duplicate names — but
+            // `data/win32_constants.txt` rejects mismatched values at
+            // build time, so duplicates here should agree.
+            constants_map.insert(name.clone(), *n);
+            false
+        }
+        _ => true,
+    });
+    let _ = STDLIB_CONSTANTS.set(constants_map);
 
     // Rewrite every `define function` in stdlib into a `define method
     // f (p1 :: <object>, p2 :: <object>, …)` so user code's

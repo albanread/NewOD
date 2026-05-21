@@ -306,24 +306,122 @@ fn project_functions(conn: &Connection) -> rusqlite::Result<Vec<FunctionInfo>> {
     Ok(out)
 }
 
-fn project_constants(_conn: &Connection) -> rusqlite::Result<Vec<ConstantInfo>> {
-    // The vendored schema (v5) does NOT carry a `constants` table.
-    // Sprint 27 ships with a small hand-curated set sufficient for
-    // the Phase A smoke tests (`MB_OK`, etc.); a future sprint can
-    // extend the upstream DB with a `constants` table and we'll
-    // populate from it.
-    Ok(vec![
-        ConstantInfo { name: "MB_OK".into(), value: 0x0000_0000, source_dll: Some("user32.dll".into()) },
-        ConstantInfo { name: "MB_OKCANCEL".into(), value: 0x0000_0001, source_dll: Some("user32.dll".into()) },
-        ConstantInfo { name: "MB_ICONERROR".into(), value: 0x0000_0010, source_dll: Some("user32.dll".into()) },
-        ConstantInfo { name: "MB_ICONINFORMATION".into(), value: 0x0000_0040, source_dll: Some("user32.dll".into()) },
-        ConstantInfo { name: "SW_HIDE".into(), value: 0, source_dll: Some("user32.dll".into()) },
-        ConstantInfo { name: "SW_SHOW".into(), value: 5, source_dll: Some("user32.dll".into()) },
-        ConstantInfo { name: "INVALID_HANDLE_VALUE".into(), value: -1, source_dll: Some("kernel32.dll".into()) },
-        ConstantInfo { name: "STD_INPUT_HANDLE".into(), value: -10, source_dll: Some("kernel32.dll".into()) },
-        ConstantInfo { name: "STD_OUTPUT_HANDLE".into(), value: -11, source_dll: Some("kernel32.dll".into()) },
-        ConstantInfo { name: "STD_ERROR_HANDLE".into(), value: -12, source_dll: Some("kernel32.dll".into()) },
-    ])
+/// Sprint 29 — load constants from the hand-curated `data/win32_constants.txt`.
+///
+/// The vendored `windows_api.db` (schema v5) carries enum *type*
+/// declarations (MESSAGEBOX_STYLE, WIN32_ERROR, …) but NOT the
+/// integer values of their members; that data isn't projected from
+/// the upstream WinMD into this DB. Sprint 29 therefore curates the
+/// constants Dylan FFI code actually needs by hand. We DO still
+/// take the `_conn` parameter so a future sprint that lands a
+/// constants table upstream can extend this function to merge
+/// DB-extracted rows with the curated set.
+///
+/// File format (purely line-based — no TOML dep needed):
+///
+///   # line comment
+///   # category: <name>     section header (drops a comment in the
+///                          generated Dylan file)
+///   NAME = <value>         integer constant (decimal, 0x… hex,
+///                          optionally negative)
+///   NAME = <value>  ; <dll>  optional source-DLL annotation
+///
+/// Trailing whitespace and blank lines ignored.
+fn project_constants(
+    _conn: &Connection,
+    workspace_root: &std::path::Path,
+) -> rusqlite::Result<Vec<ConstantInfo>> {
+    let path = workspace_root.join("data").join("win32_constants.txt");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "Sprint 29 invariant: data/win32_constants.txt must be readable at {} ({e})",
+            path.display()
+        )
+    });
+    let mut out: Vec<ConstantInfo> = Vec::new();
+    let mut dup_seen = std::collections::HashSet::new();
+    for (lineno, raw_line) in raw.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Split off optional `; <dll>` trailer.
+        let (lhs, trailer) = match line.find(';') {
+            Some(i) => (line[..i].trim_end(), Some(line[i + 1..].trim().to_string())),
+            None => (line, None),
+        };
+        let Some(eq) = lhs.find('=') else {
+            panic!(
+                "Sprint 29: bad line {} in {} — missing `=`: {raw_line:?}",
+                lineno + 1,
+                path.display()
+            );
+        };
+        let name = lhs[..eq].trim().to_string();
+        let value_str = lhs[eq + 1..].trim();
+        let value = parse_constant_value(value_str).unwrap_or_else(|| {
+            panic!(
+                "Sprint 29: bad value on line {} in {} — {value_str:?} (expected dec / 0x… / negative)",
+                lineno + 1,
+                path.display()
+            )
+        });
+        if !dup_seen.insert(name.clone()) {
+            // Multiple entries with the same NAME are allowed in the
+            // curated file (e.g., MB_ICONERROR == MB_ICONSTOP == 0x10
+            // — three Win32 spellings for the same flag value), but
+            // they MUST agree on the value. The first occurrence
+            // wins in the index lookup; we already pushed it.
+            let prior = out
+                .iter()
+                .find(|c| c.name == name)
+                .expect("dup_seen membership implies a prior push");
+            assert_eq!(
+                prior.value,
+                value,
+                "Sprint 29: line {} in {} repeats {name} with value {value} but it was previously defined as {}",
+                lineno + 1,
+                path.display(),
+                prior.value
+            );
+            continue;
+        }
+        out.push(ConstantInfo {
+            name,
+            value,
+            source_dll: trailer,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse an integer literal in the curated constants file. Accepts
+/// optional `-` sign, optional `0x` / `0X` prefix for hex, decimal
+/// otherwise. Values 0..=2^32-1 (e.g. `0xFFFFFFFF` = WAIT_FAILED) are
+/// accepted as unsigned and sign-extended into i64 — the curated file
+/// expresses them as Win32 headers do (positive hex).
+fn parse_constant_value(s: &str) -> Option<i64> {
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r.trim())
+    } else {
+        (false, s)
+    };
+    let (radix, body) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        (16, r)
+    } else {
+        (10, rest)
+    };
+    // Parse as u64 first to admit 0xFFFFFFFF without overflowing i64.
+    let unsigned = u64::from_str_radix(body, radix).ok()?;
+    if neg {
+        // For negative literals, the input is the magnitude.
+        let magnitude_i64 = i64::try_from(unsigned).ok()?;
+        Some(-magnitude_i64)
+    } else {
+        // Reinterpret as i64. u64::MAX → -1 in i64 is acceptable; the
+        // sema layer marshals via i64.
+        Some(unsigned as i64)
+    }
 }
 
 fn main() {
@@ -334,7 +432,10 @@ fn main() {
         .expect("nod-winapi crate must live two levels under the workspace root");
     let db_path = workspace_root.join("data").join("windows_api.db");
 
+    let constants_path = workspace_root.join("data").join("win32_constants.txt");
+
     println!("cargo:rerun-if-changed={}", db_path.display());
+    println!("cargo:rerun-if-changed={}", constants_path.display());
     println!("cargo:rerun-if-changed=src/data_schema.rs");
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -342,7 +443,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("opening vendored windows_api.db at {}: {e}", db_path.display()));
 
     let functions = project_functions(&conn).expect("project functions");
-    let constants = project_constants(&conn).expect("project constants");
+    let constants = project_constants(&conn, workspace_root).expect("project constants");
     let mut dll_names: Vec<String> = functions.iter().map(|f| f.dll.clone()).collect();
     dll_names.sort();
     dll_names.dedup();

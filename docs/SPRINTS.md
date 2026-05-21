@@ -812,34 +812,66 @@ Sprint 28 scope is integer/pointer args/returns up to arity 8. Strings (Sprint 3
 
 Deviation from the brief's wrapper API: the `eval_expr_with_items_to_string` wrap requires a blank line between `Module:` and the first item because `scan_preamble` greedily consumes lines with continuation indents (an indented `(args)` line on a `define c-function` would otherwise get eaten). Documented inline.
 
-### Sprint 28b — `format` + `print` + `streams` (`io` library kernel)
+### Sprint 29 — Win32 constants generator (`$MB-OK`, `$WM-PAINT`, …) — landed
+Replaces magic-number FFI call sites with idiomatic named constants. `MessageBoxW(NULL, "hi", "title", $MB-OK)` and `PostMessageW(hwnd, $WM-CLOSE, 0, 0)` now resolve at lowering time without a single function-ref hop.
+
+**A. Database investigation (Phase A).** Confirmed schema v5 of `windows_api.db` carries 7,773 `enum`-kind type rows (`MESSAGEBOX_STYLE`, `WIN32_ERROR`, `SHOW_WINDOW_CMD`, …) but **NOT** their member values — no `enum_members` table, no `is_const=1` rows in `types`, no rows that reference the enum type via `target_type_id`. The upstream WinMD importer didn't project member integers into the SQLite shape. Falling back to a hand-curated source of truth: `data/win32_constants.txt`, 300 entries covering the most-used Win32 constants (MessageBox flags, window messages, window styles, ShowWindow commands, GetWindowLong offsets, standard cursors/icons, system metrics, GDI ROP codes, process/file access rights, VirtualAlloc flags, standard handles, WaitFor* returns, HRESULT codes, Win32 error codes).
+
+**B. Build-time extraction (Phase B).** `src/nod-winapi/build.rs::project_constants` now reads `data/win32_constants.txt` (parsed by a stdlib-only INI-style parser — no new dep) and emits 300 `ConstantInfo` rows into the embedded blob. Each entry carries name, i64 value (parsed from decimal or `0x…` hex, sign-extended), and optional source-DLL annotation. Duplicate names allowed only if values agree (e.g., `MB_ICONERROR == MB_ICONSTOP == 0x10` — three Win32 spellings for the same flag value). Build-time `cargo:warning` reports the actual count: `nod-winapi: 13080 functions, 300 constants, 336 dlls`.
+
+**C. `nod_winapi::iter_constants` (Phase C).** New public API surface for walking the embedded constant set. `find_constant` (Sprint 27) stays as the random-access lookup; `iter_constants` covers the generator and the regression test that locks in the 50-constant floor.
+
+**D. Generator binary (Phase D).** `src/nod-winapi/src/bin/generate_constants.rs` reads `data/win32_constants.txt` (preserving category headers so the generated Dylan file stays grouped) and emits `src/nod-dylan/dylan-sources/win32-constants.dylan` — 300 `define constant $NAME = value;` lines, with `_` → `-` transformation and `$` prefix per Dylan convention. Values < 256 emit as decimal, larger values as `#xHEX` (Dylan hex literal), negatives as signed decimal. Run via `cargo run --quiet -p nod-winapi --bin generate_constants`; idempotent against unchanged source.
+
+**E. Stdlib loader picks up `win32-constants.dylan` (Phase E).** `nod-sema/src/stdlib.rs` refactored to a multi-file `STDLIB_FILES` list. The loader parses each file, merges items into a single module, then strips `Item::DefineConstant { value: Expr::Integer(_, n) }` entries into a process-global `STDLIB_CONSTANTS: HashMap<String, i128>`. User-code lowering (`Expr::Ident` resolution in `lower.rs`) consults this map BEFORE the function-ref fallback path so `$MB-OK` becomes `ConstValue::Integer(0)` — not a `<function>` Word. The 300 constants never become functions in the stdlib JIT engine; they're pure compile-time values.
+
+**F. Sprint 28 headline test wired through a constant (Phase F).** `tests/nod-tests/tests/c_function_call.rs::flash_window_with_named_constants` evaluates `$WM-NULL + GetTickCount()` and asserts the sum is the (positive) tick count, proving `$WM-NULL` resolves to 0 in the same expression context as a real Win32 call.
+
+**G. Acceptance tests (Phase G).** New `tests/nod-tests/tests/win32_constants.rs` with 9 tests:
+- `mb_ok_resolves_to_zero` — small zero flag round-trips.
+- `wm_paint_resolves_to_15` — `0x000F` hex source surfaces as decimal `"15"`.
+- `mb_iconerror_resolves_to_16` — `0x10` round-trips.
+- `ws_overlappedwindow_is_complex_mask` — `0x00CF0000 == 13565952`, the union of OVERLAPPED|CAPTION|SYSMENU|THICKFRAME|MINIMIZEBOX|MAXIMIZEBOX.
+- `gwl_style_resolves_to_minus_16` — negative offset round-trips through the curated `-16` spelling.
+- `unknown_constant_errors_at_lower` — `$NOT-A-REAL-CONSTANT` produces `EvalError::Lower` with an `undefined ident` diagnostic.
+- `constant_usable_in_arithmetic` — `$MB-OK + $MB-ICONERROR == 16`, proving both names resolve as integers in the same expression.
+- `stdlib_constants_count_at_least_50` — locks the lower bound on coverage by inspecting `nod_sema::stdlib::constants_table()`.
+- `winapi_iter_constants_count_at_least_50` — same lower bound at the `nod-winapi` layer.
+
+Test count: **464 → 475 / 0 / 5** under `newgc-backend` default (+10 tests, including the new `flash_window_with_named_constants` in `c_function_call.rs` and 9 acceptance tests in `win32_constants.rs`). Semispace escape hatch: **461 → 472 / 0 / 5**. Clippy `--all-targets -- -D warnings` clean. 5x flake check clean.
+
+Deviation from the brief: the brief considered a TOML-formatted curated file as one option for the hand-curated set; we went with a simpler `key = value` line-based format (`data/win32_constants.txt`) so `build.rs` could parse it with no new dep. The generator binary (Rust, not Python — keeps the toolchain story to "just `cargo`") preserves category headers from the source file so the emitted Dylan stays grouped by feature area.
+
+Closes the Sprint 27 deferred entry about the upstream constants table; opens a new deferred entry about reviving enum-member type-checking (Sprint 30+) and string constants (`IID_*`, `CLSID_*` — Sprint 30+ territory).
+
+### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
-### Sprint 28c — Kernel library port: arithmetic, characters, symbols
+### Sprint 29c — Kernel library port: arithmetic, characters, symbols
 Port enough of `sources/dylan/` (`number.dylan`, `character.dylan`, `symbol.dylan`, `boolean.dylan`) that the runtime stops providing these directly and the language defines them in itself.
 
-### Sprint 29 — Dylan-side IDE bring-up: window, message pump, editor surface
+### Sprint 30 — Dylan-side IDE bring-up: window, message pump, editor surface
 First IDE sprint. **All Dylan code**, written against the Sprint 25b Windows FFI stack. Module `nod-dylan/ide-shell` registers a top-level window class, runs the message pump, hosts a single editable text pane and a REPL transcript pane. No syntax colouring yet, no menus — just "the compiler can open a window and let you type into it". Re-implements the scaffolding of `E:\opendylan\sources\environment\framework\` in Dylan.
 
-### Sprint 29b — Dylan-side inspector + dispatch visualisation
+### Sprint 30b — Dylan-side inspector + dispatch visualisation
 With the IDE shell up, port the existing `:inspect` / `:dispatch-stats` / `:classes` REPL commands into IDE panels written in Dylan. Inspector handles every kernel class. Time-travel REPL prototype.
 
-### Sprint 30 — `common-dylan` library port
+### Sprint 31 — `common-dylan` library port
 Port `byte-vector`, `simple-format`, `simple-io`, `simple-random`, `transcendentals`, `threads/`. Run `opendylan-tests/sources/common-dylan/tests/`.
 
-### Sprint 31 — Multi-threaded mutator + cooperative GC across threads
+### Sprint 32 — Multi-threaded mutator + cooperative GC across threads
 Thread-local TLABs, parking protocol, lock primitives in Dylan-side code. Run `opendylan-tests/sources/app/thread-test/`.
 
-### Sprint 32 — Library-merge optimisation (v2 candidate moved up if cheap)
+### Sprint 33 — Library-merge optimisation (v2 candidate moved up if cheap)
 DFM serialisation, cache-key extension with downstream library hashes, cross-library inlining gated on sealing. May slip to post-v1.
 
-### Sprint 33 — AOT mode — emit a standalone Windows executable
+### Sprint 34 — AOT mode — emit a standalone Windows executable
 JIT artefacts written out as a PE binary plus a shipped `nod-runtime` static lib. Cache key already covers it; mostly a packaging exercise.
 
-### Sprint 34 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
+### Sprint 35 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
 All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.
 
-### Sprint 35 — macOS port (aarch64-apple-darwin first)
+### Sprint 36 — macOS port (aarch64-apple-darwin first)
 The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 25b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.
 
 ---

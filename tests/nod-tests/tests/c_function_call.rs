@@ -243,7 +243,35 @@ end;
     }
 }
 
-// ─── 8. Unknown symbol in a real DLL → <c-ffi-error> ──────────────────────
+// ─── 8b. Sprint 29: named constants in an FFI call expression ─────────────
+//
+// Demonstrates that the Sprint 29 stdlib constants resolve in the
+// same expression context as a c-function call. `$WM-NULL` is the
+// integer 0; adding it to `GetTickCount()` must give back the tick
+// count unchanged. The test would fail (or eval-error) if
+// `$WM-NULL` was treated as a function-ref instead of an integer.
+
+#[test]
+#[serial]
+fn flash_window_with_named_constants() {
+    setup();
+    let s = eval_expr_with_items_to_string(
+        "\
+define c-function GetTickCount () => (ticks :: <c-dword>);
+  library: \"kernel32.dll\";
+end;
+",
+        "$WM-NULL + GetTickCount()",
+    )
+    .unwrap_or_else(|e| panic!("flash_window_with_named_constants eval failed: {e:?}"));
+    let n: i64 = s.parse().expect("integer");
+    assert!(
+        n > 1_000,
+        "$WM-NULL must resolve to 0 and GetTickCount must return wall-time ticks > 1s, got {n}"
+    );
+}
+
+// ─── 9. Unknown symbol in a real DLL → <c-ffi-error> ──────────────────────
 
 #[test]
 #[serial]

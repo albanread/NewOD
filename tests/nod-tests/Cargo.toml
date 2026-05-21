@@ -28,4 +28,5 @@ nod-namespace = { path = "../../src/nod-namespace" }
 nod-dfm = { path = "../../src/nod-dfm" }
 nod-sema = { path = "../../src/nod-sema", default-features = false }
 nod-runtime = { path = "../../src/nod-runtime", default-features = false }
+nod-winapi = { path = "../../src/nod-winapi" }
 serial_test = "3"

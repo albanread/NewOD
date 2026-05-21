@@ -1614,13 +1614,25 @@ done.
   the user picks. A future ergonomics pass can auto-pick `W` for
   `define c-function MessageBox(...)` if the bare name isn't
   present and a `W` variant is.
-- **:open: Constants table in the upstream DB** — Sprint 27 →
-  upstream-side fix. Sprint 27 ships with a hand-curated list of
-  ~10 well-known constants (`MB_OK`, `INVALID_HANDLE_VALUE`, …)
-  because the `windows_api.db` schema v5 doesn't model constants.
-  Future work: extend the upstream `bootstrap.py` to scan win32
-  metadata's `Constants` API container and populate a `constants`
-  table.
+- **:closed: Constants table in the upstream DB** — Sprint 27 →
+  Sprint 29 (closed via curation, not via upstream DB fix).
+  Investigation in Sprint 29 Phase A confirmed schema v5 carries
+  enum *type* declarations (7,773 `enum`-kind type rows, e.g.
+  `MESSAGEBOX_STYLE`) but the upstream WinMD importer never
+  projected member integer values into the SQLite shape — no
+  `enum_members` table, no `is_const=1` rows. Rather than fix
+  upstream, Sprint 29 ships a hand-curated `data/win32_constants.txt`
+  (300 entries: MessageBox flags, window messages/styles, ShowWindow
+  commands, GetWindowLong offsets, cursors/icons, system metrics,
+  GDI ROP codes, process/file access rights, VirtualAlloc, standard
+  handles, WaitFor* returns, HRESULT codes, Win32 error codes). The
+  build.rs reads the file, the generator binary emits
+  `src/nod-dylan/dylan-sources/win32-constants.dylan`, the stdlib
+  loader strips `Item::DefineConstant` rows into a process-global
+  `STDLIB_CONSTANTS` table, and user-code lowering resolves
+  `$MB-OK` etc. as integer literals at lowering time. Adding an
+  upstream-projection later would *augment* the curated set, not
+  replace it; the curated entries are the floor.
 - **:open: JIT-time materialization (vs. compile-time embed)** —
   Sprint 27 → much later (Sprint 33 AOT?). The Sprint 27 blob is
   embedded into `nod-winapi`'s `.rlib` at compile time. A future
@@ -1733,3 +1745,65 @@ not yet done.
   inserting a blank line. The proper fix is for the preamble scanner
   to recognise that `define` starts a Dylan source line; the scanner
   doesn't currently know any Dylan keywords. Trivial follow-up.
+
+## Carry-over from Sprint 29 (Win32 constants generator) — into Sprint 30+
+
+Sprint 29 landed 300 hand-curated Win32 integer constants surfaced
+as `$MB-OK`, `$WM-PAINT`, … and a stdlib loader path that resolves
+them at lowering time. Below is what Sprint 29 explicitly did NOT do.
+
+- **:open: Enum-member type-checking** — Sprint 29 → Sprint 30+.
+  Sprint 29 flattens every constant to a raw integer; the Win32
+  type system distinguishes `MESSAGEBOX_STYLE` from `WIN32_ERROR`,
+  but Dylan sees both as `<integer>`. A future sprint can introduce
+  an `<enum>` Dylan superclass and register `<show-window-cmd>`
+  whose members are `$SW-SHOW`, `$SW-HIDE`, … and accept that type
+  on the corresponding `c-function` parameter. The `windows_api.db`
+  schema already has the enum-type rows (`type_id=669` for
+  `MESSAGEBOX_STYLE`, etc.); the membership relation is what's
+  missing upstream, which means we'd need to extend the curated
+  file with `enum:` annotations OR extend the upstream importer.
+- **:open: String constants (`IID_*`, `CLSID_*`, registry paths)**
+  — Sprint 29 → Sprint 30+ (string-marshaling sprint). Sprint 29
+  scope is integer constants only. COM interface IIDs and registry
+  path templates are stored as string literals in the headers; they
+  need a separate `StringConstant { name, value, source_dll }` shape
+  and a marshaling path that lifts them into `<byte-string>` /
+  `<unicode-string>` Words. Postponed until c-string marshaling
+  lands.
+- **:open: Struct-shaped constants (`POINT`, `RECT`, `GUID`)** —
+  Sprint 29 → far-future struct sprint (Sprint 34?). A few Win32
+  constants are struct-shaped (`CLSID_*` GUIDs are 16-byte structs;
+  some default `RECT` constants exist in headers). These wait for
+  the by-value struct marshaling work and aren't useful before
+  then.
+- **:open: Per-DLL grouping in the generated `.dylan` file** —
+  Sprint 29 → cosmetic follow-up. The current grouping is by
+  category (MessageBox flags, window styles, …) which scans well
+  for human readers but doesn't reflect DLL ownership. A future
+  pass could emit `// kernel32.dll constants ──────` etc. headers
+  if the IDE journey wants to filter by DLL.
+- **:open: Symbolic-OR expressions on the RHS** — Sprint 29 →
+  cosmetic follow-up. `WS_OVERLAPPEDWINDOW = WS_OVERLAPPED |
+  WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX |
+  WS_MAXIMIZEBOX` is currently spelled as the precomputed hex
+  `0x00CF0000` (with the formula in a comment). A future generator
+  pass could keep the bitwise-OR expression in source and have
+  Dylan compute the value, so an edit to `WS_CAPTION` would
+  propagate automatically. Low priority — the values are stable
+  by API contract.
+- **:open: Upstream constants table** — Sprint 29 →
+  upstream-side maintenance. The pragmatic close in Sprint 29
+  (hand-curated `data/win32_constants.txt`) doesn't preclude
+  extending the upstream `bootstrap.py` to scan win32 metadata's
+  `Constants` API container and populate a `constants` table. If
+  that ships, build.rs would merge DB-extracted rows with the
+  curated set (DB wins on overlap; curated set adds anything the
+  DB doesn't carry).
+- **:open: stdlib `define constant` for non-FFI use** — Sprint 29
+  → naturally available now. The stdlib loader's
+  `Item::DefineConstant` extraction works for ANY integer constant
+  in the stdlib, not just Win32. A future sprint can add e.g.
+  `define constant $machine-epsilon = …;` to `stdlib.dylan` and it
+  reaches user code through the same path. No further plumbing
+  needed.

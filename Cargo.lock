@@ -459,6 +459,7 @@ dependencies = [
  "nod-reader",
  "nod-runtime",
  "nod-sema",
+ "nod-winapi",
  "serial_test",
 ]
 

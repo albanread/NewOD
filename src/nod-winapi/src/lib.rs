@@ -166,6 +166,13 @@ pub fn constants() -> &'static [ConstantInfo] {
     &INDEX.constants
 }
 
+/// Iterator over every embedded constant. Used by the
+/// `win32-constants.dylan` generator (Sprint 29) to walk the
+/// curated set.
+pub fn iter_constants() -> impl Iterator<Item = &'static ConstantInfo> {
+    INDEX.constants.iter()
+}
+
 /// Aggregate counts.
 pub fn stats() -> Stats {
     Stats {
