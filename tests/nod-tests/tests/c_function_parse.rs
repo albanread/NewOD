@@ -155,9 +155,10 @@ end function;
 
 #[test]
 #[serial]
-fn c_function_with_unsupported_type_still_defers() {
-    // Strings ship in Sprint 30 — a c-function declaring `<c-string>`
-    // must still produce a deferral diagnostic at the call site.
+fn c_function_with_string_arg_lowers_in_sprint30() {
+    // Sprint 30: `<c-string>` and `<c-wide-string>` are now first-class
+    // marshaled types. A c-function declaring them must lower cleanly
+    // and produce a signature with the expected arg kinds.
     let src = "\
 define c-function MessageBoxA
     (handle :: <c-handle>, text :: <c-string>, caption :: <c-string>, ty :: <c-dword>)
@@ -170,16 +171,23 @@ define function pop ()
 end function;
 ";
     let m = parse_src(src);
-    match lower_module_full(&m) {
-        Ok(_) => panic!("expected Sprint 28 deferral for unsupported c-type"),
-        Err(errs) => {
-            let msg = format!("{errs:#?}");
-            assert!(
-                msg.contains("Sprint 28") && msg.contains("MessageBoxA"),
-                "expected Sprint-28 deferral diagnostic for unsupported c-string; got:\n{msg}"
-            );
-        }
-    }
+    let lm = lower_module_full(&m).unwrap_or_else(|e| {
+        panic!("Sprint 30 string marshaling: lowering must succeed; got: {e:?}")
+    });
+    assert_eq!(lm.c_functions.len(), 1);
+    assert!(
+        lm.c_functions[0].signature.is_some(),
+        "Sprint 30 must derive a signature for MessageBoxA(handle, string, string, dword) -> int"
+    );
+    // Confirm the four arg kinds and the return kind made it through.
+    let sig = lm.c_functions[0].signature.expect("signature present");
+    assert_eq!(sig.arg_count, 4);
+    // Handle, NarrowString, NarrowString, UInt32 (from c-dword)
+    assert_eq!(sig.arg_kinds[0], nod_runtime::CArgKind::Handle as u8);
+    assert_eq!(sig.arg_kinds[1], nod_runtime::CArgKind::NarrowString as u8);
+    assert_eq!(sig.arg_kinds[2], nod_runtime::CArgKind::NarrowString as u8);
+    assert_eq!(sig.arg_kinds[3], nod_runtime::CArgKind::UInt32 as u8);
+    assert_eq!(sig.return_kind, nod_runtime::CReturnKind::Int32 as u8);
 }
 
 #[test]

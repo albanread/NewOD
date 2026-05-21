@@ -844,14 +844,53 @@ Deviation from the brief: the brief considered a TOML-formatted curated file as 
 
 Closes the Sprint 27 deferred entry about the upstream constants table; opens a new deferred entry about reviving enum-member type-checking (Sprint 30+) and string constants (`IID_*`, `CLSID_*` — Sprint 30+ territory).
 
+### Sprint 30 — FFI Phase C: `<c-string>` + `<c-wide-string>` + `$NULL` — landed
+Empirical headline: `lstrlenW("héllo") → "5"`. 'é' (U+00E9) is two UTF-8 bytes (0xC3 0xA9) but one UTF-16 code unit; only correct UTF-8 → UTF-16 transcoding produces 5. A byte-copy implementation would return 6, and any test that just checks ASCII strings would never spot the bug. The non-ASCII assertion *is* the proof that string marshaling works.
+
+**A. `TempBuf` infrastructure + per-call buffer lifetimes (Phase A).** New `enum TempBuf { Narrow(Vec<u8>), Wide(Vec<u16>) }` in `nod-runtime/src/winffi.rs`. Each arity-N trampoline (`nod_winffi_call_1` .. `nod_winffi_call_8`) now allocates `let mut temps: Vec<TempBuf> = Vec::new();` on its stack frame before the unbox phase; `unbox_arg(w, kind, &mut temps)` pushes one `TempBuf` per string arg, returns the buffer's `as_ptr() as u64`, and the `Vec` drops at end of scope — *after* the C call returns. No leaks; lifetime is exactly the call.
+
+**B. `CArgKind::NarrowString` + `CArgKind::WideString` (Phase A continued).** Two new discriminants on `#[repr(u8)] enum CArgKind` (values 12 and 13), plus `CReturnKind::NarrowString` (8) and `CReturnKind::WideString` (9). `signature_from_names` recognises `"<c-string>"` and `"<c-wide-string>"` for both arg and return positions. The receive-side path (Win32 API returns an LPCSTR/LPCWSTR — e.g. `GetCommandLineW`) scans the returned pointer to its null terminator (capped at 1MiB) and copies into a fresh Dylan `<byte-string>` via `intern_string_literal`.
+
+**C. Wide-string transcoding (Phase A continued).** Uses `s.encode_utf16().collect::<Vec<u16>>()` + push(0) — std-lib only, no new transitive deps. The narrow path is intentionally pass-through bytes (UTF-8 → LPSTR with terminator) — this matches CP_ACP on the ASCII subset and avoids pulling in `WideCharToMultiByte` for the headline test. CP_ACP conversion for non-ASCII narrow strings is a deferred polish item.
+
+**D. `$NULL` constant + null-pointer marshaling (Phase B).** New "Pointer / handle sentinels" category in `data/win32_constants.txt`: `NULL = 0`. The Sprint 29 generator picks this up, so `src/nod-dylan/dylan-sources/win32-constants.dylan` now exposes `define constant $NULL = 0;`. The marshaling change is one branch in `marshal_narrow_string` / `marshal_wide_string` / `unbox_arg`'s `Pointer|Handle` arm: a Dylan fixnum 0 → C `null` pointer. Callers can write `MessageBoxW($NULL, "hi", "title", $MB-OK)` idiomatically.
+
+**E. Stats accounting (Phase A continued).** `WinFfiStats` gains a `tempbufs_allocated_lifetime: usize` counter, bumped by `marshal_narrow_string` / `marshal_wide_string`. Useful for the per-call allocation regression test and for any future cost-watch. Reset alongside the other counters by `_reset_winffi_stats_for_tests`.
+
+**F. Sema lift of the Sprint 28 deferral (Phase C).** The Sprint 28-era `c_function_with_unsupported_type_still_defers` test is replaced by `c_function_with_string_arg_lowers_in_sprint30` in `tests/nod-tests/tests/c_function_parse.rs`: lowering a `MessageBoxA(<c-handle>, <c-string>, <c-string>, <c-dword>) => (<c-int>)` declaration now succeeds and produces an `ApiCallSignature` with arg kinds `[Handle, NarrowString, NarrowString, UInt32]` and return kind `Int32`.
+
+**G. Acceptance tests in a new file (Phase C+).** `tests/nod-tests/tests/winffi_strings.rs` — 9 value-asserting tests + 1 ignored-by-default interactive demo:
+- `lstrlen_w_returns_correct_wide_length` — `lstrlenW("hello world") → "11"`.
+- `lstrlen_w_handles_unicode_correctly` — **`lstrlenW("héllo") → "5"`** (the empirical UTF-16 proof).
+- `lstrlen_a_returns_correct_narrow_length` — `lstrlenA("hello world") → "11"`.
+- `lstrlen_a_handles_utf8_as_bytes` — `lstrlenA("café") → "5"` (5 UTF-8 bytes; proves narrow path doesn't transcode).
+- `lstrlen_w_empty_string` — `lstrlenW("") → "0"`.
+- `null_constant_evaluates_to_zero` — `$NULL → "0"`.
+- `null_pointer_via_dollar_null` — `lstrlenW($NULL) → "0"` (NULL pointer reaches the API per MSDN's documented contract).
+- `mixed_args_string_and_int` — `lstrcmpW("abc", "abc") → "0"` (two wide-string args, separate temp buffers).
+- `tempbuf_allocation_count_tracks_string_args` — two `lstrlenW` calls bump `tempbufs_allocated_lifetime` from 0 to exactly 2.
+- `message_box_w_pops_real_dialog` — **`#[ignore]`-gated** opt-in developer demo; run manually via `cargo test --test winffi_strings -- --ignored`. NOT invoked by routine `cargo test`.
+
+The brief originally suggested `IsBadStringPtrW($NULL, 10)` for the NULL-marshaling test; we substituted `lstrlenW($NULL)` because IsBadStringPtrW is deprecated and behaves unreliably on modern Windows, while `lstrlenW`'s NULL contract is documented and stable. Same shape of proof — fixnum 0 must reach the API as a real null pointer or the API would crash / return garbage instead of 0.
+
+Test count: **475 → 484 / 0 / 6** under `newgc-backend` default (+9 passing string tests; +1 ignored MessageBoxW). Clippy `--all-targets -- -D warnings` clean. 5x flake check clean. The semispace backend is no longer routinely exercised — newgc default is the only verification path now.
+
+**Out of scope for Sprint 30 (deferred):**
+- C → Dylan string returns at the headline level (basic LPCSTR/LPCWSTR scan-and-copy is wired up via `CReturnKind::NarrowString` / `WideString`, but the out-buffer pattern — caller-allocated buffer + length, e.g. `GetWindowTextW(hwnd, buf, len)` — needs a separate sprint).
+- CP_ACP encoding conversion for `<c-string>` (currently pass-through UTF-8 bytes).
+- True wide-character Dylan-side storage (`<unicode-string>` Dylan class for UTF-16 payloads — currently we transcode at the boundary).
+- BSTR / OLEStr handling (Sprint 35 — COM territory).
+
+Sprint 30's "Dylan-side IDE bring-up" slot from the prior plan shifts forward; the FFI Phase C string-marshaling work moves into the Sprint 30 slot, and the IDE work tracks behind the Sprint 31 (`common-dylan` port) entry as Sprint 32+. Renumbering of downstream slots is deferred to the next sprint-plan review.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
 ### Sprint 29c — Kernel library port: arithmetic, characters, symbols
 Port enough of `sources/dylan/` (`number.dylan`, `character.dylan`, `symbol.dylan`, `boolean.dylan`) that the runtime stops providing these directly and the language defines them in itself.
 
-### Sprint 30 — Dylan-side IDE bring-up: window, message pump, editor surface
-First IDE sprint. **All Dylan code**, written against the Sprint 25b Windows FFI stack. Module `nod-dylan/ide-shell` registers a top-level window class, runs the message pump, hosts a single editable text pane and a REPL transcript pane. No syntax colouring yet, no menus — just "the compiler can open a window and let you type into it". Re-implements the scaffolding of `E:\opendylan\sources\environment\framework\` in Dylan.
+### Sprint 30 (planned, slipped) — Dylan-side IDE bring-up: window, message pump, editor surface
+**Slipped:** the Sprint 30 slot was reclaimed by FFI Phase C (string marshaling — see "Sprint 30 — FFI Phase C" above). This IDE-bring-up plan stays on the roadmap and runs after Sprint 31's `common-dylan` port. First IDE sprint. **All Dylan code**, written against the Sprint 25b Windows FFI stack. Module `nod-dylan/ide-shell` registers a top-level window class, runs the message pump, hosts a single editable text pane and a REPL transcript pane. No syntax colouring yet, no menus — just "the compiler can open a window and let you type into it". Re-implements the scaffolding of `E:\opendylan\sources\environment\framework\` in Dylan.
 
 ### Sprint 30b — Dylan-side inspector + dispatch visualisation
 With the IDE shell up, port the existing `:inspect` / `:dispatch-stats` / `:classes` REPL commands into IDE panels written in Dylan. Inspector handles every kernel class. Time-travel REPL prototype.

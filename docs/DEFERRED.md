@@ -1663,14 +1663,18 @@ deduplicated per-module API stub table. The Phase-B subset is
 integer + pointer args/returns up to arity 8. Everything below is
 not yet done.
 
-- **:open: String marshaling (`<c-string>` / `<c-wide-string>`)** —
-  Sprint 28 → Sprint 30. The c-type *names* exist (Sprint 27); the
-  signature builder in `nod-runtime/src/winffi.rs::CArgKind::from_c_type_name`
-  returns `None` for them. The deferral diagnostic
-  `c_function_with_unsupported_type_still_defers` covers this. Sprint
-  30 adds (a) a `<byte-string>` ↔ `LPSTR` shim, (b) a `<unicode-string>`
-  ↔ `LPWSTR` shim that also un-blocks `MessageBoxW` / `CreateFileW`,
-  and (c) the optional `set-last-error: #t` plumbing.
+- **:closed: String marshaling (`<c-string>` / `<c-wide-string>`)** —
+  Sprint 28 → Sprint 30. **Landed Sprint 30.** Both `CArgKind::NarrowString`
+  (`<c-string>` ↔ LPSTR/LPCSTR, pass-through UTF-8 + null terminator)
+  and `CArgKind::WideString` (`<c-wide-string>` ↔ LPWSTR/LPCWSTR,
+  `String::encode_utf16().collect::<Vec<u16>>()` + null u16) are
+  marshaled via per-call `Vec<TempBuf>` buffers that drop at end of
+  scope. Return-side symmetric `CReturnKind::NarrowString` / `WideString`
+  scan the returned LPCSTR/LPCWSTR to its null terminator and copy
+  into a fresh Dylan `<byte-string>` via `intern_string_literal`.
+  Empirical proof: `lstrlenW("héllo") → "5"` (correct UTF-16
+  transcoding, not byte-copy). The `set-last-error: #t` ergonomic
+  plumbing remains deferred (see below).
 - **:open: PLT-style lazy resolution** — Sprint 28 → Sprint 38+.
   Sprint 28's `initialize_module_winffi` is eager: every entry in
   the per-module stub table is resolved at JIT-finalize. A lazy
@@ -1699,11 +1703,12 @@ not yet done.
   positions (no register-class shuffling), so this is more about
   argument-counting in the lowerer than ABI gymnastics.
 - **:open: Auto-raise on Win32 failure (`set-last-error: #t`)** —
-  Sprint 28 → Sprint 30. The trampolines return whatever the API
-  returned; the Dylan caller checks against 0 / -1 manually and
-  calls `GetLastError` if needed. A future ergonomic mode would
-  auto-raise `<win32-error>` when the API returns the documented
-  failure sentinel.
+  Sprint 28 → Sprint 30 → Sprint 31+. Sprint 30 (string marshaling)
+  deliberately deferred this ergonomic addition; the trampolines
+  still return whatever the API returned, the Dylan caller checks
+  against 0 / -1 manually and calls `GetLastError` if needed. A
+  future ergonomic mode auto-raises `<win32-error>` when the API
+  returns the documented failure sentinel.
 - **:open: Multi-value c-function returns** — Sprint 28 → later FFI
   sprint. The Sprint 28 signature builder bails out (`signature_ok =
   false`) on `=> (a, b)` returns. Out-parameter returns are the
@@ -1807,3 +1812,92 @@ them at lowering time. Below is what Sprint 29 explicitly did NOT do.
   `define constant $machine-epsilon = …;` to `stdlib.dylan` and it
   reaches user code through the same path. No further plumbing
   needed.
+
+## Carry-over from Sprint 30 (FFI Phase C — string marshaling) — into Sprint 31+
+
+Sprint 30 landed the Dylan-side → C-side string path (`<c-string>`,
+`<c-wide-string>`) plus the `$NULL` null-pointer literal. Headline
+`lstrlenW("héllo") → 5` proves the UTF-8 → UTF-16 transcoding is
+real. Below is what Sprint 30 explicitly did NOT do.
+
+- **:open: C → Dylan string return at the headline level
+  (out-buffer pattern)** — Sprint 30 → Sprint 31+. The receive-side
+  `CReturnKind::NarrowString` / `WideString` paths exist and the
+  scan-and-copy machinery (`scan_cstr_bytes`, `scan_wcstr_units`) is
+  wired through `box_return`. But the canonical Win32 idiom for
+  returning text is the OUT-BUFFER pattern — the caller allocates a
+  buffer, passes it as `LPWSTR buf` plus an `int cchBuf` length, and
+  the callee writes through the pointer (`GetWindowTextW`,
+  `GetModuleFileNameW`, `FormatMessageW`). That needs (a) a
+  `<c-pointer-to> (<c-byte>)` or `<c-mutable-string>` parameter type
+  that signals "caller-owned writable buffer", (b) a way for Dylan
+  code to materialise such a buffer (heap allocation + raw pointer
+  handoff), and (c) a way to coerce the post-call buffer back into
+  a Dylan `<byte-string>`. The simplest first step is a
+  `<c-pointer-to> (<c-byte>)` parametric pointer class (deferred
+  from Sprint 27).
+- **:open: CP_ACP encoding conversion for `<c-string>`** — Sprint
+  30 → cosmetic polish. Sprint 30's narrow-string path is
+  pass-through UTF-8 bytes + null terminator. For ASCII strings
+  this matches CP_ACP exactly (every ANSI codepage agrees with
+  ASCII on `0..0x7F`). For non-ASCII narrow strings on a non-UTF-8
+  codepage host (most modern Windows installs still default
+  CP_ACP to CP1252, not CP_UTF8) the bytes are passed verbatim —
+  a Win32 API will read them as Windows-1252 / Shift-JIS / etc.
+  per the system codepage, NOT as UTF-8. For Sprint 30's headline
+  tests (ASCII inputs) this never bites; the right fix when it
+  does is to call `WideCharToMultiByte(CP_ACP, …)` in
+  `marshal_narrow_string` after a transient UTF-8 → UTF-16 step.
+  Defer until a real non-ASCII narrow-string call site bites.
+- **:open: True `<unicode-string>` Dylan class for UTF-16 storage** —
+  Sprint 10 → Sprint 27 → Sprint 30 → Sprint 31+. Currently
+  Sprint 30 transcodes UTF-8 ↔ UTF-16 at the FFI boundary. Dylan
+  code holds strings as UTF-8 `<byte-string>`. A genuine
+  `<unicode-string>` (UTF-16 payload, surrogate-pair aware,
+  separate class wrapper) lets Dylan code work in UTF-16 natively
+  for tasks where the boundary cost is real (e.g. building a long
+  text buffer for an IDE editor pane). Out of scope until the IDE
+  shell sprint exposes the pain.
+- **:open: BSTR / `SysAllocString` interop** — Sprint 30 → Sprint
+  35 (COM). BSTRs are length-prefixed UTF-16 buffers owned by
+  `OleAut32.dll`. Needed for COM `BSTR` parameters / returns.
+  Sprint 35 territory.
+- **:open: MessageBoxW as a routine acceptance test** — Sprint 30
+  → permanent design choice. The Sprint 30 MessageBoxW test
+  exists in `tests/nod-tests/tests/winffi_strings.rs` but is
+  `#[ignore]`-gated to prevent UI side effects during routine
+  `cargo test`. Promotion to a routine test would require a
+  headless / mock Win32 layer (or running the suite under a
+  service account that auto-dismisses dialogs). Neither is worth
+  doing — the value-asserting tests (`lstrlenW("héllo") → 5`,
+  `lstrcmpW("abc", "abc") → 0`, etc.) prove the marshaling, and
+  MessageBoxW is just the demo. The `#[ignore]` gate is permanent;
+  developers run it manually with `cargo test --test winffi_strings
+  -- --ignored` when they want to see the dialog pop.
+- **:open: 1MiB cap on returned-string scan length** — Sprint 30
+  → cosmetic. `scan_cstr_bytes` and `scan_wcstr_units` cap their
+  scan at 1MiB worth of bytes / u16s to guard against an
+  unterminated string from a buggy API. For real Win32 APIs this
+  is wildly generous; for malicious / fuzzing scenarios it's a
+  bound but not a strong one. A configurable cap or a per-call
+  hint argument is a future ergonomic.
+- **:open: u64 string-pointer fits** — Sprint 30 → minor follow-up.
+  When a `<c-string>` / `<c-wide-string>` is returned, the
+  underlying pointer is read as `*const u8` / `*const u16`. On a
+  64-bit Win64 host this is always 64-bit; no truncation. But the
+  fixnum-0 NULL marshaling assumes 0 is a valid sentinel for an
+  honest pointer that happens to be address 0 — true in practice
+  on Windows (the first 64KB is non-mappable), worth a note here.
+- **:open: Error propagation from a failed `marshal_*` call** —
+  Sprint 30 → minor. The current marshalers panic on a Word that
+  doesn't carry a `<byte-string>` payload. Sema is responsible
+  for type-checking before lowering, so this *should* be
+  unreachable; but a Sprint 30+ sema-bypass primitive (e.g.
+  `%winffi-raw-call`) would need to raise a `<c-ffi-error>`
+  instead of panic.
+- **:open: Reusable per-call buffer pool** — Sprint 30 →
+  performance follow-up. Every string arg allocates a `Vec<u8>`
+  / `Vec<u16>` per call. A thread-local arena that reuses the
+  same backing storage across calls (truncating at end of call)
+  would avoid the allocator hit. Not worth doing until profiling
+  flags it.

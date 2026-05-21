@@ -19,6 +19,12 @@
 # Win32 spelling; the generator transforms it into `$UPPER-SNAKE-CASE`
 # at emit time (Dylan convention: $-prefixed constant, `-` separated).
 
+# category: Pointer / handle sentinels
+# `$NULL` marshals as the zero pointer through the FFI layer — passing
+# it as a `<c-pointer>`, `<c-handle>`, `<c-string>`, or
+# `<c-wide-string>` arg produces a null pointer at the C call site.
+NULL = 0
+
 # category: MessageBox flags (user32) — buttons
 MB_OK = 0x0000  ; user32.dll
 MB_OKCANCEL = 0x0001  ; user32.dll

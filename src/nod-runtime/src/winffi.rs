@@ -1,4 +1,4 @@
-//! Sprint 28 — per-module API stub tables + Win64 marshaling
+//! Sprint 28–30 — per-module API stub tables + Win64 marshaling
 //! trampolines for `define c-function` calls.
 //!
 //! ## Architecture (from the Sprint 28 brief)
@@ -27,13 +27,28 @@
 //! - Pointer/handle args/returns: `<c-pointer>`, `<c-handle>`.
 //! - Up to **8 args per call** (Win64: RCX/RDX/R8/R9 + 4 stack slots).
 //!
+//! ## Sprint 30 additions
+//!
+//! - String args: `<c-string>` (narrow, UTF-8 byte sequence + null
+//!   terminator, used as LPSTR/LPCSTR) and `<c-wide-string>` (wide,
+//!   UTF-16LE + null u16, used as LPWSTR/LPCWSTR). Each call allocates
+//!   per-arg [`TempBuf`]s that live for the duration of the call only.
+//! - String returns: a returned `LPCSTR` or `LPCWSTR` (e.g. from
+//!   `GetCommandLineW`) is scanned to its null terminator and copied
+//!   into a fresh Dylan `<byte-string>`.
+//! - NULL pointer: a fixnum `0` in a pointer / handle / string position
+//!   marshals to a null pointer. The `$NULL` Dylan constant is just
+//!   `0`, so `MessageBoxW($NULL, ...)` works.
+//!
 //! Out of scope (later sprints):
 //!
-//! - Strings (Sprint 30): no `<c-string>` / `<c-wide-string>` marshalling.
-//! - Structs by value (Sprint 34).
+//! - Structs by value (Sprint 34) and out-buffer string patterns like
+//!   `GetWindowTextW(hwnd, buf, len)` — Sprint 34 territory.
 //! - Callbacks / function pointers (Sprint 33).
-//! - COM interfaces (Sprint 35).
+//! - COM interfaces / BSTR (Sprint 35).
 //! - Variadics, structured `GetLastError`, auto-raise on failure.
+//! - Full CP_ACP conversion for non-ASCII narrow strings (deferred —
+//!   ASCII subset suffices for Sprint 30's tests).
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -72,6 +87,16 @@ pub enum CArgKind {
     /// [`CArgKind::Pointer`]; kept distinct so error messages /
     /// diagnostics can surface the source type.
     Handle = 11,
+    /// Sprint 30: narrow string (`<c-string>` → LPSTR/LPCSTR). The
+    /// trampoline copies the Dylan `<byte-string>`'s bytes, appends a
+    /// null terminator, and passes a pointer to the resulting
+    /// process-stable temp buffer. The temp buffer is freed when the
+    /// trampoline returns.
+    NarrowString = 12,
+    /// Sprint 30: wide string (`<c-wide-string>` → LPWSTR/LPCWSTR).
+    /// The trampoline converts the Dylan `<byte-string>` from UTF-8 to
+    /// UTF-16LE, appends a null u16, and passes the resulting pointer.
+    WideString = 13,
 }
 
 impl CArgKind {
@@ -89,6 +114,8 @@ impl CArgKind {
             9 => CArgKind::Bool32,
             10 => CArgKind::Pointer,
             11 => CArgKind::Handle,
+            12 => CArgKind::NarrowString,
+            13 => CArgKind::WideString,
             _ => panic!("nod-runtime/winffi: unknown CArgKind byte {b}"),
         }
     }
@@ -113,6 +140,8 @@ impl CArgKind {
             "<c-word>" => CArgKind::Int64,
             "<c-pointer>" => CArgKind::Pointer,
             "<c-handle>" => CArgKind::Handle,
+            "<c-string>" => CArgKind::NarrowString,
+            "<c-wide-string>" => CArgKind::WideString,
             _ => return None,
         })
     }
@@ -133,6 +162,17 @@ pub enum CReturnKind {
     Bool32 = 5,
     Pointer = 6,
     Handle = 7,
+    /// Sprint 30: narrow string return (`<c-string>` returned from a
+    /// Win32 API that yields LPCSTR — e.g. `lstrcatA` returns the
+    /// destination pointer). The trampoline scans the returned pointer
+    /// to its null terminator and copies the bytes into a fresh Dylan
+    /// `<byte-string>`.
+    NarrowString = 8,
+    /// Sprint 30: wide string return (`<c-wide-string>` returned from a
+    /// Win32 API yielding LPCWSTR — e.g. `GetCommandLineW`). Scanned to
+    /// the null u16, UTF-16 → UTF-8 converted, copied into a fresh
+    /// Dylan `<byte-string>`.
+    WideString = 9,
 }
 
 impl CReturnKind {
@@ -146,6 +186,8 @@ impl CReturnKind {
             5 => CReturnKind::Bool32,
             6 => CReturnKind::Pointer,
             7 => CReturnKind::Handle,
+            8 => CReturnKind::NarrowString,
+            9 => CReturnKind::WideString,
             _ => panic!("nod-runtime/winffi: unknown CReturnKind byte {b}"),
         }
     }
@@ -165,6 +207,8 @@ impl CReturnKind {
             "<c-word>" => CReturnKind::Int64,
             "<c-pointer>" => CReturnKind::Pointer,
             "<c-handle>" => CReturnKind::Handle,
+            "<c-string>" => CReturnKind::NarrowString,
+            "<c-wide-string>" => CReturnKind::WideString,
             _ => return None,
         })
     }
@@ -310,11 +354,18 @@ pub struct WinFfiStats {
     /// JIT session, eager init) we typically have `entries ==
     /// total_resolved == unique_symbols`.
     pub unique_symbols: usize,
+    /// Sprint 30: cumulative count of [`TempBuf`] allocations made by
+    /// the marshaling trampolines. Each `<c-string>` / `<c-wide-string>`
+    /// arg in a Win32 call bumps this counter. Useful for tracking
+    /// per-call allocation overhead and for the Sprint 30 acceptance
+    /// reporting; the buffer itself is freed at end of call (Vec drop).
+    pub tempbufs_allocated_lifetime: usize,
 }
 
 static STAT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 static STAT_RESOLVED: AtomicUsize = AtomicUsize::new(0);
 static STAT_UNIQUE: AtomicUsize = AtomicUsize::new(0);
+static STAT_TEMPBUFS: AtomicUsize = AtomicUsize::new(0);
 
 static UNIQUE_KEYS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
@@ -323,12 +374,14 @@ fn unique_keys() -> &'static Mutex<std::collections::HashSet<String>> {
 }
 
 /// Snapshot the WinFFI stats counters. Used by the
-/// `api_stub_table_deduplicates_call_sites` acceptance test.
+/// `api_stub_table_deduplicates_call_sites` acceptance test and the
+/// Sprint 30 tempbuf accounting tests.
 pub fn winffi_stats() -> WinFfiStats {
     WinFfiStats {
         entries: STAT_ENTRIES.load(Ordering::Relaxed),
         total_resolved: STAT_RESOLVED.load(Ordering::Relaxed),
         unique_symbols: STAT_UNIQUE.load(Ordering::Relaxed),
+        tempbufs_allocated_lifetime: STAT_TEMPBUFS.load(Ordering::Relaxed),
     }
 }
 
@@ -337,6 +390,7 @@ pub fn _reset_winffi_stats_for_tests() {
     STAT_ENTRIES.store(0, Ordering::Relaxed);
     STAT_RESOLVED.store(0, Ordering::Relaxed);
     STAT_UNIQUE.store(0, Ordering::Relaxed);
+    STAT_TEMPBUFS.store(0, Ordering::Relaxed);
     if let Some(m) = UNIQUE_KEYS.get() {
         m.lock().expect("unique_keys poisoned").clear();
     }
@@ -612,16 +666,126 @@ pub fn allocate_stub_table(specs: &[StubEntrySpec]) -> (&'static ApiStubTable, V
 
 // ─── Win64 marshaling helpers ─────────────────────────────────────────────
 
+/// Per-call temporary buffer holding marshaled bytes for a single
+/// `<c-string>` or `<c-wide-string>` argument. The trampoline allocates
+/// one of these per string arg, pushes it into a local `Vec<TempBuf>`,
+/// hands its `as_ptr()` to the C call, and the Vec drops at end of
+/// scope — freeing every TempBuf's heap storage exactly when the C
+/// call returns.
+///
+/// Lifetime rule: `as_ptr()` is valid only while `self` (and the owning
+/// `Vec<TempBuf>`) lives. The trampoline structure guarantees this by
+/// holding the `Vec` in a stack-local across the C call.
+#[derive(Debug)]
+enum TempBuf {
+    /// Null-terminated UTF-8 bytes for an LPSTR/LPCSTR arg. For Sprint
+    /// 30 the bytes are the raw Dylan `<byte-string>` payload plus a
+    /// trailing 0; this matches CP_ACP only on the ASCII subset, but
+    /// every Sprint 30 acceptance test stays ASCII for the narrow path.
+    /// Full CP_ACP conversion (`WideCharToMultiByte`) is deferred.
+    Narrow(Vec<u8>),
+    /// Null-terminated UTF-16LE u16s for an LPWSTR/LPCWSTR arg. Built
+    /// via `str::encode_utf16().collect::<Vec<u16>>()` + push(0).
+    Wide(Vec<u16>),
+}
+
+impl TempBuf {
+    /// Pointer to the first byte/u16 of the buffer, suitable for
+    /// passing to a Win32 API expecting LPSTR / LPCSTR / LPWSTR /
+    /// LPCWSTR.
+    ///
+    /// Sprint 30 currently captures the pointer at allocation time in
+    /// `marshal_narrow_string` / `marshal_wide_string` (saving a match
+    /// in the hot path), but the accessor is retained for future
+    /// out-buffer codepaths (Sprint 34) that will need to address the
+    /// payload after the trampoline returns.
+    #[allow(dead_code)]
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            TempBuf::Narrow(b) => b.as_ptr(),
+            TempBuf::Wide(w) => w.as_ptr() as *const u8,
+        }
+    }
+}
+
+/// Build a narrow `TempBuf` from a Dylan `<byte-string>` Word. The
+/// resulting buffer is the raw bytes followed by a single null
+/// terminator. Pushes onto `temps` and bumps `STAT_TEMPBUFS`.
+///
+/// Returns the resulting pointer as a `u64` ready for the Win64 ABI.
+fn marshal_narrow_string(w: Word, temps: &mut Vec<TempBuf>) -> u64 {
+    // NULL pointer: fixnum 0 → null pointer. Matches the
+    // documented `$NULL = 0` convention.
+    if let Some(0) = w.as_fixnum() {
+        return 0;
+    }
+    let s = read_dylan_byte_string(w);
+    let mut bytes = Vec::with_capacity(s.len() + 1);
+    bytes.extend_from_slice(s.as_bytes());
+    bytes.push(0);
+    let p = bytes.as_ptr() as u64;
+    temps.push(TempBuf::Narrow(bytes));
+    STAT_TEMPBUFS.fetch_add(1, Ordering::Relaxed);
+    p
+}
+
+/// Build a wide `TempBuf` from a Dylan `<byte-string>` Word — decoding
+/// the source UTF-8 to UTF-16LE and appending a null u16 terminator.
+fn marshal_wide_string(w: Word, temps: &mut Vec<TempBuf>) -> u64 {
+    if let Some(0) = w.as_fixnum() {
+        return 0;
+    }
+    let s = read_dylan_byte_string(w);
+    let mut units: Vec<u16> = s.encode_utf16().collect();
+    units.push(0);
+    let p = units.as_ptr() as u64;
+    temps.push(TempBuf::Wide(units));
+    STAT_TEMPBUFS.fetch_add(1, Ordering::Relaxed);
+    p
+}
+
+/// Read the bytes of a Dylan `<byte-string>` Word as `&str`. Panics if
+/// the Word isn't a `<byte-string>` (the sema layer enforces the type
+/// before lowering the call).
+fn read_dylan_byte_string(w: Word) -> String {
+    // SAFETY: the Word is type-checked by sema as a `<byte-string>`
+    // (the only Dylan-side representation of `<c-string>` /
+    // `<c-wide-string>` literals in Sprint 30). We resolve the
+    // wrapper class against the global BYTE_STRING constant and
+    // panic on mismatch so a sema-level bug surfaces loudly rather
+    // than silently passing random bytes to a Win32 API.
+    let Some(bs) = (unsafe {
+        crate::try_byte_string(w, crate::ClassId::BYTE_STRING)
+    }) else {
+        panic!(
+            "winffi: expected Dylan `<byte-string>` for a string-typed arg; got raw Word {:#x}",
+            w.raw()
+        );
+    };
+    // SAFETY: `bs` points at the live allocation; `bytes()` returns
+    // borrowed inline payload. Copy into an owned String so the
+    // borrow ends before we touch the heap again.
+    let bytes = unsafe { bs.bytes() };
+    // The Dylan source-text path produces UTF-8, but if a future
+    // code path produces invalid UTF-8 we surface lossy text — the
+    // C API can't handle non-UTF-8 narrow input meaningfully anyway.
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// Unbox one Dylan-side arg Word according to its `kind` to a `u64`
 /// suitable for the Win64 register/stack-slot ABI. Integers are
 /// sign- or zero-extended to 64 bits as required.
 ///
+/// String kinds (`NarrowString`, `WideString`) push a [`TempBuf`] into
+/// `temps`; the returned u64 is the pointer to that buffer. `temps`
+/// MUST outlive the C call (the caller holds it on its stack frame).
+///
 /// # Panics
-/// On kinds outside the Sprint 28 supported set, or on a Word that
-/// doesn't carry the expected payload (e.g. a non-fixnum for an
-/// integer kind). The Sema layer is responsible for type-checking
-/// before emitting the WinFfiCall.
-fn unbox_arg(w: Word, kind: u8) -> u64 {
+/// On a Word that doesn't carry the expected payload (e.g. a non-fixnum
+/// for an integer kind, or a non-`<byte-string>` for a string kind).
+/// The Sema layer is responsible for type-checking before emitting the
+/// WinFfiCall.
+fn unbox_arg(w: Word, kind: u8, temps: &mut Vec<TempBuf>) -> u64 {
     let k = CArgKind::from_u8(kind);
     match k {
         CArgKind::Void => 0,
@@ -664,7 +828,7 @@ fn unbox_arg(w: Word, kind: u8) -> u64 {
         }
         CArgKind::Pointer | CArgKind::Handle => {
             // Pointer payloads: a Dylan fixnum is treated as a raw
-            // numeric handle (so callers can pass e.g. `null` as 0).
+            // numeric handle (so callers can pass e.g. `$NULL` = 0).
             // A pointer-tagged Word carries an 8-byte-aligned address;
             // we strip the tag bit and pass the raw address.
             if let Some(n) = w.as_fixnum() {
@@ -675,6 +839,8 @@ fn unbox_arg(w: Word, kind: u8) -> u64 {
                 0
             }
         }
+        CArgKind::NarrowString => marshal_narrow_string(w, temps),
+        CArgKind::WideString => marshal_wide_string(w, temps),
     }
 }
 
@@ -719,7 +885,88 @@ fn box_return(raw: u64, kind: u8) -> Word {
             // `as i64` reinterprets the bit pattern.
             Word::fixnum_unchecked(raw as i64)
         }
+        CReturnKind::NarrowString => {
+            // Sprint 30: API returned an LPCSTR pointer to a
+            // process-owned (often static) UTF-8/ANSI byte run. Scan
+            // to the null terminator and copy into a fresh Dylan
+            // `<byte-string>`. NULL → empty Dylan string (the formatter
+            // surfaces it as `""`).
+            if raw == 0 {
+                return crate::intern_string_literal("");
+            }
+            // SAFETY: `raw` is a pointer into process-stable memory
+            // (per the Win32 API's contract — e.g. lstrcatA returns
+            // its destination buffer). Bound the scan at 1MiB to
+            // protect against unterminated strings from a buggy API.
+            let bytes = unsafe { scan_cstr_bytes(raw as *const u8, 1 << 20) };
+            let s = String::from_utf8_lossy(bytes).into_owned();
+            crate::intern_string_literal(&s)
+        }
+        CReturnKind::WideString => {
+            // Sprint 30: API returned an LPCWSTR pointer (e.g.
+            // GetCommandLineW). Scan to the null u16, convert
+            // UTF-16LE → UTF-8 (lossy on any unpaired surrogates),
+            // and allocate a Dylan `<byte-string>`.
+            if raw == 0 {
+                return crate::intern_string_literal("");
+            }
+            // SAFETY: same as the narrow path — bound the scan at
+            // 1MiB worth of u16s.
+            let units = unsafe { scan_wcstr_units(raw as *const u16, 1 << 20) };
+            let s = String::from_utf16_lossy(&units);
+            crate::intern_string_literal(&s)
+        }
     }
+}
+
+/// Read bytes from `ptr` until a null terminator, capping at `max`
+/// bytes. Returns a borrowed slice into the input memory — the caller
+/// must not mutate the underlying region during the borrow.
+///
+/// # Safety
+/// `ptr` must point at a readable region of at least `max` bytes (or be
+/// null — in which case caller already handled the early-exit). The
+/// returned slice's lifetime is tied to `ptr`'s validity.
+unsafe fn scan_cstr_bytes<'a>(ptr: *const u8, max: usize) -> &'a [u8] {
+    if ptr.is_null() {
+        return &[];
+    }
+    let mut len = 0usize;
+    while len < max {
+        // SAFETY: caller's invariant — readable for `max` bytes.
+        let b = unsafe { *ptr.add(len) };
+        if b == 0 {
+            break;
+        }
+        len += 1;
+    }
+    // SAFETY: ditto; len is bounded by max.
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// Read u16s from `ptr` until a null u16, capping at `max` units.
+/// Returns an owned `Vec<u16>` because UTF-16 decoding requires owned
+/// data on the caller side anyway (`String::from_utf16_lossy(&[u16])`).
+///
+/// # Safety
+/// `ptr` must point at a readable region of at least `max` u16s (or be
+/// null).
+unsafe fn scan_wcstr_units(ptr: *const u16, max: usize) -> Vec<u16> {
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut len = 0usize;
+    while len < max {
+        // SAFETY: caller's invariant.
+        let u = unsafe { *ptr.add(len) };
+        if u == 0 {
+            break;
+        }
+        out.push(u);
+        len += 1;
+    }
+    out
 }
 
 /// Common prelude for all trampolines: load the resolved function
@@ -773,13 +1020,18 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_0(entry: u64) -> u64 {
     // SAFETY: `entry` is the static-area pointer the codegen baked.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 0);
+    // Arity 0 has no string args; the empty Vec<TempBuf> incurs no
+    // allocation. Kept here for symmetry with N>0 trampolines.
+    let _temps: Vec<TempBuf> = Vec::new();
     // SAFETY: by sema invariant, sig.return_kind matches the actual
     // function's return shape, and arity 0 means no args.
     let raw = unsafe {
         let f: extern "system" fn() -> u64 = std::mem::transmute(fn_ptr);
         f()
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(_temps);
+    boxed
 }
 
 // Concat-paste meta-variable expressions aren't stable on the workspace
@@ -794,13 +1046,16 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_1(entry: u64, a0: u64) -> u64 {
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 1);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
     // SAFETY: sema-validated; Win64 ABI for one 64-bit arg.
     let raw = unsafe {
         let f: extern "system" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
         f(c0)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 2-arg trampoline.
@@ -812,14 +1067,17 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_2(entry: u64, a0: u64, a1: u64) 
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 2);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
     // SAFETY: sema-validated; two-arg Win64 ABI.
     let raw = unsafe {
         let f: extern "system" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
         f(c0, c1)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 3-arg trampoline.
@@ -836,15 +1094,18 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_3(
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 3);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
-    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
     // SAFETY: sema-validated; three-arg Win64 ABI.
     let raw = unsafe {
         let f: extern "system" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
         f(c0, c1, c2)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 4-arg trampoline.
@@ -862,16 +1123,19 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_4(
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 4);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
-    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2]);
-    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
     // SAFETY: sema-validated; four-arg Win64 ABI.
     let raw = unsafe {
         let f: extern "system" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
         f(c0, c1, c2, c3)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 5-arg trampoline.
@@ -890,11 +1154,12 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_5(
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 5);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
-    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2]);
-    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3]);
-    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
     // SAFETY: sema-validated; five-arg Win64 ABI (RCX/RDX/R8/R9 +
     // one stack slot above shadow space).
     let raw = unsafe {
@@ -902,7 +1167,9 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_5(
             std::mem::transmute(fn_ptr);
         f(c0, c1, c2, c3, c4)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 6-arg trampoline.
@@ -922,19 +1189,22 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_6(
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 6);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
-    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2]);
-    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3]);
-    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4]);
-    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
     // SAFETY: sema-validated; six-arg Win64 ABI.
     let raw = unsafe {
         let f: extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
             std::mem::transmute(fn_ptr);
         f(c0, c1, c2, c3, c4, c5)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 7-arg trampoline.
@@ -955,20 +1225,23 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_7(
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 7);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
-    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2]);
-    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3]);
-    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4]);
-    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5]);
-    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
+    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6], &mut temps);
     // SAFETY: sema-validated; seven-arg Win64 ABI.
     let raw = unsafe {
         let f: extern "system" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
             std::mem::transmute(fn_ptr);
         f(c0, c1, c2, c3, c4, c5, c6)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 /// 8-arg trampoline — the Sprint 28 max.
@@ -990,21 +1263,24 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_8(
     // SAFETY: `entry` is the baked static-area pointer.
     let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
     debug_assert_eq!(sig.arg_count, 8);
-    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0]);
-    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1]);
-    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2]);
-    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3]);
-    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4]);
-    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5]);
-    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6]);
-    let c7 = unbox_arg(Word::from_raw(a7), sig.arg_kinds[7]);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
+    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6], &mut temps);
+    let c7 = unbox_arg(Word::from_raw(a7), sig.arg_kinds[7], &mut temps);
     // SAFETY: sema-validated; eight-arg Win64 ABI.
     let raw = unsafe {
         let f: extern "system" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
             std::mem::transmute(fn_ptr);
         f(c0, c1, c2, c3, c4, c5, c6, c7)
     };
-    box_return(raw, sig.return_kind).raw()
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
 }
 
 // ─── Sema helper: signature from c-type names ─────────────────────────────

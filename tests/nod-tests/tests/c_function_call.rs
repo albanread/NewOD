@@ -295,3 +295,10 @@ end;
         Err(other) => panic!("expected WinFfiInit, got {other:?}"),
     }
 }
+
+// Sprint 30 string-marshaling acceptance tests live in their own file
+// (`tests/nod-tests/tests/winffi_strings.rs`) so the routine
+// `cargo test` run stays free of UI side effects — MessageBoxW lives
+// there as an `#[ignore]`-gated developer demo, while the
+// value-asserting headline (`lstrlenW("héllo") -> 5`) and friends
+// run by default.

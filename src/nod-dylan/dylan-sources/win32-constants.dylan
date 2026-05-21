@@ -1,7 +1,7 @@
 Module: dylan
 Author: NewOpenDylan Sprint 29 — generated bindings, do not edit by hand.
 
-// Sprint 29 — Win32 integer constants (300 total).
+// Sprint 29 — Win32 integer constants (301 total).
 //
 // Regenerate via:
 //     cargo run --quiet -p nod-winapi --bin generate_constants
@@ -14,6 +14,10 @@ Author: NewOpenDylan Sprint 29 — generated bindings, do not edit by hand.
 // table can add a DB-extraction pass to build.rs alongside
 // the curated set; this file's layout doesn't change.
 
+
+// ─── Pointer / handle sentinels ────────────────────────────────────────
+
+define constant $NULL = 0;
 
 // ─── MessageBox flags (user32) — buttons ───────────────────────────────
 
