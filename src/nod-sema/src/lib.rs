@@ -34,9 +34,9 @@ use nod_dfm::TypeEstimate;
 use nod_llvm::{Jit, codegen_module};
 
 pub use lower::{
-    BlockHandlerRegistration, BlockRegistration, ClosureInfo, ClosureRegistry, LoweredModule,
-    LoweringError, MethodRegistration, SealingViolation, dump_classes, lower_function,
-    lower_module, lower_module_full,
+    BlockHandlerRegistration, BlockRegistration, CFunctionBinding, ClosureInfo, ClosureRegistry,
+    LoweredModule, LoweringError, LoweringWarning, MethodRegistration, SealingViolation,
+    dump_classes, lower_function, lower_module, lower_module_full,
 };
 
 /// Sprint 17: parse + macro-expand + lower in one shot. Existing

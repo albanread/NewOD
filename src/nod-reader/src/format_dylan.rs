@@ -222,6 +222,30 @@ fn fmt_item(it: &Item, depth: usize, out: &mut String) {
             out.push_str(name);
             out.push_str(";\n");
         }
+        Item::DefineCFunction { modifiers, name, params, return_, c_name, library, .. } => {
+            out.push_str("define ");
+            fmt_modifiers(modifiers, out);
+            out.push_str("c-function ");
+            out.push_str(name);
+            out.push(' ');
+            fmt_params(params, out);
+            fmt_return(return_, out);
+            out.push_str(";\n");
+            if let Some(cn) = c_name {
+                indent(out, depth + 1);
+                out.push_str("c-name: \"");
+                out.push_str(cn);
+                out.push_str("\";\n");
+            }
+            indent(out, depth + 1);
+            out.push_str("library: \"");
+            out.push_str(library);
+            out.push_str("\";\n");
+            indent(out, depth);
+            out.push_str("end c-function ");
+            out.push_str(name);
+            out.push_str(";\n");
+        }
         Item::DefineMacro { name, body_fragments, .. } => {
             // Emit a stub body that is bracket-balanced and contains no
             // top-level `end` token. The original body fragments cannot be

@@ -11,6 +11,7 @@ members = [
     "src/nod-loader",
     "src/nod-runtime",
     "src/nod-dylan",
+    "src/nod-winapi",
     "tests/nod-tests",
     "tests/nod-od-suite",
 ]

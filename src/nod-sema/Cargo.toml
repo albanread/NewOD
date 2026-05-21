@@ -19,6 +19,9 @@ nod-macro   = { path = "../nod-macro" }
 nod-dfm     = { path = "../nod-dfm" }
 nod-llvm    = { path = "../nod-llvm", default-features = false }
 nod-runtime = { path = "../nod-runtime", default-features = false }
+# Sprint 27: FFI Phase A — `define c-function` sema validates against
+# the embedded `nod-winapi` index.
+nod-winapi  = { path = "../nod-winapi" }
 # See `nod-llvm/Cargo.toml` for the inkwell feature override rationale.
 inkwell    = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
 

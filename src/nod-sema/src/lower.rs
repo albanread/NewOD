@@ -387,6 +387,62 @@ pub struct LoweredModule {
     /// register closure bodies under their *source* arity (the body's
     /// JIT signature carries a hidden env parameter on top).
     pub closures: ClosureRegistry,
+    /// Sprint 27: every `define c-function` we encountered during
+    /// lowering. The driver / FFI glue (Sprint 28+) consults this to
+    /// emit the per-module API stub table; Sprint 27 just records
+    /// the metadata.
+    pub c_functions: Vec<CFunctionBinding>,
+    /// Sprint 27: non-fatal diagnostics. Sprint 27 surfaces these
+    /// for `define c-function` declarations whose target symbol is
+    /// not present in the embedded `nod-winapi` index. The driver
+    /// prints them; they don't block compilation.
+    pub warnings: Vec<LoweringWarning>,
+}
+
+/// Sprint 27: information captured for a single `define c-function`
+/// declaration. Carries the DLL provenance + the c-side identifier;
+/// param/return types are kept verbatim from the source for Sprint 28
+/// to resolve against the embedded `nod-winapi` index.
+#[derive(Clone, Debug)]
+pub struct CFunctionBinding {
+    pub dylan_name: String,
+    pub c_name: String,
+    pub library: String,
+    pub span: Span,
+    /// `true` when the symbol was found in the embedded
+    /// `nod-winapi` index at compile time. `false` means the user
+    /// declared a custom DLL/symbol the DB doesn't know about — we
+    /// warn but continue.
+    pub resolved_in_db: bool,
+}
+
+/// Sprint 27: non-fatal sema diagnostic.
+#[derive(Clone, Debug)]
+pub enum LoweringWarning {
+    /// `define c-function NAME` references a (library, c-name) pair
+    /// not present in the embedded `nod-winapi` index. Sprint 27
+    /// accepts the declaration anyway — the user may target a
+    /// custom DLL. Sprint 28's call-site lowering will error at
+    /// runtime if the LoadLibrary / GetProcAddress fails.
+    CFunctionNotInDb {
+        span: Span,
+        name: String,
+        library: String,
+        c_name: String,
+    },
+}
+
+impl std::fmt::Display for LoweringWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoweringWarning::CFunctionNotInDb { name, library, c_name, span } => write!(
+                f,
+                "warning: `define c-function {name}` (library: \"{library}\", c-name: \"{c_name}\") \
+                 not in windows_api database; will fail at runtime if the DLL doesn't export it [{:?}]",
+                span
+            ),
+        }
+    }
 }
 
 /// Sprint 19: one lifted-thunk set per `block` form in the source. The
@@ -431,6 +487,11 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // `nod_make_cell` / `nod_cell_get` / … as `extern "C-unwind"` symbols
     // already; this just lights up the class table.
     nod_runtime::ensure_closures_registered();
+    // Sprint 27: ensure FFI c-type classes (`<c-bool>`, `<c-dword>`,
+    // …) are registered before any `define c-function` declaration
+    // tries to validate its parameter / return type annotations
+    // against the class table.
+    nod_runtime::ensure_c_types_registered();
 
     // Sprint 21 pre-pass: rewrite every `Expr::Method` in expression
     // position to a synthetic `Expr::Ident(__anon-method-NNNN)` and
@@ -501,6 +562,13 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
 
     let mut out: Vec<Function> = Vec::new();
     let mut methods: Vec<MethodRegistration> = Vec::new();
+    // Sprint 27: every `define c-function` declaration we encounter
+    // is recorded here. The driver / FFI lowerer (Sprint 28+) reads
+    // these to populate the per-module API stub table.
+    let mut c_functions: Vec<CFunctionBinding> = Vec::new();
+    // Sprint 27: non-fatal diagnostics — currently just
+    // `c-function not in windows_api database`.
+    let mut warnings: Vec<LoweringWarning> = Vec::new();
     // Sprint 19: a single `LiftSink` carries the FunctionId counter and
     // any per-`block` lifted thunks the lowerer synthesises. Both the
     // Phase 3 slot accessors and the Phase 4 user-item lowering allocate
@@ -736,6 +804,49 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                 // If one survives to here (direct `lower_module_full`
                 // call without expansion) it is inert; no codegen needed.
             }
+            Item::DefineCFunction {
+                name,
+                c_name,
+                library,
+                span,
+                ..
+            } => {
+                // Sprint 27 — FFI Phase A. We record the binding
+                // metadata so the Sprint 28 codegen has everything
+                // it needs; we do NOT emit any DFM call-site code.
+                //
+                // Validation: require `library:` to be present and
+                // non-empty. Probe the embedded `nod-winapi` index
+                // for the (DLL, c-name) pair; warn (not error) if
+                // missing — user might be targeting a custom DLL
+                // the DB doesn't know about.
+                if library.is_empty() {
+                    errors.push(LoweringError::Unsupported {
+                        span: *span,
+                        message: format!(
+                            "`define c-function {name}`: missing required `library:` attribute"
+                        ),
+                    });
+                    continue;
+                }
+                let effective_c_name = c_name.clone().unwrap_or_else(|| name.clone());
+                let resolved = nod_winapi::find_function(library, &effective_c_name).is_some();
+                if !resolved {
+                    warnings.push(LoweringWarning::CFunctionNotInDb {
+                        span: *span,
+                        name: name.clone(),
+                        library: library.clone(),
+                        c_name: effective_c_name.clone(),
+                    });
+                }
+                c_functions.push(CFunctionBinding {
+                    dylan_name: name.clone(),
+                    c_name: effective_c_name,
+                    library: library.clone(),
+                    span: *span,
+                    resolved_in_db: resolved,
+                });
+            }
             Item::DefineLibrary { .. } | Item::DefineModule { .. } => {}
             Item::DefineOther { span, keyword, .. } => {
                 errors.push(LoweringError::Unsupported {
@@ -812,6 +923,22 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         nod_dfm::populate_safepoint_roots(f);
     }
 
+    // Sprint 27: scan the AST for any call expression whose callee
+    // is the name of a `define c-function`. Sprint 27 does NOT
+    // generate FFI codegen; the Sprint 28 follow-up will. We error
+    // here so the deferral is explicit — if a user writes the
+    // declaration AND attempts to call it, they get a clear
+    // diagnostic pointing at Sprint 28.
+    let c_function_names: HashSet<String> =
+        c_functions.iter().map(|c| c.dylan_name.clone()).collect();
+    if !c_function_names.is_empty() {
+        let mut call_site_errors: Vec<LoweringError> = Vec::new();
+        scan_module_for_c_function_calls(m, &c_function_names, &mut call_site_errors);
+        if !call_site_errors.is_empty() {
+            return Err(call_site_errors);
+        }
+    }
+
     Ok(LoweredModule {
         functions: out,
         methods,
@@ -819,7 +946,131 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         resolutions,
         blocks,
         closures: closure_registry,
+        c_functions,
+        warnings,
     })
+}
+
+/// Sprint 27: walk the AST collecting any call expressions whose
+/// callee is the name of a `define c-function`. Each such call site
+/// becomes a `LoweringError::Unsupported` with the Sprint 28
+/// deferral text. Sprint 28's call-site lowering will replace this
+/// scan with proper FFI codegen.
+fn scan_module_for_c_function_calls(
+    m: &Module,
+    c_names: &HashSet<String>,
+    errors: &mut Vec<LoweringError>,
+) {
+    for item in &m.items {
+        match item {
+            Item::DefineFunction { body, .. } | Item::DefineMethod { body, .. } => {
+                for s in body {
+                    scan_stmt_for_c_calls(s, c_names, errors);
+                }
+            }
+            Item::DefineConstant { value, .. } | Item::DefineVariable { value, .. } => {
+                scan_expr_for_c_calls(value, c_names, errors);
+            }
+            Item::Expr(e) => scan_expr_for_c_calls(e, c_names, errors),
+            _ => {}
+        }
+    }
+}
+
+fn scan_stmt_for_c_calls(
+    s: &nod_reader::Statement,
+    c_names: &HashSet<String>,
+    errors: &mut Vec<LoweringError>,
+) {
+    use nod_reader::Statement as S;
+    match s {
+        S::Expr(e) => scan_expr_for_c_calls(e, c_names, errors),
+        S::Let { value, .. } => {
+            scan_expr_for_c_calls(value, c_names, errors);
+        }
+        S::Local { .. } => {
+            // local methods carry exprs in bodies. Sprint 27 doesn't
+            // recurse into them — c-function call inside a local
+            // method is exotic and Sprint 28 will sweep this up.
+        }
+        S::For { body, finally_, .. } => {
+            for s in body {
+                scan_stmt_for_c_calls(s, c_names, errors);
+            }
+            for s in finally_ {
+                scan_stmt_for_c_calls(s, c_names, errors);
+            }
+        }
+        S::While { cond, body, .. } | S::Until { cond, body, .. } => {
+            scan_expr_for_c_calls(cond, c_names, errors);
+            for s in body {
+                scan_stmt_for_c_calls(s, c_names, errors);
+            }
+        }
+        S::Block { body, cleanup, afterwards, .. } => {
+            for s in body {
+                scan_stmt_for_c_calls(s, c_names, errors);
+            }
+            for s in cleanup {
+                scan_stmt_for_c_calls(s, c_names, errors);
+            }
+            for s in afterwards {
+                scan_stmt_for_c_calls(s, c_names, errors);
+            }
+        }
+    }
+}
+
+fn scan_expr_for_c_calls(
+    e: &Expr,
+    c_names: &HashSet<String>,
+    errors: &mut Vec<LoweringError>,
+) {
+    use nod_reader::Expr as E;
+    match e {
+        E::Call { callee, args, span } => {
+            if let E::Ident(_, name) = callee.as_ref()
+                && c_names.contains(name)
+            {
+                errors.push(LoweringError::Unsupported {
+                    span: *span,
+                    message: format!(
+                        "`{name}`: c-function calls not yet supported (Sprint 28)"
+                    ),
+                });
+            }
+            scan_expr_for_c_calls(callee, c_names, errors);
+            for a in args {
+                scan_expr_for_c_calls(a, c_names, errors);
+            }
+        }
+        E::BinOp { lhs, rhs, .. } => {
+            scan_expr_for_c_calls(lhs, c_names, errors);
+            scan_expr_for_c_calls(rhs, c_names, errors);
+        }
+        E::UnOp { operand, .. } => scan_expr_for_c_calls(operand, c_names, errors),
+        E::Paren { inner, .. } => scan_expr_for_c_calls(inner, c_names, errors),
+        E::If { cond, then_, else_, .. } => {
+            scan_expr_for_c_calls(cond, c_names, errors);
+            scan_expr_for_c_calls(then_, c_names, errors);
+            if let Some(eb) = else_ {
+                scan_expr_for_c_calls(eb, c_names, errors);
+            }
+        }
+        E::Begin { body, .. } => {
+            for e in body {
+                scan_expr_for_c_calls(e, c_names, errors);
+            }
+        }
+        E::Let { value, .. } => scan_expr_for_c_calls(value, c_names, errors),
+        E::Method { body, .. } | E::LocalMethod { body, .. } => {
+            for e in body {
+                scan_expr_for_c_calls(e, c_names, errors);
+            }
+        }
+        E::Stmt(s) => scan_stmt_for_c_calls(s, c_names, errors),
+        _ => {}
+    }
 }
 
 // ─── Class registration ────────────────────────────────────────────────────

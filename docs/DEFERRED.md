@@ -1564,3 +1564,86 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   `:dump-closures` REPL command (and a corresponding
   `nod-driver dump-closures` subcommand) is the natural Sprint 26
   add.
+
+## Carry-over from Sprint 27 (FFI Phase A) — into Sprint 28+
+
+Sprint 27 is data plumbing only. Sprint 28 is the FFI Phase B
+end-to-end-call sprint. Everything below is consciously not yet
+done.
+
+- **:open: Actual `Beep(440, 1000)` end-to-end** — Sprint 27 →
+  Sprint 28. The c-function declaration is parsed, the DLL
+  provenance is recorded, the (DLL, c-name) pair is validated against
+  the embedded `nod-winapi` index — but no codegen runs. Sprint 28
+  emits LLVM IR for the call site, marshals arguments through the
+  Sprint 27 c-type seed classes, and dispatches against the
+  per-module API stub table.
+- **:open: Per-module API stub table** — Sprint 27 → Sprint 28. Each
+  compiled module gets a per-module table of (DLL, symbol) entries
+  deduplicated across call sites. Eager `LoadLibrary` /
+  `GetProcAddress` at module init time. PLT-style lazy resolution is
+  a later optimization once Sprint 28 is in.
+- **:open: c-type marshaling** — Sprint 27 → Sprint 28. The 14
+  c-type seed classes (`<c-bool>`, `<c-dword>`, `<c-int>`,
+  `<c-uint>`, `<c-short>`, `<c-ushort>`, `<c-long>`, `<c-ulong>`,
+  `<c-word>`, `<c-byte>`, `<c-pointer>`, `<c-handle>`,
+  `<c-string>`, `<c-wide-string>`) have *names* but no marshaling
+  behavior. Sprint 28 adds the marshal-in / marshal-out shims that
+  bridge Dylan values (fixnums, `<byte-string>`, `<boolean>`) to the
+  C ABI representation.
+- **:open: `<c-pointer-to>` parametric pointer type** — Sprint 27
+  → Sprint 28 or 29. Sprint 27's `<c-pointer>` is opaque; many APIs
+  want `<c-pointer-to> (<c-int>)` etc. for out-parameters. The
+  parser shape for type-parametric forms is `<c-pointer-to> (T)` —
+  needs a parser extension.
+- **:open: Callback / function-pointer parameters** — Sprint 27 →
+  later FFI sprint. Many APIs (`EnumWindows`,
+  `SetUnhandledExceptionFilter`) take callback function pointers.
+  Sprint 27's projection filter drops them. Re-projecting + adding
+  the callback bridge is its own trajectory.
+- **:open: Struct-by-value parameters** — Sprint 27 → later FFI
+  sprint. Sprint 27's projection drops every function with a
+  struct-by-value param (RECT, POINT, …). Reconstituting takes
+  `<c-struct>` class machinery + ABI-aware marshaling.
+- **:open: COM interface types** — Sprint 27 → much later FFI
+  sprint. The DB has 7957 `interface`-kind types (`IUnknown`,
+  `ID3D11Device`, …). Sprint 27 drops every function that
+  references them. COM brings vtable dispatch + reference counting
+  that's a multi-sprint subsystem on its own.
+- **:open: Variadic functions** — Sprint 27 → later FFI sprint.
+  `printf` family. Sprint 27 filter drops them. Variadic ABI
+  awareness on x64 Windows is straightforward but separate work.
+- **:open: A/W auto-pick** — Sprint 27 → Sprint 28 or 29. The DB
+  carries `aw_family ∈ {None, 'A', 'W'}` on each function. Sprint
+  27 treats `MessageBoxA` and `MessageBoxW` as separate functions;
+  the user picks. A future ergonomics pass can auto-pick `W` for
+  `define c-function MessageBox(...)` if the bare name isn't
+  present and a `W` variant is.
+- **:open: Constants table in the upstream DB** — Sprint 27 →
+  upstream-side fix. Sprint 27 ships with a hand-curated list of
+  ~10 well-known constants (`MB_OK`, `INVALID_HANDLE_VALUE`, …)
+  because the `windows_api.db` schema v5 doesn't model constants.
+  Future work: extend the upstream `bootstrap.py` to scan win32
+  metadata's `Constants` API container and populate a `constants`
+  table.
+- **:open: JIT-time materialization (vs. compile-time embed)** —
+  Sprint 27 → much later (Sprint 33 AOT?). The Sprint 27 blob is
+  embedded into `nod-winapi`'s `.rlib` at compile time. A future
+  AOT mode might prefer to load the SQLite DB at JIT startup
+  instead — keeps the Rust binary lean. Not a priority while we're
+  in JIT-only territory.
+- **:open: Cross-DLL name collision disambiguation** — Sprint 27 →
+  Sprint 28 or 29. `find_function_any_dll(name)` returns only the
+  first match; the embedded index does track all DLLs that export a
+  name, but the lookup API surfaces only one. Sprint 28 will need
+  the disambiguator when an unqualified `define c-function`
+  reference resolves ambiguously across DLLs.
+- **:open: `Binding` table consolidation for Dylan-to-Dylan
+  bindings** — Sprint 27 → far-future namespace sprint. Sprint 27's
+  `Binding { dll: Option<String>, kind: BindingKind::CFunction }`
+  records c-function bindings. Dylan-to-Dylan bindings still live
+  in the flat sema tables (`TopNames`, generic registry, class
+  registry). A future sprint can migrate the rest into the same
+  `Binding` table, give `BindingKind` real width (`Function`,
+  `Class`, `Constant`, `Variable`, `Generic`, …), and centralise
+  name resolution.

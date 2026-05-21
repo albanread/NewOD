@@ -36,6 +36,7 @@ compile_error!(
     "nod-runtime: one of `newgc-backend` (default) or `semispace-backend` must be enabled."
 );
 
+mod c_types;
 mod classes;
 mod closures;
 mod collections;
@@ -89,6 +90,11 @@ pub use collections::{
     nod_stretchy_vector_push, nod_stretchy_vector_size, out_of_range_error_class_id,
     range_class_id, range_fields, sequence_class_id, stretchy_collection_class_id,
     stretchy_vector_class_id, stretchy_vector_fields, stretchy_vector_push,
+};
+pub use c_types::{
+    c_bool_class_id, c_dword_class_id, c_handle_class_id, c_int_class_id, c_pointer_class_id,
+    c_string_class_id, c_wide_string_class_id,
+    ensure_registered as ensure_c_types_registered,
 };
 pub use conditions::{
     BlockFns, HandlerFn, HandlerFrame, MAX_BLOCK_CAPTURED, NlxPayload, _reset_block_registry_for_tests,

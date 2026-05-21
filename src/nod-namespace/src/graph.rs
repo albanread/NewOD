@@ -20,6 +20,43 @@ pub struct BindingId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Symbol(pub u32);
 
+/// What a name resolves to inside a module. Sprint 27 introduces this
+/// record specifically to carry DLL provenance for `define c-function`
+/// bindings — Dylan-to-Dylan bindings still live in the sema-side
+/// flat tables for now and won't be migrated here until a future
+/// sprint consolidates the namespace plumbing.
+///
+/// Today the `Binding` table is populated solely by the
+/// `define c-function` lowering path: each c-function declaration
+/// allocates a `BindingId` and stores its DLL provenance here. The
+/// future FFI codegen (Sprint 28+) reads `dll` to drive the
+/// per-module API stub table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub id: BindingId,
+    pub name: Symbol,
+    pub kind: BindingKind,
+    /// `Some(...)` for `define c-function` bindings; `None` for
+    /// Dylan-to-Dylan bindings.
+    pub dll: Option<String>,
+}
+
+impl Binding {
+    /// Convenience accessor for the c-function DLL provenance.
+    pub fn dll(&self) -> Option<&str> {
+        self.dll.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingKind {
+    /// `define c-function` binding. `dll` must be `Some`.
+    CFunction,
+    // Future sprints can extend this with `Function`, `Constant`,
+    // `Variable`, `Class`, … as the namespace plumbing migrates
+    // toward a unified Binding table.
+}
+
 #[derive(Debug, Default)]
 pub struct SymbolInterner {
     symbols: Vec<String>,
@@ -123,6 +160,9 @@ pub struct Graph {
     libraries: Vec<Library>,
     modules: Vec<Module>,
     interner: SymbolInterner,
+    /// Sprint 27: flat backing store for `Binding`s populated by
+    /// `define c-function` lowering. Indexed by `BindingId.0`.
+    bindings: Vec<Binding>,
 }
 
 impl Graph {
@@ -205,6 +245,53 @@ impl Graph {
 
     pub fn modules(&self) -> impl Iterator<Item = &Module> {
         self.modules.iter()
+    }
+
+    /// Sprint 27: record a `define c-function` binding in the given
+    /// module. The DLL name is normalized to lower-case (matching
+    /// `nod-winapi`'s lookup convention) so downstream lookups are
+    /// case-stable. Returns the freshly-allocated `BindingId`.
+    pub fn record_c_function_binding(
+        &mut self,
+        module: ModuleId,
+        name: &str,
+        dll: &str,
+    ) -> BindingId {
+        let sym = self.interner.intern(name);
+        let id = BindingId(self.bindings.len() as u32);
+        self.bindings.push(Binding {
+            id,
+            name: sym,
+            kind: BindingKind::CFunction,
+            dll: Some(dll.to_ascii_lowercase()),
+        });
+        // Wire it into the module's binding map. If a binding for
+        // this name already exists, the new BindingId replaces it —
+        // matching Dylan's "later definition wins" rule (single-file
+        // scope, anyway). Sprint 28 will tighten this when it adds
+        // cross-file binding merging.
+        self.modules[module.0 as usize].bindings.insert(sym, id);
+        id
+    }
+
+    pub fn binding(&self, id: BindingId) -> &Binding {
+        &self.bindings[id.0 as usize]
+    }
+
+    pub fn bindings(&self) -> &[Binding] {
+        &self.bindings
+    }
+
+    /// Look up a binding by name in the given module. Returns
+    /// `None` if the name is not recorded in this module's binding
+    /// table.
+    pub fn lookup_binding(&self, module: ModuleId, name: &str) -> Option<&Binding> {
+        let m = &self.modules[module.0 as usize];
+        let sym = *m.bindings.iter().find_map(|(s, _)| {
+            (self.interner.resolve(*s) == name).then_some(s)
+        })?;
+        let id = *m.bindings.get(&sym)?;
+        Some(&self.bindings[id.0 as usize])
     }
 }
 

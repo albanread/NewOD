@@ -1723,6 +1723,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.parse_define_function_like(define_tok, modifiers, /*kind=*/ "function")
             }
+            "c-function" => {
+                // Sprint 27: FFI Phase A.
+                self.bump();
+                self.parse_define_c_function(define_tok, modifiers)
+            }
             "method" => {
                 self.bump();
                 self.parse_define_function_like(define_tok, modifiers, "method")
@@ -1866,6 +1871,119 @@ impl<'a> Parser<'a> {
                 return_,
                 body,
             }
+        })
+    }
+
+    /// Sprint 27 FFI Phase A — `define c-function`.
+    ///
+    /// Grammar:
+    /// ```text
+    /// define c-function NAME (PARAMS) [=> (RET)] ;
+    ///     [c-name:  "STR" ;]
+    ///     [library: "STR" ;]
+    /// end [c-function] [NAME] ;
+    /// ```
+    ///
+    /// Header attribute clauses appear AFTER the signature `;` and
+    /// BEFORE `end`. Order is not significant. `library:` is the
+    /// only mandatory attribute (Sprint 27 sema enforces); `c-name:`
+    /// defaults to the Dylan-side `NAME` when omitted.
+    ///
+    /// Body shape mirrors `define function`'s tail (`end c-function
+    /// Beep;`); the optional `kind` echo and optional name echo are
+    /// both accepted.
+    fn parse_define_c_function(
+        &mut self,
+        define_tok: Token,
+        modifiers: Vec<Modifier>,
+    ) -> Result<Item, Diagnostic> {
+        let name_tok = self.expect(TokenKind::Ident, "name in define-c-function form")?;
+        let name = self.token_text(name_tok).to_string();
+        let params = self.parse_param_list_loose()?;
+        let return_ = self.maybe_return_sig()?;
+        // Consume the signature-terminator `;` if present.
+        if matches!(self.peek_kind(), TokenKind::Semicolon) {
+            self.bump();
+        }
+
+        // Attribute clauses: `c-name:` / `library:`. Loop until we
+        // see `end`. Each attribute is `IDENT : STRING ;`.
+        let mut c_name: Option<String> = None;
+        let mut library: Option<String> = None;
+        loop {
+            if matches!(self.peek_kind(), TokenKind::KwEnd | TokenKind::Eof) {
+                break;
+            }
+            // `KeywordColon` lexes `foo:` as a single token whose
+            // text includes the trailing `:`. The text matches by
+            // stripping the colon.
+            let tk = self.peek();
+            if tk.kind != TokenKind::KeywordColon {
+                return Err(self.diag(
+                    tk.span,
+                    format!(
+                        "expected `c-name:` / `library:` attribute or `end` in define-c-function, got {:?}",
+                        tk.kind
+                    ),
+                ));
+            }
+            let attr_text = self.token_text(tk);
+            let attr = attr_text.trim_end_matches(':').to_string();
+            self.bump();
+            // String literal value.
+            let val_tok = self.peek();
+            let value = match val_tok.kind {
+                TokenKind::String | TokenKind::StringRaw | TokenKind::StringMulti => {
+                    self.bump();
+                    let raw = self.token_text(val_tok);
+                    // Strip enclosing quotes for plain `String`. Raw /
+                    // Multi forms keep their delimiters; we strip the
+                    // first/last char which is the simple case for
+                    // Sprint 27 (DLL names don't need escapes).
+                    raw.trim_start_matches('"').trim_end_matches('"').to_string()
+                }
+                _ => {
+                    return Err(self.diag(
+                        val_tok.span,
+                        format!(
+                            "expected string literal for `{attr}:` value, got {:?}",
+                            val_tok.kind
+                        ),
+                    ));
+                }
+            };
+            // Consume terminator `;`.
+            if matches!(self.peek_kind(), TokenKind::Semicolon) {
+                self.bump();
+            }
+            match attr.as_str() {
+                "c-name" => c_name = Some(value),
+                "library" => library = Some(value),
+                _ => {
+                    // Unknown attribute — accept for forward compat
+                    // but ignore. Sprint 28+ will widen the set.
+                }
+            }
+        }
+
+        let end_tok = self.expect(TokenKind::KwEnd, "`end` of define-c-function")?;
+        self.consume_optional_kw("c-function");
+        if matches!(self.peek_kind(), TokenKind::Ident)
+            && self.token_text(self.peek()) == name
+        {
+            self.bump();
+        }
+        let span = join(define_tok.span, end_tok.span);
+
+        Ok(Item::DefineCFunction {
+            span,
+            modifiers,
+            name,
+            params,
+            return_,
+            c_name,
+            // Sema enforces non-empty.
+            library: library.unwrap_or_default(),
         })
     }
 

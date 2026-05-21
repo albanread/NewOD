@@ -100,13 +100,26 @@ dispatch (Sprint 12); conditions + non-local exit skeleton
 **Driver / REPL** (`nod-driver`). REPL loop, `dump-tokens`,
 `dump-ast`, `dump-graph`, `dump-dfm`, `dump-llvm`, `eval`.
 
+**FFI trajectory (Sprint 27 → Sprint 37).** Sprint 27 lands the FFI
+*data* layer: the vendored Windows API metadata database lives at
+`data/windows_api.db`, the `nod-winapi` crate embeds a 205 KB
+zstd-compressed postcard projection (13,080 primitive-typed Win32
+functions across 336 DLLs), and the reader / sema layer accepts
+`define c-function NAME (PARAMS) => (RET); library: "kernel32.dll";
+end;` declarations and records DLL provenance in
+`nod-namespace::Binding`. **No API call executes yet — Sprint 28 lands
+the per-module API stub table + the first `Beep(440, 1000)`
+end-to-end.** Sprints 28-37 then build the `c-ffi` library port
+(structs, callbacks, COM), the `io` / kernel library ports, the
+Dylan-side IDE shell on top of the Sprint-27 FFI stack, and finally
+the Cocoa-FFI variant for the macOS port.
+
 **What's not yet in tree:** `gc.statepoint` precise-roots emission
-(Sprint 11d), `<table>` + hashing + string conformance (Sprint 21),
-full restart semantics (Sprint 22), C FFI port (Sprints 23-23b),
-`format` / `print` / `streams` (Sprint 24), kernel library port
-(Sprint 25), the Dylan-side IDE (Sprints 26+), `common-dylan` library
-(Sprint 27), multi-threaded mutator (Sprint 28), AOT mode
-(Sprint 30), Mac port (Sprint 32).
+(Sprint 11d), end-to-end FFI calls (Sprint 28), `format` / `print` /
+`streams` (Sprint 28b), kernel library port (Sprint 28c), the
+Dylan-side IDE (Sprints 29+), `common-dylan` library (Sprint 30),
+multi-threaded mutator (Sprint 31), AOT mode (Sprint 33), Mac port
+(Sprint 35).
 
 Day-to-day: `cargo build --workspace` is green, `cargo run -p
 nod-driver -- dump-tokens hello.dylan` works, and Sprint 16's
