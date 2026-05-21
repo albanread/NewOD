@@ -26,6 +26,9 @@ pub use format::format_tokens;
 pub use format_dylan::format_dylan;
 pub use fragments::{Fragment, FragmentError, GroupKind, build_fragments};
 pub use lexer::{Preamble, lex, scan_preamble};
-pub use parser::{Diagnostic, parse_expr, parse_module, parse_top_level_exprs};
+pub use parser::{
+    Diagnostic, parse_expr, parse_expr_with_macros, parse_module, parse_module_with_macros,
+    parse_top_level_exprs,
+};
 pub use span::{FileId, SourceMap, SourceMapError, Span};
 pub use token::{Token, TokenKind};

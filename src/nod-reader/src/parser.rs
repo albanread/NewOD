@@ -5,6 +5,8 @@
 //! token stream; source text is required to read identifier/literal
 //! lexemes.
 
+use std::collections::HashSet;
+
 use crate::ast::{
     BinOp, Binder, CaseArm, ExceptionClause, Expr, ForClause, FromForClause, ImportSet,
     ImportSpec, Item, LibraryUseClause, LocalMethodDecl, Modifier, Module, ModuleUseClause,
@@ -43,7 +45,21 @@ impl std::fmt::Display for Diagnostic {
 impl std::error::Error for Diagnostic {}
 
 pub fn parse_expr(src: &str, tokens: &[Token]) -> Result<Expr, Diagnostic> {
-    let mut p = Parser::new(src, tokens);
+    parse_expr_with_macros(src, tokens, &HashSet::new())
+}
+
+/// Sprint 25: expression parser variant that recognises body-shaped
+/// macro calls. `known_macros` is the set of names (typically populated
+/// from the stdlib + the surrounding module's `define macro` items) the
+/// parser should treat as macro call sites when it sees the shape
+/// `<name>(head…) body… end`. Callers that don't need this (most
+/// tests, the `dump-tokens`/`dump-ast` paths) pass an empty set.
+pub fn parse_expr_with_macros(
+    src: &str,
+    tokens: &[Token],
+    known_macros: &HashSet<String>,
+) -> Result<Expr, Diagnostic> {
+    let mut p = Parser::new(src, tokens, known_macros);
     let e = p.parse_expr_full()?;
     p.skip_trailing_semis();
     if !p.at_end() {
@@ -54,7 +70,8 @@ pub fn parse_expr(src: &str, tokens: &[Token]) -> Result<Expr, Diagnostic> {
 }
 
 pub fn parse_top_level_exprs(src: &str, tokens: &[Token]) -> Result<Vec<Expr>, Vec<Diagnostic>> {
-    let mut p = Parser::new(src, tokens);
+    let empty = HashSet::new();
+    let mut p = Parser::new(src, tokens, &empty);
     let mut out = Vec::new();
     let mut diags = Vec::new();
     p.skip_trailing_semis();
@@ -84,6 +101,25 @@ pub fn parse_module(
     tokens: &[Token],
     preamble: Option<&Preamble>,
 ) -> Result<Module, Vec<Diagnostic>> {
+    parse_module_with_macros(src, tokens, preamble, &HashSet::new())
+}
+
+/// Sprint 25: top-level entry that takes a pre-seeded set of macro
+/// names the parser should recognise as body-shaped call sites
+/// (`<name>(…) … end`). Used by `nod-sema::expand_and_lower_module`
+/// to seed in the stdlib's macros (so user code can write
+/// `for-each (x in c) … end` without referencing the macro by
+/// `define macro` in its own file).
+///
+/// As the parser encounters in-source `define macro <name>` items,
+/// it extends its OWN copy of the set so later items in the same
+/// module can call the macro.
+pub fn parse_module_with_macros(
+    src: &str,
+    tokens: &[Token],
+    preamble: Option<&Preamble>,
+    seed_macros: &HashSet<String>,
+) -> Result<Module, Vec<Diagnostic>> {
     let header: Vec<(String, String)> = match preamble {
         Some(p) => p.entries.clone(),
         None => crate::lexer::scan_preamble(src)
@@ -91,7 +127,7 @@ pub fn parse_module(
             .unwrap_or_default(),
     };
 
-    let mut p = Parser::new(src, tokens);
+    let mut p = Parser::new(src, tokens, seed_macros);
     let mut items: Vec<Item> = Vec::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
     p.skip_trailing_semis();
@@ -134,11 +170,22 @@ struct Parser<'a> {
     src: &'a str,
     tokens: &'a [Token],
     pos: usize,
+    /// Sprint 25: names the parser should recognise as body-shaped
+    /// macro call sites (`<name>(…) … end`). Seeded by the caller
+    /// (typically `nod-sema` with the stdlib's macros), then extended
+    /// in-place as `define macro <name>` items are parsed in the
+    /// surrounding module so later items can use the macro.
+    known_macros: HashSet<String>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(src: &'a str, tokens: &'a [Token]) -> Self {
-        Self { src, tokens, pos: 0 }
+    fn new(src: &'a str, tokens: &'a [Token], seed_macros: &HashSet<String>) -> Self {
+        Self {
+            src,
+            tokens,
+            pos: 0,
+            known_macros: seed_macros.clone(),
+        }
     }
 
     fn peek(&self) -> Token {
@@ -583,7 +630,6 @@ impl<'a> Parser<'a> {
                 let word = self.token_text(t).to_string();
                 match word.as_str() {
                     "if" => self.parse_if(),
-                    "unless" => self.parse_unless(),
                     "begin" => self.parse_begin(),
                     "let" => self.parse_let_expr_compat(),
                     "local" => self.parse_local_expr_compat(),
@@ -605,6 +651,11 @@ impl<'a> Parser<'a> {
                     "block" => {
                         let s = self.parse_block()?;
                         Ok(Expr::Stmt(Box::new(s)))
+                    }
+                    _ if self.known_macros.contains(&word)
+                        && self.peek_after_ident_is_macro_call_shape() =>
+                    {
+                        self.parse_body_shaped_macro_call(t, word)
                     }
                     _ => {
                         self.bump();
@@ -708,22 +759,177 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_unless(&mut self) -> Result<Expr, Diagnostic> {
-        let kw = self.bump();
-        self.expect(TokenKind::LParen, "`(` after `unless`")?;
-        let cond = self.parse_expr_full()?;
-        self.expect(TokenKind::RParen, "`)` after `unless` condition")?;
-        let body = self.parse_body_until_end()?;
-        let end_tok = self.expect(TokenKind::KwEnd, "`end`")?;
-        self.consume_optional_kw("unless");
-        let body_sp = body_span(&body, end_tok.span);
-        Ok(Expr::Unless {
-            span: join(kw.span, end_tok.span),
-            cond: Box::new(cond),
-            body: Box::new(Expr::Begin {
-                span: body_sp,
-                body,
-            }),
+    /// Sprint 25: lookahead from the *current* ident token. Returns
+    /// `true` iff what follows looks like a body-shaped macro call
+    /// — `(head…) <body-content> end` with at least one non-trivial
+    /// body token between `)` and `end`.
+    ///
+    /// Disambiguation from call-shape macros: a macro defined as
+    /// `{ forever ?x:expression }` (no body) is called as
+    /// `forever(1)` and the next token is whatever follows. If
+    /// that "next" is a continuation token (binop, comma,
+    /// semicolon, closer, dot, arrow, assign) we treat the form
+    /// as a normal `Expr::Call` — the macro engine still picks it
+    /// up via the `Call(Ident, args)` recognition path. The empty
+    /// body case (`<name>(head) end`) currently isn't recognised
+    /// by this lookahead; it's not a shape any in-tree macro uses.
+    fn peek_after_ident_is_macro_call_shape(&self) -> bool {
+        // Position immediately past the macro-name ident.
+        let mut i = self.pos + 1;
+        // Sprint 25 v1: only recognise the parenthesised-head shape.
+        // `<name> body end` without a head paren ambiguates badly
+        // with `<name>` as an expression followed by a statement,
+        // so the head paren is required.
+        if self.tokens.get(i).map(|t| t.kind) != Some(TokenKind::LParen) {
+            return false;
+        }
+        i += 1;
+        let mut depth = 1i32;
+        while let Some(t) = self.tokens.get(i) {
+            match t.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
+                | TokenKind::HashLParen | TokenKind::HashLBracket | TokenKind::HashLBrace => {
+                    depth += 1;
+                }
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        // `i` now points to the first token AFTER `)`. If it's a
+        // continuation token, this is a normal call.
+        let next = match self.tokens.get(i).map(|t| t.kind) {
+            Some(k) => k,
+            None => return false,
+        };
+        if is_call_continuation(next) {
+            return false;
+        }
+        // Now scan body content: require at least one significant
+        // token before the matching `end` at depth 0.
+        let mut depth = 0i32;
+        let mut saw_body_content = false;
+        while let Some(t) = self.tokens.get(i) {
+            match t.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
+                | TokenKind::HashLParen | TokenKind::HashLBracket | TokenKind::HashLBrace => {
+                    depth += 1;
+                    saw_body_content = true;
+                }
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::KwEnd if depth == 0 => return saw_body_content,
+                TokenKind::Semicolon if depth == 0 => {
+                    // Stay; semicolons separate body statements.
+                }
+                TokenKind::Eof => return false,
+                _ => {
+                    saw_body_content = true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Sprint 25: parse `<name>(head…) body… end` (or `<name> body… end`)
+    /// into an `Expr::MacroCall`. The macro engine re-lexes the span
+    /// to do fragment-level pattern matching, so we only need to
+    /// capture the source extent here — not the head's internal
+    /// structure (which is macro-pattern-specific and can't be
+    /// AST'd at the parser layer).
+    fn parse_body_shaped_macro_call(
+        &mut self,
+        name_tok: Token,
+        name: String,
+    ) -> Result<Expr, Diagnostic> {
+        // Consume the macro name.
+        self.bump();
+        // Skip the head group (paren / bracket / brace) if present.
+        if matches!(self.peek_kind(), TokenKind::LParen) {
+            self.bump();
+            let mut depth = 1i32;
+            while !self.at_end() {
+                match self.peek_kind() {
+                    TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
+                    | TokenKind::HashLParen | TokenKind::HashLBracket | TokenKind::HashLBrace => {
+                        depth += 1;
+                        self.bump();
+                    }
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                        depth -= 1;
+                        self.bump();
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {
+                        self.bump();
+                    }
+                }
+            }
+        }
+        // Skip body tokens up to the matching `end` at depth 0.
+        // The body is opaque to the parser — macro pattern matching
+        // sees it as raw fragments via `call_site_fragments`.
+        let mut depth = 0i32;
+        let end_tok = loop {
+            if self.at_end() {
+                return Err(self.diag(
+                    name_tok.span,
+                    format!(
+                        "macro call `{name}` is missing its closing `end` keyword"
+                    ),
+                ));
+            }
+            match self.peek_kind() {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
+                | TokenKind::HashLParen | TokenKind::HashLBracket | TokenKind::HashLBrace => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    if depth == 0 {
+                        // Shouldn't happen given peek_after_ident_is_macro_call_shape
+                        // succeeded, but guard for robustness.
+                        return Err(self.diag(
+                            self.peek().span,
+                            format!(
+                                "macro call `{name}`: unbalanced closing delimiter"
+                            ),
+                        ));
+                    }
+                    depth -= 1;
+                    self.bump();
+                }
+                TokenKind::KwEnd if depth == 0 => {
+                    break self.bump();
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        };
+        // Optional trailing form-name `end <name>;` — consume it.
+        if matches!(self.peek_kind(), TokenKind::Ident)
+            && self.token_text(self.peek()) == name
+        {
+            self.bump();
+        }
+        Ok(Expr::MacroCall {
+            span: join(name_tok.span, end_tok.span),
+            name,
         })
     }
 
@@ -2236,6 +2442,9 @@ impl<'a> Parser<'a> {
     fn parse_define_macro(&mut self, define_tok: Token) -> Result<Item, Diagnostic> {
         let name_tok = self.expect(TokenKind::Ident, "macro name")?;
         let name = self.token_text(name_tok).to_string();
+        // Sprint 25: extend the known-macro set so later items in
+        // this module can call the macro as a body-shaped form.
+        self.known_macros.insert(name.clone());
         // Capture everything up to the matching `end macro [name]` (i.e. the
         // `end` for *this* form). Nested body forms like `end for` are not
         // the macro-end; skip past them. See `parse_define_other` for the
@@ -2605,6 +2814,48 @@ impl<'a> Parser<'a> {
 
 fn join(a: Span, b: Span) -> Span {
     Span::new(a.file_id, a.lo.min(b.lo), a.hi.max(b.hi))
+}
+
+/// Sprint 25: tokens that, when seen immediately after `<ident>(args)`,
+/// indicate the form is part of a larger expression (a function call
+/// being used as an operand, an operator continuation, or a list
+/// element) rather than a body-shaped macro call's head terminator.
+/// The body-shaped macro recognition path uses this to bail out
+/// before consuming source it doesn't own.
+fn is_call_continuation(k: TokenKind) -> bool {
+    matches!(
+        k,
+        // Arithmetic / comparison / logical operators
+        TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Caret
+            | TokenKind::Amp
+            | TokenKind::Bar
+            | TokenKind::Equal
+            | TokenKind::ColonEqual
+            | TokenKind::EqualEqual
+            | TokenKind::TildeEqual
+            | TokenKind::TildeEqualEqual
+            | TokenKind::Less
+            | TokenKind::Greater
+            | TokenKind::LessEqual
+            | TokenKind::GreaterEqual
+            | TokenKind::Tilde
+            // Separators / closers / postfix
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::RParen
+            | TokenKind::RBracket
+            | TokenKind::RBrace
+            | TokenKind::Dot
+            | TokenKind::Ellipsis
+            | TokenKind::Colon
+            | TokenKind::ColonColon
+            | TokenKind::Arrow
+            | TokenKind::Eof
+    )
 }
 
 fn body_span(body: &[Expr], fallback: Span) -> Span {

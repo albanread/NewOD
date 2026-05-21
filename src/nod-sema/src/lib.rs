@@ -58,6 +58,31 @@ pub fn expand_and_lower_module(
     lower_module_full(&m).map_err(ExpandLowerError::Lower)
 }
 
+/// Sprint 25: parse a user-code module with the stdlib's macro
+/// names pre-seeded into the parser's known-macro set. This is what
+/// lights up body-shaped macro calls (`unless (c) b end`,
+/// `for-each (x in c) b end`) for user code — those names aren't
+/// in the user's own `define macro` items, but the stdlib loader
+/// registered them at process start, and the parser needs to know
+/// about them at parse time to recognise the body-shaped surface.
+///
+/// Idempotent: assumes the caller has already called
+/// `stdlib::ensure_loaded()` (or will route via one of the public
+/// helpers in this module that does).
+fn parse_user_module(
+    src: &str,
+    tokens: &[nod_reader::Token],
+    preamble: Option<&nod_reader::Preamble>,
+) -> Result<nod_reader::Module, Vec<nod_reader::Diagnostic>> {
+    let seed = stdlib_macro_name_set();
+    nod_reader::parse_module_with_macros(src, tokens, preamble, &seed)
+}
+
+fn stdlib_macro_name_set() -> std::collections::HashSet<String> {
+    let table = stdlib::stdlib_macros();
+    table.defs.keys().cloned().collect()
+}
+
 /// Sprint 20b: macro expansion that merges `stdlib_macros()` on top
 /// of the user's per-call table. Same semantics as
 /// `nod_macro::collect_and_expand` but with the stdlib's macros
@@ -113,8 +138,7 @@ pub fn dump_expanded_for_file(path: &Path) -> Result<String, DumpError> {
         .map_err(DumpError::SourceMap)?;
     let toks = nod_reader::lex(&src, file_id);
     let pre = nod_reader::scan_preamble(&src);
-    let mut module =
-        nod_reader::parse_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
+    let mut module = parse_user_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(DumpError::Macro)?;
     Ok(nod_reader::format_ast_module(&module))
 }
@@ -130,8 +154,7 @@ pub fn dump_dfm_for_file(path: &Path) -> Result<String, DumpError> {
     let file_id = sm.add(path.to_path_buf(), src.clone()).map_err(DumpError::SourceMap)?;
     let toks = nod_reader::lex(&src, file_id);
     let pre = nod_reader::scan_preamble(&src);
-    let mut module =
-        nod_reader::parse_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
+    let mut module = parse_user_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(DumpError::Macro)?;
     let lm = lower_module_full(&module).map_err(DumpError::Lower)?;
     Ok(nod_dfm::format_dfm_module(&lm.functions))
@@ -146,8 +169,7 @@ pub fn dump_llvm_for_file(path: &Path) -> Result<String, DumpError> {
     let file_id = sm.add(path.to_path_buf(), src.clone()).map_err(DumpError::SourceMap)?;
     let toks = nod_reader::lex(&src, file_id);
     let pre = nod_reader::scan_preamble(&src);
-    let mut module =
-        nod_reader::parse_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
+    let mut module = parse_user_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(DumpError::Macro)?;
     let lm = lower_module_full(&module).map_err(DumpError::Lower)?;
     let module_name = path
@@ -191,8 +213,8 @@ pub fn eval_expr_to_string(expr_src: &str) -> Result<String, EvalError> {
         .map_err(EvalError::SourceMap)?;
     let toks = nod_reader::lex(&wrapped, file_id);
     let pre = nod_reader::scan_preamble(&wrapped);
-    let mut module = nod_reader::parse_module(&wrapped, &toks, pre.as_ref())
-        .map_err(EvalError::Parse)?;
+    let mut module =
+        parse_user_module(&wrapped, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
     let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
 
@@ -233,8 +255,8 @@ pub fn run_function_to_i64(
         .map_err(EvalError::SourceMap)?;
     let toks = nod_reader::lex(&src, file_id);
     let pre = nod_reader::scan_preamble(&src);
-    let mut module = nod_reader::parse_module(&src, &toks, pre.as_ref())
-        .map_err(EvalError::Parse)?;
+    let mut module =
+        parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
     let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
 

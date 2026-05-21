@@ -1979,9 +1979,12 @@ fn lift_expr(
             lift_expr(value, scope, st);
             scope.in_scope.insert(binder.clone());
         }
-        Expr::Unless { .. } | Expr::Case { .. } | Expr::LocalMethod { .. } => {
+        Expr::Case { .. } | Expr::LocalMethod { .. } | Expr::MacroCall { .. } => {
             // Not lowered; leave the unsupported diagnostic to the
-            // main lowering pass.
+            // main lowering pass. `MacroCall` should never reach
+            // lowering — the macro engine substitutes it away
+            // before lower runs. If we see one here it's a missing
+            // macro definition; the diagnostic path catches it.
         }
         Expr::Stmt(s) => {
             lift_statement(s, scope, st);
@@ -2162,7 +2165,7 @@ fn check_free_vars(
             check_free_vars(value, inner_scope, outer_scope, top, free);
             inner_scope.insert(binder.clone());
         }
-        Expr::Unless { .. } | Expr::Case { .. } | Expr::LocalMethod { .. } => {}
+        Expr::Case { .. } | Expr::LocalMethod { .. } | Expr::MacroCall { .. } => {}
         Expr::Method { params, body, .. } => {
             // Nested anonymous method: its own params extend the inner
             // scope; the outer scope is unchanged for the recursive walk
@@ -2792,13 +2795,20 @@ impl FunctionBuilder {
                         .to_string(),
                 })
             }
-            Expr::Unless { span, .. }
-            | Expr::Case { span, .. }
-            | Expr::LocalMethod { span, .. } => Err(LoweringError::Unsupported {
+            Expr::Case { span, .. } | Expr::LocalMethod { span, .. } => {
+                Err(LoweringError::Unsupported {
+                    span: *span,
+                    message: format!(
+                        "expression form `{}` not lowered in Sprint 06",
+                        expr_kind(e)
+                    ),
+                })
+            }
+            Expr::MacroCall { span, name } => Err(LoweringError::Unsupported {
                 span: *span,
                 message: format!(
-                    "expression form `{}` not lowered in Sprint 06",
-                    expr_kind(e)
+                    "macro call `{name}` reached lowering — no matching `define macro` \
+                     in the seeded macro table; expansion was skipped"
                 ),
             }),
             Expr::Stmt(s) => self.lower_stmt_as_expr(s, env, ctx),
@@ -4071,10 +4081,6 @@ fn collect_assigned_in_expr(e: &Expr, env: &LocalEnv, out: &mut HashSet<String>)
             }
         }
         Expr::Stmt(s) => collect_assigned_in_stmt(s, env, out),
-        Expr::Unless { cond, body, .. } => {
-            collect_assigned_in_expr(cond, env, out);
-            collect_assigned_in_expr(body, env, out);
-        }
         Expr::Case { arms, otherwise, .. } => {
             for a in arms {
                 collect_assigned_in_expr(&a.cond, env, out);
@@ -4151,8 +4157,8 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::UnOp { .. } => "unop",
         Expr::Paren { .. } => "paren",
         Expr::If { .. } => "if",
-        Expr::Unless { .. } => "unless",
         Expr::Case { .. } => "case",
+        Expr::MacroCall { .. } => "macro-call",
         Expr::Begin { .. } => "begin",
         Expr::Let { .. } => "let",
         Expr::LocalMethod { .. } => "local-method",

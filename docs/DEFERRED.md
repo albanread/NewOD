@@ -1088,10 +1088,22 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   upstream `for (i from 1 to 10) body end` shape is a heroic
   macro that needs auxiliary `rule` clauses + statement-position
   parsing of bare keywords with their own `end`; both deferred.
-- **:open: `case` / `cond` macros** — Sprint 17 → Sprint 25. Need
-  auxiliary `rule` clauses for the arm-by-arm patterns. Sprint 18's
-  multi-rule selection doesn't substitute for the inner-arm
-  taxonomy. Migrate from hardcoded `Expr::Case` here.
+- **:open: `case` / `cond` macros + `Expr::Case` retirement** —
+  Sprint 17 → Sprint 26 (was Sprint 25; partially deferred again
+  after the Sprint 25 unless migration landed). Need auxiliary
+  `rule` clauses inside `define macro` (or a richer macro pattern
+  language) for the arm-by-arm patterns. Sprint 18's multi-rule
+  selection doesn't substitute for the inner-arm taxonomy.
+  Sprint 25 retired `Expr::Unless` cleanly via the
+  body-shaped-macro path but `Expr::Case` stayed put — the
+  `Expr::MacroCall` recogniser handles `<name>(head) body end`,
+  not `case ... ?key1, ?key2 => ?body1; ?key3 => ?body2;
+  otherwise => ?body3 end`. Two viable next steps for Sprint 26:
+  (1) extend `define macro` to accept multiple `=>`-separated
+  clauses and pattern-match them as a list; (2) introduce a
+  `Group` pattern with `;`-separated sub-rules. Either lifts
+  `case` into the stdlib and the `parse_case`/`Expr::Case`
+  machinery can finally retire.
 - **:open: `Statement::For` lowering** — Sprint 17 → Sprint 25.
   `Statement::For` errors as `Unsupported`; the upstream `for`
   macro will expand into `let` + `while` via the engine; until then
@@ -1138,22 +1150,32 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   statements, and matching `end` — needs a fragment-pre-pass that
   consumes statement-macro tokens before the AST-ifying parser
   runs. Sprint 19 adds it alongside the NLX block parsing.
-- **:open: Migration of hardcoded `Expr::Unless` / `Expr::Case` /
-  `Expr::Begin` to stdlib macros** — Sprint 18 → Sprint 25.
-  Per the `feedback_dylan_lang_defined_by_macros.md` policy,
-  Sprint 03's hardcoded AST forms exist only until the macro
-  engine + stdlib catch up. Sprint 18 lights the engine; Sprint 25's
-  stdlib port migrates `unless`, `case`, `cond`, `select`, `when`
-  out of the parser and into Dylan-defined macros, then strips
-  the AST variants. The Sprint 17/18 `Expr::Unless`-shape macro
-  recognition (`macro_call_name` returns `"unless"` for the AST
-  variant) is a transitional bridge that's removed in Sprint 25.
-- **:open: Stdlib-min auto-loaded at compiler startup** —
-  Sprint 18 → Sprint 25. The Sprint 18 `stdlib-min.dylan` fixture
-  lives under `tests/nod-tests/fixtures/`; the "real" `nod-dylan/
-  stdlib.dylan` that auto-loads before user code lands when
-  Sprint 25 wires the loader to seed the macro table from a
-  pinned source file.
+- **:partial: Migration of hardcoded `Expr::Unless` / `Expr::Case` /
+  `Expr::Begin` to stdlib macros** — Sprint 18 → Sprint 25 (unless)
+  / Sprint 26 (case) / KEEP (begin). Sprint 25 closed the `unless`
+  half: the parser-hardcoded `parse_unless` arm and the
+  `Expr::Unless` AST variant are deleted; `define macro unless`
+  in stdlib.dylan plus the body-shaped macro recogniser cover the
+  surface end-to-end. The Sprint 17/18 transitional bridge
+  (`macro_call_name` returning `"unless"` for `Expr::Unless`) is
+  also gone — replaced by `Expr::MacroCall { name, span }` for
+  every body-shaped macro surface. `Expr::Case` retirement
+  slipped to Sprint 26: case's multi-arm `=>` syntax
+  (`?keys => ?body;` repeated, plus `otherwise => ?body`) doesn't
+  fit the body-shaped recogniser; it needs auxiliary `rule`
+  clauses inside `define macro`, or a richer macro pattern
+  language that can describe N-way clause shapes. `Expr::Begin`
+  stays per the keep-list in `feedback_dylan_lang_defined_by_macros.md`
+  — it's a kernel primitive, not scaffolding.
+- **:closed: Stdlib-min auto-loaded at compiler startup** —
+  Sprint 18 → Sprint 20b (this entry's milestone was eclipsed
+  by Sprint 20b landing `nod-dylan/dylan-sources/stdlib.dylan`
+  + `nod-sema::stdlib::ensure_loaded()` ahead of schedule).
+  Sprint 25 extended the stdlib's surface (`unless` joined
+  `for-each`) and seeded the parser's known-macro set from
+  the same table, but the "auto-load at compiler startup"
+  goal itself landed two sprints earlier than originally
+  planned.
 - **:open: `for-range` upstream-fidelity gap** — Sprint 18 →
   Sprint 25. Sprint 18's `for-range(var, start, end, body)` takes
   four call-shape args. Upstream Dylan's `for (i from 1 to 10
@@ -1382,19 +1404,16 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   the new `dylan_fip_reduce_range_one_to_one_hundred_is_5050`
   test (FIP-form, same machinery, no first-class function) cover
   the same code paths.
-- **:open: Body-shaped macro calls in expression position** —
-  Sprint 20b → Sprint 21. The `for-each` macro IS defined in
-  `src/nod-dylan/dylan-sources/stdlib.dylan`, parsed, collected into
-  the process-global macro table, and confirmed reachable by
-  `dylan_stdlib_loader_registers_for_each_macro`. But the
-  expression-level parser (`nod-reader/src/parser.rs`) can't yet
-  recognise `for-each (x in c) body end` as a macro call — that
-  syntax doesn't fit the `Expr::Call` shape the macro engine matches.
-  Sprint 21 extends the parser to detect `<ident> (...) body end`
-  patterns when `<ident>` resolves to a known macro name. Today's
-  workaround: write the expansion target directly
-  (`let s = %fip-init(c); until (%fip-finished?(s)) … end`); the
-  `dylan_fip_until_loop_*` tests exercise this shape.
+- **:closed: Body-shaped macro calls in expression position** —
+  Sprint 20b → Sprint 25. Closed by Sprint 25. The parser now
+  emits `Expr::MacroCall { name, span }` when it sees
+  `<name>(head…) body… end` and `<name>` is in the parser's
+  known-macro set (seeded from the stdlib by
+  `nod-sema::parse_user_module`). The macro engine re-lexes the
+  span via the existing `call_site_fragments` path and runs the
+  fragment-level pattern matcher against the registered
+  `define macro` rule. The `dylan_for_each_surface_sums_three_element_list_to_6`
+  acceptance test exercises the end-to-end path.
 - **:open: Cross-module dispatch resolution against legacy
   `{generic}${specialisers}` body name** — Sprint 20b → Sprint 21. The
   codegen layer's fallback path (`find_method_body_ptr` extern

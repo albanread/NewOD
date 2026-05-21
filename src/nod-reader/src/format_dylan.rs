@@ -690,12 +690,15 @@ fn fmt_expr(e: &Expr, out: &mut String) {
             }
             out.push_str(" end");
         }
-        Expr::Unless { cond, body, .. } => {
-            out.push_str("unless (");
-            fmt_expr(cond, out);
-            out.push_str(") ");
-            fmt_expr(body, out);
-            out.push_str(" end");
+        Expr::MacroCall { name, .. } => {
+            // Sprint 25: pretty-print body-shaped macro calls as a
+            // pseudo-call followed by `end`. We don't have the head /
+            // body in the AST (only the source span), so the output
+            // is intentionally schematic — round-trip fidelity for
+            // macro call sites isn't a property the formatter
+            // currently promises.
+            out.push_str(name);
+            out.push_str("() end");
         }
         Expr::Case { arms, otherwise, .. } => {
             out.push_str("case ");

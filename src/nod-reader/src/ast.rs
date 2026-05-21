@@ -38,15 +38,30 @@ pub enum Expr {
         then_: Box<Expr>,
         else_: Option<Box<Expr>>,
     },
-    Unless {
-        span: Span,
-        cond: Box<Expr>,
-        body: Box<Expr>,
-    },
     Case {
         span: Span,
         arms: Vec<CaseArm>,
         otherwise: Option<Box<Expr>>,
+    },
+    /// Sprint 25: body-shaped macro call.
+    ///
+    /// Recognises the surface
+    /// ```text
+    ///   <name> (head…) body… end
+    /// ```
+    /// at parse time when `<name>` is in the parser's known-macro set
+    /// (passed in via [`crate::parser::parse_module_with_macros`]).
+    /// The variant carries only the name and the full source span;
+    /// the macro engine re-lexes the span (via the existing
+    /// `call_site_fragments` path in `nod-macro`) and runs its
+    /// fragment-level pattern matcher on the result, so the head's
+    /// internal structure doesn't need to be modelled in the AST.
+    /// This is what lets a macro head contain macro-specific syntax
+    /// like `(?var:name in ?coll:expression)` — the parser doesn't
+    /// have to parse `x in c` as a Dylan expression.
+    MacroCall {
+        span: Span,
+        name: String,
     },
     Begin {
         span: Span,
@@ -166,8 +181,8 @@ impl Expr {
             | Expr::UnOp { span, .. }
             | Expr::Paren { span, .. }
             | Expr::If { span, .. }
-            | Expr::Unless { span, .. }
             | Expr::Case { span, .. }
+            | Expr::MacroCall { span, .. }
             | Expr::Begin { span, .. }
             | Expr::Let { span, .. }
             | Expr::LocalMethod { span, .. }
@@ -258,12 +273,8 @@ fn fmt_expr(e: &Expr, depth: usize, out: &mut String) {
             indent(depth, out);
             out.push_str(")\n");
         }
-        Expr::Unless { cond, body, .. } => {
-            out.push_str("(Unless\n");
-            fmt_expr(cond, depth + 1, out);
-            fmt_expr(body, depth + 1, out);
-            indent(depth, out);
-            out.push_str(")\n");
+        Expr::MacroCall { name, .. } => {
+            out.push_str(&format!("(MacroCall {name:?})\n"));
         }
         Expr::Case { arms, otherwise, .. } => {
             out.push_str("(Case\n");

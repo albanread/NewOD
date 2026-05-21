@@ -38,15 +38,20 @@
 //!
 //! Fragment-vs-AST representation choice (option 1 from SPRINTS.md):
 //! pattern matching is fundamentally fragment-level, so when we see a
-//! macro-shaped AST node (currently `Expr::Unless` or a `Call(Ident, …)`
-//! whose name is registered) we materialise the call-site fragment
-//! sequence by stitching together the AST subtrees' source slices,
-//! re-lexing the result into the macro-internal scratch source. The
-//! substituted fragment vector is then flattened back to text, re-lexed,
-//! and re-parsed. This sidesteps an AST-shape change and lets the macro
-//! engine evolve toward generic shapes (`define <kw> …`, statement
-//! macros, paren-less call sites) in Sprint 18 without disturbing
-//! Sprint 04's parser output.
+//! macro-shaped AST node (`Expr::MacroCall { name, span }` for
+//! body-shaped Sprint 25 surfaces, or a `Call(Ident, …)` whose name
+//! is registered for call-shape sites) we materialise the call-site
+//! fragment sequence by re-lexing the AST node's source span. The
+//! substituted fragment vector is then flattened back to text,
+//! re-lexed, and re-parsed. This sidesteps an AST-shape change for
+//! each new macro surface and lets the macro engine evolve toward
+//! generic shapes (`define <kw> …`, statement macros, paren-less
+//! call sites) without disturbing the parser's output.
+//!
+//! Sprint 25 retired the hardcoded `Expr::Unless` AST variant in
+//! favour of the body-shaped `Expr::MacroCall` recognised by the
+//! parser when a name is in its known-macro set; the stdlib's
+//! `define macro unless` lives at the call sites' macro table.
 
 use std::collections::HashMap;
 
@@ -1322,9 +1327,11 @@ fn walk_subexprs(e: &mut Expr, ctx: &mut ExpansionCtx<'_>, errs: &mut Vec<MacroE
                 expand_expr(b, ctx, errs);
             }
         }
-        Expr::Unless { cond, body, .. } => {
-            expand_expr(cond, ctx, errs);
-            expand_expr(body, ctx, errs);
+        Expr::MacroCall { .. } => {
+            // Body-shaped macro call. No sub-expressions in the AST
+            // (the body is opaque source text reachable via the span),
+            // so the macro engine re-lexes and pattern-matches at the
+            // expand_one step below.
         }
         Expr::Case { arms, otherwise, .. } => {
             for a in arms {
@@ -1353,14 +1360,16 @@ fn walk_subexprs(e: &mut Expr, ctx: &mut ExpansionCtx<'_>, errs: &mut Vec<MacroE
 }
 
 /// If `e` is a macro-shaped form whose name might appear in the table,
-/// return that name. Sprint 17 recognises:
-///   - `Expr::Unless` → name `"unless"` (the parser pre-folds this form).
-///   - `Expr::Call { callee: Ident(name), … }` → that name.
-///   - `Expr::Ident(name)` followed by an arg list at the AST level …
-///     not recognised; only call-shape forms.
+/// return that name. Sprint 25 recognises:
+///   - `Expr::MacroCall { name, … }` → that name (body-shaped macro
+///     call, captured by the parser when `<name>(…) … end` was seen
+///     and `<name>` was in the parser's known-macro set).
+///   - `Expr::Call { callee: Ident(name), … }` → that name (call-shape
+///     macro call, also handles statement-position macros expanded
+///     in place).
 fn macro_call_name(e: &Expr) -> Option<String> {
     match e {
-        Expr::Unless { .. } => Some("unless".to_string()),
+        Expr::MacroCall { name, .. } => Some(name.clone()),
         Expr::Call { callee, .. } => match callee.as_ref() {
             Expr::Ident(_, n) => Some(n.clone()),
             _ => None,
@@ -1473,8 +1482,8 @@ fn set_top_span(e: &mut Expr, sp: Span) {
         | Expr::UnOp { span, .. }
         | Expr::Paren { span, .. }
         | Expr::If { span, .. }
-        | Expr::Unless { span, .. }
         | Expr::Case { span, .. }
+        | Expr::MacroCall { span, .. }
         | Expr::Begin { span, .. }
         | Expr::Let { span, .. }
         | Expr::LocalMethod { span, .. }
@@ -1634,11 +1643,7 @@ fn walk_expr_spans(e: &mut Expr, f: &mut dyn FnMut(&mut Span)) {
                 walk_expr_spans(b, f);
             }
         }
-        Expr::Unless { span, cond, body } => {
-            f(span);
-            walk_expr_spans(cond, f);
-            walk_expr_spans(body, f);
-        }
+        Expr::MacroCall { span, .. } => f(span),
         Expr::Case { span, arms, otherwise } => {
             f(span);
             for a in arms {

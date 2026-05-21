@@ -356,6 +356,41 @@ fn find_unop_in_expr(e: &Expr) -> Option<nod_reader::Span> {
     }
 }
 
+// ─── Sprint 25 — stdlib `unless` as a body-shaped macro call ───────────
+
+#[test]
+#[serial]
+fn sprint25_unless_macro_false_cond_runs_body() {
+    // `unless (#f) <body> end` ≡ `if (~ #f) <body> end` — the body
+    // runs. After Sprint 25, this surface goes through the stdlib's
+    // `define macro unless` (no parser-side hardcoded `Expr::Unless`).
+    let s = nod_sema::eval_expr_to_string("unless (#f) 42 end")
+        .expect("eval `unless (#f) 42 end`");
+    assert_eq!(s, "42", "unless (#f) 42 end must evaluate the body");
+}
+
+#[test]
+#[serial]
+fn sprint25_unless_macro_true_cond_skips_body() {
+    // `unless (#t) <body> end` ≡ `if (~ #t) <body> end` — the body
+    // doesn't run; the `if` has no else, so the result is the
+    // canonical-false value (`#f`).
+    let s = nod_sema::eval_expr_to_string("unless (#t) 1 end")
+        .expect("eval `unless (#t) 1 end`");
+    assert_eq!(s, "#f", "unless (#t) 1 end must skip the body");
+}
+
+#[test]
+#[serial]
+fn sprint25_unless_via_stdlib_replaces_hardcoded_form() {
+    // Sprint 17/18 fixture: `unless (1 = 0) 42 end` — confirms the
+    // stdlib `unless` macro (the body-shaped path) yields the same
+    // result the now-deleted `Expr::Unless` hardcoded form produced.
+    let s = nod_sema::eval_expr_to_string("unless (1 = 0) 42 end")
+        .expect("eval `unless (1 = 0) 42 end`");
+    assert_eq!(s, "42");
+}
+
 // WHY: silence unused-import warning on MacroDef / TemplateElem — these
 // types are part of the public surface and we want them tested via the
 // `MacroTable::get` return shape, but tests don't directly construct them.

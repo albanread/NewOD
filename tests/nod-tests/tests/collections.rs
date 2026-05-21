@@ -536,6 +536,33 @@ fn dylan_fip_until_loop_sums_three_element_list_to_6() {
 
 #[test]
 #[serial]
+fn dylan_for_each_surface_sums_three_element_list_to_6() {
+    setup();
+    // Sprint 25 headline: the `for-each (x in c) body end` surface
+    // syntax now works end-to-end through the parser, the stdlib
+    // macro engine, and the lowering. This is the Sprint 20b
+    // deferral closing test — the macro was defined back in
+    // Sprint 20b but the parser couldn't recognise body-shaped
+    // macro calls until Sprint 25's body-shaped macro recogniser
+    // landed. Compare with `dylan_fip_until_loop_sums_three_element_list_to_6`
+    // above: that test exercises the expansion target directly;
+    // this test exercises the macro engine driving the same
+    // result from the surface syntax.
+    let s = nod_sema::eval_expr_to_string(
+        "let total = 0; \
+         for-each (x in #(1, 2, 3)) total := total + x end; \
+         total \
+         end",
+    )
+    .expect("eval `for-each` surface");
+    assert_eq!(
+        s, "6",
+        "for-each (x in #(1,2,3)) total := total + x end must sum to 6"
+    );
+}
+
+#[test]
+#[serial]
 fn dylan_fip_until_loop_sums_range_one_to_ten() {
     setup();
     // Same shape, range collection. Confirms the FIP primitives

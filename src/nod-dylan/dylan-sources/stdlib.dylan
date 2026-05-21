@@ -176,18 +176,34 @@ end method;
 // `?var:name` binding is rebound on each iteration to the current
 // element.
 //
-// Sprint 20b deviation: the standard Dylan `for ... in ...` clause is a
-// `for` macro with many clause types; `for-each` is a single-clause
-// subset chosen here because Sprint 20b's macro engine handles
-// single-pattern macros cleanly. The full `for` macro is Sprint 21
-// work — see DEFERRED.md.
+// Sprint 25: the body-shaped surface `for-each (x in c) body end` is
+// recognised by the parser now (see `Expr::MacroCall` + the
+// `known_macros` plumbing in `nod-reader/src/parser.rs`). Sprint 20b
+// shipped the macro definition but couldn't call it from a separate
+// file because the parser didn't know body-shaped macro syntax.
 
 define macro for-each
-  { for-each (?var:name in ?coll:expression) ?body:expression end }
-    => { let %fip-state = %fip-init(?coll);
-         until (%fip-finished?(%fip-state))
-           let ?var = %fip-current-element(%fip-state);
-           ?body;
-           %fip-advance!(%fip-state)
+  { for-each (?var:name in ?coll:expression) ?body:body end }
+    => { begin
+           let %fip-state = %fip-init(?coll);
+           until (%fip-finished?(%fip-state))
+             let ?var = %fip-current-element(%fip-state);
+             ?body;
+             %fip-advance!(%fip-state)
+           end
          end }
+end macro;
+
+// ─── unless macro ──────────────────────────────────────────────────────────
+//
+// Sprint 25: retired the hardcoded `Expr::Unless` AST variant. The
+// parser now treats `unless (cond) body end` as a body-shaped macro
+// call (because `unless` is in the parser's known-macro set, seeded
+// from this stdlib), and the rule below expands it to `if (~ cond)
+// body end`. Identical compile-time output to the old hardcoded
+// lowering — `if` remains the kernel primitive.
+
+define macro unless
+  { unless ?cond:expression ?body:body end }
+    => { if (~ ?cond) ?body else #f end }
 end macro;
