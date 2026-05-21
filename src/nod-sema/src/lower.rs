@@ -411,7 +411,9 @@ pub struct LoweredModule {
 /// Sprint 27: information captured for a single `define c-function`
 /// declaration. Carries the DLL provenance + the c-side identifier;
 /// Sprint 28 adds the marshaling signature + the index into the
-/// per-module stub table.
+/// per-module stub table. Sprint 31 adds `source` so callers can tell
+/// user-written declarations apart from bindings the JIT materialized
+/// from the embedded Win32 index on the fly.
 #[derive(Clone, Debug)]
 pub struct CFunctionBinding {
     pub dylan_name: String,
@@ -428,6 +430,28 @@ pub struct CFunctionBinding {
     /// c-type outside the Sprint 28 supported set; calls then surface
     /// a deferral diagnostic.
     pub signature: Option<nod_runtime::ApiCallSignature>,
+    /// Sprint 31: provenance of this binding. `UserCFunction` for any
+    /// explicit `define c-function` in user source (or stdlib);
+    /// `JitMaterialized` when the lowerer synthesized the binding from
+    /// the embedded `nod-winapi` index because a bare-name call site
+    /// referenced a Win32 export the user hadn't declared.
+    pub source: BindingSource,
+}
+
+/// Sprint 31: where a [`CFunctionBinding`] came from. User declarations
+/// always win — if a name is declared explicitly anywhere in the module,
+/// the JIT-materialization path declines to synthesize a binding for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingSource {
+    /// `define c-function` written in user Dylan source (or in the
+    /// future, stdlib). The default for every Sprint 27 / 28 / 30
+    /// declaration.
+    UserCFunction,
+    /// Synthesized on the fly by Sprint 31's bare-name lookup hook.
+    /// The binding never appears in the source; the lowerer fabricated
+    /// it from the embedded `nod-winapi` index because a call site
+    /// referenced a name the user hadn't declared.
+    JitMaterialized,
 }
 
 /// Sprint 28: one resolved stub-table entry for the module being
@@ -475,6 +499,567 @@ impl std::fmt::Display for LoweringWarning {
             ),
         }
     }
+}
+
+/// Sprint 31: a synthesized c-function binding the lowerer fabricated
+/// from the embedded Win32 index because a bare-name call site
+/// referenced a name the user hadn't declared. Pre-stub-table working
+/// state — once we've allocated the table this turns into both a
+/// `CFunctionBinding` (for introspection) and a `CFunctionCallInfo`
+/// (for per-call lowering).
+#[derive(Clone, Debug)]
+struct MaterializedBindingSpec {
+    dylan_name: String,
+    c_name: String,
+    library: String,
+    span: Span,
+    signature: nod_runtime::ApiCallSignature,
+    /// Index into `c_function_specs` where the stub-table slot lives.
+    spec_idx: usize,
+}
+
+/// Sprint 31: outcome of [`try_jit_materialize_winapi`] for a single
+/// bare-name candidate. Distinguishes "found and fully supported",
+/// "found but signature unsupported" (so we can surface a helpful
+/// diagnostic), and "not in the index at all" (so we fall through to
+/// the existing unknown-ident path).
+#[derive(Clone, Debug)]
+enum MaterializationOutcome {
+    Materialized {
+        c_name: String,
+        library: String,
+        signature: nod_runtime::ApiCallSignature,
+    },
+    UnsupportedSignature {
+        /// The DLL the matched function lives in. Surfaced for future
+        /// diagnostic improvements (currently consumed only via the
+        /// `reason` string).
+        #[allow(dead_code)]
+        c_name: String,
+        #[allow(dead_code)]
+        library: String,
+        reason: String,
+    },
+    NotFound,
+}
+
+/// Sprint 31: DLL priority order for cross-DLL name collisions. Kernel
+/// wins over user / gdi / advapi / shell / comctl; any other DLL falls
+/// to alphabetical fallback. The list is small; a linear scan beats
+/// pulling in a `phf` for six strings.
+const WINAPI_DLL_PRIORITY: &[&str] = &[
+    "kernel32.dll",
+    "user32.dll",
+    "gdi32.dll",
+    "advapi32.dll",
+    "shell32.dll",
+    "comctl32.dll",
+];
+
+fn winapi_dll_priority(dll: &str) -> usize {
+    WINAPI_DLL_PRIORITY
+        .iter()
+        .position(|&p| p == dll)
+        .unwrap_or(WINAPI_DLL_PRIORITY.len())
+}
+
+/// Sprint 31: try to materialize a [`MaterializedBindingSpec`] for the
+/// bare-name `name`. Default A/W disambiguation prefers W; if the
+/// literal name already ends in `A` or `W` (or neither variant exists)
+/// we use it as-is. Cross-DLL ambiguity is broken by
+/// [`WINAPI_DLL_PRIORITY`]. Functions whose param / return types fall
+/// outside Sprint 28-30's marshaling set return
+/// [`MaterializationOutcome::UnsupportedSignature`] so the caller can
+/// surface a helpful diagnostic instead of "unknown identifier".
+fn try_jit_materialize_winapi(name: &str) -> MaterializationOutcome {
+    // Pull candidates by name. We need to enumerate every DLL the name
+    // lives in to apply the priority order, so we scan `functions()`
+    // once rather than relying on the convenience accessor (which only
+    // surfaces the first match).
+    let try_one = |candidate_name: &str| -> Vec<&'static nod_winapi::FunctionInfo> {
+        nod_winapi::functions()
+            .iter()
+            .filter(|f| f.name == candidate_name)
+            .collect()
+    };
+
+    // A/W default: if the user wrote a bare name with no A/W suffix,
+    // prefer the W variant (modern Unicode-correct).
+    let try_order: Vec<String> = if name.ends_with('A') || name.ends_with('W') {
+        vec![name.to_string()]
+    } else {
+        vec![format!("{name}W"), name.to_string()]
+    };
+    let mut candidates: Vec<&'static nod_winapi::FunctionInfo> = Vec::new();
+    let mut resolved_via: String = String::new();
+    for n in &try_order {
+        let hits = try_one(n);
+        if !hits.is_empty() {
+            candidates = hits;
+            resolved_via = n.clone();
+            break;
+        }
+    }
+    if candidates.is_empty() {
+        return MaterializationOutcome::NotFound;
+    }
+    // Cross-DLL priority. Stable secondary key on dll name keeps the
+    // pick deterministic when two non-priority DLLs tie.
+    candidates.sort_by(|a, b| {
+        winapi_dll_priority(&a.dll)
+            .cmp(&winapi_dll_priority(&b.dll))
+            .then_with(|| a.dll.cmp(&b.dll))
+    });
+    let chosen = candidates[0];
+
+    match build_signature_from_function_info(chosen) {
+        Ok(sig) => MaterializationOutcome::Materialized {
+            c_name: resolved_via,
+            library: chosen.dll.clone(),
+            signature: sig,
+        },
+        Err(reason) => MaterializationOutcome::UnsupportedSignature {
+            c_name: chosen.name.clone(),
+            library: chosen.dll.clone(),
+            reason,
+        },
+    }
+}
+
+/// Sprint 31: derive a Sprint 28/30 marshaling signature from a
+/// [`nod_winapi::FunctionInfo`]. Returns `Err(reason)` if any param /
+/// return type uses a category Sprint 28-30 can't marshal yet
+/// (struct-by-value, function-pointer callback, opaque
+/// pointer-to-pointer, …).
+fn build_signature_from_function_info(
+    info: &nod_winapi::FunctionInfo,
+) -> Result<nod_runtime::ApiCallSignature, String> {
+    if info.params.len() > 8 {
+        return Err(format!(
+            "arity {} exceeds Sprint 28 cap of 8",
+            info.params.len()
+        ));
+    }
+    let mut arg_kinds = [nod_runtime::CArgKind::Void as u8; 8];
+    for (i, p) in info.params.iter().enumerate() {
+        let kind = c_arg_kind_from_type_ref(&p.type_ref).map_err(|why| {
+            format!(
+                "parameter #{} ({}) has unsupported type: {}",
+                i + 1,
+                p.name.as_deref().unwrap_or("?"),
+                why
+            )
+        })?;
+        arg_kinds[i] = kind as u8;
+    }
+    let return_kind = c_return_kind_from_type_ref(&info.return_type)
+        .map_err(|why| format!("return type has unsupported shape: {why}"))?;
+    Ok(nod_runtime::ApiCallSignature {
+        arg_count: info.params.len() as u8,
+        arg_kinds,
+        return_kind: return_kind as u8,
+    })
+}
+
+/// Sprint 31: map a [`nod_winapi::TypeRef`] to a [`nod_runtime::CArgKind`].
+/// Mirrors the Dylan-name table in `nod_runtime::CArgKind::from_c_type_name`
+/// but works on the structured TypeRef enum directly so the JIT
+/// materializer doesn't have to stringify-then-parse.
+fn c_arg_kind_from_type_ref(t: &nod_winapi::TypeRef) -> Result<nod_runtime::CArgKind, String> {
+    use nod_runtime::CArgKind;
+    use nod_winapi::TypeRef as T;
+    Ok(match t {
+        T::I8 => CArgKind::Int8,
+        T::U8 => CArgKind::UInt8,
+        T::I16 => CArgKind::Int16,
+        T::U16 => CArgKind::UInt16,
+        T::I32 => CArgKind::Int32,
+        T::U32 => CArgKind::UInt32,
+        T::I64 => CArgKind::Int64,
+        T::U64 => CArgKind::UInt64,
+        T::Bool32 => CArgKind::Bool32,
+        T::Handle => CArgKind::Handle,
+        T::NarrowString => CArgKind::NarrowString,
+        T::WideString => CArgKind::WideString,
+        T::Pointer { pointee_type_ref } => match pointee_type_ref {
+            // Opaque `*mut void` and one-level pointers to primitive
+            // scalars marshal as a raw pointer; the Dylan side passes a
+            // fixnum 0 (NULL) or a tagged-pointer word in.
+            None => CArgKind::Pointer,
+            Some(inner) => match inner.as_ref() {
+                T::I8 | T::U8 | T::I16 | T::U16 | T::I32 | T::U32 | T::I64 | T::U64
+                | T::Handle | T::Pointer { .. } => CArgKind::Pointer,
+                // Pointers to enums / aliases / strings reduce to
+                // raw `void*` for Sprint 31's purposes — callers can
+                // still pass NULL or a raw word.
+                T::Enum { .. } | T::Alias { .. } => CArgKind::Pointer,
+                T::Bool32 => CArgKind::Pointer,
+                T::NarrowString | T::WideString => CArgKind::Pointer,
+                T::Void => CArgKind::Pointer,
+            },
+        },
+        T::Enum { base } => c_arg_kind_from_type_ref(base)?,
+        T::Alias { base, .. } => c_arg_kind_from_type_ref(base)?,
+        T::Void => return Err("void as parameter type".to_string()),
+    })
+}
+
+/// Sprint 31: companion to [`c_arg_kind_from_type_ref`] for return
+/// types. Returns the matching [`nod_runtime::CReturnKind`].
+fn c_return_kind_from_type_ref(t: &nod_winapi::TypeRef) -> Result<nod_runtime::CReturnKind, String> {
+    use nod_runtime::CReturnKind;
+    use nod_winapi::TypeRef as T;
+    Ok(match t {
+        T::Void => CReturnKind::Void,
+        T::I8 | T::I16 | T::I32 => CReturnKind::Int32,
+        T::U8 | T::U16 | T::U32 => CReturnKind::UInt32,
+        T::I64 => CReturnKind::Int64,
+        T::U64 => CReturnKind::UInt64,
+        T::Bool32 => CReturnKind::Bool32,
+        T::Handle => CReturnKind::Handle,
+        T::NarrowString => CReturnKind::NarrowString,
+        T::WideString => CReturnKind::WideString,
+        T::Pointer { .. } => CReturnKind::Pointer,
+        T::Enum { base } => c_return_kind_from_type_ref(base)?,
+        T::Alias { base, .. } => c_return_kind_from_type_ref(base)?,
+    })
+}
+
+/// Sprint 31: walk a module's call sites collecting bare-name callees
+/// that are *candidates* for JIT materialization — i.e. names that
+/// aren't user-declared c-functions, aren't user-defined functions,
+/// aren't generics, aren't classes, and aren't reserved builtins like
+/// `make` / `instance?` / etc. The caller then tries each candidate
+/// against the embedded Win32 index.
+fn collect_bare_call_candidates(
+    m: &Module,
+    user_declared_c_names: &HashSet<String>,
+    top_names: &TopNames,
+    generics: &HashSet<String>,
+    user_classes: &HashMap<String, ClassId>,
+    out: &mut Vec<(String, nod_reader::Span)>,
+) {
+    for item in &m.items {
+        match item {
+            Item::DefineFunction { body, .. } | Item::DefineMethod { body, .. } => {
+                for s in body {
+                    walk_stmt_for_candidates(
+                        s,
+                        user_declared_c_names,
+                        top_names,
+                        generics,
+                        user_classes,
+                        out,
+                    );
+                }
+            }
+            Item::DefineConstant { value, .. } | Item::DefineVariable { value, .. } => {
+                walk_expr_for_candidates(
+                    value,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+            Item::Expr(e) => walk_expr_for_candidates(
+                e,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn walk_stmt_for_candidates(
+    s: &Statement,
+    user_declared_c_names: &HashSet<String>,
+    top_names: &TopNames,
+    generics: &HashSet<String>,
+    user_classes: &HashMap<String, ClassId>,
+    out: &mut Vec<(String, nod_reader::Span)>,
+) {
+    match s {
+        Statement::Expr(e) => walk_expr_for_candidates(
+            e,
+            user_declared_c_names,
+            top_names,
+            generics,
+            user_classes,
+            out,
+        ),
+        Statement::Let { value, .. } => walk_expr_for_candidates(
+            value,
+            user_declared_c_names,
+            top_names,
+            generics,
+            user_classes,
+            out,
+        ),
+        Statement::Local { .. } => {}
+        Statement::For { body, finally_, .. } => {
+            for s in body {
+                walk_stmt_for_candidates(
+                    s,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+            for s in finally_ {
+                walk_stmt_for_candidates(
+                    s,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+        }
+        Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
+            walk_expr_for_candidates(
+                cond,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            );
+            for s in body {
+                walk_stmt_for_candidates(
+                    s,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+        }
+        Statement::Block { body, cleanup, afterwards, .. } => {
+            for s in body {
+                walk_stmt_for_candidates(
+                    s,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+            for s in cleanup {
+                walk_stmt_for_candidates(
+                    s,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+            for s in afterwards {
+                walk_stmt_for_candidates(
+                    s,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+        }
+    }
+}
+
+fn walk_expr_for_candidates(
+    e: &Expr,
+    user_declared_c_names: &HashSet<String>,
+    top_names: &TopNames,
+    generics: &HashSet<String>,
+    user_classes: &HashMap<String, ClassId>,
+    out: &mut Vec<(String, nod_reader::Span)>,
+) {
+    match e {
+        Expr::Call { callee, args, span } => {
+            if let Expr::Ident(_, name) = callee.as_ref()
+                && is_winapi_candidate_name(
+                    name,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                )
+            {
+                out.push((name.clone(), *span));
+            }
+            walk_expr_for_candidates(
+                callee,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            );
+            for a in args {
+                walk_expr_for_candidates(
+                    a,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            walk_expr_for_candidates(
+                lhs,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            );
+            walk_expr_for_candidates(
+                rhs,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            );
+        }
+        Expr::UnOp { operand, .. } => walk_expr_for_candidates(
+            operand,
+            user_declared_c_names,
+            top_names,
+            generics,
+            user_classes,
+            out,
+        ),
+        Expr::Paren { inner, .. } => walk_expr_for_candidates(
+            inner,
+            user_declared_c_names,
+            top_names,
+            generics,
+            user_classes,
+            out,
+        ),
+        Expr::If { cond, then_, else_, .. } => {
+            walk_expr_for_candidates(
+                cond,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            );
+            walk_expr_for_candidates(
+                then_,
+                user_declared_c_names,
+                top_names,
+                generics,
+                user_classes,
+                out,
+            );
+            if let Some(eb) = else_ {
+                walk_expr_for_candidates(
+                    eb,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+        }
+        Expr::Begin { body, .. } => {
+            for e in body {
+                walk_expr_for_candidates(
+                    e,
+                    user_declared_c_names,
+                    top_names,
+                    generics,
+                    user_classes,
+                    out,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sprint 31: callee-name filter. A name is a winapi-candidate iff it
+/// looks like a Win32 export (capital-letter start, all ASCII letters
+/// / digits, no Dylan-style `<...>` / hyphenated tokens, and not a
+/// known intrinsic / Dylan symbol).
+fn is_winapi_candidate_name(
+    name: &str,
+    user_declared_c_names: &HashSet<String>,
+    top_names: &TopNames,
+    generics: &HashSet<String>,
+    user_classes: &HashMap<String, ClassId>,
+) -> bool {
+    if user_declared_c_names.contains(name) {
+        return false;
+    }
+    if top_names.contains(name) {
+        return false;
+    }
+    if generics.contains(name) {
+        return false;
+    }
+    if user_classes.contains_key(name) {
+        return false;
+    }
+    if nod_runtime::is_generic_defined(name) {
+        return false;
+    }
+    // Reserved Dylan-side identifiers. We could enumerate from a single
+    // table, but the explicit allowlist of Win32-shape names below is
+    // a stronger filter — if a name doesn't match that shape we never
+    // bother the index.
+    if !looks_like_win32_export(name) {
+        return false;
+    }
+    true
+}
+
+/// Sprint 31: shape filter for Win32 exports. Must:
+///   * Be at least 3 characters long
+///   * Contain only ASCII letters and digits (no `-`, `_`, `<`, `>`, `?`, `!`)
+///   * Contain at least one uppercase ASCII letter somewhere (so e.g.
+///     `print`, `read`, `format` don't trigger a 13000-entry index
+///     scan — every real Win32 export has at least one uppercase
+///     letter, including the lowercase-prefixed ones like `lstrlenW`
+///     and `wsprintfW`).
+///
+/// This keeps Dylan-side names like `print`, `+`, `<my-class>`, `id?`
+/// out of the candidate set while admitting the unusual lowercase-
+/// prefixed Win32 exports (`lstrlenA/W`, `wsprintf*`, `wnsprintf*`).
+fn looks_like_win32_export(name: &str) -> bool {
+    if name.len() < 3 {
+        return false;
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    // Must start with a letter (no leading digits — those aren't Dylan
+    // identifiers anyway, but belt-and-braces).
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    // Must contain at least one uppercase letter somewhere. Every real
+    // Win32 export does; ordinary Dylan identifiers don't.
+    name.chars().any(|c| c.is_ascii_uppercase())
 }
 
 /// Sprint 19: one lifted-thunk set per `block` form in the source. The
@@ -826,6 +1411,82 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         // The entry_ptr is patched once the table is allocated; we
         // need to know `idx` first, hence the two-phase loop here.
     }
+
+    // Sprint 31: JIT-time API materialization. Walk the module's call
+    // sites looking for bare-name callees that haven't already been
+    // declared as `define c-function` (user wins) AND don't resolve as
+    // a Dylan-side function, generic, class, or builtin. For each such
+    // name try the embedded `nod-winapi` index; on a successful match
+    // synthesize a `CFunctionBinding` + a stub-table entry on the fly.
+    //
+    // The materialization respects the same `spec_dedupe` map so two
+    // bare references to `GetTickCount64` in the same module share one
+    // table slot (and one resolver invocation at init time).
+    //
+    // Names whose signatures use unsupported types (struct-by-value,
+    // function-pointer, opaque pointer-to-pointer, …) decline silently
+    // — the call site then falls through to the existing
+    // "unknown ident" DirectCall path. We track them so Phase 4's
+    // unsupported-signature error can mention "Win32 function exists,
+    // but signature uses unsupported types".
+    let user_declared_c_names: HashSet<String> = c_function_pre
+        .iter()
+        .map(|(n, _, _)| n.clone())
+        .collect();
+    let mut materialized_binding_specs: Vec<MaterializedBindingSpec> = Vec::new();
+    let mut materialized_call_names: HashSet<String> = HashSet::new();
+    let mut materialized_unsupported: HashMap<String, String> = HashMap::new();
+    let mut materialization_candidates: Vec<(String, nod_reader::Span)> = Vec::new();
+    collect_bare_call_candidates(
+        m,
+        &user_declared_c_names,
+        &top_names,
+        &generics,
+        &user_classes,
+        &mut materialization_candidates,
+    );
+    let mut seen_candidate_names: HashSet<String> = HashSet::new();
+    for (name, span) in &materialization_candidates {
+        if !seen_candidate_names.insert(name.clone()) {
+            continue;
+        }
+        match try_jit_materialize_winapi(name) {
+            MaterializationOutcome::Materialized {
+                c_name,
+                library,
+                signature,
+            } => {
+                let key = (library.clone(), c_name.clone());
+                let idx = if let Some(&i) = spec_dedupe.get(&key) {
+                    i
+                } else {
+                    let i = c_function_specs.len();
+                    spec_dedupe.insert(key, i);
+                    c_function_specs.push(nod_runtime::StubEntrySpec {
+                        dll: library.clone(),
+                        symbol: c_name.clone(),
+                        signature,
+                    });
+                    i
+                };
+                materialized_binding_specs.push(MaterializedBindingSpec {
+                    dylan_name: name.clone(),
+                    c_name,
+                    library,
+                    span: *span,
+                    signature,
+                    spec_idx: idx,
+                });
+                materialized_call_names.insert(name.clone());
+                nod_runtime::winffi_record_materialized();
+            }
+            MaterializationOutcome::UnsupportedSignature { reason, .. } => {
+                materialized_unsupported.insert(name.clone(), reason);
+            }
+            MaterializationOutcome::NotFound => {}
+        }
+    }
+
     // Allocate the stub table NOW (in the static area). The returned
     // `entry_ptrs` are stable for the process lifetime; we bake them
     // into per-call IR as `i64` constants.
@@ -862,6 +1523,35 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                 },
             );
         }
+    }
+    // Sprint 31: wire materialized bindings into the same lookup map
+    // and register a synthesized `CFunctionBinding` so dump-ast and
+    // introspection see them. User declarations always sit first in
+    // `c_functions` (and in `c_function_call_map`) so explicit names
+    // win over JIT materialization automatically — but `c_functions`
+    // is a Vec, not a map, so explicit dedupe on `dylan_name` happens
+    // here too as a belt-and-braces guard.
+    for spec in &materialized_binding_specs {
+        if user_declared_c_names.contains(&spec.dylan_name) {
+            continue;
+        }
+        let p = entry_ptrs[spec.spec_idx];
+        let sig = spec.signature;
+        c_function_call_map
+            .entry(spec.dylan_name.clone())
+            .or_insert(CFunctionCallInfo {
+                entry_ptr: p as u64,
+                arg_count: sig.arg_count as usize,
+            });
+        c_functions.push(CFunctionBinding {
+            dylan_name: spec.dylan_name.clone(),
+            c_name: spec.c_name.clone(),
+            library: spec.library.clone(),
+            span: spec.span,
+            resolved_in_db: true,
+            signature: Some(sig),
+            source: BindingSource::JitMaterialized,
+        });
     }
 
     // Phase 4: lower user-defined items.
@@ -1063,6 +1753,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     span: *span,
                     resolved_in_db: resolved,
                     signature,
+                    source: BindingSource::UserCFunction,
                 });
             }
             Item::DefineLibrary { .. } | Item::DefineModule { .. } => {}
@@ -1151,7 +1842,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // the bare name"; we surface a deferral diagnostic instead.
     let unsupported_c_names: HashSet<String> = c_functions
         .iter()
-        .filter(|c| c.signature.is_none())
+        .filter(|c| c.signature.is_none() && c.source == BindingSource::UserCFunction)
         .map(|c| c.dylan_name.clone())
         .collect();
     if !unsupported_c_names.is_empty() {
@@ -1161,6 +1852,25 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
             return Err(call_site_errors);
         }
     }
+
+    // Sprint 31: bare-name calls whose Win32 entry exists in the index
+    // BUT whose signature uses unsupported types (struct-by-value,
+    // function-pointer callback, …) decline materialization and would
+    // otherwise fall through to "unknown identifier" — surface a more
+    // informative error so the user knows the API exists but isn't
+    // yet wired up.
+    if !materialized_unsupported.is_empty() {
+        let mut call_site_errors: Vec<LoweringError> = Vec::new();
+        scan_module_for_materialized_unsupported(
+            m,
+            &materialized_unsupported,
+            &mut call_site_errors,
+        );
+        if !call_site_errors.is_empty() {
+            return Err(call_site_errors);
+        }
+    }
+    let _ = materialized_call_names;
 
     Ok(LoweredModule {
         functions: out,
@@ -1295,6 +2005,125 @@ fn scan_expr_for_c_calls(
             }
         }
         E::Stmt(s) => scan_stmt_for_c_calls(s, c_names, errors),
+        _ => {}
+    }
+}
+
+/// Sprint 31: parallel scan to [`scan_module_for_c_function_calls`] that
+/// emits a different error message for bare-name calls whose Win32 entry
+/// is present in the embedded index but uses an unsupported parameter /
+/// return shape. We surface the matched (library, c-name) so the user
+/// can declare a shim by hand.
+fn scan_module_for_materialized_unsupported(
+    m: &Module,
+    unsupported: &HashMap<String, String>,
+    errors: &mut Vec<LoweringError>,
+) {
+    for item in &m.items {
+        match item {
+            Item::DefineFunction { body, .. } | Item::DefineMethod { body, .. } => {
+                for s in body {
+                    scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+                }
+            }
+            Item::DefineConstant { value, .. } | Item::DefineVariable { value, .. } => {
+                scan_expr_for_unsupported_winapi(value, unsupported, errors);
+            }
+            Item::Expr(e) => scan_expr_for_unsupported_winapi(e, unsupported, errors),
+            _ => {}
+        }
+    }
+}
+
+fn scan_stmt_for_unsupported_winapi(
+    s: &Statement,
+    unsupported: &HashMap<String, String>,
+    errors: &mut Vec<LoweringError>,
+) {
+    match s {
+        Statement::Expr(e) => scan_expr_for_unsupported_winapi(e, unsupported, errors),
+        Statement::Let { value, .. } => scan_expr_for_unsupported_winapi(value, unsupported, errors),
+        Statement::Local { .. } => {}
+        Statement::For { body, finally_, .. } => {
+            for s in body {
+                scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+            }
+            for s in finally_ {
+                scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+            }
+        }
+        Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
+            scan_expr_for_unsupported_winapi(cond, unsupported, errors);
+            for s in body {
+                scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+            }
+        }
+        Statement::Block { body, cleanup, afterwards, .. } => {
+            for s in body {
+                scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+            }
+            for s in cleanup {
+                scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+            }
+            for s in afterwards {
+                scan_stmt_for_unsupported_winapi(s, unsupported, errors);
+            }
+        }
+    }
+}
+
+fn scan_expr_for_unsupported_winapi(
+    e: &Expr,
+    unsupported: &HashMap<String, String>,
+    errors: &mut Vec<LoweringError>,
+) {
+    match e {
+        Expr::Call { callee, args, span } => {
+            if let Expr::Ident(_, name) = callee.as_ref()
+                && let Some(reason) = unsupported.get(name)
+            {
+                errors.push(LoweringError::Unsupported {
+                    span: *span,
+                    message: format!(
+                        "Win32 function `{name}` was found in the embedded \
+                         windows_api.db index, but its signature uses unsupported \
+                         types ({reason}). To use this function, declare an \
+                         explicit `define c-function {name} ... library: \"…\"; end;` \
+                         with a shim signature, or wait for the relevant FFI \
+                         capability sprint (callbacks: Sprint 33; structs: Sprint 34)."
+                    ),
+                });
+            }
+            scan_expr_for_unsupported_winapi(callee, unsupported, errors);
+            for a in args {
+                scan_expr_for_unsupported_winapi(a, unsupported, errors);
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            scan_expr_for_unsupported_winapi(lhs, unsupported, errors);
+            scan_expr_for_unsupported_winapi(rhs, unsupported, errors);
+        }
+        Expr::UnOp { operand, .. } => scan_expr_for_unsupported_winapi(operand, unsupported, errors),
+        Expr::Paren { inner, .. } => scan_expr_for_unsupported_winapi(inner, unsupported, errors),
+        Expr::If { cond, then_, else_, .. } => {
+            scan_expr_for_unsupported_winapi(cond, unsupported, errors);
+            scan_expr_for_unsupported_winapi(then_, unsupported, errors);
+            if let Some(eb) = else_ {
+                scan_expr_for_unsupported_winapi(eb, unsupported, errors);
+            }
+        }
+        Expr::Begin { body, .. } => {
+            for e in body {
+                scan_expr_for_unsupported_winapi(e, unsupported, errors);
+            }
+        }
+        Expr::Let { value, .. } => scan_expr_for_unsupported_winapi(value, unsupported, errors),
+        Expr::Method { body, .. } | Expr::LocalMethod { body, .. } => {
+            for e in body {
+                scan_expr_for_unsupported_winapi(e, unsupported, errors);
+            }
+        }
+        Expr::Stmt(s) => scan_stmt_for_unsupported_winapi(s, unsupported, errors),
         _ => {}
     }
 }
@@ -5458,4 +6287,112 @@ fn lower_statements_into(
         }
     }
     Ok(())
+}
+
+// ─── Sprint 31 unit tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod sprint31_tests {
+    use super::*;
+
+    #[test]
+    fn winapi_dll_priority_orders_kernel_first() {
+        assert!(winapi_dll_priority("kernel32.dll") < winapi_dll_priority("user32.dll"));
+        assert!(winapi_dll_priority("user32.dll") < winapi_dll_priority("gdi32.dll"));
+        assert!(winapi_dll_priority("gdi32.dll") < winapi_dll_priority("advapi32.dll"));
+        assert!(winapi_dll_priority("advapi32.dll") < winapi_dll_priority("shell32.dll"));
+        assert!(winapi_dll_priority("shell32.dll") < winapi_dll_priority("comctl32.dll"));
+        // Unknown DLLs sort to the end (alphabetical fallback there).
+        assert!(winapi_dll_priority("d3d12.dll") > winapi_dll_priority("comctl32.dll"));
+    }
+
+    #[test]
+    fn looks_like_win32_export_filters_correctly() {
+        // Yes: standard Win32 export shape.
+        assert!(looks_like_win32_export("MessageBoxW"));
+        assert!(looks_like_win32_export("GetTickCount64"));
+        assert!(looks_like_win32_export("Beep"));
+        // Yes: lowercase-prefixed Win32 exports like lstrlenW.
+        assert!(looks_like_win32_export("lstrlenW"));
+        assert!(looks_like_win32_export("lstrlenA"));
+        assert!(looks_like_win32_export("wsprintfW"));
+        // Yes: mixed-case but starting lowercase.
+        assert!(looks_like_win32_export("messageBox"));
+        // No: Dylan-side names, punctuated, all-lowercase.
+        assert!(!looks_like_win32_export("print"));
+        assert!(!looks_like_win32_export("format"));
+        assert!(!looks_like_win32_export("<my-class>"));
+        assert!(!looks_like_win32_export("c-function"));
+        assert!(!looks_like_win32_export("+"));
+        assert!(!looks_like_win32_export("instance?"));
+        assert!(!looks_like_win32_export("A"));
+        assert!(!looks_like_win32_export("ab"));
+    }
+
+    #[test]
+    fn jit_materialize_GetTickCount64_yields_kernel32_no_args() {
+        let outcome = try_jit_materialize_winapi("GetTickCount64");
+        match outcome {
+            MaterializationOutcome::Materialized { c_name, library, signature } => {
+                assert_eq!(c_name, "GetTickCount64");
+                assert_eq!(library, "kernel32.dll");
+                assert_eq!(signature.arg_count, 0);
+            }
+            other => panic!("expected materialized; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jit_materialize_bare_MessageBox_picks_W() {
+        let outcome = try_jit_materialize_winapi("MessageBox");
+        match outcome {
+            MaterializationOutcome::Materialized { c_name, library, .. } => {
+                assert_eq!(c_name, "MessageBoxW");
+                assert_eq!(library, "user32.dll");
+            }
+            other => panic!("expected materialized; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jit_materialize_unknown_name_returns_not_found() {
+        let outcome = try_jit_materialize_winapi("ThisIsNotAWin32Export");
+        assert!(matches!(outcome, MaterializationOutcome::NotFound));
+    }
+
+    #[test]
+    fn jit_materialize_lstrlenW_succeeds() {
+        let outcome = try_jit_materialize_winapi("lstrlenW");
+        match outcome {
+            MaterializationOutcome::Materialized { c_name, library, signature } => {
+                assert_eq!(c_name, "lstrlenW");
+                assert_eq!(library, "kernel32.dll");
+                assert_eq!(signature.arg_count, 1);
+            }
+            other => panic!("lstrlenW: expected materialized; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jit_materialize_EnumWindows_outcome() {
+        // EnumWindows has a callback (WNDENUMPROC). The outcome must
+        // be either NotFound (if not in the embedded blob) or
+        // UnsupportedSignature (function pointer). Both are acceptable
+        // — Sprint 31 only needs the user to get a non-silent error
+        // path. The blob filter in `build.rs` may have dropped it
+        // entirely (`bad_type=5191`).
+        let outcome = try_jit_materialize_winapi("EnumWindows");
+        eprintln!("EnumWindows outcome: {outcome:?}");
+        match outcome {
+            MaterializationOutcome::NotFound
+            | MaterializationOutcome::UnsupportedSignature { .. } => {}
+            MaterializationOutcome::Materialized { signature, .. } => {
+                // If it materialized, accept that — the index doesn't
+                // expose callbacks as TypeRef::Function in this build,
+                // they collapse to opaque pointers.
+                eprintln!("EnumWindows actually materialized with sig {signature:?}");
+            }
+        }
+    }
 }

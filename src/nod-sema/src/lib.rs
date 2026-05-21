@@ -34,9 +34,9 @@ use nod_dfm::TypeEstimate;
 use nod_llvm::{Jit, codegen_module};
 
 pub use lower::{
-    BlockHandlerRegistration, BlockRegistration, CFunctionBinding, ClosureInfo, ClosureRegistry,
-    LoweredModule, LoweringError, LoweringWarning, MethodRegistration, SealingViolation,
-    dump_classes, lower_function, lower_module, lower_module_full,
+    BindingSource, BlockHandlerRegistration, BlockRegistration, CFunctionBinding, ClosureInfo,
+    ClosureRegistry, LoweredModule, LoweringError, LoweringWarning, MethodRegistration,
+    SealingViolation, dump_classes, lower_function, lower_module, lower_module_full,
 };
 
 /// Sprint 17: parse + macro-expand + lower in one shot. Existing
@@ -315,6 +315,36 @@ fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
         }
     }
     Ok(())
+}
+
+/// Sprint 31: parse the same `items + expr` shape as
+/// [`eval_expr_with_items_to_string`] but stop after lowering and
+/// return the module's c-function bindings. Tests use this to inspect
+/// which bindings the JIT-materialization path synthesized (and to
+/// confirm A/W disambiguation + user-override-wins behavior) without
+/// actually invoking a Win32 API.
+pub fn introspect_bindings(
+    items_src: &str,
+    expr_src: &str,
+) -> Result<Vec<CFunctionBinding>, EvalError> {
+    stdlib::ensure_loaded();
+    let wrapped = format!(
+        "Module: __eval__\n\
+         \n\
+         {items_src}\n\
+         define function <eval-entry> ()\n  {expr_src}\nend;\n"
+    );
+    let mut sm = nod_reader::SourceMap::new();
+    let file_id = sm
+        .add("<eval>", wrapped.clone())
+        .map_err(EvalError::SourceMap)?;
+    let toks = nod_reader::lex(&wrapped, file_id);
+    let pre = nod_reader::scan_preamble(&wrapped);
+    let mut module =
+        parse_user_module(&wrapped, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
+    expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
+    let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    Ok(lm.c_functions)
 }
 
 /// Lower `source_path`, JIT it, look up `entry_name` (a `() => <integer>`

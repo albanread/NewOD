@@ -883,6 +883,49 @@ Test count: **475 → 484 / 0 / 6** under `newgc-backend` default (+9 passing st
 
 Sprint 30's "Dylan-side IDE bring-up" slot from the prior plan shifts forward; the FFI Phase C string-marshaling work moves into the Sprint 30 slot, and the IDE work tracks behind the Sprint 31 (`common-dylan` port) entry as Sprint 32+. Renumbering of downstream slots is deferred to the next sprint-plan review.
 
+### Sprint 31 — JIT-time Win32 API materialization (bare-name calls) — landed
+
+**Goal:** `GetTickCount64()` returns the system uptime via `eval_expr_to_string` **without any `define c-function` declaration above it**. Sprint 28 wired the table; Sprint 31 makes the table populate itself from the embedded `nod-winapi` index when Dylan source references a bare Win32 name.
+
+**A. Sema lookup hook (`nod-sema/src/lower.rs`).** After the existing Phase 3b walk that builds the per-module stub table from explicit `define c-function` declarations, a new pre-Phase-4 pass walks the AST for `Expr::Call { callee: Expr::Ident(name), ... }` and collects every name that (a) isn't user-declared, (b) isn't a Dylan top-level function, generic, or class, and (c) passes a shape filter for Win32 exports (`looks_like_win32_export`: at least one uppercase letter, all ASCII alphanumerics, ≥ 3 chars). For each such candidate `try_jit_materialize_winapi(name)` consults `nod_winapi::functions()`:
+
+1. **A/W default to W.** Bare `MessageBox` is rewritten to `MessageBoxW` first; the literal name is the fallback. Bare `MessageBoxA` keeps the explicit A suffix.
+2. **Cross-DLL priority.** When a name resolves in multiple DLLs, `WINAPI_DLL_PRIORITY` breaks the tie: `kernel32.dll` > `user32.dll` > `gdi32.dll` > `advapi32.dll` > `shell32.dll` > `comctl32.dll` > alphabetical fallback.
+3. **Signature derivation.** `build_signature_from_function_info` walks `FunctionInfo::params` + `return_type` (`nod_winapi::TypeRef`) and maps each to `nod_runtime::CArgKind` / `CReturnKind`. Unmappable shapes (`Void` as a param, `Pointer { pointee: Function }`, struct-by-value — none of which actually reach the embedded blob because `build.rs` filters them — and arity > 8) return `Err(reason)`; the materialization declines and the caller surfaces a "Win32 function found but signature uses unsupported types" diagnostic.
+
+**B. `BindingSource` enum (`nod-sema/src/lower.rs`).** New `BindingSource::{UserCFunction, JitMaterialized}` on `CFunctionBinding`. User declarations always carry `UserCFunction`; the bare-name fallback decline-on-collision rule guarantees JIT materialization never overwrites an explicit binding. Introspection (`introspect_bindings`) exposes the field directly.
+
+**C. Stub-table integration.** Synthesized bindings feed into the existing `c_function_specs` / `spec_dedupe` machinery — two bare references to `GetTickCount64` in the same module share one slot, and the resolver / trampoline path is unchanged from Sprint 28. No new IR variants, no new runtime infrastructure, no marshaling changes. Sprint 31 is sema-only.
+
+**D. Diagnostics.** Bare-name calls whose Win32 entry exists in the index BUT whose signature uses unsupported categories now emit `LoweringError::Unsupported { message: "Win32 function `X` was found in the embedded windows_api.db index, but its signature uses unsupported types (...); declare an explicit `define c-function X ... library: ...; end;` with a shim signature, or wait for Sprint 33 (callbacks) / Sprint 34 (structs)." }`. Bare names that aren't in the index at all fall through to the existing `Codegen(UnknownCallee)` path — same behavior as before Sprint 31.
+
+**E. Stats.** `WinFfiStats::materialized_lifetime` (process-global counter, bumped from `nod_runtime::winffi_record_materialized()` once per synthesized binding) surfaces materialization activity for tests and the future `winffi-stats` diagnostic command.
+
+**F. Tests (`tests/nod-tests/tests/winffi_materialize.rs`).** 10 acceptance tests + 1 ignored marker, all `#[serial]` (`#[cfg(windows)]`):
+- `bare_GetTickCount64_resolves_to_kernel32` — **headline**: bare-name uptime call, asserts > 1000 ms.
+- `bare_GetCurrentProcessId_resolves_correctly` — positive u32.
+- `bare_Sleep_resolves_to_void_returning` — void-return materialization works.
+- `bare_lstrlenW_resolves_with_string_marshaling` — bare `lstrlenW("héllo")` → "5" (UTF-16 transcoding through a synthesized binding).
+- `bare_MessageBox_resolves_to_W_variant` — introspection: bare `MessageBox` materializes as `MessageBoxW` from `user32.dll`, no dialog popped.
+- `bare_MessageBoxA_resolves_explicitly` — introspection: explicit A suffix kept.
+- `user_define_c_function_overrides_materialization` — user-declared `GetTickCount` carries `BindingSource::UserCFunction`, exactly one binding (no duplicate JIT-materialized entry).
+- `unsupported_signature_declines_materialization` — `CreateProcessW` (10 params, > 8 arity cap) either errors with "unsupported types" or falls through to `UnknownCallee`; never silently succeeds.
+- `stats_show_materialization_count` — two distinct bare calls bump `materialized_lifetime` by 2.
+- `duplicate_bare_calls_share_one_materialization` — two calls to the same bare name share one slot (one materialization counter bump).
+- `ambiguous_name_picks_kernel32_first` — `#[ignore]` marker: no genuine cross-DLL collisions in the current embedded blob; priority order covered by the pure-function unit test in `nod-sema` below.
+
+Plus 7 unit tests in `nod-sema::lower::sprint31_tests`: `winapi_dll_priority_orders_kernel_first`, `looks_like_win32_export_filters_correctly`, `jit_materialize_GetTickCount64_yields_kernel32_no_args`, `jit_materialize_bare_MessageBox_picks_W`, `jit_materialize_unknown_name_returns_not_found`, `jit_materialize_lstrlenW_succeeds`, `jit_materialize_EnumWindows_outcome`.
+
+**Headline acceptance:** `eval_expr_to_string("GetTickCount64()")` returns a positive integer > 1000 with no `define c-function` declaration. The bare-name `lstrlenW("héllo")` returns "5" through the same path Sprint 30 proved out for explicit declarations.
+
+**Gate results:** 501 / 0 / 7 under newgc default (484 → 501; +17 new tests, +1 ignored marker). 5x sequential flake clean. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Out of scope (deferred):**
+- Process-global materialized-binding cache (each eval-module re-materializes; not yet measurably hot).
+- Better ambiguity fix-it hints (currently the message just names the colliding DLLs; no auto-suggest).
+- Materialize-by-pattern (`Get*`, `*A` / `*W` family expansions) for IDE auto-completion.
+- A/W resolution that walks back to a single canonical Dylan-name (currently `MessageBox` materializes to `MessageBoxW` and the synthesized binding's `dylan_name` stays `MessageBox` — the user code sees the bare name they wrote).
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 

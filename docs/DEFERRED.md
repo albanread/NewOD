@@ -1608,12 +1608,14 @@ done.
 - **:open: Variadic functions** — Sprint 27 → later FFI sprint.
   `printf` family. Sprint 27 filter drops them. Variadic ABI
   awareness on x64 Windows is straightforward but separate work.
-- **:open: A/W auto-pick** — Sprint 27 → Sprint 28 or 29. The DB
-  carries `aw_family ∈ {None, 'A', 'W'}` on each function. Sprint
-  27 treats `MessageBoxA` and `MessageBoxW` as separate functions;
-  the user picks. A future ergonomics pass can auto-pick `W` for
-  `define c-function MessageBox(...)` if the bare name isn't
-  present and a `W` variant is.
+- **:closed: A/W auto-pick** — Sprint 27 → Sprint 31. **Landed
+  Sprint 31.** The DB still carries `aw_family ∈ {None, 'A', 'W'}`
+  per function, but the Sprint 31 JIT-materialization hook does
+  the A/W resolution automatically: bare `MessageBox` materializes
+  to `MessageBoxW` (modern default), explicit `MessageBoxA` keeps
+  the A variant. Sprint 27's `define c-function MessageBox(...)`
+  surface still works too — user declarations win over the
+  materialization rule.
 - **:closed: Constants table in the upstream DB** — Sprint 27 →
   Sprint 29 (closed via curation, not via upstream DB fix).
   Investigation in Sprint 29 Phase A confirmed schema v5 carries
@@ -1901,3 +1903,75 @@ real. Below is what Sprint 30 explicitly did NOT do.
   same backing storage across calls (truncating at end of call)
   would avoid the allocator hit. Not worth doing until profiling
   flags it.
+
+## Carry-over from Sprint 31 (JIT-time API materialization — bare-name Win32 calls) — into Sprint 32+
+
+Sprint 31 closes the "user wrote `MessageBox(...)`, didn't declare
+it; look it up in the embedded index" ergonomic gap. The remaining
+work is about *broadening* that path or *speeding* it up — none of
+it gates Sprint 32+ on its own.
+
+- **:closed: A/W auto-pick** — Sprint 27 → Sprint 31. **Landed
+  Sprint 31.** The Sprint 27 deferred entry is closed by the
+  Sprint 31 materialization hook: bare `MessageBox` resolves to
+  `MessageBoxW` (default to wide); explicit `MessageBoxA` keeps
+  the A variant. Same rule applies to `Beep` (no A/W family),
+  `lstrlenW`, etc. — names already carrying an A/W suffix bypass
+  the rewrite.
+- **:closed: JIT-time materialization** — Sprint 27 / 28 → Sprint
+  31. **Landed Sprint 31.** The "call sites instantiate the table
+  on demand" item from the Sprint 27 / 28 deferred lists is now
+  the default path for any bare Win32 name in user source. Explicit
+  `define c-function` still works (and wins over materialization).
+- **:open: Cross-module materialized-binding cache** — Sprint 31
+  → performance follow-up. Each `eval_expr_*` call lowers a fresh
+  module and re-materializes every bare-name binding from scratch.
+  Two consecutive `eval_expr_to_string("GetTickCount64()")` runs
+  resolve `kernel32!GetTickCount64` twice (LoadLibrary is cached
+  globally, but the stub-table slot is per-module). A process-
+  global cache keyed by `(dll, c-name, signature)` would dedup
+  across modules. Not worth doing until the IDE (Sprint 30b / 32)
+  drives enough back-to-back evals to make it measurable.
+- **:open: Better ambiguity fix-it hints** — Sprint 31 → minor.
+  When the priority order picks a winner, sema doesn't log which
+  DLLs the name lived in. A future diagnostic (probably surfaced
+  through `dump-ast`) can list "MessageBox materialized as
+  MessageBoxW from user32.dll; also exists in [other DLLs]".
+- **:open: Materialize-by-pattern (`Get*`, `*A`/`*W` family
+  expansion)** — Sprint 31 → IDE-ergonomic follow-up. The current
+  materializer takes one bare name at a time. An IDE completion
+  helper that walks the embedded index for `Get*` patterns (or for
+  every A/W family member of a base name) would help discovery.
+  Probably an IDE-side feature reading `nod_winapi::functions()`
+  directly rather than a sema change.
+- **:open: A/W resolution that rewrites the Dylan-side name** —
+  Sprint 31 → ergonomic tweak. Currently bare `MessageBox`
+  materializes as `c_name: "MessageBoxW"` but the Dylan-side
+  binding name stays `"MessageBox"` (matching what the user wrote).
+  An alternate design would canonicalize the Dylan-side name to
+  `MessageBoxW` so call-graph dumps and stack traces all reference
+  the same string. The current design preserves the user's spelling;
+  flip-side is that two source files written as `MessageBox` and
+  `MessageBoxW` get two distinct bindings even though they bind to
+  the same underlying export. The Sprint 28 `spec_dedupe` map
+  collapses them at the stub-table level, so the runtime cost is
+  zero — but the bookkeeping carries two `CFunctionBinding`s where
+  one would be cleaner. Revisit when something actually trips over
+  this.
+- **:open: Stdlib c-function index** — Sprint 31 → Sprint 32+.
+  The Sprint 31 brief mentions "stdlib's `define c-function`s
+  (none yet, but eventually) sit in `UserCFunction` category and
+  win over JIT materialization too". As of Sprint 31 the stdlib
+  has zero `define c-function` declarations. When Sprint 32 starts
+  porting the `common-dylan` library, real stdlib bindings will
+  appear and this rule will be exercised. The materialization hook
+  already treats stdlib-declared names identically to user-declared
+  names (both go through the `define c-function` parse path); no
+  code changes needed when the stdlib starts shipping bindings.
+- **:open: Materialization for non-Win32 platforms** — Sprint 31 →
+  Sprint 36 (macOS port). The current `nod_winapi` blob is Win32-
+  specific. The macOS port (Sprint 36) will need an equivalent
+  `nod_macapi` blob (Cocoa / Mach exports). The materialization
+  hook is platform-agnostic in shape; replacing the `nod_winapi`
+  query with a per-platform indirection is mechanical when the
+  second platform arrives.

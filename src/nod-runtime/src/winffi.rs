@@ -360,12 +360,20 @@ pub struct WinFfiStats {
     /// per-call allocation overhead and for the Sprint 30 acceptance
     /// reporting; the buffer itself is freed at end of call (Vec drop).
     pub tempbufs_allocated_lifetime: usize,
+    /// Sprint 31: cumulative count of c-function bindings the sema
+    /// layer materialized from the embedded `nod-winapi` index because
+    /// a bare-name call site referenced a Win32 export the user hadn't
+    /// declared with `define c-function`. Useful for diagnostics and
+    /// for the Sprint 31 acceptance assertion that materialization is
+    /// actually happening.
+    pub materialized_lifetime: usize,
 }
 
 static STAT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 static STAT_RESOLVED: AtomicUsize = AtomicUsize::new(0);
 static STAT_UNIQUE: AtomicUsize = AtomicUsize::new(0);
 static STAT_TEMPBUFS: AtomicUsize = AtomicUsize::new(0);
+static STAT_MATERIALIZED: AtomicUsize = AtomicUsize::new(0);
 
 static UNIQUE_KEYS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
@@ -382,6 +390,7 @@ pub fn winffi_stats() -> WinFfiStats {
         total_resolved: STAT_RESOLVED.load(Ordering::Relaxed),
         unique_symbols: STAT_UNIQUE.load(Ordering::Relaxed),
         tempbufs_allocated_lifetime: STAT_TEMPBUFS.load(Ordering::Relaxed),
+        materialized_lifetime: STAT_MATERIALIZED.load(Ordering::Relaxed),
     }
 }
 
@@ -391,9 +400,17 @@ pub fn _reset_winffi_stats_for_tests() {
     STAT_RESOLVED.store(0, Ordering::Relaxed);
     STAT_UNIQUE.store(0, Ordering::Relaxed);
     STAT_TEMPBUFS.store(0, Ordering::Relaxed);
+    STAT_MATERIALIZED.store(0, Ordering::Relaxed);
     if let Some(m) = UNIQUE_KEYS.get() {
         m.lock().expect("unique_keys poisoned").clear();
     }
+}
+
+/// Sprint 31: bump the `materialized_lifetime` counter. Called from
+/// `nod-sema` whenever the JIT materialization hook synthesizes a new
+/// c-function binding for a bare-name Win32 reference.
+pub fn winffi_record_materialized() {
+    STAT_MATERIALIZED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record that one stub-table entry was allocated by the sema layer.

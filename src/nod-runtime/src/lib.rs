@@ -175,7 +175,7 @@ pub use winffi::{
     nod_winffi_call_0, nod_winffi_call_1, nod_winffi_call_2, nod_winffi_call_3,
     nod_winffi_call_4, nod_winffi_call_5, nod_winffi_call_6, nod_winffi_call_7,
     nod_winffi_call_8, record_stub_entry_allocated, resolve_into_entry, resolve_symbol,
-    signature_from_names, winffi_stats,
+    signature_from_names, winffi_record_materialized, winffi_stats,
 };
 pub use word::{FIXNUM_MAX, FIXNUM_MIN, FixnumOverflow, Word};
 pub use wrapper::{GcBit, Wrapper};
