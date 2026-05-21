@@ -182,8 +182,12 @@ pub const NOD_MAKE_STRETCHY_VECTOR_SYMBOL: &str = "nod_make_stretchy_vector";
 // invoking a `<function>` Word. See `nod-runtime::functions` for the
 // implementation.
 pub const NOD_MAKE_FUNCTION_REF_SYMBOL: &str = "nod_make_function_ref";
+pub const NOD_FUNCALL0_SYMBOL: &str = "nod_funcall0";
 pub const NOD_FUNCALL1_SYMBOL: &str = "nod_funcall1";
 pub const NOD_FUNCALL2_SYMBOL: &str = "nod_funcall2";
+pub const NOD_FUNCALL3_SYMBOL: &str = "nod_funcall3";
+pub const NOD_FUNCALL4_SYMBOL: &str = "nod_funcall4";
+pub const NOD_FUNCALL5_SYMBOL: &str = "nod_funcall5";
 pub const NOD_APPLY_SYMBOL: &str = "nod_apply";
 pub const NOD_MAKE_SOV_LEN_SYMBOL: &str = "nod_make_sov_len";
 
@@ -235,8 +239,12 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_make_stretchy_vector", NOD_MAKE_STRETCHY_VECTOR_SYMBOL, 1),
     // Sprint 21 — first-class function values.
     ("nod_make_function_ref", NOD_MAKE_FUNCTION_REF_SYMBOL, 2),
+    ("nod_funcall0", NOD_FUNCALL0_SYMBOL, 1),
     ("nod_funcall1", NOD_FUNCALL1_SYMBOL, 2),
     ("nod_funcall2", NOD_FUNCALL2_SYMBOL, 3),
+    ("nod_funcall3", NOD_FUNCALL3_SYMBOL, 4),
+    ("nod_funcall4", NOD_FUNCALL4_SYMBOL, 5),
+    ("nod_funcall5", NOD_FUNCALL5_SYMBOL, 6),
     ("nod_apply", NOD_APPLY_SYMBOL, 2),
     ("nod_make_sov_len", NOD_MAKE_SOV_LEN_SYMBOL, 1),
     // Sprint 22 — <table> + hashing.

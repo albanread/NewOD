@@ -1473,21 +1473,63 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   `nod_funcall_N`). The Sprint 21 deferral test
   (`closure_capture_errors_with_sprint24_diagnostic`) is replaced by
   the positive test `closure_capture_works`.
+- **:done: `make(<range>, from:, to:)` keyword-init form** — Sprint 21 →
+  **CLOSED in Sprint 26**. The Sprint 21 headline test
+  `dylan_reduce_plus_zero_range_one_to_hundred_is_5050` had to use the
+  `%make-range(1, 100, 1)` primitive workaround because the canonical
+  `make(<range>, from: 1, to: 100)` form left the `range-by` slot at
+  zero and the iterator never advanced. Sprint 26 adds a
+  `slot_integer_default` helper alongside `slot_integer` in
+  `nod-runtime/src/collections.rs` and uses it to default `range-by`
+  to fixnum `1` via `SlotDefault::Value`. `make(<range>, from: 1, to:
+  100)` now produces a size-100 range with `by = 1` end-to-end, and
+  the Sprint 21 headline test is rewritten to use the canonical form.
+  New test file `tests/nod-tests/tests/range_keyword_init.rs` pins
+  the all-three-kw, defaulted-by, and negative-step variants.
+
+## Carry-over from Sprint 22 (`<table>` + hashing) — closes
+
+- **:done: generic-dispatch trampoline for first-class function refs**
+  — Sprint 22 → **CLOSED in Sprint 26**. Sprint 22 introduced a
+  "first-registration-wins" hack in
+  `nod-sema::register_top_level_functions` so that `\size` (a generic
+  with multiple methods) resolved to *some* method body's code-ptr;
+  the most-general fallback tended to register first, which made the
+  common cases work but baked the wrong body for non-fallback receiver
+  classes (e.g. `\size(<table>)` would call the `<object>` method).
+  Sprint 26 introduces `FUNCTION_KIND_GENERIC_TRAMPOLINE` — a fourth
+  `<function>` kind-tag value — and a `make_generic_trampoline_ref`
+  constructor: when `make_function_ref(name, arity)` is asked for a
+  name that already has at least one registered method
+  (`is_generic_defined`), it returns a trampoline `<function>` Word
+  whose `env-ptr` slot stashes the `&'static GenericFunction` pointer
+  (raw u64; 8-aligned so the GC's bit-0 classifier correctly skips
+  it). Each `nod_funcall_N` / `nod_apply` checks the kind-tag first;
+  on a generic-trampoline match the dispatch path routes through
+  `dispatch_via_generic_trampoline`, which calls `nod_dispatch` to
+  walk the applicable-method chain and tail-call the most-specific
+  winner. The Sprint 22 shadow-registration in
+  `register_top_level_functions` is removed. New test file
+  `tests/nod-tests/tests/generic_function_ref.rs` pins the dispatch
+  routing across `<list>` / `<table>` / `<range>` receivers.
 
 ## Carry-over from Sprint 24 (closures)
 
-- **:open: Closure-body arity-0 calls** — Sprint 21 → Sprint 24
-  retrospective → Sprint 25 (or whenever apply-0 lands). The
-  Sprint 21 `anonymous_method_zero_args` test recorded that calling a
-  `method () … end` with zero args isn't lowered through
-  `nod_funcall_N` (which only has `nod_funcall1` / `nod_funcall2`
-  trampolines). Sprint 24 hits the same gate from closures: a
-  mutable-state closure built as `method () count := count + 1 end` is
-  expressible but unreachable through the funcall path. Sprint 24's
-  `closure_writes_captured_variable` test uses a dummy-arg variant
-  (`method (dummy) … end`) to exercise the cell-set! plumbing without
-  tripping the arity-0 limitation. Fix: add `nod_funcall0` (one-liner)
-  or route arity-0 through `nod_apply` with an empty args vector.
+- **:done: Closure-body arity-0 calls** — Sprint 21 → Sprint 24 →
+  **CLOSED in Sprint 26**. Added `nod_funcall0` (and arities 3..=5 for
+  symmetry) with the same env-ptr-conditional dispatch shape as the
+  Sprint 21/24 `nod_funcall1` / `nod_funcall2`. `LOWER_PRIMITIVE_TABLE`,
+  the SPRINT_20B_PRIMITIVES symbol table, the JIT global mapping, and
+  the env-bound funcall lowering site (`nod-sema::lower`) all gained
+  the new arity arms. The canonical `method () … end` form (no dummy
+  arg) now drives `%funcall0` cleanly; the Sprint 24 brief's
+  `closure_writes_captured_variable` test gains an `_arity_0` variant
+  that exercises `bump(); bump(); count`. New test file
+  `tests/nod-tests/tests/funcall_arity.rs` pins arities 0/3/4/5 with
+  both env-less and closure-with-capture variants. Sprint 21's
+  `anonymous_method_zero_args` test is rewritten to assert success
+  ("eval method () 42 end; k() → 42") in place of the prior
+  limitation diagnostic.
 - **:open: Env-sharing between sibling closures** — Sprint 24 → v1.x
   optimisation. Two anonymous methods defined in the same enclosing
   scope with the SAME capture set currently allocate two separate

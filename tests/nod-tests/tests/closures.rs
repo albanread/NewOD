@@ -67,11 +67,9 @@ fn closure_reads_captured_variable() {
 /// `count := count + 1` inside a closure increments the captured cell.
 /// Two successive calls accumulate; the outer scope sees the result.
 ///
-/// **Note on arity-0**: the brief allows substituting a dummy-arg
-/// method because arity-0 calls through `nod_funcall_N` are explicitly
-/// deferred from Sprint 21 (the `anonymous_method_zero_args` test
-/// records this). The dummy-arg variant exercises the same cell-set!
-/// machinery without falling on the arity-0 limitation.
+/// Sprint 26 closed the arity-0 deferral; the canonical `method ()`
+/// form now works. The dummy-arg form is retained as a sanity check
+/// that the arity-1 path is still wired the same way.
 #[test]
 #[serial]
 fn closure_writes_captured_variable() {
@@ -82,6 +80,23 @@ fn closure_writes_captured_variable() {
          bump(0); bump(0); count",
     )
     .expect("eval bump-bump-count");
+    assert_eq!(s, "2");
+}
+
+/// Sprint 26: the canonical arity-0 form `method () … end` now drives
+/// `%funcall0` cleanly, so the test from the Sprint 24 brief that had
+/// to use a dummy-arg method is now exercisable in its source-true
+/// shape.
+#[test]
+#[serial]
+fn closure_writes_captured_variable_arity_0() {
+    setup();
+    let s = nod_sema::eval_expr_to_string(
+        "let count = 0; \
+         let bump = method () count := count + 1 end; \
+         bump(); bump(); count",
+    )
+    .expect("eval bump-bump-count (arity-0)");
     assert_eq!(s, "2");
 }
 

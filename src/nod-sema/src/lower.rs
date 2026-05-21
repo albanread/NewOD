@@ -233,8 +233,15 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%make-range", "nod_make_range", 3, TypeEstimate::Top),
     ("%make-stretchy-vector", "nod_make_stretchy_vector", 1, TypeEstimate::Top),
     // Sprint 21: first-class function dispatch primitives.
+    // Sprint 26: extended to arities 0 and 3..=5 so closures and
+    // env-bound function-Refs can be called cleanly without packing
+    // args into a `<simple-object-vector>` for `nod_apply`.
+    ("%funcall0", "nod_funcall0", 1, TypeEstimate::Top),
     ("%funcall1", "nod_funcall1", 2, TypeEstimate::Top),
     ("%funcall2", "nod_funcall2", 3, TypeEstimate::Top),
+    ("%funcall3", "nod_funcall3", 4, TypeEstimate::Top),
+    ("%funcall4", "nod_funcall4", 5, TypeEstimate::Top),
+    ("%funcall5", "nod_funcall5", 6, TypeEstimate::Top),
     ("%apply", "nod_apply", 2, TypeEstimate::Top),
     // Sprint 21: allocate a zero-filled `<simple-object-vector>` of the
     // given length. Mirrors `collection_map`'s allocator path.
@@ -3375,14 +3382,25 @@ impl FunctionBuilder {
                 .iter()
                 .map(|a| self.lower_expr(a, env, ctx))
                 .collect::<Result<_, _>>()?;
+            // Sprint 26: arities 0..=5 dispatch through the direct
+            // `nod_funcall_N` trampolines. Higher arities still need
+            // `nod_apply` and are surfaced as a "not yet supported" so
+            // the lowerer doesn't silently SOV-pack without the caller
+            // opting in. `<exit-procedure>` is always arity 1 at the
+            // source level; the arity-0 path skips the exit-procedure
+            // shortcut inside `nod_funcall0` deliberately.
             let funcall_sym = match arg_temps.len() {
+                0 => "nod_funcall0",
                 1 => "nod_funcall1",
                 2 => "nod_funcall2",
+                3 => "nod_funcall3",
+                4 => "nod_funcall4",
+                5 => "nod_funcall5",
                 n => {
                     return Err(LoweringError::Unsupported {
                         span,
                         message: format!(
-                            "Sprint 21: calling a local <function>/<exit-procedure> binding `{name}` with arity {n} not supported (only 1 or 2 args); higher-arity apply is deferred"
+                            "calling a local <function>/<exit-procedure> binding `{name}` with arity {n} not supported (cap is 5 direct args); use `apply(f, args)` for higher arities"
                         ),
                     });
                 }

@@ -18,7 +18,8 @@ use crate::codegen::{
     NOD_COLLECTION_CONCATENATE_SYMBOL, NOD_COLLECTION_SIZE_SYMBOL, NOD_CONDITION_MESSAGE_SYMBOL,
     NOD_DISPATCH_BINARY_SYMBOL, NOD_DISPATCH_SYMBOL, NOD_DISPATCH_UNARY_SYMBOL, NOD_EMPTY_P_SYMBOL,
     NOD_FIP_ADVANCE_SYMBOL, NOD_FIP_CURRENT_ELEMENT_SYMBOL, NOD_FIP_FINISHED_P_SYMBOL,
-    NOD_FIP_INIT_SYMBOL, NOD_FUNCALL1_SYMBOL, NOD_FUNCALL2_SYMBOL, NOD_HAS_NEXT_METHOD_SYMBOL,
+    NOD_FIP_INIT_SYMBOL, NOD_FUNCALL0_SYMBOL, NOD_FUNCALL1_SYMBOL, NOD_FUNCALL2_SYMBOL,
+    NOD_FUNCALL3_SYMBOL, NOD_FUNCALL4_SYMBOL, NOD_FUNCALL5_SYMBOL, NOD_HAS_NEXT_METHOD_SYMBOL,
     NOD_INVOKE_EXIT_SYMBOL, NOD_IS_INSTANCE_OF_SYMBOL, NOD_MAKE_EXIT_PROCEDURE_SYMBOL,
     NOD_MAKE_FUNCTION_REF_SYMBOL, NOD_MAKE_RANGE_SYMBOL, NOD_MAKE_SOV_LEN_SYMBOL,
     NOD_MAKE_STRETCHY_VECTOR_SYMBOL, NOD_MAKE_SYMBOL, NOD_NEXT_METHOD_SYMBOL, NOD_NIL_SYMBOL, NOD_PAIR_ALLOC_SYMBOL,
@@ -200,12 +201,28 @@ impl<'ctx> Jit<'ctx> {
                 nod_runtime::nod_make_function_ref as *const () as *mut std::ffi::c_void,
             ),
             (
+                module.get_function(NOD_FUNCALL0_SYMBOL),
+                nod_runtime::nod_funcall0 as *const () as *mut std::ffi::c_void,
+            ),
+            (
                 module.get_function(NOD_FUNCALL1_SYMBOL),
                 nod_runtime::nod_funcall1 as *const () as *mut std::ffi::c_void,
             ),
             (
                 module.get_function(NOD_FUNCALL2_SYMBOL),
                 nod_runtime::nod_funcall2 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_FUNCALL3_SYMBOL),
+                nod_runtime::nod_funcall3 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_FUNCALL4_SYMBOL),
+                nod_runtime::nod_funcall4 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_FUNCALL5_SYMBOL),
+                nod_runtime::nod_funcall5 as *const () as *mut std::ffi::c_void,
             ),
             (
                 module.get_function(NOD_APPLY_SYMBOL),

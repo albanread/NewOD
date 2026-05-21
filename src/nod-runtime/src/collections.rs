@@ -146,14 +146,19 @@ pub fn ensure_registered() {
             ],
         );
 
-        // Concrete: `<range>` — three fixnum slots.
+        // Concrete: `<range>` — three fixnum slots. Sprint 26: default
+        // `by:` to `1` so the canonical Dylan spec form
+        // `make(<range>, from: 1, to: 100)` works without the caller
+        // having to spell out the step. The bare default of
+        // `SlotDefault::Unbound` leaves `by` zero, which makes the
+        // iterator never advance.
         let (range, _) = crate::register_simple_user_class(
             "<range>",
             Some(sequence),
             vec![
                 slot_integer("range-from", "from"),
                 slot_integer("range-to", "to"),
-                slot_integer("range-by", "by"),
+                slot_integer_default("range-by", "by", 1),
             ],
         );
 
@@ -242,6 +247,24 @@ fn slot_integer(name: &str, init_kw: &str) -> SlotInfo {
         init_keyword: Some(init_kw.to_string()),
         required_init_keyword: false,
         default_init: SlotDefault::Unbound,
+        has_setter: true,
+    }
+}
+
+/// `slot_integer` variant that defaults to a fixnum literal when the
+/// caller omits the init-keyword. Sprint 26: used for `<range>`'s
+/// `range-by` slot so `make(<range>, from: 1, to: 100)` does not leave
+/// `by` as zero (which would make the range degenerate).
+fn slot_integer_default(name: &str, init_kw: &str, default: i64) -> SlotInfo {
+    let default_word = crate::word::Word::from_fixnum(default)
+        .expect("slot_integer_default: fixnum default fits");
+    SlotInfo {
+        name: name.to_string(),
+        offset: 0,
+        type_kind: SlotType::Integer,
+        init_keyword: Some(init_kw.to_string()),
+        required_init_keyword: false,
+        default_init: SlotDefault::Value(default_word),
         has_setter: true,
     }
 }

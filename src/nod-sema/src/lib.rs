@@ -348,18 +348,11 @@ pub fn register_top_level_functions(
     // whose name isn't a block thunk. The function-ref registry is
     // keyed on `(name, arity)`, so collisions are impossible across
     // arities.
-    // Names whose addresses we register under the SOURCE name (vs the
-    // mangled body symbol). For methods, the source name lives in
-    // `lm.methods[i].generic_name` and the body name in
-    // `lm.methods[i].body_fn_name`. Build a map from body name to
-    // source name so the function pass below can register under both.
-    let mut body_to_source: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for m in &lm.methods {
-        body_to_source
-            .entry(m.body_fn_name.clone())
-            .or_insert_with(|| m.generic_name.clone());
-    }
+    //
+    // Sprint 26: dropped the body-name → source-name fallback shadow
+    // registration. Generic source names are now resolved through the
+    // dispatch trampoline path (see `nod_runtime::make_function_ref`),
+    // so the function-ref registry never needs a generic alias entry.
     for f in &lm.functions {
         if block_thunk_names.contains(&f.name) {
             continue;
@@ -389,26 +382,6 @@ pub fn register_top_level_functions(
         // SAFETY: ptr is JIT-emitted, signature `(u64*arity) -> u64`.
         unsafe {
             nod_runtime::register_jit_function(&f.name, arity, ptr as *const u8);
-            // If this function is a method body (e.g. stdlib's
-            // `size$<object>` body), also register under the
-            // generic-source name so `\size` resolves.
-            //
-            // Sprint 22 fix: only register under the generic source name
-            // if no entry exists yet — otherwise a later method body
-            // (e.g. `size$<table>`) would overwrite the earlier
-            // `<object>` body, and `\size` would call the wrong method
-            // for non-table arguments. The first-registered method body
-            // tends to be the most-general one (loader processes
-            // `define function size` before `define method size(t ::
-            // <table>)`), so first-wins matches "most general fallback".
-            // The proper fix — generic-dispatcher trampoline — lands
-            // when first-class dispatch wraps a `<function>` (DEFERRED).
-            if let Some(src) = body_to_source.get(&f.name)
-                && src != &f.name
-                && nod_runtime::lookup_function_code(src, arity).is_none()
-            {
-                nod_runtime::register_jit_function(src, arity, ptr as *const u8);
-            }
         }
     }
     Ok(())

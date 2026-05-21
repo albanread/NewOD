@@ -11,11 +11,15 @@
 //!      `nod_funcall_N` extern shims when the descriptor's arity
 //!      doesn't match the call shape. Parent `<error>`.
 //!
-//!   3. **`nod_funcall1` / `nod_funcall2`** — JIT-callable trampolines
-//!      that pull the function-pointer out of the `<function>` Word and
-//!      tail-call to it. The `<function>` ABI for callees is the same
-//!      `extern "C-unwind" fn(u64, …) -> u64` shape that the rest of
-//!      the JIT uses; the trampoline just transmutes and calls.
+//!   3. **`nod_funcall0` / `nod_funcall1` / `nod_funcall2` /
+//!      `nod_funcall3` / `nod_funcall4` / `nod_funcall5`** — JIT-callable
+//!      trampolines that pull the function-pointer out of the
+//!      `<function>` Word and tail-call to it. The `<function>` ABI for
+//!      callees is the same `extern "C-unwind" fn(u64, …) -> u64` shape
+//!      that the rest of the JIT uses; the trampoline just transmutes
+//!      and calls. Sprint 26 lifted the lower bound to 0 and the upper
+//!      bound on direct funcall (without going through `nod_apply`) to
+//!      5; higher arities continue to route through `nod_apply`.
 //!
 //!   4. **`nod_apply`** — variadic dispatch: an args-vector
 //!      (`<simple-object-vector>` containing tagged Words) unpacks up to
@@ -73,6 +77,24 @@ use crate::word::Word;
 /// unpack from its arg-vector. Larger applies error with a clear
 /// diagnostic; see DEFERRED.md for the lift-the-cap follow-up.
 pub const MAX_APPLY_ARITY: usize = 8;
+
+/// `<function>` kind-tag values. The slot is sourced from
+/// `make_function`'s `kind_tag` parameter and read back by
+/// `function_kind_tag` for dispatch decisions inside `nod_funcall_N`.
+///
+/// The dispatch is staged: kind-tag is checked FIRST so generic
+/// trampolines (which carry a raw `&'static GenericFunction` pointer in
+/// `env-ptr`) don't get misinterpreted as closures with a tagged
+/// `<environment>` env-ptr.
+pub const FUNCTION_KIND_TOP_LEVEL: u32 = 0;
+pub const FUNCTION_KIND_LIFTED_ANON: u32 = 1;
+pub const FUNCTION_KIND_CLOSURE: u32 = 2;
+/// Sprint 26: generic-dispatch trampoline. `env-ptr` carries a raw
+/// `*const GenericFunction` (not a Dylan Word); the trampoline reads it
+/// when dispatched, walks the applicable-method chain, and tail-calls
+/// the winner. Lets `\generic-name` route to the right method body at
+/// call time instead of baking one specific method's address in.
+pub const FUNCTION_KIND_GENERIC_TRAMPOLINE: u32 = 3;
 
 struct FunctionClassIds {
     function: ClassId,
@@ -258,6 +280,26 @@ pub fn function_arity(f: Word) -> Option<usize> {
     Some(raw as usize)
 }
 
+/// Sprint 26: read the `kind-tag` slot from a `<function>` Word.
+///
+///   * `0` — top-level non-closure function.
+///   * `1` — lifted anonymous (legacy; created by the Sprint 21 lifter
+///     before closures landed).
+///   * `2` — closure built by `nod_make_closure` (env-ptr points at a
+///     real `<environment>`).
+///   * `3` — generic-dispatch trampoline (Sprint 26). The `env-ptr`
+///     slot then carries a raw `&'static GenericFunction` pointer (NOT
+///     a Dylan Word), and `code-ptr` points at one of the per-arity
+///     `nod_generic_dispatch_trampoline_N` shims.
+pub fn function_kind_tag(f: Word) -> Option<u32> {
+    let md = classes().function_md;
+    let p = f.as_ptr::<u8>()?;
+    let offset = md.slot_offset("kind-tag")?;
+    // SAFETY: same as `function_code_ptr`.
+    let raw = unsafe { *((p as usize + offset) as *const u64) };
+    Some(raw as u32)
+}
+
 /// Sprint 24: read the `env-ptr` slot from a `<function>` Word. Returns
 /// `0` for top-level (non-closure) functions; a non-zero `u64` is a
 /// raw `Word::raw()` whose pointer payload identifies the closure's
@@ -365,6 +407,99 @@ fn code_ptr_or_panic(f: Word) -> *const u8 {
     })
 }
 
+/// Internal: dispatch `f` as a generic-trampoline `<function>` Word.
+/// Reads the `env-ptr` slot (which carries a raw
+/// `*const crate::dispatch::GenericFunction` — see
+/// `FUNCTION_KIND_GENERIC_TRAMPOLINE`), looks up the most-specific
+/// applicable method for the argument classes, and tail-calls it via
+/// the dispatch crate's `call_method`. Returns the method's result.
+///
+/// Diverges via `<no-applicable-methods-error>` if no method matches.
+///
+/// # Safety
+///
+/// `f` must be a pointer-tagged `<function>` Word with
+/// `kind-tag = FUNCTION_KIND_GENERIC_TRAMPOLINE`. Each `args[i]` is a
+/// valid Dylan Word. `args.len()` must be `<= 8`.
+unsafe fn dispatch_via_generic_trampoline(f: Word, args: &[u64]) -> u64 {
+    let env_raw = function_env_ptr(f).unwrap_or(0);
+    // The `env-ptr` slot stores `&'static GenericFunction as u64`. A
+    // null pointer here would be a registration bug; surface it as a
+    // panic rather than silently misbehaving.
+    if env_raw == 0 {
+        panic!(
+            "generic-trampoline <function> Word at {:#x} has null env-ptr — registration is broken",
+            f.raw()
+        );
+    }
+    // Pad args out to 8 (the `nod_dispatch` slot count). Unused slots
+    // are ignored when `arity < 8`.
+    let mut padded = [0u64; 8];
+    for (i, &a) in args.iter().enumerate().take(8) {
+        padded[i] = a;
+    }
+    // SAFETY: generic-ptr is a `&'static GenericFunction`; cache-slot
+    // is `0` (no inline cache for the trampoline path — Sprint 26 keeps
+    // it simple); arity matches the args length the lowerer emitted;
+    // each padded[i] is a valid Word.
+    unsafe {
+        crate::dispatch::nod_dispatch(
+            env_raw,
+            0,
+            args.len() as u64,
+            padded[0],
+            padded[1],
+            padded[2],
+            padded[3],
+            padded[4],
+            padded[5],
+            padded[6],
+            padded[7],
+        )
+    }
+}
+
+/// `nod_funcall0(f) -> r` — invoke `f` with zero args.
+///
+/// Sprint 26: completes the symmetry that Sprint 21 set up for arities
+/// 1 and 2. Like `nod_funcall1`, dispatches on the `<function>`'s
+/// `env-ptr` slot to pick between an env-less callee body
+/// (`fn() -> u64`) and a closure body (`fn(env) -> u64`, where the env
+/// is the synthetic first argument).
+///
+/// `<exit-procedure>` is intentionally NOT accepted here — escape
+/// procedures always take exactly one value to throw, so an arity-0
+/// invoke of one would be ill-typed at the source level. The arity
+/// check below diverges via `<wrong-number-of-arguments-error>` if a
+/// non-`<function>` Word ends up here.
+///
+/// # Safety
+///
+/// `f_raw` must be a pointer-tagged Dylan `<function>` Word. Its
+/// `code-ptr` must point at an `extern "C-unwind" fn() -> u64` (no env)
+/// or `extern "C-unwind" fn(u64) -> u64` (with env) per the env-ptr
+/// slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_funcall0(f_raw: u64) -> u64 {
+    let f = Word::from_raw(f_raw);
+    let _ = check_arity_or_signal(f, 0);
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &[]) };
+    }
+    let code = code_ptr_or_panic(f);
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
+    if env_ptr == 0 {
+        // SAFETY: env-less function, callee matches arity-0 ABI.
+        let f0: Arity0Fn = unsafe { std::mem::transmute(code) };
+        f0()
+    } else {
+        // SAFETY: closure body, callee matches (env,) ABI.
+        let f1: Arity1Fn = unsafe { std::mem::transmute(code) };
+        f1(env_ptr)
+    }
+}
+
 /// `nod_funcall1(f, a) -> r` — invoke `f` with one arg.
 ///
 /// Sprint 21 also accepts `<exit-procedure>` Words and routes them
@@ -397,6 +532,10 @@ pub unsafe extern "C-unwind" fn nod_funcall1(f_raw: u64, a: u64) -> u64 {
         return unsafe { crate::conditions::nod_invoke_exit(f_raw, a) };
     }
     let _ = check_arity_or_signal(f, 1);
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &[a]) };
+    }
     let code = code_ptr_or_panic(f);
     let env_ptr = function_env_ptr(f).unwrap_or(0);
     if env_ptr == 0 {
@@ -424,6 +563,10 @@ pub unsafe extern "C-unwind" fn nod_funcall1(f_raw: u64, a: u64) -> u64 {
 pub unsafe extern "C-unwind" fn nod_funcall2(f_raw: u64, a: u64, b: u64) -> u64 {
     let f = Word::from_raw(f_raw);
     let _ = check_arity_or_signal(f, 2);
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &[a, b]) };
+    }
     let code = code_ptr_or_panic(f);
     let env_ptr = function_env_ptr(f).unwrap_or(0);
     if env_ptr == 0 {
@@ -434,6 +577,99 @@ pub unsafe extern "C-unwind" fn nod_funcall2(f_raw: u64, a: u64, b: u64) -> u64 
         // SAFETY: closure body, callee matches (env, arity-2) ABI.
         let f3: Arity3Fn = unsafe { std::mem::transmute(code) };
         f3(env_ptr, a, b)
+    }
+}
+
+/// `nod_funcall3(f, a, b, c) -> r` — invoke `f` with three args.
+///
+/// Sprint 26: extends the direct-funcall family up to arity 5 so the
+/// JIT can emit a clean single call instead of having to pack args into
+/// a `<simple-object-vector>` and route through `nod_apply`. Higher
+/// arities (6+) continue to go through `nod_apply`.
+///
+/// # Safety
+///
+/// See `nod_funcall1`; callee must match arity-3 ABI (no env) or
+/// arity-4 ABI (with env).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_funcall3(f_raw: u64, a: u64, b: u64, c: u64) -> u64 {
+    let f = Word::from_raw(f_raw);
+    let _ = check_arity_or_signal(f, 3);
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &[a, b, c]) };
+    }
+    let code = code_ptr_or_panic(f);
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
+    if env_ptr == 0 {
+        // SAFETY: env-less function, callee matches arity-3 ABI.
+        let f3: Arity3Fn = unsafe { std::mem::transmute(code) };
+        f3(a, b, c)
+    } else {
+        // SAFETY: closure body, callee matches (env, arity-3) ABI.
+        let f4: Arity4Fn = unsafe { std::mem::transmute(code) };
+        f4(env_ptr, a, b, c)
+    }
+}
+
+/// `nod_funcall4(f, a, b, c, d) -> r` — invoke `f` with four args.
+///
+/// # Safety
+///
+/// See `nod_funcall1`; callee must match arity-4 ABI (no env) or
+/// arity-5 ABI (with env).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_funcall4(f_raw: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
+    let f = Word::from_raw(f_raw);
+    let _ = check_arity_or_signal(f, 4);
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &[a, b, c, d]) };
+    }
+    let code = code_ptr_or_panic(f);
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
+    if env_ptr == 0 {
+        // SAFETY: env-less function, callee matches arity-4 ABI.
+        let f4: Arity4Fn = unsafe { std::mem::transmute(code) };
+        f4(a, b, c, d)
+    } else {
+        // SAFETY: closure body, callee matches (env, arity-4) ABI.
+        let f5: Arity5Fn = unsafe { std::mem::transmute(code) };
+        f5(env_ptr, a, b, c, d)
+    }
+}
+
+/// `nod_funcall5(f, a, b, c, d, e) -> r` — invoke `f` with five args.
+///
+/// # Safety
+///
+/// See `nod_funcall1`; callee must match arity-5 ABI (no env) or
+/// arity-6 ABI (with env).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_funcall5(
+    f_raw: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+) -> u64 {
+    let f = Word::from_raw(f_raw);
+    let _ = check_arity_or_signal(f, 5);
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &[a, b, c, d, e]) };
+    }
+    let code = code_ptr_or_panic(f);
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
+    if env_ptr == 0 {
+        // SAFETY: env-less function, callee matches arity-5 ABI.
+        let f5: Arity5Fn = unsafe { std::mem::transmute(code) };
+        f5(a, b, c, d, e)
+    } else {
+        // SAFETY: closure body, callee matches (env, arity-5) ABI.
+        let f6: Arity6Fn = unsafe { std::mem::transmute(code) };
+        f6(env_ptr, a, b, c, d, e)
     }
 }
 
@@ -476,8 +712,6 @@ pub unsafe extern "C-unwind" fn nod_apply(f_raw: u64, args_raw: u64) -> u64 {
              higher-arity apply is a Sprint 22+ follow-up"
         );
     }
-    let code = code_ptr_or_panic(f);
-    let env_ptr = function_env_ptr(f).unwrap_or(0);
     // SAFETY: sov has at least `n` element slots; reading each as a u64
     // matches the `<simple-object-vector>` element layout (tagged Word
     // per slot).
@@ -486,6 +720,17 @@ pub unsafe extern "C-unwind" fn nod_apply(f_raw: u64, args_raw: u64) -> u64 {
     for i in 0..n {
         a[i] = slots[i].raw();
     }
+    // Sprint 26: generic-trampoline `<function>` Words dispatch by
+    // class at call time. Reaching this before reading the raw
+    // code-ptr matters because the trampoline's `code-ptr` slot is
+    // *unused* (set to null at registration), so a transmute below
+    // would crash.
+    if function_kind_tag(f) == Some(FUNCTION_KIND_GENERIC_TRAMPOLINE) {
+        // SAFETY: kind tag was verified.
+        return unsafe { dispatch_via_generic_trampoline(f, &a[..n]) };
+    }
+    let code = code_ptr_or_panic(f);
+    let env_ptr = function_env_ptr(f).unwrap_or(0);
     // Sprint 24: closures get an env-pointer threaded as the synthetic
     // first arg. Plain top-level functions get the args verbatim.
     //
@@ -671,7 +916,22 @@ pub fn lookup_function_code(name: &str, arity: usize) -> Option<*const u8> {
 /// constant.
 ///
 /// Returns `None` if the name+arity isn't registered.
+///
+/// Sprint 26: if `name` is a registered generic with at least one
+/// method (i.e. `is_generic_defined(name)` is true), returns a
+/// generic-dispatch trampoline Word instead of a direct-pointer Word.
+/// This is what makes `\size` (a generic with multiple methods)
+/// dispatch by class at call time, replacing the Sprint 22
+/// "first-registration-wins" hack that baked a single method's
+/// address into the function-Ref.
+///
+/// A direct (non-generic) function takes the cached static-area path
+/// described below; both variants share the same cache so `\name`
+/// canonically resolves to one Word per `(name, arity)` either way.
 pub fn make_function_ref(name: &str, arity: usize) -> Option<Word> {
+    if crate::dispatch::is_generic_defined(name) {
+        return Some(make_generic_trampoline_ref(name, arity));
+    }
     let mut cache = FUNCTION_REF_CACHE
         .lock()
         .expect("function ref cache poisoned");
@@ -701,6 +961,53 @@ pub fn make_function_ref(name: &str, arity: usize) -> Option<Word> {
     crate::heap_register_root(Box::leak(Box::new(w)) as *const Word as *mut Word);
     cache.push(((name.to_string(), arity), w));
     Some(w)
+}
+
+/// Sprint 26: build a generic-dispatch trampoline `<function>` Word
+/// for `(generic_name, arity)`. The Word's `kind-tag` slot is
+/// `FUNCTION_KIND_GENERIC_TRAMPOLINE`; its `env-ptr` slot carries the
+/// `&'static GenericFunction` pointer (raw u64, bit 0 == 0, so the
+/// `SlotType::Object` GC classifier sees it as `Immediate` and
+/// correctly skips it). Its `code-ptr` slot is null — the trampoline
+/// is invoked via the `nod_funcall_N` / `nod_apply` kind-tag check,
+/// which routes to `dispatch_via_generic_trampoline` and never reads
+/// code-ptr.
+///
+/// Registers the Word as a heap root so it survives GC. Multiple
+/// calls with the same `(generic_name, arity)` cache one trampoline
+/// instance per pair (mirroring `make_function_ref`).
+pub fn make_generic_trampoline_ref(generic_name: &str, arity: usize) -> Word {
+    // The function-ref cache key shape matches the `make_function_ref`
+    // cache exactly — `(name, arity)` is unique across the trampoline
+    // and direct-call variants because a generic name with multiple
+    // methods can't ALSO be a direct function (the dispatch registry
+    // would collide). So we reuse the same cache.
+    let mut cache = FUNCTION_REF_CACHE
+        .lock()
+        .expect("function ref cache poisoned");
+    if let Some((_, w)) = cache
+        .iter()
+        .find(|((n, a), _)| n == generic_name && *a == arity)
+    {
+        return *w;
+    }
+    let g = crate::dispatch::get_or_create_generic(generic_name);
+    let g_ptr = g as *const _ as u64;
+    // `code-ptr` is null (0). The dispatch path is selected by the
+    // kind-tag, which routes through `dispatch_via_generic_trampoline`
+    // before reading code-ptr — so a null is safe here, and surfaces
+    // any future regression that bypasses the kind-tag gate as an
+    // immediate crash rather than silent misbehaviour.
+    let w = make_function(
+        generic_name,
+        arity,
+        std::ptr::null(),
+        FUNCTION_KIND_GENERIC_TRAMPOLINE,
+        g_ptr,
+    );
+    crate::heap_register_root(Box::leak(Box::new(w)) as *const Word as *mut Word);
+    cache.push(((generic_name.to_string(), arity), w));
+    w
 }
 
 /// JIT-callable shim that returns the function-ref Word for the

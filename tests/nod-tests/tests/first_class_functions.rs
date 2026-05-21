@@ -142,28 +142,11 @@ fn do_invokes_side_effecting_function() {
 #[test]
 #[serial]
 fn anonymous_method_zero_args() {
-    // `let k = method () 42 end; k()` -> 42. Exercises arity-0
-    // through `nod_funcall_N` — Sprint 21 supports up to arity-2
-    // through dedicated trampolines; arity-0 / arity-3+ go through
-    // `nod_apply`. But `k()` with 0 args goes through... actually,
-    // the lowerer routes `env-bound name`-shaped calls through
-    // `%funcall1` / `%funcall2`; arity 0 isn't currently a supported
-    // shape, so this is an explicit Sprint 21 limitation. Surface as
-    // a lowering error.
+    // Sprint 26: arity-0 funcall is now wired through `nod_funcall0`,
+    // closing the Sprint 21 deferral. `let k = method () 42 end; k()`
+    // routes through `%funcall0` and returns `42`.
     setup();
-    let result = nod_sema::eval_expr_to_string("let k = method () 42 end; k() end");
-    match result {
-        Ok(_) => {
-            // If it works (Sprint 22+ adds arity-0), accept the result.
-            // The asserted Sprint 21 behaviour is: lowering errors.
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("arity 0") || msg.contains("Sprint 21")
-                    || msg.contains("not supported"),
-                "expected Sprint 21 limitation diagnostic; got: {msg}"
-            );
-        }
-    }
+    let s = nod_sema::eval_expr_to_string("let k = method () 42 end; k() end")
+        .expect("eval `let k = method () 42 end; k()`");
+    assert_eq!(s, "42");
 }

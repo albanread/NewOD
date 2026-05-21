@@ -733,7 +733,7 @@ Run `reduce` + `map` at the REPL; profile shows the iterator inlined via sealing
 
 ---
 
-## Sprints 21–32 — Sketches (phases 7+ continuations and 8–12)
+## Sprints 21–35 — Sketches (phases 7+ continuations and 8–12)
 
 > Detail level intentionally lower: each is 2-3 sentences. Concrete
 > deliverables are decided after Sprint 20 retrospective. Sprints
@@ -752,6 +752,17 @@ Replaced the bespoke semispace `Heap` with the sibling-project `PageHeap<DylanLa
 ### Sprint 24 — Closures (free-variable capture) — landed
 Shipped: `<cell>` and `<environment>` heap classes (`nod-runtime/src/closures.rs`), a cell-conversion pass in `nod-sema/src/lower.rs` that promotes captured locals to heap cells and wires per-closure environments through the existing `<function>` `env-ptr` slot, and an env-ptr-conditional dispatch in `nod_funcall_N` / `nod_apply` (ABI choice 1 from the brief — closure bodies grow a synthetic env first parameter; top-level functions keep their Sprint 21 ABI unchanged). The canonical Dylan idiom `let m = 10; map(method (x) x * m end, #(1, 2, 3))` returns `"#(10, 20, 30)"`. By-reference capture: `:=` inside a closure body mutates the underlying cell, and the outer scope reads through the same cell — the textbook ML/Scheme semantics. Captured parameters are cell-promoted alongside captured `let` bindings (so curried `method (a) method (b) a + b end end` works). Test count moves from 410 / 0 / 5 to 421 / 0 / 5 under the `newgc-backend` default; the `semispace-backend` escape hatch stays green. Deferred to follow-up: closure-body arity-0 calls (Sprint 21's `anonymous_method_zero_args` limitation still bites — covered by writing dummy-arg variants in the meantime), env-sharing between sibling closures created in the same scope (each currently allocates its own env even if the capture sets overlap exactly), and deep nesting beyond two levels (works in practice but no explicit acceptance test).
 
+### Sprint 26 — Polish bundle (landed)
+Three small surface-level cleanups closed before the c-ffi greenfield, each from a Sprint 21/22/24 DEFERRED bin.
+
+**A. Arity-0 and arity-3+ closure calls.** Sprint 21 wired the env-bound funcall dispatch at arities 1 and 2; arity 0 surfaced a "not supported" lowering error and arity 3+ was implicit. Sprint 26 extends the direct-funcall family to arities 0..=5 (`nod_funcall0`, `nod_funcall3`, `nod_funcall4`, `nod_funcall5` join `nod_funcall1` / `nod_funcall2`), each dispatching on the `<function>`'s `env-ptr` slot exactly like the existing pair. The Sprint 24 brief's `closure_writes_captured_variable` test now exists in its canonical `method ()` form (no dummy arg needed); the new `funcall_arity.rs` test file pins arities 0/3/4/5 with both env-less and closure-with-capture variants. Arities 6+ continue to route through `nod_apply` (8-cap unchanged).
+
+**B. `make(<range>, from:, to:)` keyword-init.** Sprint 21 had to use the `%make-range(1, 100, 1)` primitive workaround because the canonical Dylan spec form left the `by:` slot at zero and the range iterator never advanced. The fix is a one-line default: `<range>`'s `range-by` slot now defaults to fixnum `1` via the new `slot_integer_default` helper. The Sprint 21 headline test `dylan_reduce_plus_zero_range_one_to_hundred_is_5050` now uses `reduce(\+, 0, make(<range>, from: 1, to: 100))` end-to-end, closing the deferral.
+
+**C. Generic-dispatch trampoline for `\name`.** Sprint 22's `register_top_level_functions` had a "first-registration-wins" hack: when `\size` was used as a value, Sprint 21's function-ref machinery had to pick ONE method body's code-ptr to register against the source name. That made `\size(<table>)` call the wrong body. Sprint 26 introduces `FUNCTION_KIND_GENERIC_TRAMPOLINE` (a fourth `<function>` kind-tag value, alongside top-level/lifted-anon/closure) and `make_generic_trampoline_ref`: when `make_function_ref(name, arity)` is asked for a name that already has at least one registered method (`is_generic_defined`), it returns a trampoline `<function>` Word whose `env-ptr` slot stashes the `&'static GenericFunction` pointer. Every `nod_funcall_N` checks the kind-tag first; on a match it routes to `dispatch_via_generic_trampoline`, which walks the applicable-method chain via `nod_dispatch` and tail-calls the most-specific body. `\size(<table>)` now selects the `(t :: <table>)` method, `\size(<list>)` selects the generic-fallback body, and `\size(<range>)` likewise — confirmed by `generic_function_ref.rs`. The Sprint 22 shadow-registration in `register_top_level_functions` is removed.
+
+Test count moves from 425 / 0 / 5 to 441 / 0 / 5 under `newgc-backend` default; semispace escape hatch tracks from 417 to 438. Clippy clean. 5x flake check clean.
+
 ### Sprint 25 — Retire `Expr::Unless` in favor of stdlib macros — landed
 Shipped: body-shaped macro call parser (`Expr::MacroCall { name, span }` recognised at parse time when `<name>(head…) body… end` appears and `<name>` is in the parser's known-macro set, seeded from the stdlib by `nod-sema::parse_user_module`). `define macro unless` joins `define macro for-each` in `nod-dylan/dylan-sources/stdlib.dylan`; the parser-hardcoded `parse_unless` arm and the `Expr::Unless` AST variant are deleted. `unless (cond) body end` parses to `Expr::MacroCall("unless", ...)`, the stdlib's `unless` macro expands it to `if (~ cond) body else #f end`, and the kernel `Expr::If` lowering handles the rest. As a bonus, `for-each (x in #(1, 2, 3)) total := total + x end` now works as a body-shaped surface — the Sprint 20b deferred call site that the parser couldn't recognise. Test count moves from 421 / 0 / 5 to 425 / 0 / 5 under `newgc-backend` default; semispace escape hatch from 413 / 0 / 5 to 417 / 0 / 5. Deferred: `Expr::Case` retirement (case's multi-arm `=>` syntax doesn't fit the body-shaped recogniser — needs auxiliary `rule` clauses inside `define macro`; tracked for Sprint 26). The `feedback_dylan_lang_defined_by_macros.md` direction is validated: the compiler shrinks by ~70 deleted lines of hardcoded `unless` machinery and the language surface grows by ~10 lines of Dylan macro source.
 
@@ -761,34 +772,34 @@ Shipped: body-shaped macro call parser (`Expr::MacroCall { name, span }` recogni
 ### Sprint 25c — Windows FFI runtime stack (borrowed from NewCormanLisp)
 Port NCL's Windows FFI design (`E:\CL\NewCormanLisp\docs\WINDOWS_FFI.md`, phases 1–6) into `nod-runtime`: surface bootstrap, `%ffi-call` calling-convention dispatcher, Windows API metadata pack loader, foreign-buffer primitives, callback bridge. Files lift nearly verbatim: `win_ffi.rs`, `win_callback.rs`, `win_buffer.rs`, `win_surface.rs`, `win_metadata.rs`. Demo: `define interface user32, function CreateWindowExW … end` from Dylan and successfully open a Win32 window from REPL code.
 
-### Sprint 26 — `format` + `print` + `streams` (`io` library kernel)
+### Sprint 27 — `format` + `print` + `streams` (`io` library kernel)
 Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
-### Sprint 27 — Kernel library port: arithmetic, characters, symbols
+### Sprint 28 — Kernel library port: arithmetic, characters, symbols
 Port enough of `sources/dylan/` (`number.dylan`, `character.dylan`, `symbol.dylan`, `boolean.dylan`) that the runtime stops providing these directly and the language defines them in itself.
 
-### Sprint 28 — Dylan-side IDE bring-up: window, message pump, editor surface
+### Sprint 29 — Dylan-side IDE bring-up: window, message pump, editor surface
 First IDE sprint. **All Dylan code**, written against the Sprint 25b Windows FFI stack. Module `nod-dylan/ide-shell` registers a top-level window class, runs the message pump, hosts a single editable text pane and a REPL transcript pane. No syntax colouring yet, no menus — just "the compiler can open a window and let you type into it". Re-implements the scaffolding of `E:\opendylan\sources\environment\framework\` in Dylan.
 
-### Sprint 28b — Dylan-side inspector + dispatch visualisation
+### Sprint 29b — Dylan-side inspector + dispatch visualisation
 With the IDE shell up, port the existing `:inspect` / `:dispatch-stats` / `:classes` REPL commands into IDE panels written in Dylan. Inspector handles every kernel class. Time-travel REPL prototype.
 
-### Sprint 29 — `common-dylan` library port
+### Sprint 30 — `common-dylan` library port
 Port `byte-vector`, `simple-format`, `simple-io`, `simple-random`, `transcendentals`, `threads/`. Run `opendylan-tests/sources/common-dylan/tests/`.
 
-### Sprint 30 — Multi-threaded mutator + cooperative GC across threads
+### Sprint 31 — Multi-threaded mutator + cooperative GC across threads
 Thread-local TLABs, parking protocol, lock primitives in Dylan-side code. Run `opendylan-tests/sources/app/thread-test/`.
 
-### Sprint 31 — Library-merge optimisation (v2 candidate moved up if cheap)
+### Sprint 32 — Library-merge optimisation (v2 candidate moved up if cheap)
 DFM serialisation, cache-key extension with downstream library hashes, cross-library inlining gated on sealing. May slip to post-v1.
 
-### Sprint 32 — AOT mode — emit a standalone Windows executable
+### Sprint 33 — AOT mode — emit a standalone Windows executable
 JIT artefacts written out as a PE binary plus a shipped `nod-runtime` static lib. Cache key already covers it; mostly a packaging exercise.
 
-### Sprint 33 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
+### Sprint 34 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
 All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.
 
-### Sprint 34 — macOS port (aarch64-apple-darwin first)
+### Sprint 35 — macOS port (aarch64-apple-darwin first)
 The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 25b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.
 
 ---

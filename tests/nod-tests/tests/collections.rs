@@ -592,8 +592,13 @@ fn dylan_reduce_plus_zero_range_one_to_hundred_is_5050() {
     // Sprint 21 headline: `\+` lowers to a `<function>` Word; `reduce`
     // is the Dylan-defined stdlib method that drives the FIP loop and
     // calls the combiner via `%funcall2`.
-    let s = nod_sema::eval_expr_to_string("reduce(\\+, 0, %make-range(1, 100, 1))")
-        .expect("eval `reduce(\\+, 0, range(1, 100, 1))`");
+    //
+    // Sprint 26: now drives the canonical `make(<range>, …)` keyword-
+    // init form (`by:` defaults to `1`), instead of the
+    // `%make-range(from, to, by)` primitive workaround the Sprint 21
+    // brief originally accepted.
+    let s = nod_sema::eval_expr_to_string("reduce(\\+, 0, make(<range>, from: 1, to: 100))")
+        .expect("eval `reduce(\\+, 0, make(<range>, from: 1, to: 100))`");
     assert_eq!(s, "5050");
 }
 
