@@ -181,6 +181,71 @@ pub fn dump_llvm_for_file(path: &Path) -> Result<String, DumpError> {
     Ok(out.module.print_to_string().to_string())
 }
 
+/// Parse + lower + codegen + JIT-call a full Dylan module containing
+/// the supplied top-level items (e.g. `define c-function` declarations)
+/// PLUS a synthetic `<eval-entry>` function whose body is `expr_src`.
+/// Returns the formatted return value of `<eval-entry>`.
+///
+/// Sprint 28 uses this to test `define c-function` declarations followed
+/// by call sites: the items are spliced into the module ABOVE the
+/// synthetic entry function so c-function bindings are in scope when
+/// the entry's body is lowered.
+pub fn eval_expr_with_items_to_string(
+    items_src: &str,
+    expr_src: &str,
+) -> Result<String, EvalError> {
+    stdlib::ensure_loaded();
+    // The blank line after `Module:` is load-bearing — `scan_preamble`
+    // continues consuming lines as continuations of the previous
+    // header key until it hits a blank line, so omitting it lets an
+    // indented `(args)` line on a `define c-function` declaration get
+    // swallowed by the preamble parser.
+    let wrapped = format!(
+        "Module: __eval__\n\
+         \n\
+         {items_src}\n\
+         define function <eval-entry> ()\n  {expr_src}\nend;\n"
+    );
+    eval_wrapped_source(&wrapped)
+}
+
+/// Shared implementation for `eval_expr_to_string` and
+/// `eval_expr_with_items_to_string` — handles parse → expand → lower
+/// → codegen → JIT → invoke entry → format.
+fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
+    let mut sm = nod_reader::SourceMap::new();
+    let file_id = sm
+        .add("<eval>", wrapped.to_string())
+        .map_err(EvalError::SourceMap)?;
+    let toks = nod_reader::lex(wrapped, file_id);
+    let pre = nod_reader::scan_preamble(wrapped);
+    let mut module =
+        parse_user_module(wrapped, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
+    expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
+    let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+
+    let entry = lm
+        .functions
+        .iter()
+        .find(|f| f.name == "<eval-entry>")
+        .ok_or_else(|| EvalError::NoEntry("<eval-entry> missing after lowering".into()))?;
+    let return_type = entry.return_type;
+
+    let ctx = Context::create();
+    let out = codegen_module(&ctx, &lm.functions, "__eval__").map_err(EvalError::Codegen)?;
+    let mut jit = Jit::new(&ctx).map_err(EvalError::Jit)?;
+    jit.add_module(out).map_err(EvalError::Jit)?;
+    register_methods(&jit, &lm.methods)?;
+    register_blocks(&jit, &lm.blocks)?;
+    register_top_level_functions(&jit, &lm)?;
+    initialize_module_winffi(&lm)?;
+
+    // SAFETY: see `eval_expr_to_string`.
+    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+        .ok_or_else(|| EvalError::NoEntry("<eval-entry>".into()))?;
+    Ok(call_and_format(ptr, return_type))
+}
+
 /// Parse + lower + codegen + JIT-call a single Dylan expression. Wraps
 /// the expression in a synthetic `<eval-entry>` function whose inferred
 /// return type drives the call signature. Single-shot.
@@ -206,39 +271,50 @@ pub fn eval_expr_to_string(expr_src: &str) -> Result<String, EvalError> {
         "Module: __eval__\n\
          define function <eval-entry> ()\n  {body}\nend;\n"
     );
+    eval_wrapped_source(&wrapped)
+}
 
-    let mut sm = nod_reader::SourceMap::new();
-    let file_id = sm
-        .add("<eval>", wrapped.clone())
-        .map_err(EvalError::SourceMap)?;
-    let toks = nod_reader::lex(&wrapped, file_id);
-    let pre = nod_reader::scan_preamble(&wrapped);
-    let mut module =
-        parse_user_module(&wrapped, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
-    expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
-    let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
-
-    let entry = lm
-        .functions
-        .iter()
-        .find(|f| f.name == "<eval-entry>")
-        .ok_or_else(|| EvalError::NoEntry("<eval-entry> missing after lowering".into()))?;
-    let return_type = entry.return_type;
-
-    let ctx = Context::create();
-    let out = codegen_module(&ctx, &lm.functions, "__eval__").map_err(EvalError::Codegen)?;
-    let mut jit = Jit::new(&ctx).map_err(EvalError::Jit)?;
-    jit.add_module(out).map_err(EvalError::Jit)?;
-    register_methods(&jit, &lm.methods)?;
-    register_blocks(&jit, &lm.blocks)?;
-    register_top_level_functions(&jit, &lm)?;
-
-    // SAFETY: the JIT'd function takes no params; we transmute to the
-    // exact signature dictated by `return_type` and call once. The JIT
-    // engine outlives the call (held in `jit`).
-    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
-        .ok_or_else(|| EvalError::NoEntry("<eval-entry>".into()))?;
-    Ok(call_and_format(ptr, return_type))
+/// Sprint 28: walk the module's stub-table entries, build a runtime
+/// [`nod_runtime::ApiStubTable`] view of them, and call
+/// `nod_runtime::initialize_stub_table`. On failure the `<c-ffi-error>`
+/// condition Word is surfaced as an `EvalError::WinFfiInit` — Sprint 28
+/// tests use this to assert that bad DLL / symbol names raise the
+/// expected error class. (The signal-handler path inside Dylan code
+/// would catch it through `block/exception` instead; the eval
+/// helper's caller doesn't have one of those.)
+fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
+    if lm.c_function_stub_table.is_empty() {
+        return Ok(());
+    }
+    // The stub-table entries were already pinned in the static area
+    // by the lowering pass; we just need to call
+    // `initialize_stub_table` on the table descriptor. Recover it by
+    // walking the first entry's pointer back to the slice it lives in
+    // — except we don't carry a back-pointer. Simpler: rebuild a tiny
+    // local slice view from the entry_ptrs and walk it directly via
+    // the runtime helper. Each entry_ptr is a `*const ApiStubEntry`;
+    // we can resolve them one by one. (`initialize_stub_table` was
+    // designed around a static slice for layout-stability, but we
+    // never carry that slice back to sema. Resolve each entry
+    // directly here.)
+    for spec in &lm.c_function_stub_table {
+        let entry_ptr = spec.entry_ptr as *const nod_runtime::ApiStubEntry;
+        // SAFETY: `entry_ptr` came from `nod_runtime::allocate_stub_table`,
+        // which leaks a `Box<[ApiStubEntry]>` for the process lifetime.
+        match unsafe { nod_runtime::resolve_into_entry(entry_ptr, &spec.dll, &spec.symbol) } {
+            Ok(()) => {}
+            Err(err_word) => {
+                let class_name = nod_runtime::condition_class_name(err_word)
+                    .unwrap_or_else(|| "<c-ffi-error>".to_string());
+                return Err(EvalError::WinFfiInit {
+                    class_name,
+                    dll: spec.dll.clone(),
+                    symbol: spec.symbol.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Lower `source_path`, JIT it, look up `entry_name` (a `() => <integer>`
@@ -284,6 +360,7 @@ pub fn run_function_to_i64(
     register_methods(&jit, &lm.methods)?;
     register_blocks(&jit, &lm.blocks)?;
     register_top_level_functions(&jit, &lm)?;
+    initialize_module_winffi(&lm)?;
 
     let ptr = unsafe { jit.get_function_ptr(entry_name) }
         .ok_or_else(|| EvalError::NoEntry(entry_name.to_string()))?;
@@ -691,6 +768,16 @@ pub enum EvalError {
         expected: &'static str,
         actual: &'static str,
     },
+    /// Sprint 28: the per-module API stub table failed to populate
+    /// (LoadLibrary / GetProcAddress returned null). Carries the class
+    /// name of the `<c-ffi-error>` (`"<c-ffi-error>"`) and the offending
+    /// (dll, symbol) pair so tests can pattern-match without parsing the
+    /// rendered message.
+    WinFfiInit {
+        class_name: String,
+        dll: String,
+        symbol: String,
+    },
 }
 
 impl std::fmt::Display for EvalError {
@@ -719,6 +806,10 @@ impl std::fmt::Display for EvalError {
             EvalError::ReturnTypeMismatch { entry, expected, actual } => write!(
                 f,
                 "entry `{entry}` returns {actual}, expected {expected}"
+            ),
+            EvalError::WinFfiInit { class_name, dll, symbol } => write!(
+                f,
+                "winffi init failed: {class_name} raised for `{symbol}@{dll}`"
             ),
         }
     }

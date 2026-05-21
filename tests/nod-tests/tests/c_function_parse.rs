@@ -115,9 +115,11 @@ end;
 
 #[test]
 #[serial]
-fn c_function_call_site_errors_in_sprint27() {
-    // The c-function is declared AND called — Sprint 27 sema must
-    // refuse with a Sprint-28 deferral message.
+fn c_function_call_site_lowers_in_sprint28() {
+    // Sprint 28: a c-function declared AND called must lower cleanly.
+    // The lowered module carries the resolved stub table; the call
+    // site routes through `nod_winffi_call_2`. (We don't execute the
+    // JIT here — that's `tests/c_function_call.rs`'s job.)
     let src = "\
 define c-function Beep
     (dw-freq :: <c-dword>, dw-duration :: <c-dword>)
@@ -130,14 +132,51 @@ define function call-beep ()
 end function;
 ";
     let m = parse_src(src);
+    let lm = lower_module_full(&m)
+        .unwrap_or_else(|e| panic!("Sprint 28 lowering must succeed; got: {e:?}"));
+    assert_eq!(lm.c_functions.len(), 1);
+    assert!(
+        lm.c_functions[0].signature.is_some(),
+        "Sprint 28 must derive a signature for Beep(dword,dword) -> bool"
+    );
+    // Deduplicated stub-table has exactly one entry for `(kernel32.dll,
+    // Beep)` regardless of how many call sites the body had.
+    assert_eq!(
+        lm.c_function_stub_table.len(),
+        1,
+        "expected one stub-table entry; got {}",
+        lm.c_function_stub_table.len()
+    );
+    let entry = &lm.c_function_stub_table[0];
+    assert_eq!(entry.dll, "kernel32.dll");
+    assert_eq!(entry.symbol, "Beep");
+    assert!(entry.entry_ptr != 0);
+}
+
+#[test]
+#[serial]
+fn c_function_with_unsupported_type_still_defers() {
+    // Strings ship in Sprint 30 — a c-function declaring `<c-string>`
+    // must still produce a deferral diagnostic at the call site.
+    let src = "\
+define c-function MessageBoxA
+    (handle :: <c-handle>, text :: <c-string>, caption :: <c-string>, ty :: <c-dword>)
+ => (response :: <c-int>);
+  library: \"user32.dll\";
+end;
+
+define function pop ()
+  MessageBoxA(0, \"hi\", \"hi\", 0);
+end function;
+";
+    let m = parse_src(src);
     match lower_module_full(&m) {
-        Ok(_) => panic!("expected sema error for c-function call site"),
+        Ok(_) => panic!("expected Sprint 28 deferral for unsupported c-type"),
         Err(errs) => {
             let msg = format!("{errs:#?}");
             assert!(
-                msg.contains("Sprint 28")
-                    && (msg.contains("Beep") || msg.contains("c-function calls")),
-                "expected Sprint-28 deferral diagnostic mentioning `Beep` and c-function calls; got:\n{msg}"
+                msg.contains("Sprint 28") && msg.contains("MessageBoxA"),
+                "expected Sprint-28 deferral diagnostic for unsupported c-string; got:\n{msg}"
             );
         }
     }

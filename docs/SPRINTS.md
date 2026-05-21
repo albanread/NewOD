@@ -781,8 +781,36 @@ Test count moves from 441 / 0 / 5 to **455 / 0 / 5** under `newgc-backend` defau
 
 Deviation from the brief: the upstream `windows_api.db` schema doesn't carry a `constants` table; Sprint 27 ships with a hand-curated list of ~10 well-known constants (`MB_OK`, etc.) to keep the Phase A smoke test honest. Sprint 28 (or a separate DB-extension task) can widen this.
 
-### Sprint 28 — FFI Phase B: per-module API stub table + first end-to-end `Beep(440, 1000)`
-Headline: actually call Win32 APIs from Dylan. Wire `Item::DefineCFunction` into the codegen pipeline so each module gets a per-module API stub table populated at JIT install time via eager `LoadLibrary` + `GetProcAddress`. LLVM IR for `Beep(dw-freq, dw-duration)` lowers to a marshalled C-ABI call against the resolved function pointer. Marshaling layer: `<c-dword>` ↔ fixnum, `<c-bool>` ↔ `<boolean>`, narrow/wide string. PLT-style lazy resolution is a follow-up; eager init keeps Sprint 28 small. The Sprint-27 "c-function calls not yet supported" sema scan disappears in favor of real call-site codegen.
+### Sprint 28 — FFI Phase B: per-module API stub table + first end-to-end `Beep(440, 50)` — landed
+Headline acceptance: `Beep(440, 50)` runs through `eval_expr_with_items_to_string`, produces an audible 50ms beep (when an audio device is present — returns `#t` regardless), and the test passes.
+
+**A. `<c-ffi-error>` condition + WinFFI types (Phase A).** New `nod-runtime/src/winffi.rs` (~900 lines including the per-arity trampolines) carries `ApiStubEntry { dll_name_ptr, dll_name_len, symbol_name_ptr, symbol_name_len, fn_ptr: AtomicPtr<u8>, signature: ApiCallSignature }`, `ApiStubTable { entries: &'static [ApiStubEntry] }`, `CArgKind` / `CReturnKind`, plus `<c-ffi-error>` as a subclass of `<error>` with `dll-name`, `symbol-name`, `os-error-code`, `message` slots.
+
+**B. Win64 trampolines for arity 0..=8 (Phase B).** Nine `#[unsafe(no_mangle)] pub unsafe extern "C-unwind" fn nod_winffi_call_N(entry: u64, a0: u64, …) -> u64`. Each loads the resolved fn-ptr from the entry (Acquire), unboxes each arg per the recorded signature, transmutes to `extern "system" fn(…)` (Win64 ABI: RCX/RDX/R8/R9 + stack slots beyond shadow space), invokes, reboxes the return as a Dylan Word.
+
+**C. Eager LoadLibrary + GetProcAddress (Phase C).** `resolve_symbol(dll, symbol)` caches HMODULEs in a process-wide `Mutex<HashMap<String, isize>>`. `resolve_into_entry(entry_ptr, dll, symbol)` populates one entry, bumps WinFFI stats. **Deviation from the brief**: we use `windows-sys`'s raw `LoadLibraryA` / `GetProcAddress` instead of `libloading`. `nod-runtime` already depends on `windows-sys` for `Win32_System_Memory`; adding `Win32_System_LibraryLoader` is a one-feature bump rather than a whole new dependency.
+
+**D. Lowering + codegen (Phase D).** `nod-sema/src/lower.rs` gets a Phase 3b pre-pass that walks `Item::DefineCFunction` declarations, builds the marshaling signature from the `<c-…>` ident annotations, deduplicates `(dll, symbol)` pairs, and allocates a single per-module `ApiStubTable` in the static area. The per-call lowering (in `lower_call`) emits `Computation::DirectCall { callee: "nod_winffi_call_N" }` against the synthetic trampoline name; the first arg is a `ConstValue::WordBits` carrying the raw static-area pointer to the entry. Codegen (`nod-llvm/src/codegen.rs`) gets 9 new symbol constants + a 9-row entry in `SPRINT_20B_PRIMITIVES`; the JIT layer (`nod-llvm/src/jit.rs`) binds them to the runtime trampoline addresses via `LLVMAddGlobalMapping`.
+
+Module init: `nod-sema::initialize_module_winffi` walks `LoweredModule::c_function_stub_table` after the JIT engine finalises and calls `resolve_into_entry` for each spec; failures surface as `EvalError::WinFfiInit { class_name: "<c-ffi-error>", dll, symbol }` so tests can pattern-match without parsing a rendered message.
+
+**E. Acceptance tests (Phase E).** `tests/nod-tests/tests/c_function_call.rs` (Windows-only, all `#[serial]`):
+- `headline_beep_call_returns_true` — `Beep(440, 50)` → `"#t"`.
+- `get_tick_count_returns_increasing_value` — `GetTickCount` + `Sleep` + `GetTickCount`, asserts delta ≥ 0.
+- `get_current_process_id_returns_integer` — PID > 0, fits in u32.
+- `sleep_zero_returns_without_crashing` — void-return `Sleep(0)` surfaces as `"#()"`.
+- `get_current_process_returns_handle` — pseudo-handle (-1) returned, asserts non-zero.
+- `api_stub_table_deduplicates_call_sites` — two call sites of `GetTickCount` → `winffi_stats().entries == 1`.
+- `unknown_dll_signals_c_ffi_error` — `block`-free expectation via `EvalError::WinFfiInit { class_name: "<c-ffi-error>", dll: "nosuchmodule_sprint28.dll", … }`.
+- `unknown_symbol_signals_c_ffi_error` — same shape, `kernel32.dll` + bogus symbol name.
+
+Plus a rewritten `c_function_call_site_lowers_in_sprint28` test in `c_function_parse.rs` (was the Sprint 27 deferral test), plus `c_function_with_unsupported_type_still_defers` for `<c-string>` (Sprint 30 territory).
+
+Test count: **455 → 464 / 0 / 5** under `newgc-backend` default (+9 tests). Semispace escape hatch: **452 → 461 / 0 / 5**. Clippy `--all-targets -- -D warnings` clean. 5x flake-check clean.
+
+Sprint 28 scope is integer/pointer args/returns up to arity 8. Strings (Sprint 30), structs (34), callbacks (33), COM (35), and variadics remain deferred. Per-call `GetLastError` is available manually; auto-raise on Win32 failure (the `set-last-error:` plumbing) waits for Sprint 30+.
+
+Deviation from the brief's wrapper API: the `eval_expr_with_items_to_string` wrap requires a blank line between `Module:` and the first item because `scan_preamble` greedily consumes lines with continuation indents (an indented `(args)` line on a `define c-function` would otherwise get eaten). Documented inline.
 
 ### Sprint 28b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.

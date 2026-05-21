@@ -37,6 +37,10 @@ use crate::codegen::{
     // Sprint 24 — closures.
     NOD_CELL_GET_SYMBOL, NOD_CELL_SET_SYMBOL, NOD_ENV_CELL_SYMBOL,
     NOD_MAKE_CELL_SYMBOL, NOD_MAKE_CLOSURE_SYMBOL, NOD_MAKE_ENVIRONMENT_SYMBOL,
+    // Sprint 28 — Win64 FFI trampolines.
+    NOD_WINFFI_CALL_0_SYMBOL, NOD_WINFFI_CALL_1_SYMBOL, NOD_WINFFI_CALL_2_SYMBOL,
+    NOD_WINFFI_CALL_3_SYMBOL, NOD_WINFFI_CALL_4_SYMBOL, NOD_WINFFI_CALL_5_SYMBOL,
+    NOD_WINFFI_CALL_6_SYMBOL, NOD_WINFFI_CALL_7_SYMBOL, NOD_WINFFI_CALL_8_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -297,6 +301,43 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_MAKE_CLOSURE_SYMBOL),
                 nod_runtime::nod_make_closure as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 28 — Win64 FFI trampolines.
+            (
+                module.get_function(NOD_WINFFI_CALL_0_SYMBOL),
+                nod_runtime::nod_winffi_call_0 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_1_SYMBOL),
+                nod_runtime::nod_winffi_call_1 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_2_SYMBOL),
+                nod_runtime::nod_winffi_call_2 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_3_SYMBOL),
+                nod_runtime::nod_winffi_call_3 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_4_SYMBOL),
+                nod_runtime::nod_winffi_call_4 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_5_SYMBOL),
+                nod_runtime::nod_winffi_call_5 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_6_SYMBOL),
+                nod_runtime::nod_winffi_call_6 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_7_SYMBOL),
+                nod_runtime::nod_winffi_call_7 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_8_SYMBOL),
+                nod_runtime::nod_winffi_call_8 as *const () as *mut std::ffi::c_void,
             ),
         ];
 

@@ -1571,26 +1571,21 @@ Sprint 27 is data plumbing only. Sprint 28 is the FFI Phase B
 end-to-end-call sprint. Everything below is consciously not yet
 done.
 
-- **:open: Actual `Beep(440, 1000)` end-to-end** — Sprint 27 →
-  Sprint 28. The c-function declaration is parsed, the DLL
-  provenance is recorded, the (DLL, c-name) pair is validated against
-  the embedded `nod-winapi` index — but no codegen runs. Sprint 28
-  emits LLVM IR for the call site, marshals arguments through the
-  Sprint 27 c-type seed classes, and dispatches against the
-  per-module API stub table.
-- **:open: Per-module API stub table** — Sprint 27 → Sprint 28. Each
-  compiled module gets a per-module table of (DLL, symbol) entries
-  deduplicated across call sites. Eager `LoadLibrary` /
-  `GetProcAddress` at module init time. PLT-style lazy resolution is
-  a later optimization once Sprint 28 is in.
-- **:open: c-type marshaling** — Sprint 27 → Sprint 28. The 14
-  c-type seed classes (`<c-bool>`, `<c-dword>`, `<c-int>`,
-  `<c-uint>`, `<c-short>`, `<c-ushort>`, `<c-long>`, `<c-ulong>`,
-  `<c-word>`, `<c-byte>`, `<c-pointer>`, `<c-handle>`,
-  `<c-string>`, `<c-wide-string>`) have *names* but no marshaling
-  behavior. Sprint 28 adds the marshal-in / marshal-out shims that
-  bridge Dylan values (fixnums, `<byte-string>`, `<boolean>`) to the
-  C ABI representation.
+- **:closed: Actual `Beep(440, 1000)` end-to-end** — Sprint 27 →
+  Sprint 28. **Landed Sprint 28.** `Beep(440, 50)` runs through
+  `eval_expr_with_items_to_string`, marshals the args via the
+  arity-2 trampoline, beeps audibly on hardware, returns `#t`.
+- **:closed: Per-module API stub table** — Sprint 27 → Sprint 28.
+  **Landed Sprint 28.** `nod-sema::lower::lower_module_full` builds
+  the deduplicated table in Phase 3b; `nod_runtime::allocate_stub_table`
+  pins it in the static area; `initialize_module_winffi` eagerly
+  populates each entry at JIT-finalize via `resolve_into_entry`.
+- **:closed: c-type marshaling (integer + pointer subset)** — Sprint
+  27 → Sprint 28. **Landed Sprint 28** for the integer / pointer
+  subset (`<c-bool>`, `<c-byte>`, `<c-short>`, `<c-ushort>`,
+  `<c-int>`, `<c-uint>`, `<c-long>`, `<c-ulong>`, `<c-dword>`,
+  `<c-word>`, `<c-pointer>`, `<c-handle>`). String marshaling
+  (`<c-string>`, `<c-wide-string>`) carries over to Sprint 30.
 - **:open: `<c-pointer-to>` parametric pointer type** — Sprint 27
   → Sprint 28 or 29. Sprint 27's `<c-pointer>` is opaque; many APIs
   want `<c-pointer-to> (<c-int>)` etc. for out-parameters. The
@@ -1647,3 +1642,94 @@ done.
   `Binding` table, give `BindingKind` real width (`Function`,
   `Class`, `Constant`, `Variable`, `Generic`, …), and centralise
   name resolution.
+
+## Carry-over from Sprint 28 (FFI Phase B — end-to-end Win32 calls) — into Sprint 30+
+
+Sprint 28 landed actual Win32 calls (`Beep`, `GetTickCount`,
+`GetCurrentProcessId`, `Sleep`, `GetCurrentProcess`) plus a
+deduplicated per-module API stub table. The Phase-B subset is
+integer + pointer args/returns up to arity 8. Everything below is
+not yet done.
+
+- **:open: String marshaling (`<c-string>` / `<c-wide-string>`)** —
+  Sprint 28 → Sprint 30. The c-type *names* exist (Sprint 27); the
+  signature builder in `nod-runtime/src/winffi.rs::CArgKind::from_c_type_name`
+  returns `None` for them. The deferral diagnostic
+  `c_function_with_unsupported_type_still_defers` covers this. Sprint
+  30 adds (a) a `<byte-string>` ↔ `LPSTR` shim, (b) a `<unicode-string>`
+  ↔ `LPWSTR` shim that also un-blocks `MessageBoxW` / `CreateFileW`,
+  and (c) the optional `set-last-error: #t` plumbing.
+- **:open: PLT-style lazy resolution** — Sprint 28 → Sprint 38+.
+  Sprint 28's `initialize_module_winffi` is eager: every entry in
+  the per-module stub table is resolved at JIT-finalize. A lazy
+  PLT-style stub (resolve on first call, slot a tail call into the
+  real address) saves startup work for modules that touch many APIs
+  but only call a few. Not a priority while modules are small.
+- **:open: JIT-time materialization of the table** — Sprint 28 →
+  Sprint 38+. Today the stub table is allocated through the
+  static-area arena (`StaticArea::alloc`); the entry pointers are
+  baked into IR as `WordBits` constants. An AOT mode would emit the
+  table as an LLVM `@global_var` and the trampoline call as a GEP,
+  avoiding the "address baked at JIT time" coupling.
+- **:open: Callback / function-pointer parameters** — Sprint 28 →
+  Sprint 33. Many APIs (`EnumWindows`, `CreateThread`'s
+  `lpStartAddress`, window procs for `WndClassExW`) take callback
+  function pointers. The trampolines + signature shape need a
+  reverse direction.
+- **:open: Struct-by-value parameters** — Sprint 28 → Sprint 34.
+  `RECT`, `POINT`, `MSG`, `WNDCLASSEXW`. Needs `<c-struct>` class
+  machinery + ABI-aware marshaling (Win64 passes 1/2/4/8-byte
+  aggregates in registers; bigger ones by hidden pointer).
+- **:open: COM interface dispatch** — Sprint 28 → Sprint 35. Vtable
+  calls plus `AddRef` / `Release` / `QueryInterface` semantics.
+- **:open: Variadic functions** — Sprint 28 → later FFI sprint.
+  `sprintf`-family. Win64 ABI is uniform between fixed + variadic
+  positions (no register-class shuffling), so this is more about
+  argument-counting in the lowerer than ABI gymnastics.
+- **:open: Auto-raise on Win32 failure (`set-last-error: #t`)** —
+  Sprint 28 → Sprint 30. The trampolines return whatever the API
+  returned; the Dylan caller checks against 0 / -1 manually and
+  calls `GetLastError` if needed. A future ergonomic mode would
+  auto-raise `<win32-error>` when the API returns the documented
+  failure sentinel.
+- **:open: Multi-value c-function returns** — Sprint 28 → later FFI
+  sprint. The Sprint 28 signature builder bails out (`signature_ok =
+  false`) on `=> (a, b)` returns. Out-parameter returns are the
+  Win32-idiomatic way to do multi-value; that ships with
+  `<c-pointer-to>` (Sprint 29 or 30).
+- **:open: `<c-pointer-to>` parametric pointer type** — Sprint 28
+  → Sprint 29 or 30. Sprint 28's `<c-pointer>` is opaque (a fixnum
+  carrying the raw address). Many APIs want `<c-pointer-to> (<c-int>)`
+  for out-parameters. Parser + sema work.
+- **:open: u64 return widening** — Sprint 28 → minor follow-up. A
+  `<c-ulong>` / `<c-pointer>` return whose value exceeds the 63-bit
+  fixnum range is truncated by `box_return`'s mask. For Sprint 28's
+  Win32 acceptance tests this never bites (PIDs, tick counts,
+  pseudo-handles all fit). When it does, the right fix is a
+  `<big-integer>` boxing fallback.
+- **:open: Arity > 8** — Sprint 28 → Sprint 30+. The trampolines
+  cap at arity 8. Real APIs do go higher (`CreateFileW` has 7,
+  `CreateProcessW` has 10). When the cap bites we can either (a)
+  add `nod_winffi_call_N` for N up to ~16 (more boilerplate, but
+  same shape), or (b) switch to a variadic packer that builds an
+  argv array and calls one entry-point. Defer until a real API
+  needs it.
+- **:open: `libloading` swap-in** — Sprint 28 deviation. The brief
+  asked for `libloading`; we used `windows-sys` directly to avoid
+  a new dependency. Functionally identical; if the cross-platform
+  story matters later (e.g. Sprint 31's threading port also wants
+  to load Linux `.so`s), `libloading` becomes the right shape.
+- **:open: AOT-mode stub table emission** — Sprint 28 → Sprint 33+
+  (AOT). The Sprint 28 table is JIT-only — we leak `Box<[ApiStubEntry]>`
+  into the process arena. AOT mode emits the table as an LLVM global
+  with read-write `fn_ptr` fields populated by a generated init
+  function called on `DllMain` (or equivalent).
+- **:open: `Module:` header continuation footgun** — Sprint 28 →
+  ergonomic fix. `scan_preamble` greedily consumes indented lines
+  as continuations of the previous `Key:` header, so a
+  `Module: __eval__` immediately followed by a `define c-function`
+  declaration with indented `(args)` lines gets eaten whole. Sprint
+  28 works around this in `eval_expr_with_items_to_string` by
+  inserting a blank line. The proper fix is for the preamble scanner
+  to recognise that `define` starts a Dylan source line; the scanner
+  doesn't currently know any Dylan keywords. Trivial follow-up.

@@ -389,9 +389,18 @@ pub struct LoweredModule {
     pub closures: ClosureRegistry,
     /// Sprint 27: every `define c-function` we encountered during
     /// lowering. The driver / FFI glue (Sprint 28+) consults this to
-    /// emit the per-module API stub table; Sprint 27 just records
-    /// the metadata.
+    /// emit the per-module API stub table; Sprint 27 just recorded
+    /// the metadata. Sprint 28 adds the parsed marshaling signature
+    /// to each binding.
     pub c_functions: Vec<CFunctionBinding>,
+    /// Sprint 28: deduplicated stub-table for this module. One entry
+    /// per unique `(dll, symbol)` pair referenced by the module's
+    /// `define c-function`s. The driver-side glue (`eval_expr_to_string`)
+    /// builds the runtime [`nod_runtime::ApiStubTable`] from these
+    /// specs and calls `nod_runtime::initialize_stub_table` BEFORE
+    /// any JIT-emitted code runs. The `entry_ptr` field is patched
+    /// in-place by lowering once the static-area entries exist.
+    pub c_function_stub_table: Vec<CFunctionStubEntry>,
     /// Sprint 27: non-fatal diagnostics. Sprint 27 surfaces these
     /// for `define c-function` declarations whose target symbol is
     /// not present in the embedded `nod-winapi` index. The driver
@@ -401,8 +410,8 @@ pub struct LoweredModule {
 
 /// Sprint 27: information captured for a single `define c-function`
 /// declaration. Carries the DLL provenance + the c-side identifier;
-/// param/return types are kept verbatim from the source for Sprint 28
-/// to resolve against the embedded `nod-winapi` index.
+/// Sprint 28 adds the marshaling signature + the index into the
+/// per-module stub table.
 #[derive(Clone, Debug)]
 pub struct CFunctionBinding {
     pub dylan_name: String,
@@ -414,6 +423,29 @@ pub struct CFunctionBinding {
     /// declared a custom DLL/symbol the DB doesn't know about — we
     /// warn but continue.
     pub resolved_in_db: bool,
+    /// Sprint 28: marshaling signature derived from the param /
+    /// return c-type annotations. `None` when the declaration uses a
+    /// c-type outside the Sprint 28 supported set; calls then surface
+    /// a deferral diagnostic.
+    pub signature: Option<nod_runtime::ApiCallSignature>,
+}
+
+/// Sprint 28: one resolved stub-table entry for the module being
+/// lowered. The runtime-side [`nod_runtime::ApiStubTable`] is built
+/// from these specs at JIT-finalize time. The per-call lowering bakes
+/// the entry's static-area pointer (recovered from `entry_ptr`) into
+/// the call site as an `i64` constant.
+#[derive(Clone, Debug)]
+pub struct CFunctionStubEntry {
+    pub dll: String,
+    pub symbol: String,
+    pub signature: nod_runtime::ApiCallSignature,
+    /// Pointer to the static-area [`nod_runtime::ApiStubEntry`] this
+    /// resolved to. Populated once the per-module table is built.
+    /// Until then this is null and per-call codegen would emit a 0
+    /// constant; we always allocate the table BEFORE lowering call
+    /// sites, so callers never observe `None` here.
+    pub entry_ptr: u64,
 }
 
 /// Sprint 27: non-fatal sema diagnostic.
@@ -702,6 +734,136 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         }
     }
 
+    // Sprint 28 — Phase 3b: walk `define c-function` items, build the
+    // marshaling signature for each, deduplicate `(dll, symbol)` pairs,
+    // and allocate the per-module API stub table in the static area.
+    // The resulting `c_function_call_map` is threaded through `LowerCtx`
+    // so call-site lowering inside Phase 4 can resolve `Beep(...)` to a
+    // WinFFI DirectCall against the right entry.
+    //
+    // We process declarations eagerly so the `entry_ptr` is non-null
+    // before any call site is lowered. Unknown / unsupported c-types
+    // produce a `signature: None`; call sites of those names then
+    // surface a deferral error.
+    nod_runtime::ensure_c_ffi_error_registered();
+    let mut c_function_specs: Vec<nod_runtime::StubEntrySpec> = Vec::new();
+    let mut c_function_pre: Vec<(String, Option<usize>, nod_reader::Span)> = Vec::new();
+    let mut c_function_call_map: HashMap<String, CFunctionCallInfo> = HashMap::new();
+    let mut spec_dedupe: HashMap<(String, String), usize> = HashMap::new();
+    for item in &m.items {
+        let Item::DefineCFunction {
+            name,
+            params,
+            return_,
+            c_name,
+            library,
+            span,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if library.is_empty() {
+            // Diagnostic emitted in Phase 4; nothing to register here.
+            continue;
+        }
+        // Build the marshaling signature from parsed types.
+        let mut arg_names: Vec<String> = Vec::with_capacity(params.len());
+        let mut signature_ok = true;
+        for p in params {
+            match &p.type_ {
+                Some(Expr::Ident(_, n)) => arg_names.push(n.clone()),
+                _ => {
+                    signature_ok = false;
+                    break;
+                }
+            }
+        }
+        let return_name: Option<String> = match return_ {
+            Some(rs) if rs.values.len() > 1 => {
+                signature_ok = false;
+                None
+            }
+            Some(rs) => match rs.values.first() {
+                Some(v) => match &v.type_ {
+                    Some(Expr::Ident(_, n)) => Some(n.clone()),
+                    _ => {
+                        signature_ok = false;
+                        None
+                    }
+                },
+                None => None,
+            },
+            None => None,
+        };
+        if !signature_ok {
+            c_function_pre.push((name.clone(), None, *span));
+            continue;
+        }
+        let arg_refs: Vec<&str> = arg_names.iter().map(|s| s.as_str()).collect();
+        let sig = match nod_runtime::signature_from_names(&arg_refs, return_name.as_deref()) {
+            Ok(sig) => sig,
+            Err(_) => {
+                c_function_pre.push((name.clone(), None, *span));
+                continue;
+            }
+        };
+        let effective_c_name = c_name.clone().unwrap_or_else(|| name.clone());
+        let key = (library.clone(), effective_c_name.clone());
+        let idx = if let Some(&i) = spec_dedupe.get(&key) {
+            i
+        } else {
+            let i = c_function_specs.len();
+            spec_dedupe.insert(key, i);
+            c_function_specs.push(nod_runtime::StubEntrySpec {
+                dll: library.clone(),
+                symbol: effective_c_name.clone(),
+                signature: sig,
+            });
+            i
+        };
+        c_function_pre.push((name.clone(), Some(idx), *span));
+        // The entry_ptr is patched once the table is allocated; we
+        // need to know `idx` first, hence the two-phase loop here.
+    }
+    // Allocate the stub table NOW (in the static area). The returned
+    // `entry_ptrs` are stable for the process lifetime; we bake them
+    // into per-call IR as `i64` constants.
+    let c_function_stub_table_entries: Vec<CFunctionStubEntry>;
+    let entry_ptrs: Vec<*const nod_runtime::ApiStubEntry>;
+    if !c_function_specs.is_empty() {
+        let (_table, ptrs) = nod_runtime::allocate_stub_table(&c_function_specs);
+        entry_ptrs = ptrs;
+        c_function_stub_table_entries = c_function_specs
+            .iter()
+            .zip(entry_ptrs.iter())
+            .map(|(s, &p)| CFunctionStubEntry {
+                dll: s.dll.clone(),
+                symbol: s.symbol.clone(),
+                signature: s.signature,
+                entry_ptr: p as u64,
+            })
+            .collect();
+    } else {
+        entry_ptrs = Vec::new();
+        c_function_stub_table_entries = Vec::new();
+    }
+    // Build the per-call lookup map: Dylan name -> entry pointer +
+    // arg count.
+    for (name, idx_opt, _) in &c_function_pre {
+        if let Some(idx) = idx_opt {
+            let p = entry_ptrs[*idx];
+            let sig = c_function_specs[*idx].signature;
+            c_function_call_map.insert(
+                name.clone(),
+                CFunctionCallInfo {
+                    entry_ptr: p as u64,
+                    arg_count: sig.arg_count as usize,
+                },
+            );
+        }
+    }
+
     // Phase 4: lower user-defined items.
     let user_classes_snapshot = user_classes.clone();
     for item in &m.items {
@@ -714,6 +876,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     generics: &generics,
                     user_classes: &user_classes_snapshot,
                     closures: Some(&closure_registry),
+                    c_functions: Some(&c_function_call_map),
                 };
                 match b.lower_expr(value, &mut env, &ctx) {
                     Ok(t) => {
@@ -738,6 +901,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     generics: &generics,
                     user_classes: &user_classes_snapshot,
                     closures: Some(&closure_registry),
+                    c_functions: Some(&c_function_call_map),
                 };
                 match lower_function_inner(
                     alloc_id(&mut lift_sink),
@@ -766,6 +930,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     generics: &generics,
                     user_classes: &user_classes_snapshot,
                     closures: Some(&closure_registry),
+                    c_functions: Some(&c_function_call_map),
                 };
                 match lower_method_item(
                     alloc_id(&mut lift_sink),
@@ -806,14 +971,17 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
             }
             Item::DefineCFunction {
                 name,
+                params,
+                return_,
                 c_name,
                 library,
                 span,
                 ..
             } => {
-                // Sprint 27 — FFI Phase A. We record the binding
-                // metadata so the Sprint 28 codegen has everything
-                // it needs; we do NOT emit any DFM call-site code.
+                // Sprint 27 recorded the binding; Sprint 28 builds
+                // the marshaling signature, picks a stub-table slot,
+                // and registers a "synthetic top name" so call sites
+                // can resolve `Beep(...)` to a WinFFI DirectCall.
                 //
                 // Validation: require `library:` to be present and
                 // non-empty. Probe the embedded `nod-winapi` index
@@ -830,7 +998,8 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     continue;
                 }
                 let effective_c_name = c_name.clone().unwrap_or_else(|| name.clone());
-                let resolved = nod_winapi::find_function(library, &effective_c_name).is_some();
+                let resolved =
+                    nod_winapi::find_function(library, &effective_c_name).is_some();
                 if !resolved {
                     warnings.push(LoweringWarning::CFunctionNotInDb {
                         span: *span,
@@ -839,12 +1008,61 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                         c_name: effective_c_name.clone(),
                     });
                 }
+                // Sprint 28: derive the marshaling signature. Each
+                // param's type annotation must be a `<c-…>` ident
+                // that maps to a [`nod_runtime::CArgKind`]. Bail out
+                // (signature = None) on any unknown type — call sites
+                // then surface a deferral error per the Sprint 28
+                // brief ("integer / pointer only").
+                let mut arg_names: Vec<String> = Vec::with_capacity(params.len());
+                let mut signature_ok = true;
+                for p in params {
+                    let n = match &p.type_ {
+                        Some(Expr::Ident(_, n)) => n.clone(),
+                        _ => {
+                            signature_ok = false;
+                            String::new()
+                        }
+                    };
+                    arg_names.push(n);
+                }
+                let return_name: Option<String> = match return_ {
+                    Some(rs) => {
+                        if rs.values.len() > 1 {
+                            // Multi-value c-function returns are not in
+                            // Sprint 28 scope; fall through to
+                            // signature = None.
+                            signature_ok = false;
+                            None
+                        } else if let Some(v) = rs.values.first() {
+                            match &v.type_ {
+                                Some(Expr::Ident(_, n)) => Some(n.clone()),
+                                _ => {
+                                    signature_ok = false;
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                let signature: Option<nod_runtime::ApiCallSignature> = if signature_ok {
+                    let arg_refs: Vec<&str> =
+                        arg_names.iter().map(|s| s.as_str()).collect();
+                    nod_runtime::signature_from_names(&arg_refs, return_name.as_deref())
+                        .ok()
+                } else {
+                    None
+                };
                 c_functions.push(CFunctionBinding {
                     dylan_name: name.clone(),
                     c_name: effective_c_name,
                     library: library.clone(),
                     span: *span,
                     resolved_in_db: resolved,
+                    signature,
                 });
             }
             Item::DefineLibrary { .. } | Item::DefineModule { .. } => {}
@@ -923,17 +1141,22 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         nod_dfm::populate_safepoint_roots(f);
     }
 
-    // Sprint 27: scan the AST for any call expression whose callee
-    // is the name of a `define c-function`. Sprint 27 does NOT
-    // generate FFI codegen; the Sprint 28 follow-up will. We error
-    // here so the deferral is explicit — if a user writes the
-    // declaration AND attempts to call it, they get a clear
-    // diagnostic pointing at Sprint 28.
-    let c_function_names: HashSet<String> =
-        c_functions.iter().map(|c| c.dylan_name.clone()).collect();
-    if !c_function_names.is_empty() {
+    // Sprint 28: scan the AST for any call expression whose callee
+    // is the name of a `define c-function` WHOSE signature couldn't
+    // be derived (unsupported c-type, multi-value return, etc.). The
+    // happy path (a supported signature) is fully lowered inside
+    // `lower_call`. Names with `signature: None` aren't in
+    // `c_function_call_map`, so their call sites would otherwise
+    // silently fall through to "unknown ident — DirectCall against
+    // the bare name"; we surface a deferral diagnostic instead.
+    let unsupported_c_names: HashSet<String> = c_functions
+        .iter()
+        .filter(|c| c.signature.is_none())
+        .map(|c| c.dylan_name.clone())
+        .collect();
+    if !unsupported_c_names.is_empty() {
         let mut call_site_errors: Vec<LoweringError> = Vec::new();
-        scan_module_for_c_function_calls(m, &c_function_names, &mut call_site_errors);
+        scan_module_for_c_function_calls(m, &unsupported_c_names, &mut call_site_errors);
         if !call_site_errors.is_empty() {
             return Err(call_site_errors);
         }
@@ -947,6 +1170,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         blocks,
         closures: closure_registry,
         c_functions,
+        c_function_stub_table: c_function_stub_table_entries,
         warnings,
     })
 }
@@ -1035,7 +1259,9 @@ fn scan_expr_for_c_calls(
                 errors.push(LoweringError::Unsupported {
                     span: *span,
                     message: format!(
-                        "`{name}`: c-function calls not yet supported (Sprint 28)"
+                        "`{name}`: c-function uses parameter / return c-type \
+                         not yet supported in Sprint 28 (integer + pointer only). \
+                         Strings ship in Sprint 30; structs in 34; callbacks in 33."
                     ),
                 });
             }
@@ -1618,6 +1844,7 @@ pub fn lower_function(
         generics: &generics,
         user_classes: &user_classes,
         closures: None,
+        c_functions: None,
     };
     let mut sink = LiftSink::default();
     lower_function_inner(FunctionId(0), name, params, None, body, span, &ctx, &mut sink)
@@ -1864,6 +2091,24 @@ struct LowerCtx<'a> {
     /// (e.g. the `lower_function` test helper); in that case the
     /// lowerer behaves exactly as it did in Sprint 21.
     closures: Option<&'a ClosureRegistry>,
+    /// Sprint 28: per-module c-function call site dispatch table.
+    /// Maps the Dylan-side name (`Beep`) to the resolved stub-table
+    /// entry + signature for code-gen-time lowering. `None` outside
+    /// `lower_module_full` (no `define c-function` in scope).
+    c_functions: Option<&'a HashMap<String, CFunctionCallInfo>>,
+}
+
+/// Sprint 28: per-c-function metadata threaded through `LowerCtx` so
+/// call-site lowering can look up the stub-table entry pointer + the
+/// marshaling signature for a given Dylan-side name.
+#[derive(Clone, Debug)]
+struct CFunctionCallInfo {
+    /// Static-area address of the resolved [`nod_runtime::ApiStubEntry`]
+    /// — baked into each call site as an `i64` constant.
+    entry_ptr: u64,
+    /// Argument count from the parsed signature. Drives which
+    /// `nod_winffi_call_N` trampoline the call site emits.
+    arg_count: usize,
 }
 
 /// Sprint 24: per-body lowering state for cell-promotion + env access.
@@ -3689,6 +3934,65 @@ impl FunctionBuilder {
             .map(|a| self.lower_expr(a, env, ctx))
             .collect::<Result<_, _>>()?;
         if let Expr::Ident(_, name) = callee {
+            // Sprint 28: c-function call — look up the per-module
+            // stub table and emit `nod_winffi_call_N(entry_ptr_const,
+            // args...)`. The entry pointer is baked as a `WordBits`
+            // i64 constant so codegen lowers it to a literal LLVM i64.
+            if let Some(cf_map) = ctx.c_functions
+                && let Some(info) = cf_map.get(name)
+            {
+                if arg_temps.len() != info.arg_count {
+                    return Err(LoweringError::Unsupported {
+                        span,
+                        message: format!(
+                            "c-function `{name}` declared with {} parameter(s), called with {}",
+                            info.arg_count,
+                            arg_temps.len()
+                        ),
+                    });
+                }
+                if info.arg_count > 8 {
+                    return Err(LoweringError::Unsupported {
+                        span,
+                        message: format!(
+                            "c-function `{name}`: Sprint 28 caps arity at 8, got {}",
+                            info.arg_count
+                        ),
+                    });
+                }
+                // Materialise the entry pointer as a `WordBits` i64
+                // constant. The codegen layer emits this as a literal
+                // `i64` — no shifting, no tagging.
+                let entry_t = self.fresh_temp(TypeEstimate::Top);
+                self.push(Computation::Const {
+                    dst: entry_t,
+                    value: ConstValue::WordBits(info.entry_ptr),
+                });
+                let mut call_args = Vec::with_capacity(arg_temps.len() + 1);
+                call_args.push(entry_t);
+                call_args.extend(arg_temps);
+                let callee_sym = match info.arg_count {
+                    0 => "nod_winffi_call_0",
+                    1 => "nod_winffi_call_1",
+                    2 => "nod_winffi_call_2",
+                    3 => "nod_winffi_call_3",
+                    4 => "nod_winffi_call_4",
+                    5 => "nod_winffi_call_5",
+                    6 => "nod_winffi_call_6",
+                    7 => "nod_winffi_call_7",
+                    8 => "nod_winffi_call_8",
+                    // Unreachable: arity_count <= 8 enforced above.
+                    _ => unreachable!(),
+                };
+                let dst = self.fresh_temp(TypeEstimate::Top);
+                self.push(Computation::DirectCall {
+                    dst,
+                    callee: callee_sym.to_string(),
+                    args: call_args,
+                    safepoint_roots: Vec::new(),
+                });
+                return Ok(dst);
+            }
             // Sprint 12: prefer dispatch when the name is a known
             // generic AND the receiver's type estimate doesn't statically
             // resolve. For known top-level functions (slot accessors

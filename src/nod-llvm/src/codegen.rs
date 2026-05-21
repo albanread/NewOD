@@ -191,6 +191,24 @@ pub const NOD_FUNCALL5_SYMBOL: &str = "nod_funcall5";
 pub const NOD_APPLY_SYMBOL: &str = "nod_apply";
 pub const NOD_MAKE_SOV_LEN_SYMBOL: &str = "nod_make_sov_len";
 
+// ─── Sprint 28 — Win64 FFI trampolines ────────────────────────────────────
+//
+// One trampoline per arity 0..=8. Lowering emits a DirectCall against
+// the synthetic `%winffi-call-N` callee; codegen recognises the prefix
+// and declares the matching extern. The first arg of each trampoline
+// is the static-area pointer of the entry's [`ApiStubEntry`] (baked as
+// an `i64` constant by lowering); the remaining args are the Dylan
+// caller's args, each passed as a tagged `i64` Word.
+pub const NOD_WINFFI_CALL_0_SYMBOL: &str = "nod_winffi_call_0";
+pub const NOD_WINFFI_CALL_1_SYMBOL: &str = "nod_winffi_call_1";
+pub const NOD_WINFFI_CALL_2_SYMBOL: &str = "nod_winffi_call_2";
+pub const NOD_WINFFI_CALL_3_SYMBOL: &str = "nod_winffi_call_3";
+pub const NOD_WINFFI_CALL_4_SYMBOL: &str = "nod_winffi_call_4";
+pub const NOD_WINFFI_CALL_5_SYMBOL: &str = "nod_winffi_call_5";
+pub const NOD_WINFFI_CALL_6_SYMBOL: &str = "nod_winffi_call_6";
+pub const NOD_WINFFI_CALL_7_SYMBOL: &str = "nod_winffi_call_7";
+pub const NOD_WINFFI_CALL_8_SYMBOL: &str = "nod_winffi_call_8";
+
 // ─── Sprint 24 — closures: <cell> and <environment> ───────────────────────
 pub const NOD_MAKE_CELL_SYMBOL: &str = "nod_make_cell";
 pub const NOD_CELL_GET_SYMBOL: &str = "nod_cell_get";
@@ -265,6 +283,18 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_env_cell", NOD_ENV_CELL_SYMBOL, 2),
     ("nod_make_environment", NOD_MAKE_ENVIRONMENT_SYMBOL, 1),
     ("nod_make_closure", NOD_MAKE_CLOSURE_SYMBOL, 3),
+    // Sprint 28 — Win64 FFI trampolines. Arity here is the trampoline's
+    // C-ABI arity (entry-pointer + user args), so `nod_winffi_call_N`
+    // entry takes `N + 1` Dylan-side args.
+    ("nod_winffi_call_0", NOD_WINFFI_CALL_0_SYMBOL, 1),
+    ("nod_winffi_call_1", NOD_WINFFI_CALL_1_SYMBOL, 2),
+    ("nod_winffi_call_2", NOD_WINFFI_CALL_2_SYMBOL, 3),
+    ("nod_winffi_call_3", NOD_WINFFI_CALL_3_SYMBOL, 4),
+    ("nod_winffi_call_4", NOD_WINFFI_CALL_4_SYMBOL, 5),
+    ("nod_winffi_call_5", NOD_WINFFI_CALL_5_SYMBOL, 6),
+    ("nod_winffi_call_6", NOD_WINFFI_CALL_6_SYMBOL, 7),
+    ("nod_winffi_call_7", NOD_WINFFI_CALL_7_SYMBOL, 8),
+    ("nod_winffi_call_8", NOD_WINFFI_CALL_8_SYMBOL, 9),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

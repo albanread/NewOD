@@ -42,6 +42,7 @@ mod closures;
 mod collections;
 mod conditions;
 mod dispatch;
+mod winffi;
 #[cfg(feature = "newgc-backend")]
 mod dylan_layout;
 mod format_out;
@@ -166,6 +167,15 @@ pub use tracer::{HeapObjectInfo, HeapTrace, trace_heap};
 pub use vectors::{
     SimpleObjectVector, nod_make_sov_len, nod_make_sov_literal, nod_sov_element,
     nod_sov_element_setter, nod_sov_size, try_simple_object_vector, try_simple_object_vector_mut,
+};
+pub use winffi::{
+    ApiCallSignature, ApiStubEntry, ApiStubTable, CArgKind, CReturnKind, StubEntrySpec,
+    WinFfiStats, _reset_winffi_stats_for_tests, allocate_stub_table, c_ffi_error_class_id,
+    ensure_c_ffi_error_registered, initialize_stub_table, make_c_ffi_error,
+    nod_winffi_call_0, nod_winffi_call_1, nod_winffi_call_2, nod_winffi_call_3,
+    nod_winffi_call_4, nod_winffi_call_5, nod_winffi_call_6, nod_winffi_call_7,
+    nod_winffi_call_8, record_stub_entry_allocated, resolve_into_entry, resolve_symbol,
+    signature_from_names, winffi_stats,
 };
 pub use word::{FIXNUM_MAX, FIXNUM_MIN, FixnumOverflow, Word};
 pub use wrapper::{GcBit, Wrapper};
