@@ -217,7 +217,8 @@ pub use winffi::{
     ensure_c_ffi_error_registered, initialize_stub_table, make_c_ffi_error,
     nod_winffi_call_0, nod_winffi_call_1, nod_winffi_call_2, nod_winffi_call_3,
     nod_winffi_call_4, nod_winffi_call_5, nod_winffi_call_6, nod_winffi_call_7,
-    nod_winffi_call_8, record_stub_entry_allocated, resolve_into_entry, resolve_symbol,
+    nod_winffi_call_8, nod_winffi_call_9, nod_winffi_call_10, nod_winffi_call_11,
+    nod_winffi_call_12, record_stub_entry_allocated, resolve_into_entry, resolve_symbol,
     signature_from_names, winffi_record_materialized, winffi_stats,
 };
 pub use word::{FIXNUM_MAX, FIXNUM_MIN, FixnumOverflow, Word};

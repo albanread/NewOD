@@ -252,12 +252,14 @@ impl CReturnKind {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ApiCallSignature {
-    /// Number of arguments (0..=8 in Sprint 28). The trampoline at
-    /// arity N expects `arg_count == N`.
+    /// Number of arguments (0..=12). Sprint 36b raised the cap from
+    /// Sprint 28's 8 to 12 to support CreateWindowExW + the rest of
+    /// the IDE-shell Win32 surface. The trampoline at arity N
+    /// expects `arg_count == N`.
     pub arg_count: u8,
     /// Packed arg kinds; only the first `arg_count` entries are
-    /// meaningful. Indices `arg_count..8` MUST be `CArgKind::Void` (0).
-    pub arg_kinds: [u8; 8],
+    /// meaningful. Indices `arg_count..12` MUST be `CArgKind::Void` (0).
+    pub arg_kinds: [u8; 12],
     /// Return value kind.
     pub return_kind: u8,
 }
@@ -1375,6 +1377,145 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_8(
     boxed
 }
 
+/// 9-arg trampoline. Sprint 36b: needed for Win32 APIs like
+/// `CreateWindowExA`/`CreateWindowExW` (12 args), `CreateProcessW`
+/// (10 args). Mechanical extension of the 8-arg pattern.
+///
+/// # Safety
+/// See [`nod_winffi_call_0`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_winffi_call_9(
+    entry: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64,
+    a4: u64, a5: u64, a6: u64, a7: u64, a8: u64,
+) -> u64 {
+    // SAFETY: `entry` is the baked static-area pointer.
+    let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
+    debug_assert_eq!(sig.arg_count, 9);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
+    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6], &mut temps);
+    let c7 = unbox_arg(Word::from_raw(a7), sig.arg_kinds[7], &mut temps);
+    let c8 = unbox_arg(Word::from_raw(a8), sig.arg_kinds[8], &mut temps);
+    // SAFETY: sema-validated; nine-arg Win64 ABI.
+    let raw = unsafe {
+        let f: extern "system" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            std::mem::transmute(fn_ptr);
+        f(c0, c1, c2, c3, c4, c5, c6, c7, c8)
+    };
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
+}
+
+/// 10-arg trampoline. Sprint 36b. See [`nod_winffi_call_0`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_winffi_call_10(
+    entry: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
+    a5: u64, a6: u64, a7: u64, a8: u64, a9: u64,
+) -> u64 {
+    // SAFETY: `entry` is the baked static-area pointer.
+    let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
+    debug_assert_eq!(sig.arg_count, 10);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
+    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6], &mut temps);
+    let c7 = unbox_arg(Word::from_raw(a7), sig.arg_kinds[7], &mut temps);
+    let c8 = unbox_arg(Word::from_raw(a8), sig.arg_kinds[8], &mut temps);
+    let c9 = unbox_arg(Word::from_raw(a9), sig.arg_kinds[9], &mut temps);
+    // SAFETY: sema-validated; ten-arg Win64 ABI.
+    let raw = unsafe {
+        let f: extern "system" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+        ) -> u64 = std::mem::transmute(fn_ptr);
+        f(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9)
+    };
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
+}
+
+/// 11-arg trampoline. Sprint 36b. See [`nod_winffi_call_0`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_winffi_call_11(
+    entry: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+    a6: u64, a7: u64, a8: u64, a9: u64, a10: u64,
+) -> u64 {
+    // SAFETY: `entry` is the baked static-area pointer.
+    let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
+    debug_assert_eq!(sig.arg_count, 11);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
+    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6], &mut temps);
+    let c7 = unbox_arg(Word::from_raw(a7), sig.arg_kinds[7], &mut temps);
+    let c8 = unbox_arg(Word::from_raw(a8), sig.arg_kinds[8], &mut temps);
+    let c9 = unbox_arg(Word::from_raw(a9), sig.arg_kinds[9], &mut temps);
+    let c10 = unbox_arg(Word::from_raw(a10), sig.arg_kinds[10], &mut temps);
+    // SAFETY: sema-validated; eleven-arg Win64 ABI.
+    let raw = unsafe {
+        let f: extern "system" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+        ) -> u64 = std::mem::transmute(fn_ptr);
+        f(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10)
+    };
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
+}
+
+/// 12-arg trampoline. Sprint 36b: this is the CreateWindowExW arity —
+/// the IDE-shell-blocker. See [`nod_winffi_call_0`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_winffi_call_12(
+    entry: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+    a6: u64, a7: u64, a8: u64, a9: u64, a10: u64, a11: u64,
+) -> u64 {
+    // SAFETY: `entry` is the baked static-area pointer.
+    let (fn_ptr, sig) = unsafe { trampoline_prelude(entry as *const ApiStubEntry) };
+    debug_assert_eq!(sig.arg_count, 12);
+    let mut temps: Vec<TempBuf> = Vec::new();
+    let c0 = unbox_arg(Word::from_raw(a0), sig.arg_kinds[0], &mut temps);
+    let c1 = unbox_arg(Word::from_raw(a1), sig.arg_kinds[1], &mut temps);
+    let c2 = unbox_arg(Word::from_raw(a2), sig.arg_kinds[2], &mut temps);
+    let c3 = unbox_arg(Word::from_raw(a3), sig.arg_kinds[3], &mut temps);
+    let c4 = unbox_arg(Word::from_raw(a4), sig.arg_kinds[4], &mut temps);
+    let c5 = unbox_arg(Word::from_raw(a5), sig.arg_kinds[5], &mut temps);
+    let c6 = unbox_arg(Word::from_raw(a6), sig.arg_kinds[6], &mut temps);
+    let c7 = unbox_arg(Word::from_raw(a7), sig.arg_kinds[7], &mut temps);
+    let c8 = unbox_arg(Word::from_raw(a8), sig.arg_kinds[8], &mut temps);
+    let c9 = unbox_arg(Word::from_raw(a9), sig.arg_kinds[9], &mut temps);
+    let c10 = unbox_arg(Word::from_raw(a10), sig.arg_kinds[10], &mut temps);
+    let c11 = unbox_arg(Word::from_raw(a11), sig.arg_kinds[11], &mut temps);
+    // SAFETY: sema-validated; twelve-arg Win64 ABI.
+    let raw = unsafe {
+        let f: extern "system" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+        ) -> u64 = std::mem::transmute(fn_ptr);
+        f(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11)
+    };
+    let boxed = box_return(raw, sig.return_kind).raw();
+    drop(temps);
+    boxed
+}
+
 // ─── Sema helper: signature from c-type names ─────────────────────────────
 
 /// Build an [`ApiCallSignature`] from a list of param c-type names
@@ -1385,13 +1526,13 @@ pub fn signature_from_names(
     arg_names: &[&str],
     return_name: Option<&str>,
 ) -> Result<ApiCallSignature, String> {
-    if arg_names.len() > 8 {
+    if arg_names.len() > 12 {
         return Err(format!(
-            "winffi: arity {} exceeds Sprint 28 cap of 8",
+            "winffi: arity {} exceeds Sprint 36b cap of 12",
             arg_names.len()
         ));
     }
-    let mut arg_kinds = [CArgKind::Void as u8; 8];
+    let mut arg_kinds = [CArgKind::Void as u8; 12];
     for (i, n) in arg_names.iter().enumerate() {
         let k = CArgKind::from_c_type_name(n).ok_or_else(|| n.to_string())?;
         arg_kinds[i] = k as u8;

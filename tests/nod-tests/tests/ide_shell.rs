@@ -140,7 +140,7 @@ fn ide_shell_window_renders_hello_dylan() {
                      if (swap ~= 0) \
                        if (bitmap = 0) \
                          bitmap := %d2d-create-bitmap-from-swap-chain(dc, swap); \
-                       end; \
+                       else 0 end; \
                        %d2d-set-target(dc, bitmap); \
                        %d2d-begin-draw(dc); \
                        %d2d-clear(dc, 255, 255, 255, 255); \
@@ -151,7 +151,7 @@ fn ide_shell_window_renders_hello_dylan() {
                        %com-release(brush); \
                        %com-release(layout); \
                        %dxgi-swap-chain-present(swap); \
-                     end; \
+                     else 0 end; \
                      0 \
                    elseif (msg = 2) \
                      PostQuitMessage(0); \

@@ -208,6 +208,11 @@ pub const NOD_WINFFI_CALL_5_SYMBOL: &str = "nod_winffi_call_5";
 pub const NOD_WINFFI_CALL_6_SYMBOL: &str = "nod_winffi_call_6";
 pub const NOD_WINFFI_CALL_7_SYMBOL: &str = "nod_winffi_call_7";
 pub const NOD_WINFFI_CALL_8_SYMBOL: &str = "nod_winffi_call_8";
+// Sprint 36b: extend trampoline family to arity 12 (CreateWindowExW).
+pub const NOD_WINFFI_CALL_9_SYMBOL: &str = "nod_winffi_call_9";
+pub const NOD_WINFFI_CALL_10_SYMBOL: &str = "nod_winffi_call_10";
+pub const NOD_WINFFI_CALL_11_SYMBOL: &str = "nod_winffi_call_11";
+pub const NOD_WINFFI_CALL_12_SYMBOL: &str = "nod_winffi_call_12";
 
 // ─── Sprint 32 — closure → C callback function-pointer trampolines ────────
 //
@@ -372,6 +377,10 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_winffi_call_6", NOD_WINFFI_CALL_6_SYMBOL, 7),
     ("nod_winffi_call_7", NOD_WINFFI_CALL_7_SYMBOL, 8),
     ("nod_winffi_call_8", NOD_WINFFI_CALL_8_SYMBOL, 9),
+    ("nod_winffi_call_9", NOD_WINFFI_CALL_9_SYMBOL, 10),
+    ("nod_winffi_call_10", NOD_WINFFI_CALL_10_SYMBOL, 11),
+    ("nod_winffi_call_11", NOD_WINFFI_CALL_11_SYMBOL, 12),
+    ("nod_winffi_call_12", NOD_WINFFI_CALL_12_SYMBOL, 13),
     // Sprint 32 — closure-to-C-callback trampoline registration.
     ("nod_register_wndproc", NOD_REGISTER_WNDPROC_SYMBOL, 1),
     ("nod_register_wndenumproc", NOD_REGISTER_WNDENUMPROC_SYMBOL, 1),

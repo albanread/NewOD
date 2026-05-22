@@ -708,13 +708,13 @@ fn try_jit_materialize_winapi(name: &str) -> MaterializationOutcome {
 fn build_signature_from_function_info(
     info: &nod_winapi::FunctionInfo,
 ) -> Result<nod_runtime::ApiCallSignature, String> {
-    if info.params.len() > 8 {
+    if info.params.len() > 12 {
         return Err(format!(
-            "arity {} exceeds Sprint 28 cap of 8",
+            "arity {} exceeds Sprint 36b cap of 12",
             info.params.len()
         ));
     }
-    let mut arg_kinds = [nod_runtime::CArgKind::Void as u8; 8];
+    let mut arg_kinds = [nod_runtime::CArgKind::Void as u8; 12];
     for (i, p) in info.params.iter().enumerate() {
         let kind = c_arg_kind_from_type_ref(&p.type_ref).map_err(|why| {
             format!(
@@ -2043,9 +2043,13 @@ fn scan_expr_for_c_calls(
                 errors.push(LoweringError::Unsupported {
                     span: *span,
                     message: format!(
-                        "`{name}`: c-function uses parameter / return c-type \
-                         not yet supported in Sprint 28 (integer + pointer only). \
-                         Strings ship in Sprint 30; structs in 34; callbacks in 33."
+                        "`{name}`: c-function signature couldn't be derived. \
+                         Check (a) arity ≤ 12 (Sprint 36b cap); \
+                         (b) every param + return is one of the supported \
+                         c-types: integer family, <c-bool>, <c-pointer>, \
+                         <c-handle>, <c-string>, <c-wide-string>, or a \
+                         <c-struct> subclass. Float / variadic / function-pointer \
+                         args are not yet supported (Sprint 37+)."
                     ),
                 });
             }
@@ -4911,6 +4915,10 @@ impl FunctionBuilder {
                     6 => "nod_winffi_call_6",
                     7 => "nod_winffi_call_7",
                     8 => "nod_winffi_call_8",
+                    9 => "nod_winffi_call_9",
+                    10 => "nod_winffi_call_10",
+                    11 => "nod_winffi_call_11",
+                    12 => "nod_winffi_call_12",
                     // Unreachable: arity_count <= 8 enforced above.
                     _ => unreachable!(),
                 };

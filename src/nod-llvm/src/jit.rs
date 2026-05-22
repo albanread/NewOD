@@ -41,6 +41,8 @@ use crate::codegen::{
     NOD_WINFFI_CALL_0_SYMBOL, NOD_WINFFI_CALL_1_SYMBOL, NOD_WINFFI_CALL_2_SYMBOL,
     NOD_WINFFI_CALL_3_SYMBOL, NOD_WINFFI_CALL_4_SYMBOL, NOD_WINFFI_CALL_5_SYMBOL,
     NOD_WINFFI_CALL_6_SYMBOL, NOD_WINFFI_CALL_7_SYMBOL, NOD_WINFFI_CALL_8_SYMBOL,
+    NOD_WINFFI_CALL_9_SYMBOL, NOD_WINFFI_CALL_10_SYMBOL, NOD_WINFFI_CALL_11_SYMBOL,
+    NOD_WINFFI_CALL_12_SYMBOL,
     // Sprint 32 — closure-to-C-callback trampoline registration.
     NOD_REGISTER_WNDENUMPROC_SYMBOL, NOD_REGISTER_WNDPROC_SYMBOL,
     // Sprint 34 — <c-struct> field accessor primitives.
@@ -377,6 +379,24 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_WINFFI_CALL_8_SYMBOL),
                 nod_runtime::nod_winffi_call_8 as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 36b — trampoline family extended to arity 12
+            // (CreateWindowExW + the rest of the IDE-shell Win32 surface).
+            (
+                module.get_function(NOD_WINFFI_CALL_9_SYMBOL),
+                nod_runtime::nod_winffi_call_9 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_10_SYMBOL),
+                nod_runtime::nod_winffi_call_10 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_11_SYMBOL),
+                nod_runtime::nod_winffi_call_11 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_WINFFI_CALL_12_SYMBOL),
+                nod_runtime::nod_winffi_call_12 as *const () as *mut std::ffi::c_void,
             ),
             // Sprint 32 — closure-to-C-callback trampoline registration.
             (
