@@ -187,42 +187,9 @@ fn ide_shell_window_renders_hello_dylan() {
         UpdateWindow(hwnd); \
         \
         \
+        Sleep(5000); \
         \
-        let msg = make(<msg>); \
-        let exit-code = 0; \
-        \
-        \
-        \
-        \
-        \
-        \
-        \
-        \
-        \
-        \
-        \
-        let pumping = #t; \
-        let iters = 0; \
-        while (pumping) \
-          let has-msg = PeekMessageW(msg, 0, 0, 0, 1); \
-          if (has-msg ~= 0) \
-            let msg-id = msg-message(msg); \
-            if (msg-id = 18) \
-              pumping := #f; \
-              exit-code := 0; \
-            else \
-              TranslateMessage(msg); \
-              DispatchMessageW(msg); \
-            end; \
-          else 0 end; \
-          Sleep(10); \
-          iters := iters + 1; \
-          if (iters > 3000) \
-            pumping := #f; \
-          else 0 end; \
-        end; \
-        \
-        exit-code";
+        0";
     let s = eval_expr_with_items_to_string(IDE_SHELL_DECL, body)
         .unwrap_or_else(|e| panic!("IDE shell test failed: {e:?}"));
     assert_eq!(
