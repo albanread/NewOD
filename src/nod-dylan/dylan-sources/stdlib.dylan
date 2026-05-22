@@ -470,3 +470,109 @@ end function;
 define function msg-lprivate-setter (m, v) => (v)
   %struct-set-u32(v, m, 44)
 end function;
+
+// ─── Sprint 36: <wndclassexw> field accessors ─────────────────────────────
+//
+// WNDCLASSEXW carries the window-class registration shape that
+// `RegisterClassExW` writes. Sprint 36's `nod-register-window-class`
+// helper builds this struct in Rust (because the `lpszClassName`
+// field needs a process-lifetime wide-string buffer that's awkward
+// to express in pure Dylan); these accessors are here for callers
+// that build their own WNDCLASSEXW. The size accessor is the most
+// commonly used — calling code must store `sizeof(WNDCLASSEXW) = 80`
+// in `cbSize` before passing the struct to `RegisterClassExW`.
+
+define function wndclassexw-cbSize (w) => (n)
+  %struct-get-u32(w, 0)
+end function;
+
+define function wndclassexw-cbSize-setter (w, v) => (v)
+  %struct-set-u32(v, w, 0)
+end function;
+
+define function wndclassexw-style (w) => (n)
+  %struct-get-u32(w, 4)
+end function;
+
+define function wndclassexw-style-setter (w, v) => (v)
+  %struct-set-u32(v, w, 4)
+end function;
+
+define function wndclassexw-lpfnWndProc (w) => (n)
+  %struct-get-pointer(w, 8)
+end function;
+
+define function wndclassexw-lpfnWndProc-setter (w, v) => (v)
+  %struct-set-pointer(v, w, 8)
+end function;
+
+define function wndclassexw-hInstance (w) => (n)
+  %struct-get-pointer(w, 24)
+end function;
+
+define function wndclassexw-hInstance-setter (w, v) => (v)
+  %struct-set-pointer(v, w, 24)
+end function;
+
+define function wndclassexw-lpszClassName (w) => (n)
+  %struct-get-pointer(w, 64)
+end function;
+
+define function wndclassexw-lpszClassName-setter (w, v) => (v)
+  %struct-set-pointer(v, w, 64)
+end function;
+
+// ─── Sprint 36: <paintstruct> field accessors ─────────────────────────────
+//
+// PAINTSTRUCT is populated by `BeginPaint(hwnd, &ps)`. The IDE-shell
+// WNDPROC typically only reads `hdc` and the inline `rcPaint` —
+// we expose those plus a couple of the flag fields. The 32-byte
+// `rgbReserved` tail is OS scratch; we don't expose it.
+
+define function paintstruct-hdc (p) => (n)
+  %struct-get-pointer(p, 0)
+end function;
+
+define function paintstruct-hdc-setter (p, v) => (v)
+  %struct-set-pointer(v, p, 0)
+end function;
+
+define function paintstruct-fErase (p) => (n)
+  %struct-get-i32(p, 8)
+end function;
+
+define function paintstruct-fErase-setter (p, v) => (v)
+  %struct-set-i32(v, p, 8)
+end function;
+
+define function paintstruct-rc-left (p) => (n)
+  %struct-get-i32(p, 16)
+end function;
+
+define function paintstruct-rc-left-setter (p, v) => (v)
+  %struct-set-i32(v, p, 16)
+end function;
+
+define function paintstruct-rc-top (p) => (n)
+  %struct-get-i32(p, 20)
+end function;
+
+define function paintstruct-rc-top-setter (p, v) => (v)
+  %struct-set-i32(v, p, 20)
+end function;
+
+define function paintstruct-rc-right (p) => (n)
+  %struct-get-i32(p, 24)
+end function;
+
+define function paintstruct-rc-right-setter (p, v) => (v)
+  %struct-set-i32(v, p, 24)
+end function;
+
+define function paintstruct-rc-bottom (p) => (n)
+  %struct-get-i32(p, 28)
+end function;
+
+define function paintstruct-rc-bottom-setter (p, v) => (v)
+  %struct-set-i32(v, p, 28)
+end function;

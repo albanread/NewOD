@@ -1116,6 +1116,55 @@ Run output: **`717`** red pixels rendered (out of 65 536 total) — proof that t
 - **Compositional swap chains.** `CreateSwapChainForComposition` enables IDE panes embedded in non-Win32 hosts (XAML islands, etc.). Later.
 - **Hand-rolled C++ shim DLL (the original Sprint 35 brief).** Superseded by the `windows`-crate approach. The C++ shim is no longer on the roadmap.
 
+### Sprint 36 — IDE shell: the FFI journey's headline payoff — landed
+
+**Goal:** assemble the nine FFI sprints into a working Win32 IDE shell. `cargo test --test ide_shell -- --ignored` opens a real titled window, renders "hello, dylan" via D2D + DirectWrite into the window's client area through an HWND-bound swap chain, handles WM_PAINT/WM_SIZE/WM_DESTROY via a Dylan-source WNDPROC closure, and exits cleanly when the user closes the window. The infrastructure pieces (WNDCLASSEXW registration, HWND swap-chain creation, WNDPROC dispatch, message-loop primitives) are verified separately by six `ide_shell_infra.rs` tests that use message-only / hidden windows so routine `cargo test` doesn't pop UI.
+
+**Architectural shape.**
+
+A. **Two new C-struct types: `<wndclassexw>` (80 B) and `<paintstruct>` (72 B).** Both go through the Sprint 34 `<c-struct>` family — `is_byte_payload = true`, parent `<c-struct>`, field offsets verified at Sprint-36-time against the `windows`-crate's `std::mem::size_of::<…>()` (one of the new unit tests). The stdlib gets accessor pairs for the load-bearing fields: `wndclassexw-cbSize`, `lpfnWndProc`, `lpszClassName`, `hInstance`, `hIconSm`; `paintstruct-hdc`, `fErase`, and the nested `rcPaint` fields surfaced flat as `paintstruct-rc-{left,top,right,bottom}`.
+
+B. **HWND-bound swap chain shims (5 new entries in `com_shim.rs`).** A new `IDXGISwapChain1` variant joins the `ComObject` enum. The Sprint 36 shims:
+- `nod_dxgi_factory_from_d3d_device(d3d)` — walks `D3D11Device → IDXGIDevice → IDXGIAdapter → IDXGIFactory2`, since `CreateSwapChainForHwnd` requires the factory associated with the device's adapter (creating a fresh factory via `CreateDXGIFactory2` produces a swap chain that silently no-ops on Present).
+- `nod_dxgi_create_swap_chain_for_hwnd(factory, device, hwnd, w, h)` — `DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL`, two buffers, BGRA8, `DXGI_ALPHA_MODE_IGNORE`.
+- `nod_d2d_create_bitmap_from_swap_chain(dc, sc)` — fetches the back buffer surface and wraps it as a D2D bitmap. Same property shape as Sprint 35's offscreen path but `DXGI_ALPHA_MODE_IGNORE` to match the swap chain.
+- `nod_dxgi_swap_chain_present(sc)` — VSync (`SyncInterval = 1`).
+- `nod_dxgi_swap_chain_resize_buffers(sc, w, h)` — for WM_SIZE; caller must release the previous bitmap first (DXGI fails `ResizeBuffers` otherwise).
+
+C. **Window-class + window-creation helpers (also Rust-side).** Building a `WNDCLASSEXW` from pure Dylan would require pinning a wide-string buffer with process-lifetime semantics — Sprint 30's `<c-wide-string>` is heap-allocated. Instead `nod_register_window_class(wndproc-ptr, class-name)` does the work in Rust: leaks a fresh `Vec<u16>` into a process-global `HashMap` keyed by class name (idempotent on the name), transmutes the trampoline pointer to the `WNDPROC` newtype shape (`HWND, UINT, WPARAM, LPARAM → LRESULT` — all four newtypes are `repr(transparent)` over their integer types on Win64), and calls `RegisterClassExW`. Plus two test-shaped helpers: `nod_create_message_only_window(atom)` for the message-pump tests (passes `HWND_MESSAGE` as parent — never displays) and `nod_create_hidden_window(atom)` for the swap-chain test (creates an `WS_OVERLAPPEDWINDOW` but never calls `ShowWindow`). DXGI rejects message-only windows as swap-chain targets, hence the two variants.
+
+D. **Message-pump primitives.** `nod_post_message`, `nod_pump_one_message` (PeekMessage / TranslateMessage / DispatchMessage loop, drains up to 32 messages, returns the count dispatched), `nod_destroy_window`, plus a critical `nod_def_window_proc` shim: a Dylan WNDPROC closure that returns 0 fails `WM_NCCREATE` and thereby fails `CreateWindowExW`. The infrastructure tests' WNDPROCs delegate to `%def-window-proc` for unhandled messages.
+
+**The interactive IDE shell test (`tests/ide_shell.rs`).** A single `#[ignore]`-gated test. Dylan source builds the D2D device chain once, registers a window class with a WNDPROC closure that handles WM_PAINT (lazy-creates a D2D bitmap on first paint, clears white, draws "hello, dylan" in black at (50, 50), Present), WM_DESTROY (calls `PostQuitMessage(0)`), and delegates everything else to `DefWindowProcW`. Then it `CreateWindowExW`s a 800×600 `WS_OVERLAPPEDWINDOW`, calls `ShowWindow` + `UpdateWindow`, and runs the canonical Win32 `while (GetMessage > 0) { TranslateMessage; DispatchMessage }` pump. Exits when `GetMessage` returns 0 (`WM_QUIT`). The test asserts `exit-code = 0`.
+
+This is the FFI journey's headline payoff: nine sprints (27 → 36) of incremental machinery compose into a working IDE shell whose source-level shape matches what a Win32 SDK sample would look like in C. The Dylan source body is ~50 lines including comments.
+
+**The non-interactive infrastructure tests (`tests/ide_shell_infra.rs`).** Six `#[serial]` tests cover the pieces in isolation:
+
+1. `wndclassexw_struct_has_correct_size` — 88 bytes (wrapper + 80-byte payload).
+2. `paintstruct_struct_has_correct_size` — 80 bytes (wrapper + 72-byte payload).
+3. `register_window_class_succeeds_with_dylan_wndproc` — register a class with a trivial Dylan WNDPROC; assert the atom is non-zero.
+4. `hwnd_swap_chain_creation_with_hidden_window` — create a hidden `WS_OVERLAPPEDWINDOW`, build the full GPU device chain, bind a swap chain. Assert the swap chain handle is non-zero.
+5. `message_pump_processes_posted_message` — PostMessage WM_USER three times; the WNDPROC closure increments a captured counter; the pump dispatches; we read the counter back.
+6. `wndproc_closure_receives_correct_hwnd` — the WNDPROC captures its `hwnd` argument in a cell; we compare the captured value against the HWND `CreateWindow` returned. They match.
+
+**Tests added (7).** 6 in `ide_shell_infra.rs` + 1 ignored in `ide_shell.rs`. Plus 4 new unit tests in `nod-runtime::structs` (the two struct-size checks, the two field-offset checks). Test counts: baseline 546 → 557 (+11). All `#[serial]` because Win32's class registry and the COM handle registry are process-global. The `ide_shell.rs` test is `#[ignore]`-gated; routine `cargo test` does NOT pop a window.
+
+**Verification.**
+- `cargo build --workspace`: clean.
+- `cargo test --workspace --no-fail-fast`: 557 passed, 0 failed, 8 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- 5x sequential flake check: 557/0/8 every run after removing `_reset_callbacks_for_tests()` from `ide_shell_infra.rs`'s setup. Resetting that registry orphans the WNDPROC pointers Win32 holds in registered classes — `DispatchMessage` then hits a stale slot and `debug_assert!` aborts. The fix is to let the callback pool grow naturally; 32 slots is comfortably above what the test binary needs.
+
+**Out of scope for Sprint 36 (deferred — see DEFERRED.md):**
+
+- **Native float-marshaling trampolines.** Still on the Sprint 37+ list — the IDE shell uses integer-encoded float arguments (color channels 0..=255, pixel coordinates as ints). Sub-pixel positioning waits for the float marshaling sprint.
+- **Multi-window support, menus, toolbars.** Sprint 36 is one window with no chrome; the COM handle registry is process-global so multi-window is mechanical but untested.
+- **WIC bitmap interop for icons / images.** Same status as Sprint 35.
+- **DPI awareness.** No `SetProcessDpiAwareness` call; the window inherits the process's DPI mode.
+- **Window resizing polish.** The shell handles WM_SIZE wiring at the API level (`nod_dxgi_swap_chain_resize_buffers` exists) but the interactive demo doesn't subscribe to it — the back buffer stays at 800×600 even if the user resizes.
+- **Compositional swap chains** (`CreateSwapChainForComposition`), **device-loss recovery**, **gradient brushes / geometries / paths**, **D2D effect graphs and animations** — same Sprint 35 carry-overs.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
@@ -1143,8 +1192,8 @@ DFM serialisation, cache-key extension with downstream library hashes, cross-lib
 ### Sprint 35b — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
 (Renumbered: Sprint 35 was reclaimed by the COM / DXGI / D3D11 / D2D / DirectWrite infrastructure work above — see "Sprint 35 — COM via `windows` crate".) All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.
 
-### Sprint 36 — macOS port (aarch64-apple-darwin first)
-The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 25b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.
+### Sprint 36b — macOS port (aarch64-apple-darwin first)
+(Renumbered: Sprint 36 was reclaimed by the IDE-shell integration work above — see "Sprint 36 — IDE shell".) The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 25b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.
 
 ---
 

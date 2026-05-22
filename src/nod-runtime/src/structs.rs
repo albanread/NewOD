@@ -8,7 +8,8 @@
 //! Sprint 34 covers POINT, RECT, SIZE, FILETIME, SYSTEMTIME, MSG —
 //! the keystone shapes for the IDE message loop. Sprint 34+ extends
 //! to `define c-struct` Dylan-side declarations and to struct-by-value
-//! marshaling.
+//! marshaling. Sprint 36 adds WNDCLASSEXW (80 bytes) and PAINTSTRUCT
+//! (72 bytes) — the last two structs the IDE shell needs.
 //!
 //! ## Auto-coerce in Win32 marshaling
 //!
@@ -84,6 +85,9 @@ struct StructClasses {
     filetime: ClassId,
     systemtime: ClassId,
     msg: ClassId,
+    // Sprint 36 — IDE-shell struct types.
+    wndclassexw: ClassId,
+    paintstruct: ClassId,
     layouts: Vec<StructLayout>,
 }
 
@@ -157,6 +161,73 @@ const MSG_FIELDS: &[StructFieldInfo] = &[
     StructFieldInfo { name: "msg-lPrivate", offset: 44, kind: StructFieldKind::U32 },
 ];
 
+// Sprint 36 — WNDCLASSEXW layout on Win64 (80 bytes). Used by
+// `RegisterClassExW`. We mostly construct one of these in the Rust
+// `nod_register_window_class` helper rather than on the Dylan side,
+// because the `lpszClassName` field needs a wide-string buffer with
+// process-lifetime; doing that purely in Dylan source would require a
+// pinning helper we don't have yet. The struct itself is still
+// registered so user code that wants to roll its own WNDCLASSEXW can.
+//
+// Layout (Win64):
+//   UINT      cbSize         :  4 bytes @  0
+//   UINT      style          :  4 bytes @  4
+//   WNDPROC   lpfnWndProc    :  8 bytes @  8  (pointer; alignment-driven offset)
+//   int       cbClsExtra     :  4 bytes @ 16
+//   int       cbWndExtra     :  4 bytes @ 20
+//   HINSTANCE hInstance      :  8 bytes @ 24
+//   HICON     hIcon          :  8 bytes @ 32
+//   HCURSOR   hCursor        :  8 bytes @ 40
+//   HBRUSH    hbrBackground  :  8 bytes @ 48
+//   LPCWSTR   lpszMenuName   :  8 bytes @ 56
+//   LPCWSTR   lpszClassName  :  8 bytes @ 64
+//   HICON     hIconSm        :  8 bytes @ 72
+//   total                    : 80 bytes
+const WNDCLASSEXW_FIELDS: &[StructFieldInfo] = &[
+    StructFieldInfo { name: "wndclassexw-cbSize",        offset: 0,  kind: StructFieldKind::U32 },
+    StructFieldInfo { name: "wndclassexw-style",         offset: 4,  kind: StructFieldKind::U32 },
+    StructFieldInfo { name: "wndclassexw-lpfnWndProc",   offset: 8,  kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-cbClsExtra",    offset: 16, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "wndclassexw-cbWndExtra",    offset: 20, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "wndclassexw-hInstance",     offset: 24, kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-hIcon",         offset: 32, kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-hCursor",       offset: 40, kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-hbrBackground", offset: 48, kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-lpszMenuName",  offset: 56, kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-lpszClassName", offset: 64, kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "wndclassexw-hIconSm",       offset: 72, kind: StructFieldKind::Pointer },
+];
+
+// Sprint 36 — PAINTSTRUCT layout on Win64 (72 bytes). Used by
+// `BeginPaint` / `EndPaint`. The OS writes the struct on
+// `BeginPaint`; the IDE shell only really cares about `hdc` (offset 0)
+// and reads `rcPaint` (offset 16, an inline RECT) when it wants to
+// know the dirty rectangle. The reserved tail (`rgbReserved`) is the
+// OS's scratch area and the Dylan side never touches it.
+//
+// Layout (Win64):
+//   HDC   hdc          :  8 bytes @  0
+//   BOOL  fErase       :  4 bytes @  8
+//   <pad>              :  4 bytes @ 12  (alignment for nested RECT)
+//   RECT  rcPaint      : 16 bytes @ 16  (left @ 16, top @ 20, right @ 24, bottom @ 28)
+//   BOOL  fRestore     :  4 bytes @ 32
+//   BOOL  fIncUpdate   :  4 bytes @ 36
+//   BYTE  rgbReserved  : 32 bytes @ 40
+//   total              : 72 bytes
+//
+// We expose flat-offset accessors for the rcPaint sub-fields, matching
+// the MSG-pt approach (Sprint 34).
+const PAINTSTRUCT_FIELDS: &[StructFieldInfo] = &[
+    StructFieldInfo { name: "paintstruct-hdc",          offset: 0,  kind: StructFieldKind::Pointer },
+    StructFieldInfo { name: "paintstruct-fErase",       offset: 8,  kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "paintstruct-rc-left",      offset: 16, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "paintstruct-rc-top",       offset: 20, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "paintstruct-rc-right",     offset: 24, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "paintstruct-rc-bottom",    offset: 28, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "paintstruct-fRestore",     offset: 32, kind: StructFieldKind::I32 },
+    StructFieldInfo { name: "paintstruct-fIncUpdate",   offset: 36, kind: StructFieldKind::I32 },
+];
+
 // ─── Registration ──────────────────────────────────────────────────────────
 
 /// Idempotently register the Sprint 34 seed structs at process boot.
@@ -187,6 +258,10 @@ pub fn ensure_structs_registered() {
         let (filetime, _) = register_struct("<filetime>", c_struct, 8);
         let (systemtime, _) = register_struct("<systemtime>", c_struct, 16);
         let (msg, _) = register_struct("<msg>", c_struct, 48);
+        // Sprint 36 — IDE-shell struct types. WNDCLASSEXW = 80 bytes,
+        // PAINTSTRUCT = 72 bytes (both Win64).
+        let (wndclassexw, _) = register_struct("<wndclassexw>", c_struct, 80);
+        let (paintstruct, _) = register_struct("<paintstruct>", c_struct, 72);
 
         let layouts = vec![
             StructLayout { class_id: point,      byte_size: 8,  fields: POINT_FIELDS },
@@ -195,6 +270,8 @@ pub fn ensure_structs_registered() {
             StructLayout { class_id: filetime,   byte_size: 8,  fields: FILETIME_FIELDS },
             StructLayout { class_id: systemtime, byte_size: 16, fields: SYSTEMTIME_FIELDS },
             StructLayout { class_id: msg,        byte_size: 48, fields: MSG_FIELDS },
+            StructLayout { class_id: wndclassexw, byte_size: 80, fields: WNDCLASSEXW_FIELDS },
+            StructLayout { class_id: paintstruct, byte_size: 72, fields: PAINTSTRUCT_FIELDS },
         ];
 
         StructClasses {
@@ -205,6 +282,8 @@ pub fn ensure_structs_registered() {
             filetime,
             systemtime,
             msg,
+            wndclassexw,
+            paintstruct,
             layouts,
         }
     });
@@ -296,6 +375,26 @@ pub fn systemtime_class_id() -> ClassId {
 pub fn msg_class_id() -> ClassId {
     ensure_structs_registered();
     STRUCT_CLASSES.get().expect("struct classes registered").msg
+}
+
+/// `<wndclassexw>` ClassId — the WNDCLASSEXW Win32 struct (80 bytes
+/// on Win64), used by `RegisterClassExW`. Sprint 36.
+pub fn wndclassexw_class_id() -> ClassId {
+    ensure_structs_registered();
+    STRUCT_CLASSES
+        .get()
+        .expect("struct classes registered")
+        .wndclassexw
+}
+
+/// `<paintstruct>` ClassId — the PAINTSTRUCT Win32 struct (72 bytes
+/// on Win64), used by `BeginPaint` / `EndPaint`. Sprint 36.
+pub fn paintstruct_class_id() -> ClassId {
+    ensure_structs_registered();
+    STRUCT_CLASSES
+        .get()
+        .expect("struct classes registered")
+        .paintstruct
 }
 
 /// True iff `w` is a pointer-tagged Word whose wrapper class is a
@@ -723,5 +822,88 @@ mod tests {
         assert!(is_c_struct_instance(w));
         // Fixnum is not a c-struct.
         assert!(!is_c_struct_instance(Word::fixnum_unchecked(42)));
+    }
+
+    // ── Sprint 36 — WNDCLASSEXW + PAINTSTRUCT registration ───────────────
+
+    #[test]
+    fn wndclassexw_has_win64_size_of_80() {
+        ensure_structs_registered();
+        // instance_size = 8 (wrapper) + 80 (struct payload).
+        assert_eq!(
+            class_metadata_for(wndclassexw_class_id()).instance_size,
+            8 + 80
+        );
+    }
+
+    #[test]
+    fn paintstruct_has_win64_size_of_72() {
+        ensure_structs_registered();
+        // instance_size = 8 (wrapper) + 72 (struct payload).
+        assert_eq!(
+            class_metadata_for(paintstruct_class_id()).instance_size,
+            8 + 72
+        );
+    }
+
+    #[test]
+    fn wndclassexw_field_offsets_match_layout() {
+        ensure_structs_registered();
+        let (size, fields) =
+            struct_layout_for(wndclassexw_class_id()).expect("wndclassexw layout");
+        assert_eq!(size, 80);
+        // Cherry-pick the load-bearing offsets the Sprint 36 brief
+        // documents: cbSize @ 0, lpfnWndProc @ 8, hInstance @ 24,
+        // lpszClassName @ 64, hIconSm @ 72.
+        let by_name = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("missing field {n}"))
+                .offset
+        };
+        assert_eq!(by_name("wndclassexw-cbSize"), 0);
+        assert_eq!(by_name("wndclassexw-lpfnWndProc"), 8);
+        assert_eq!(by_name("wndclassexw-hInstance"), 24);
+        assert_eq!(by_name("wndclassexw-lpszClassName"), 64);
+        assert_eq!(by_name("wndclassexw-hIconSm"), 72);
+    }
+
+    #[test]
+    fn paintstruct_field_offsets_match_layout() {
+        ensure_structs_registered();
+        let (size, fields) =
+            struct_layout_for(paintstruct_class_id()).expect("paintstruct layout");
+        assert_eq!(size, 72);
+        let by_name = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("missing field {n}"))
+                .offset
+        };
+        // hdc @ 0; rcPaint nested fields @ 16/20/24/28; fRestore @ 32.
+        assert_eq!(by_name("paintstruct-hdc"), 0);
+        assert_eq!(by_name("paintstruct-rc-left"), 16);
+        assert_eq!(by_name("paintstruct-rc-top"), 20);
+        assert_eq!(by_name("paintstruct-rc-right"), 24);
+        assert_eq!(by_name("paintstruct-rc-bottom"), 28);
+        assert_eq!(by_name("paintstruct-fRestore"), 32);
+    }
+
+    #[test]
+    fn paintstruct_byte_size_matches_windows_crate_on_windows() {
+        // Empirical cross-check: on Windows builds the `windows` crate
+        // gives us PAINTSTRUCT and WNDCLASSEXW with the exact same
+        // layout. We use std::mem::size_of via a feature-gated path so
+        // CI on non-Windows still compiles this test (size_of asserts
+        // execute as conditional no-ops there).
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Gdi::PAINTSTRUCT;
+            use windows::Win32::UI::WindowsAndMessaging::WNDCLASSEXW;
+            assert_eq!(std::mem::size_of::<PAINTSTRUCT>(), 72);
+            assert_eq!(std::mem::size_of::<WNDCLASSEXW>(), 80);
+        }
     }
 }

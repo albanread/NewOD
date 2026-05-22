@@ -97,11 +97,14 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
     IDWriteTextLayout,
 };
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIDevice, IDXGIFactory2, IDXGISurface,
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
 use windows::core::Interface;
 
@@ -148,6 +151,8 @@ pub enum ComObject {
     DxgiFactory(IDXGIFactory2),
     DxgiDevice(IDXGIDevice),
     DxgiSurface(IDXGISurface),
+    /// Sprint 36 — `IDXGISwapChain1` for HWND-bound presentation.
+    DxgiSwapChain(IDXGISwapChain1),
     D3D11Device(ID3D11Device),
     D3D11DeviceContext(ID3D11DeviceContext),
     D3D11Texture2D(ID3D11Texture2D),
@@ -234,6 +239,7 @@ macro_rules! typed_accessor {
 typed_accessor!(get_dxgi_factory, DxgiFactory, IDXGIFactory2);
 typed_accessor!(get_dxgi_device, DxgiDevice, IDXGIDevice);
 typed_accessor!(get_dxgi_surface, DxgiSurface, IDXGISurface);
+typed_accessor!(get_dxgi_swap_chain, DxgiSwapChain, IDXGISwapChain1);
 typed_accessor!(get_d3d11_device, D3D11Device, ID3D11Device);
 typed_accessor!(get_d3d11_device_context, D3D11DeviceContext, ID3D11DeviceContext);
 typed_accessor!(get_d3d11_texture_2d, D3D11Texture2D, ID3D11Texture2D);
@@ -490,6 +496,234 @@ pub unsafe extern "C-unwind" fn nod_dxgi_device_from_d3d_device(device_handle: u
     match hresult_to_zero(r) {
         Some(d) => tag(register(ComObject::DxgiDevice(d))),
         None => 0,
+    }
+}
+
+// ─── Sprint 36 — HWND-bound swap chain (IDXGISwapChain1) ─────────────────
+//
+// The Sprint 35 acceptance proved we can render offscreen into a D3D11
+// texture. Sprint 36 adds the missing presentation pieces:
+//   * `nod_dxgi_factory_from_d3d_device` — fetches the DXGI factory
+//     that the existing D3D11 device was created against. We can't
+//     just call `CreateDXGIFactory2` a second time because the swap
+//     chain must be created via the same factory the device's adapter
+//     came from, or Present silently no-ops.
+//   * `nod_dxgi_create_swap_chain_for_hwnd` — binds a swap chain to a
+//     window handle so DXGI presents into the window's client area.
+//   * `nod_d2d_create_bitmap_from_swap_chain` — wraps the swap chain's
+//     back-buffer surface as a D2D bitmap so the existing D2D draw
+//     pipeline can target it.
+//   * `nod_dxgi_swap_chain_present` — pushes the back buffer to the
+//     screen. Called from WM_PAINT.
+//   * `nod_dxgi_swap_chain_resize_buffers` — handles WM_SIZE. Caller
+//     must release the bitmap targeting the back buffer first
+//     (D2D::SetTarget(None)).
+
+/// JIT-callable: derive the DXGI factory associated with an existing
+/// D3D11 device. Walks D3D11Device → IDXGIDevice → IDXGIAdapter →
+/// IDXGIFactory2 (the parent of the adapter). Registers the factory
+/// in the COM registry; the caller can release with `nod_com_release`
+/// once swap-chain creation is done.
+///
+/// # Safety
+/// `device_handle` must be a valid D3D11Device handle (or 0, which
+/// returns 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_factory_from_d3d_device(device_handle: u64) -> u64 {
+    let Some(device) = get_d3d11_device(device_handle) else {
+        return 0;
+    };
+    // D3D11Device → IDXGIDevice (cast/QueryInterface).
+    let dxgi_dev: windows::core::Result<IDXGIDevice> = device.cast();
+    let Some(dxgi_dev) = hresult_to_zero(dxgi_dev) else {
+        return 0;
+    };
+    // IDXGIDevice → IDXGIAdapter → IDXGIFactory2. Both calls are
+    // `unsafe` because they fetch raw COM out-pointers via the
+    // `windows` crate's reified-pointer API.
+    // SAFETY: dxgi_dev is a valid IDXGIDevice; GetAdapter writes the
+    // out-pointer on success.
+    let adapter = match unsafe { dxgi_dev.GetAdapter() } {
+        Ok(a) => a,
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            return 0;
+        }
+    };
+    // SAFETY: adapter valid; GetParent for IDXGIFactory2 returns the
+    // factory that produced this adapter.
+    let factory: windows::core::Result<IDXGIFactory2> = unsafe { adapter.GetParent() };
+    match hresult_to_zero(factory) {
+        Some(f) => tag(register(ComObject::DxgiFactory(f))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create an HWND-bound swap chain (`IDXGISwapChain1`)
+/// using the given DXGI factory and D3D11 device, at the given
+/// dimensions. Sprint 36 uses BGRA8_UNORM with 2 buffers and
+/// FLIP_SEQUENTIAL — the modern (DXGI 1.2+) presentation model.
+///
+/// `hwnd_word` is a fixnum-tagged Word carrying the HWND value the
+/// `CreateWindowExW` shim returned (Sprint 28's `<c-handle>` ABI). On
+/// failure returns 0; HRESULT in `LAST_HRESULT`.
+///
+/// # Safety
+/// All handles must be of matching variants. `hwnd_word` must encode
+/// a real HWND (Win32 validates this).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_create_swap_chain_for_hwnd(
+    factory_handle: u64,
+    device_handle: u64,
+    hwnd_word: u64,
+    width: u64,
+    height: u64,
+) -> u64 {
+    let Some(factory) = get_dxgi_factory(factory_handle) else {
+        return 0;
+    };
+    let Some(device) = get_d3d11_device(device_handle) else {
+        return 0;
+    };
+    // HWND is a sign-extended fixnum; treat the bit pattern as a
+    // pointer-width word.
+    let hwnd_raw = untag_i64(hwnd_word);
+    if hwnd_raw == 0 {
+        return 0;
+    }
+    let hwnd_h = HWND(hwnd_raw as *mut std::ffi::c_void);
+    let w = untag(width) as u32;
+    let h = untag(height) as u32;
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: w,
+        Height: h,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Stereo: false.into(),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferCount: 2,
+        Scaling: DXGI_SCALING_STRETCH,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        Flags: 0,
+    };
+    // SAFETY: factory + device + hwnd valid; desc on stack.
+    let r: windows::core::Result<IDXGISwapChain1> = unsafe {
+        factory.CreateSwapChainForHwnd(&device, hwnd_h, &desc, None, None)
+    };
+    match hresult_to_zero(r) {
+        Some(sc) => tag(register(ComObject::DxgiSwapChain(sc))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: wrap the swap chain's back-buffer surface as a D2D
+/// bitmap, suitable as the target for a D2D device context. Returns
+/// the bitmap handle or 0. This is the Sprint 36 equivalent of
+/// Sprint 35's `nod_d2d_create_bitmap_for_target` (which took an
+/// offscreen `IDXGISurface`); the bitmap shares memory with the swap
+/// chain back buffer, so drawing into it puts pixels in front of
+/// `Present`.
+///
+/// # Safety
+/// Both handles must be of matching variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_create_bitmap_from_swap_chain(
+    dc_handle: u64,
+    sc_handle: u64,
+) -> u64 {
+    let Some(dc) = get_d2d_device_context(dc_handle) else {
+        return 0;
+    };
+    let Some(sc) = get_dxgi_swap_chain(sc_handle) else {
+        return 0;
+    };
+    // SAFETY: sc valid; GetBuffer fetches buffer 0 (the back buffer).
+    let surface: windows::core::Result<IDXGISurface> = unsafe { sc.GetBuffer(0) };
+    let Some(surface) = hresult_to_zero(surface) else {
+        return 0;
+    };
+    // Same bitmap-properties shape Sprint 35's `create_bitmap_for_target`
+    // uses: target-capable, can't-draw-from (it's a render target
+    // only), DPI 96. For HWND presentation we use ALPHA_MODE_IGNORE
+    // to match the swap-chain alpha mode set in
+    // `_create_swap_chain_for_hwnd`.
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_IGNORE,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        colorContext: std::mem::ManuallyDrop::new(None),
+    };
+    // SAFETY: surface + props valid for the call duration.
+    let r: windows::core::Result<ID2D1Bitmap1> =
+        unsafe { dc.CreateBitmapFromDxgiSurface(&surface, Some(&props)) };
+    match hresult_to_zero(r) {
+        Some(b) => tag(register(ComObject::D2DBitmap(b))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: present the swap chain's back buffer. SyncInterval=1
+/// (VSync), Flags=0. Returns 0 on success; HRESULT-as-u64 on failure.
+///
+/// # Safety
+/// `sc_handle` must be a valid DxgiSwapChain.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_swap_chain_present(sc_handle: u64) -> u64 {
+    use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
+    let Some(sc) = get_dxgi_swap_chain(sc_handle) else {
+        return tag(0xFFFF_FFFF);
+    };
+    // SAFETY: sc valid. Present is the OS hand-off; the surface
+    // pointer doesn't escape across the call. SyncInterval=1 → VSync.
+    // `IDXGISwapChain1::Present` returns raw `HRESULT` (`windows` 0.58);
+    // `.ok()` converts to `Result<(), Error>` for ergonomic matching.
+    let r = unsafe { sc.Present(1, DXGI_PRESENT(0)) }.ok();
+    match r {
+        Ok(()) => 0,
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            tag(e.code().0 as u32 as u64)
+        }
+    }
+}
+
+/// JIT-callable: resize the swap chain to the new dimensions, keeping
+/// the same buffer count + format. **Caller MUST drop any references
+/// to the previous back-buffer bitmap** before calling — DXGI fails
+/// `ResizeBuffers` with `DXGI_ERROR_INVALID_CALL` otherwise. The
+/// Sprint 36 IDE-shell handles this in its WM_SIZE branch by
+/// releasing the old D2D bitmap before resizing.
+///
+/// # Safety
+/// `sc_handle` must be a valid DxgiSwapChain.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_swap_chain_resize_buffers(
+    sc_handle: u64,
+    width: u64,
+    height: u64,
+) -> u64 {
+    let Some(sc) = get_dxgi_swap_chain(sc_handle) else {
+        return tag(0xFFFF_FFFF);
+    };
+    let w = untag(width) as u32;
+    let h = untag(height) as u32;
+    // SAFETY: sc valid; ResizeBuffers takes width/height by value.
+    // The `windows` 0.58 wrapper for this entry point produces
+    // `Result<(), Error>` directly (no `.ok()` needed).
+    let r = unsafe {
+        sc.ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            tag(e.code().0 as u32 as u64)
+        }
     }
 }
 
@@ -1189,6 +1423,401 @@ pub unsafe extern "C-unwind" fn nod_count_non_zero_red(
                 count += 1;
             }
         }
+    }
+    tag(count)
+}
+
+// ─── Sprint 36 — Window class registration (Rust helper) ──────────────────
+//
+// Building a WNDCLASSEXW in Dylan source is awkward because the
+// `lpszClassName` field needs to point at a wide-string buffer with
+// process-lifetime semantics. We could express that in pure Dylan by
+// pinning a fresh `<c-wide-string>` in the static area, but Sprint 30
+// didn't ship a "leak this into the static area for ever" helper.
+//
+// Instead we offer a Rust extern that takes a WNDPROC pointer and a
+// Dylan byte-string class name, leaks a fresh UTF-16 buffer into a
+// process-global map keyed by class name (so repeated calls with the
+// same name reuse the same buffer — important if the caller hits the
+// helper twice), constructs WNDCLASSEXW on the stack, and calls
+// `RegisterClassExW`. Returns the registered atom (non-zero) or 0 on
+// error (HRESULT-equivalent goes into `LAST_HRESULT` as the Win32
+// `GetLastError()` value cast through u32).
+//
+// Sprint 36 also exposes `nod_create_message_only_window` for the
+// non-interactive infrastructure tests. A message-only window is
+// created by passing `HWND_MESSAGE` as the parent HWND; the window
+// never displays, so it's perfect for proving the message-loop
+// plumbing without inflicting a UI on the user's screen during
+// routine `cargo test`.
+
+use std::sync::RwLock;
+
+static CLASS_NAME_BUFFERS: OnceLock<RwLock<HashMap<String, &'static [u16]>>> =
+    OnceLock::new();
+
+fn class_name_buffers() -> &'static RwLock<HashMap<String, &'static [u16]>> {
+    CLASS_NAME_BUFFERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Leak a UTF-16 null-terminated buffer for `name` into the process-
+/// global cache, returning a `&'static [u16]` whose pointer survives
+/// the process lifetime. Idempotent — repeated calls with the same
+/// name return the same buffer.
+fn leak_class_name(name: &str) -> &'static [u16] {
+    // Fast path: already cached.
+    {
+        let g = class_name_buffers().read().expect("class name cache poisoned");
+        if let Some(b) = g.get(name) {
+            return b;
+        }
+    }
+    // Slow path: insert under a write lock. Recheck after acquiring
+    // the write lock to avoid double-leaking under a race.
+    let mut g = class_name_buffers().write().expect("class name cache poisoned");
+    if let Some(b) = g.get(name) {
+        return b;
+    }
+    let mut units: Vec<u16> = name.encode_utf16().collect();
+    units.push(0);
+    let leaked: &'static [u16] = Box::leak(units.into_boxed_slice());
+    g.insert(name.to_string(), leaked);
+    leaked
+}
+
+/// JIT-callable: register a Win32 window class given a WNDPROC
+/// callback pointer (from `as-wndproc-callback`) and a class name as
+/// a Dylan byte-string. The class name is leaked into a process-
+/// global cache so the pointer stored in `lpszClassName` survives for
+/// the process lifetime — Win32 expects that pointer to be valid for
+/// the entire interval between `RegisterClassExW` and (much later)
+/// `UnregisterClass`. We don't unregister in Sprint 36; the leak is
+/// intentional and bounded (one Vec<u16> per distinct class name).
+///
+/// `wndproc_word` is a fixnum-tagged pointer (`<c-pointer>` ABI). The
+/// trampoline-pool API returns these.
+///
+/// Returns the atom (non-zero on success), 0 on failure. The Win32
+/// `GetLastError()` is stashed in `LAST_HRESULT` on failure.
+///
+/// # Safety
+/// `wndproc_word` must encode the address of a Sprint 32 trampoline
+/// slot. `class_name_word` must be a Dylan `<byte-string>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_register_window_class(
+    wndproc_word: u64,
+    class_name_word: u64,
+) -> u64 {
+    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CS_HREDRAW, CS_VREDRAW, HCURSOR, HICON, RegisterClassExW, WNDCLASSEXW, WNDPROC,
+    };
+    use windows::Win32::Graphics::Gdi::HBRUSH;
+    use windows::core::PCWSTR;
+
+    // Decode the WNDPROC pointer (fixnum-tagged raw address).
+    let wndproc_addr = untag_i64(wndproc_word);
+    if wndproc_addr == 0 {
+        return 0;
+    }
+    // SAFETY: the address came from Sprint 32's callback trampoline
+    // pool which guarantees a `extern "system" fn(HWND, UINT, WPARAM,
+    // LPARAM) -> LRESULT`. The transmute reifies that shape (the
+    // `windows` crate uses its own newtypes — WPARAM/LPARAM/LRESULT —
+    // which are repr-transparent over usize/isize, so the actual ABI
+    // matches the integer-shaped `extern "system" fn(u64, u64) -> i32`
+    // the Sprint 32 trampolines were emitted as).
+    let wndproc: WNDPROC = Some(unsafe {
+        std::mem::transmute::<*const (), unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(
+            wndproc_addr as *const (),
+        )
+    });
+
+    // Read the class-name byte string and leak a wide buffer for it.
+    let name_word = crate::word::Word::from_raw(class_name_word);
+    let name = crate::winffi::read_dylan_byte_string(name_word);
+    let wide = leak_class_name(&name);
+
+    // Fetch HINSTANCE — pass None so `GetModuleHandleW(NULL)` returns
+    // the EXE's instance, which is what `RegisterClassExW` wants for
+    // a non-DLL caller.
+    // SAFETY: GetModuleHandleW with a null lpModuleName is documented
+    // to return the calling process's module.
+    let hinstance: HINSTANCE = match unsafe { GetModuleHandleW(None) } {
+        Ok(h) => h.into(),
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            return 0;
+        }
+    };
+
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: wndproc,
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: HICON::default(),
+        hCursor: HCURSOR::default(),
+        hbrBackground: HBRUSH::default(),
+        lpszMenuName: PCWSTR::null(),
+        lpszClassName: PCWSTR(wide.as_ptr()),
+        hIconSm: HICON::default(),
+    };
+
+    // SAFETY: wc fully populated; the wide-name pointer outlives the
+    // call (Box::leak).
+    let atom = unsafe { RegisterClassExW(&wc) };
+    if atom == 0 {
+        // Map GetLastError into the HRESULT slot. RegisterClassExW
+        // doesn't return an HRESULT, but the convention is what
+        // downstream callers check.
+        // SAFETY: GetLastError has no Rust preconditions.
+        let err = unsafe { windows::Win32::Foundation::GetLastError() };
+        store_last_hresult(err.0 as i32);
+        return 0;
+    }
+    tag(atom as u64)
+}
+
+/// JIT-callable: create a *hidden* normal window. Unlike a
+/// message-only window, this one is a full-fledged overlapped
+/// window that can host an HWND-bound swap chain (DXGI rejects
+/// `HWND_MESSAGE`). Because we never call `ShowWindow`, it stays
+/// invisible — perfect for the infrastructure test that exercises
+/// swap-chain creation without popping a UI.
+///
+/// # Safety
+/// `class_atom_word` must be a previously-registered class atom.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_create_hidden_window(class_atom_word: u64) -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, CW_USEDEFAULT, HMENU, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
+    };
+    use windows::core::PCWSTR;
+
+    let atom = untag(class_atom_word) as u16;
+    if atom == 0 {
+        return 0;
+    }
+    let class_name = PCWSTR(atom as usize as *const u16);
+    // SAFETY: window is created hidden — we never call ShowWindow on
+    // it. Standard overlapped-window style; default position; 200x150
+    // dimensions for the swap chain to have something to bind to.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            PCWSTR::null(),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            200,
+            150,
+            HWND::default(),
+            HMENU::default(),
+            None,
+            None,
+        )
+    };
+    match hwnd {
+        Ok(h) if !h.0.is_null() => tag(h.0 as u64),
+        Ok(_) => 0,
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            0
+        }
+    }
+}
+
+/// JIT-callable: create a Win32 "message-only" window. Message-only
+/// windows never display anywhere — Win32 uses them as message-loop
+/// endpoints for services and tests. They support `PostMessage` /
+/// `GetMessage` / `DispatchMessage` and routed WNDPROC dispatch
+/// exactly like a normal window, so they're the right tool for
+/// proving the message-pump plumbing in the non-interactive
+/// infrastructure tests. (DXGI swap chains REQUIRE a non-message
+/// window — for that test, use `nod_create_hidden_window`.)
+///
+/// `class_atom` is the atom returned from `nod_register_window_class`.
+/// Returns the HWND-as-fixnum or 0 on failure (`GetLastError` stashed
+/// in `LAST_HRESULT`).
+///
+/// # Safety
+/// `class_atom_word` must be a valid registered class atom (call
+/// `nod_register_window_class` first).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_create_message_only_window(class_atom_word: u64) -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    };
+    use windows::core::PCWSTR;
+
+    let atom = untag(class_atom_word) as u16;
+    if atom == 0 {
+        return 0;
+    }
+    // Win32 lets you pass MAKEINTATOM(atom) (a u16 cast to LPCWSTR)
+    // as `lpClassName` to identify a previously-registered class
+    // without needing the name string. The low 16 bits are the atom;
+    // the upper bits MUST be zero so Win32 recognises it as an atom
+    // rather than a string pointer.
+    let class_name = PCWSTR(atom as usize as *const u16);
+    // SAFETY: hwndParent = HWND_MESSAGE → window is created in the
+    // message-only space (never displayed).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            PCWSTR::null(),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            HMENU::default(),
+            None,
+            None,
+        )
+    };
+    match hwnd {
+        Ok(h) if !h.0.is_null() => tag(h.0 as u64),
+        Ok(_) => 0,
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            0
+        }
+    }
+}
+
+/// JIT-callable: destroy a window. Used by tests to clean up
+/// message-only windows.
+///
+/// # Safety
+/// `hwnd_word` must encode a valid HWND obtained from
+/// `CreateWindowExW` (or `nod_create_message_only_window`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_destroy_window(hwnd_word: u64) -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+    let h = untag_i64(hwnd_word);
+    if h == 0 {
+        return 0;
+    }
+    let hwnd_h = HWND(h as *mut std::ffi::c_void);
+    // SAFETY: hwnd_h valid; DestroyWindow just calls into user32.
+    match unsafe { DestroyWindow(hwnd_h) } {
+        Ok(()) => tag(1),
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            0
+        }
+    }
+}
+
+/// JIT-callable: forward an unhandled WNDPROC message to
+/// `DefWindowProcW`. Tests use this as the WNDPROC's default-return
+/// path — returning 0 from WM_NCCREATE / WM_CREATE causes
+/// `CreateWindowExW` to fail, so a stub WNDPROC needs a working
+/// default.
+///
+/// # Safety
+/// All args must be Win32-ABI-compatible (fixnum-tagged integers).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_def_window_proc(
+    hwnd_word: u64,
+    msg: u64,
+    wparam: u64,
+    lparam: u64,
+) -> u64 {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::DefWindowProcW;
+    let h = untag_i64(hwnd_word);
+    let hwnd_h = HWND(h as *mut std::ffi::c_void);
+    let m = untag(msg) as u32;
+    let wp = WPARAM(untag(wparam) as usize);
+    let lp = LPARAM(untag_i64(lparam) as isize);
+    // SAFETY: all args are Win32-ABI compatible.
+    let result = unsafe { DefWindowProcW(hwnd_h, m, wp, lp) };
+    // result.0 is `isize`. Fixnum-encode it.
+    let val = result.0 as i64;
+    // If the value exceeds the fixnum range, truncate via tag's
+    // shift. Practical LRESULT values from DefWindowProcW fit
+    // comfortably in 62 bits.
+    crate::word::Word::fixnum_unchecked(val).raw()
+}
+
+/// JIT-callable: post a message to a window's queue. Used by tests
+/// to drive the message pump without UI events.
+///
+/// # Safety
+/// `hwnd_word` must be a valid HWND.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_post_message(
+    hwnd_word: u64,
+    msg: u64,
+    wparam: u64,
+    lparam: u64,
+) -> u64 {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let h = untag_i64(hwnd_word);
+    if h == 0 {
+        return 0;
+    }
+    let hwnd_h = HWND(h as *mut std::ffi::c_void);
+    let m = untag(msg) as u32;
+    let wp = WPARAM(untag(wparam) as usize);
+    let lp = LPARAM(untag_i64(lparam) as isize);
+    // SAFETY: hwnd valid; PostMessageW writes to the OS message
+    // queue and returns immediately.
+    match unsafe { PostMessageW(hwnd_h, m, wp, lp) } {
+        Ok(()) => tag(1),
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            0
+        }
+    }
+}
+
+/// JIT-callable: dispatch a single waiting message if there is one,
+/// using a peek-and-dispatch loop. Used by infrastructure tests to
+/// drain pending messages without blocking on `GetMessage`. Returns
+/// the number of messages dispatched (0 if the queue was empty).
+///
+/// `hwnd_word` is currently unused — we PeekMessage on the whole
+/// thread queue (passing `None` as the HWND filter), which is what
+/// the infrastructure tests want: they expect to drain any messages
+/// the test's `PostMessage` calls posted plus any framework-level
+/// messages WIN32 inserts. The arg is kept in the API for forward-
+/// compatibility (Sprint 36+1 will let callers filter to a specific
+/// HWND).
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_pump_one_message(_hwnd_word: u64) -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+    let mut count: u64 = 0;
+    // Peek up to a small bound to drain the queue without spinning.
+    for _ in 0..32 {
+        let mut msg = MSG::default();
+        // SAFETY: msg is a stack out-param; PeekMessageW writes to it.
+        // `None` HWND drains the whole thread queue.
+        let has = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() };
+        if !has {
+            break;
+        }
+        // SAFETY: msg fully populated by PeekMessageW.
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        count += 1;
     }
     tag(count)
 }

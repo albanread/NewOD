@@ -277,6 +277,23 @@ pub const NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL: &str = "nod_dwrite_create_text_l
 pub const NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL: &str = "nod_dwrite_get_layout_metrics";
 pub const NOD_COUNT_NON_ZERO_RED_SYMBOL: &str = "nod_count_non_zero_red";
 
+// ─── Sprint 36 — HWND-bound swap chain + IDE-shell window plumbing ────────
+pub const NOD_DXGI_FACTORY_FROM_D3D_DEVICE_SYMBOL: &str = "nod_dxgi_factory_from_d3d_device";
+pub const NOD_DXGI_CREATE_SWAP_CHAIN_FOR_HWND_SYMBOL: &str =
+    "nod_dxgi_create_swap_chain_for_hwnd";
+pub const NOD_D2D_CREATE_BITMAP_FROM_SWAP_CHAIN_SYMBOL: &str =
+    "nod_d2d_create_bitmap_from_swap_chain";
+pub const NOD_DXGI_SWAP_CHAIN_PRESENT_SYMBOL: &str = "nod_dxgi_swap_chain_present";
+pub const NOD_DXGI_SWAP_CHAIN_RESIZE_BUFFERS_SYMBOL: &str =
+    "nod_dxgi_swap_chain_resize_buffers";
+pub const NOD_REGISTER_WINDOW_CLASS_SYMBOL: &str = "nod_register_window_class";
+pub const NOD_CREATE_MESSAGE_ONLY_WINDOW_SYMBOL: &str = "nod_create_message_only_window";
+pub const NOD_CREATE_HIDDEN_WINDOW_SYMBOL: &str = "nod_create_hidden_window";
+pub const NOD_DESTROY_WINDOW_SYMBOL: &str = "nod_destroy_window";
+pub const NOD_POST_MESSAGE_SYMBOL: &str = "nod_post_message";
+pub const NOD_PUMP_ONE_MESSAGE_SYMBOL: &str = "nod_pump_one_message";
+pub const NOD_DEF_WINDOW_PROC_SYMBOL: &str = "nod_def_window_proc";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -410,6 +427,20 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_dwrite_create_text_layout", NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL, 5),
     ("nod_dwrite_get_layout_metrics", NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL, 1),
     ("nod_count_non_zero_red", NOD_COUNT_NON_ZERO_RED_SYMBOL, 4),
+    // Sprint 36 — HWND-bound swap chain + window-class registration helpers.
+    // All fixnum in / fixnum out; see com_shim.rs for the C-ABI shapes.
+    ("nod_dxgi_factory_from_d3d_device", NOD_DXGI_FACTORY_FROM_D3D_DEVICE_SYMBOL, 1),
+    ("nod_dxgi_create_swap_chain_for_hwnd", NOD_DXGI_CREATE_SWAP_CHAIN_FOR_HWND_SYMBOL, 5),
+    ("nod_d2d_create_bitmap_from_swap_chain", NOD_D2D_CREATE_BITMAP_FROM_SWAP_CHAIN_SYMBOL, 2),
+    ("nod_dxgi_swap_chain_present", NOD_DXGI_SWAP_CHAIN_PRESENT_SYMBOL, 1),
+    ("nod_dxgi_swap_chain_resize_buffers", NOD_DXGI_SWAP_CHAIN_RESIZE_BUFFERS_SYMBOL, 3),
+    ("nod_register_window_class", NOD_REGISTER_WINDOW_CLASS_SYMBOL, 2),
+    ("nod_create_message_only_window", NOD_CREATE_MESSAGE_ONLY_WINDOW_SYMBOL, 1),
+    ("nod_create_hidden_window", NOD_CREATE_HIDDEN_WINDOW_SYMBOL, 1),
+    ("nod_destroy_window", NOD_DESTROY_WINDOW_SYMBOL, 1),
+    ("nod_post_message", NOD_POST_MESSAGE_SYMBOL, 4),
+    ("nod_pump_one_message", NOD_PUMP_ONE_MESSAGE_SYMBOL, 1),
+    ("nod_def_window_proc", NOD_DEF_WINDOW_PROC_SYMBOL, 4),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

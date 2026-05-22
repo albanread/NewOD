@@ -2212,12 +2212,19 @@ and a few corner cases the seed-struct set didn't touch.
   Sprint 36+ adds the typed trampoline family when a real use case
   (e.g. D2D animation curves with `f64` time parameters, gradient
   brush stops) demands it.
-- **:open: HWND-bound swap chains** — Sprint 35 → Sprint 37.
-  `CreateSwapChainForHwnd`, `IDXGISwapChain1::Present`, the
-  resize-on-`WM_SIZE` dance. Sprint 35 renders offscreen only; the
-  IDE window doesn't exist yet. Sprint 37 brings up the IDE window
-  and wires the swap chain — the device-chain infrastructure
-  Sprint 35 ships is the prerequisite.
+- **:closed: HWND-bound swap chains** — Sprint 35 → Sprint 36.
+  **Landed Sprint 36.** `nod_dxgi_create_swap_chain_for_hwnd`,
+  `nod_dxgi_swap_chain_present`, `nod_dxgi_swap_chain_resize_buffers`,
+  `nod_d2d_create_bitmap_from_swap_chain`, plus
+  `nod_dxgi_factory_from_d3d_device` (the swap chain must be created
+  via the factory associated with the device's adapter, not a fresh
+  `CreateDXGIFactory2`). All wired through `IDXGISwapChain1` /
+  `DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL`. The Sprint 36 IDE shell
+  demonstrates the full pipeline; the infrastructure test
+  `hwnd_swap_chain_creation_with_hidden_window` verifies creation
+  in isolation against a hidden window (DXGI rejects message-only
+  windows as swap-chain targets, so we use a normal-window that
+  we never call `ShowWindow` on).
 - **:open: Linear/radial gradient brushes, geometries, paths** —
   Sprint 35 → Sprint 36+. Sprint 35 ships solid-color brush only
   (`ID2D1SolidColorBrush`). `ID2D1LinearGradientBrush`,
@@ -2274,3 +2281,92 @@ and a few corner cases the seed-struct set didn't touch.
   a `<c-struct>`-shaped return (Sprint 34 territory — wrap the
   packed bits into a `<size>` instance) or true multi-value
   returns from primitives. Minor; the field's diagnostic-only.
+
+## Carry-over from Sprint 36 (IDE shell — CreateWindowExW + WNDPROC + HWND swap chain) — into Sprint 37+
+
+- **:open: Native float-marshaling trampolines** — Sprint 35 →
+  Sprint 36 → still Sprint 37+. The Sprint 36 swap-chain shims
+  continue Sprint 35's integer-encoded float convention (color
+  channels 0..=255, pixel coordinates as integer pixels). The IDE
+  shell renders at integer pixel positions — sub-pixel text
+  positioning, fractional-pixel D2D draw calls, gradient brushes
+  with float-valued stops all wait on this. The blocker is the
+  Sprint 28 trampoline shape: each `nod_winffi_call_N` is a fixed
+  `extern "system" fn(u64, …) -> u64` signature. Adding f32 / f64
+  args in mid-call-frame positions changes Win64's register
+  classes (XMM0–3 for floats vs. RCX/RDX/R8/R9 for ints, by
+  source position), so the typed trampoline family expands
+  combinatorially per (arity × position × type) — but only the
+  positions that appear in real APIs need shims, so 12-20 entries
+  cover the practical surface.
+- **:open: Sub-pixel positioning + gradient brushes + geometries
+  + paths** — same as Sprint 35's carry-over. All blocked on
+  float-marshaling trampolines. The IDE's syntax highlighter and
+  shape rendering live here.
+- **:open: DPI awareness (per-monitor V2)** — Sprint 36 →
+  Sprint 37+. The IDE shell inherits whatever DPI mode the
+  process starts in. `SetProcessDpiAwarenessContext` with
+  `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` is the modern
+  baseline; the shell needs to handle `WM_DPICHANGED` and recreate
+  D2D resources at the new logical DPI. Sprint 37's first IDE
+  polish task.
+- **:open: Window resizing dispatch wired to swap-chain
+  ResizeBuffers** — Sprint 36 ships
+  `nod_dxgi_swap_chain_resize_buffers` and the WNDPROC can
+  receive WM_SIZE, but the headline interactive demo doesn't
+  re-wire the back buffer on resize. Sprint 37+ adds the WM_SIZE
+  handler that releases the current D2D bitmap, calls
+  `ResizeBuffers`, recreates the bitmap from the new back buffer,
+  and triggers a redraw via `InvalidateRect`.
+- **:open: Multi-window support** — Sprint 36 → later. The COM
+  handle registry and the callback pool are both process-global,
+  so multiple windows mechanically work (each gets its own
+  WNDPROC slot), but Sprint 36 doesn't test it. The first
+  multi-pane IDE will exercise this; expect to find a
+  same-thread message-pump assumption to clean up.
+- **:open: WIC bitmap interop for icons / images** — same as
+  Sprint 35 carry-over. The IDE's window-class `hIcon` /
+  `hIconSm` slots are zero in Sprint 36; populating them needs
+  `LoadImageW` or WIC-driven image creation.
+- **:open: PAINTSTRUCT BeginPaint/EndPaint integration** —
+  Sprint 36 registers the `<paintstruct>` shape but the interactive
+  demo doesn't actually call `BeginPaint` / `EndPaint`. The
+  current WNDPROC's WM_PAINT handler draws into the swap chain
+  directly and calls `Present` instead of going through GDI's
+  paint validation. For Sprint 36's "minimum viable shell" goal
+  this works (DXGI bypasses GDI), but a polished IDE that mixes
+  D2D and GDI content needs `BeginPaint(hwnd, &ps)` to clear the
+  update region. Sprint 37+ ships this when needed.
+- **:open: WNDPROC closure freshness across `_reset_callbacks_for_tests`** —
+  Sprint 36 had to remove the callback-registry reset from the
+  infrastructure tests' setup because Win32 still holds WNDPROC
+  trampoline pointers in registered classes even after the
+  callback registry is wiped. When `DispatchMessage` hits a stale
+  slot the dispatcher debug-asserts and the test process aborts.
+  The 32-slot pool is comfortably above what one test binary
+  needs (each test registers 1 closure), so leaking-by-omission
+  is fine for now. A clean fix would require either unregistering
+  the Win32 class atoms in `_reset_callbacks_for_tests` (Sprint
+  37+) or making the dispatcher tolerate stale slots (return
+  DefWindowProc-equivalent instead of asserting).
+- **:open: WM_SIZE → swap-chain resize wiring in the interactive
+  demo** — covered by the resizing carry-over above; mentioned
+  here separately so a follow-up sprint can pick it up as a
+  small concrete task.
+- **:closed: WNDCLASSEXW marshaling** — Sprint 34 → Sprint 36.
+  **Landed Sprint 36.** Registered as a `<c-struct>` (80 bytes
+  on Win64, parent `<c-struct>`, `is_byte_payload`). The stdlib
+  exposes accessors for the load-bearing fields. The actual
+  Sprint 36 IDE shell builds the struct in Rust (via
+  `nod_register_window_class`) rather than from Dylan source
+  because the `lpszClassName` pointer needs a process-lifetime
+  wide-string buffer — Sprint 30's `<c-wide-string>` is
+  heap-allocated. Future sprint can add a Dylan-side wide-string
+  pinning helper if needed.
+- **:closed: PAINTSTRUCT marshaling** — Sprint 34 → Sprint 36.
+  **Landed Sprint 36.** Registered as a `<c-struct>` (72 bytes
+  on Win64). Stdlib accessors for `hdc`, `fErase`, and the
+  inline `rcPaint` rectangle's four edges. Sprint 36's
+  interactive demo doesn't currently call `BeginPaint` /
+  `EndPaint` (see the open carry-over above) but the struct
+  shape is in place for when it's needed.

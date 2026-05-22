@@ -336,6 +336,21 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%dwrite-create-text-layout", "nod_dwrite_create_text_layout", 5, TypeEstimate::Integer),
     ("%dwrite-get-layout-metrics", "nod_dwrite_get_layout_metrics", 1, TypeEstimate::Integer),
     ("%count-non-zero-red", "nod_count_non_zero_red", 4, TypeEstimate::Integer),
+    // Sprint 36 — HWND-bound swap chain + IDE-shell window-class primitives.
+    // All return fixnum-tagged handles, atoms, or HRESULT-encoded results;
+    // float marshaling is deferred (Sprint 37+).
+    ("%dxgi-factory-from-d3d-device", "nod_dxgi_factory_from_d3d_device", 1, TypeEstimate::Integer),
+    ("%dxgi-create-swap-chain-for-hwnd", "nod_dxgi_create_swap_chain_for_hwnd", 5, TypeEstimate::Integer),
+    ("%d2d-create-bitmap-from-swap-chain", "nod_d2d_create_bitmap_from_swap_chain", 2, TypeEstimate::Integer),
+    ("%dxgi-swap-chain-present", "nod_dxgi_swap_chain_present", 1, TypeEstimate::Integer),
+    ("%dxgi-swap-chain-resize-buffers", "nod_dxgi_swap_chain_resize_buffers", 3, TypeEstimate::Integer),
+    ("%register-window-class", "nod_register_window_class", 2, TypeEstimate::Integer),
+    ("%create-message-only-window", "nod_create_message_only_window", 1, TypeEstimate::Integer),
+    ("%create-hidden-window", "nod_create_hidden_window", 1, TypeEstimate::Integer),
+    ("%destroy-window", "nod_destroy_window", 1, TypeEstimate::Integer),
+    ("%post-message", "nod_post_message", 4, TypeEstimate::Integer),
+    ("%pump-one-message", "nod_pump_one_message", 1, TypeEstimate::Integer),
+    ("%def-window-proc", "nod_def_window_proc", 4, TypeEstimate::Integer),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

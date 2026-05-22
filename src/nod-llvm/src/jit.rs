@@ -66,6 +66,19 @@ use crate::codegen::{
     NOD_DWRITE_CREATE_FACTORY_SYMBOL, NOD_DWRITE_CREATE_TEXT_FORMAT_SYMBOL,
     NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL, NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL,
     NOD_COUNT_NON_ZERO_RED_SYMBOL,
+    // Sprint 36 — IDE-shell symbols.
+    NOD_DXGI_FACTORY_FROM_D3D_DEVICE_SYMBOL,
+    NOD_DXGI_CREATE_SWAP_CHAIN_FOR_HWND_SYMBOL,
+    NOD_D2D_CREATE_BITMAP_FROM_SWAP_CHAIN_SYMBOL,
+    NOD_DXGI_SWAP_CHAIN_PRESENT_SYMBOL,
+    NOD_DXGI_SWAP_CHAIN_RESIZE_BUFFERS_SYMBOL,
+    NOD_REGISTER_WINDOW_CLASS_SYMBOL,
+    NOD_CREATE_MESSAGE_ONLY_WINDOW_SYMBOL,
+    NOD_CREATE_HIDDEN_WINDOW_SYMBOL,
+    NOD_DESTROY_WINDOW_SYMBOL,
+    NOD_POST_MESSAGE_SYMBOL,
+    NOD_PUMP_ONE_MESSAGE_SYMBOL,
+    NOD_DEF_WINDOW_PROC_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -495,6 +508,33 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_dwrite_get_layout_metrics as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_COUNT_NON_ZERO_RED_SYMBOL),
              nod_runtime::nod_count_non_zero_red as *const () as *mut std::ffi::c_void),
+            // Sprint 36 — HWND-bound swap chain + IDE-shell window
+            // primitives. Each entry maps the LLVM symbol declared by
+            // codegen.rs to the nod_runtime extern address.
+            (module.get_function(NOD_DXGI_FACTORY_FROM_D3D_DEVICE_SYMBOL),
+             nod_runtime::nod_dxgi_factory_from_d3d_device as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DXGI_CREATE_SWAP_CHAIN_FOR_HWND_SYMBOL),
+             nod_runtime::nod_dxgi_create_swap_chain_for_hwnd as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CREATE_BITMAP_FROM_SWAP_CHAIN_SYMBOL),
+             nod_runtime::nod_d2d_create_bitmap_from_swap_chain as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DXGI_SWAP_CHAIN_PRESENT_SYMBOL),
+             nod_runtime::nod_dxgi_swap_chain_present as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DXGI_SWAP_CHAIN_RESIZE_BUFFERS_SYMBOL),
+             nod_runtime::nod_dxgi_swap_chain_resize_buffers as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_REGISTER_WINDOW_CLASS_SYMBOL),
+             nod_runtime::nod_register_window_class as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_CREATE_MESSAGE_ONLY_WINDOW_SYMBOL),
+             nod_runtime::nod_create_message_only_window as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_CREATE_HIDDEN_WINDOW_SYMBOL),
+             nod_runtime::nod_create_hidden_window as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DESTROY_WINDOW_SYMBOL),
+             nod_runtime::nod_destroy_window as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_POST_MESSAGE_SYMBOL),
+             nod_runtime::nod_post_message as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_PUMP_ONE_MESSAGE_SYMBOL),
+             nod_runtime::nod_pump_one_message as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DEF_WINDOW_PROC_SYMBOL),
+             nod_runtime::nod_def_window_proc as *const () as *mut std::ffi::c_void),
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
