@@ -456,6 +456,7 @@ name = "nod-tests"
 version = "0.0.1"
 dependencies = [
  "nod-dfm",
+ "nod-llvm",
  "nod-macro",
  "nod-namespace",
  "nod-reader",

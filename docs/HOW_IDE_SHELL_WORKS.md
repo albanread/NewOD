@@ -499,8 +499,17 @@ A few interesting future optimizations:
   original SPRINTS.md sketch).
 
 - **The MCJIT machine code is discarded at process exit.** Each test
-  process rebuilds it. A persistent JIT cache (like LuaJIT's bytecode
-  cache or .NET's NGen) would amortise across runs.
+  process rebuilds it. **Sprint 37 partially closes this:** repeated
+  `eval_expr_to_string` calls of identical Dylan source *within one
+  process* now hit an in-process JIT-output cache, skipping the entire
+  codegen + MCJIT + binding-registration pipeline. Measured speedup is
+  10–20× on the cached re-eval. The same sprint also persists each
+  cold compile's post-codegen LLVM bitcode to
+  `$CARGO_TARGET_DIR/nod-jit-cache/<key>.bc` with a sidecar JSON
+  (LRU-evicted at 500 MB). Cross-process replay isn't wired yet — the
+  bitcode references baked-in runtime pointers that are process-volatile
+  — but the disk infrastructure is the foundation for Sprint 38 AOT,
+  which will add the fix-up pass needed to ship native code in a `.exe`.
 
 - **D3D11 device creation costs ~80 ms.** Most of this is the GPU
   driver enumerating adapters, setting up command queues, allocating

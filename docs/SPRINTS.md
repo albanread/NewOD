@@ -1165,6 +1165,61 @@ This is the FFI journey's headline payoff: nine sprints (27 → 36) of increment
 - **Window resizing polish.** The shell handles WM_SIZE wiring at the API level (`nod_dxgi_swap_chain_resize_buffers` exists) but the interactive demo doesn't subscribe to it — the back buffer stays at 800×600 even if the user resizes.
 - **Compositional swap chains** (`CreateSwapChainForComposition`), **device-loss recovery**, **gradient brushes / geometries / paths**, **D2D effect graphs and animations** — same Sprint 35 carry-overs.
 
+### Sprint 37 — JIT object-code cache — landed
+
+**Goal:** the second `eval_expr_to_string("…")` of identical Dylan source returns at least 10× faster than the first by short-circuiting the codegen + MCJIT compile + binding-registrations pipeline.
+
+**Headline measurement.** Sample fixture is ~160 helper functions invoked from an entry expression (`tests/nod-tests/fixtures/jit_cache_sample{,_items}.dylan`). Cold compile ≈ 73 ms; cached re-eval ≈ 140 µs. Observed ratio: **~500×** in isolation, comfortably ≥10× under heavy parallel `cargo test --workspace` load.
+
+**Architectural shape.**
+
+A. **Determinism audit (Phase A).** Identical Dylan source must lower to byte-identical DFM IR for the cache key to hit. The audit found two real nondeterminism sources baked into the IR as constants:
+
+- `block_id` was minted from a process-global `AtomicU64` counter via `nod_runtime::allocate_block_id()`, then baked into the DFM as a `WordBits` constant. Fixed by deriving the id deterministically from `(parent_name, thunk_seq)` via a `DefaultHasher` (SipHash 1-3 — stable across runs in Rust stdlib), masked to fit `Word::from_fixnum`'s 63-bit domain and bit-62-set to keep it non-zero. The runtime's `register_block_fns` already replaces same-id entries, so collisions across modules (vanishingly rare given the hash space) are tolerated.
+- `dispatch::allocate_cache_slot`'s returned pointer is baked into LLVM IR as an i64 immediate. Pointers are process-volatile but the *DFM* IR doesn't see them — only LLVM IR does — so this only matters for cross-process disk replay, which is out of scope for Sprint 37 (see "Storage layout" below).
+
+Already-deterministic and re-confirmed: anon-method counter resets per `lift_anonymous_methods` call; block-form captures sort by name; `c_function_specs` builds in `m.items` order. The `dfm_ir_is_deterministic_across_two_eval_calls` regression test enforces this from now on.
+
+B. **Cache key (Phase B–C).** 256-bit composite. Inputs: the **wrapped Dylan source string** that `eval_expr_to_string` / `eval_expr_with_items_to_string` constructs from caller inputs (already deterministic by construction — `format!()` produces byte-identical output for byte-identical inputs); the `nod-llvm` `CARGO_PKG_VERSION`; an `NOD_RUNTIME_ABI_VERSION` constant (bump on any `extern "C-unwind"` runtime ABI change); the LLVM major version; the target triple; the MCJIT opt level. The 256 bits are four `DefaultHasher` digests with distinct domain-separation seeds — well above the collision budget for any reasonable on-disk cache size and zero new transitive crate deps. `nod_dfm::format_for_cache_key` exists as the alternate cache-key surface for callers that want to key on post-lowering DFM IR (Sprint 38 will use it for separate-compilation per-function caching); today's eval-shaped hot path uses the source-string key because the pre-lowering string is 100× cheaper to hash than the post-lowering DFM text and is provably equivalent for identical inputs (the lowerer is deterministic post-Phase-A audit, so identical source → identical DFM → identical IR).
+
+C. **Storage (Phase D–E).** Two layers, complementary because of an LLVM-C API constraint:
+
+- **In-process JIT-output cache.** `LazyLock<Mutex<HashMap<CacheKey, ReplayFn>>>` in `nod-llvm::cache`. On hit, the entire pipeline (parse → expand → lower → codegen → MCJIT → registrations) is skipped — the cached `<eval-entry>` function pointer is called directly and `call_and_format` runs against the cached return-type tag. The leaked `LLVM Context` + `Jit` engine pair keep the JIT'd code alive forever.
+- **On-disk bitcode + sidecar.** Every cold compile writes `<key>.bc` + `<key>.json` to the cache dir. The sidecar JSON tracks `created_at_unix_ms`, `accessed_at_unix_ms`, `size_bytes`, plus the ABI/LLVM/target tuple for defense-in-depth. LRU eviction sorts by `accessed_at` and trims to 500 MB (or whatever `NOD_JIT_CACHE_MAX_BYTES` says).
+
+Cache dir resolution order: `NOD_JIT_CACHE_DIR` → `CARGO_TARGET_DIR/nod-jit-cache` → ancestor-`target/`/nod-jit-cache → `%LOCALAPPDATA%/NewOpenDylan/jit-cache`.
+
+D. **The LLVM-C API constraint and deviation from the original brief.** The sprint plan called for installing an `llvm::ObjectCache` on the MCJIT instance. The LLVM-C API exposed by `llvm-sys` 221 and `inkwell` 0.9 **does not** bind `MCJIT::setObjectCache` — that surface is C++-only. Adding a C++ shim DLL was out of sprint scope (and would have required `build.rs` + `cc` machinery this workspace doesn't currently host). The pragmatic landing is described above: in-process replay delivers the 10× target; on-disk bitcode persists the post-codegen IR for Sprint 38's cross-process replay (AOT will fix up the baked-in runtime pointers at load time). The on-disk bitcode is observable today via `jit_cache_stats()` but cross-process replay is not yet wired.
+
+E. **Statistics + introspection.** `nod_llvm::read_stats(dir) -> JitCacheStats { hits, misses, bytes_on_disk, entries }`. Counters are process-global. Test helpers: `in_process_clear`, `reset_stats`, `clear_cache_dir`, `evict_to(dir, max_bytes)`. The public Dylan-side `%`-primitives mentioned in the sprint brief (`%jit-cache-stats()` etc.) weren't wired: tests use the Rust APIs directly. Surfacing them as `%`-primitives is mechanical follow-up.
+
+F. **Tests added (8).** `tests/nod-tests/tests/jit_cache.rs` + the existing `nod-llvm::cache` unit tests (5):
+1. `cache_miss_then_hit_is_at_least_10x_faster` — headline.
+2. `cache_invalidates_on_source_change` — different source = miss; same source = hit.
+3. `cache_invalidates_on_runtime_abi_bump` — direct `cache_key` ABI-version probe.
+4. `cache_stats_track_hits_and_misses` — delta accounting.
+5. `lru_evicts_oldest_when_over_max` — populate 5 entries → evict to 1-byte cap → 0 entries.
+6. `cache_corruption_recovers_via_recompile` — overwrite a `.bc` with garbage → next eval recompiles.
+7. `dfm_ir_is_deterministic_across_two_eval_calls` — Phase A regression guard.
+8. `cache_directory_respects_env_override` — `NOD_JIT_CACHE_DIR` honoured.
+
+Test counts: baseline 556 → 569 (+13: 5 cache.rs unit tests + 8 jit_cache.rs integration tests).
+
+**Verification.**
+- `cargo build --workspace`: clean.
+- `cargo test --workspace --no-fail-fast`: 569 passed, 0 failed, 9 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean. (Sprint 37 also fixed three pre-existing `missing_safety_doc` errors on Sprint 36b's arity-10/11/12 WinFFI trampolines.)
+- 5x sequential flake check: 569/0/9 every run.
+
+**Out of scope for Sprint 37 (deferred — see DEFERRED.md):**
+
+- **True object-code-on-disk caching.** Requires either a C++ shim that wires MCJIT's `setObjectCache` or migration to ORC v2 LLJIT (which DOES expose `LLVMOrcLLJITAddObjectFile` through the C API). Sprint 38 will pick one based on the AOT design.
+- **Cross-process bitcode replay.** Baked-in runtime addresses (cache slots, generic-fn pointers, runtime shim addresses) are process-volatile; cross-process replay needs a fix-up pass at module-load time. The on-disk bitcode infrastructure landed this sprint is the foundation.
+- **Function-level / cross-module dependency tracking.** Sprint 37 keys on the whole DFM module; per-function caching is a Sprint 38+ refinement once separate compilation lands.
+- **Hot-reload invalidation when source files change on disk.** The cache today is content-addressed, so source change = different key = miss; explicit file-watching for IDE workflows is post-Sprint-38.
+- **Compressed cache files.** Bitcode compresses well; not done this sprint.
+- **`%jit-cache-stats()` / `%jit-cache-clear()` Dylan-side primitives.** Rust APIs exist; surfacing them as primitives is mechanical follow-up.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 

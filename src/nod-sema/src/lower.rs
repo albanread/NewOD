@@ -5989,8 +5989,29 @@ fn lower_block_form(
         });
     }
 
-    let block_id = nod_runtime::allocate_block_id();
     let thunk_seq = sink.alloc_thunk_suffix();
+    // Sprint 37: deterministic block_id derived from (parent_name,
+    // thunk_seq). Identical source must produce identical DFM IR for the
+    // JIT object-code cache to hit; a process-global counter via
+    // `allocate_block_id` would change across runs. The id is registered
+    // post-JIT with `register_block_fns`, which replaces same-id entries,
+    // so collisions across modules are tolerated. The hash is SipHash 1-3
+    // via `DefaultHasher`, which has fixed seeds — stable across runs.
+    // The id must fit in 63 bits because `make_exit_procedure` packs it
+    // into a tagged fixnum (see `Word::from_fixnum`), and must be
+    // non-zero because 0 is the "no block" sentinel — we OR in bit 62
+    // to satisfy both constraints with high collision-resistance.
+    let block_id = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        parent_name.hash(&mut h);
+        thunk_seq.hash(&mut h);
+        b"sprint37-block-id".hash(&mut h);
+        let raw = h.finish();
+        // Mask to 62 bits then set bit 62; gives a non-zero value
+        // strictly less than 2^63, fitting `Word::from_fixnum`'s domain.
+        (raw & ((1u64 << 62) - 1)) | (1u64 << 62)
+    };
 
     // ─── Lift each stage to a top-level function ────────────────────
     //

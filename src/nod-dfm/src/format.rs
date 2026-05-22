@@ -30,6 +30,25 @@ pub fn format_dfm_module(fns: &[Function]) -> String {
     out
 }
 
+/// Sprint 37: produce a fully-canonical text representation of a DFM
+/// module suitable for use as input to a JIT-cache hash.
+///
+/// The format is identical to [`format_dfm_module`] today — the existing
+/// dump is already line-oriented and emits functions / blocks /
+/// computations in deterministic source order, with no environment-
+/// dependent values (no addresses, no timestamps, no `Debug`-derived
+/// `HashMap` iteration).
+///
+/// The function exists as a separate API so future format changes can
+/// be made for cache-key needs without disturbing the IDE-inspector /
+/// snapshot-test consumers of [`format_dfm_module`]. Bumping the cache
+/// key's version constant (see `nod-llvm::cache::CACHE_KEY_VERSION`) is
+/// the mechanism for invalidating stale cached objects after a format
+/// change.
+pub fn format_for_cache_key(fns: &[Function]) -> String {
+    format_dfm_module(fns)
+}
+
 fn fmt_function(f: &Function, out: &mut String) {
     let _ = write!(out, "fn {} (", f.name);
     for (i, p) in f.params.iter().enumerate() {

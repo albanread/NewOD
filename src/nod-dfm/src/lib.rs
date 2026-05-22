@@ -16,7 +16,7 @@ mod ir;
 mod liveness;
 mod verify;
 
-pub use format::{format_dfm, format_dfm_module};
+pub use format::{format_dfm, format_dfm_module, format_for_cache_key};
 pub use ir::{
     Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp, SlotTypeKind,
     Temporary, TempId, Terminator, TypeEstimate,

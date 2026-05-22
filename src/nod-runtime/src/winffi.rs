@@ -1414,6 +1414,9 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_9(
 }
 
 /// 10-arg trampoline. Sprint 36b. See [`nod_winffi_call_0`].
+///
+/// # Safety
+/// See [`nod_winffi_call_0`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn nod_winffi_call_10(
     entry: u64,
@@ -1447,6 +1450,9 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_10(
 }
 
 /// 11-arg trampoline. Sprint 36b. See [`nod_winffi_call_0`].
+///
+/// # Safety
+/// See [`nod_winffi_call_0`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn nod_winffi_call_11(
     entry: u64,
@@ -1482,6 +1488,9 @@ pub unsafe extern "C-unwind" fn nod_winffi_call_11(
 
 /// 12-arg trampoline. Sprint 36b: this is the CreateWindowExW arity —
 /// the IDE-shell-blocker. See [`nod_winffi_call_0`].
+///
+/// # Safety
+/// See [`nod_winffi_call_0`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn nod_winffi_call_12(
     entry: u64,

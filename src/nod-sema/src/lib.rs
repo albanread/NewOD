@@ -212,7 +212,37 @@ pub fn eval_expr_with_items_to_string(
 /// Shared implementation for `eval_expr_to_string` and
 /// `eval_expr_with_items_to_string` — handles parse → expand → lower
 /// → codegen → JIT → invoke entry → format.
+///
+/// Sprint 37: routes through the JIT object-code cache. The cache key
+/// is the hash of the wrapped Dylan source plus runtime/LLVM/target/
+/// opt versioning. On an in-process hit, the entire pipeline (parse,
+/// macro-expand, lower, codegen, MCJIT, registrations) is skipped —
+/// only `call_and_format` runs against the previously-resolved
+/// `<eval-entry>` pointer. See `nod-llvm::cache` for the full
+/// mechanism + on-disk bitcode + LRU eviction.
+///
+/// We hash the **wrapped source string** (not the DFM IR text) because
+/// (a) the wrapped string is deterministic by construction — it's
+/// produced by `eval_expr_to_string` / `eval_expr_with_items_to_string`
+/// from caller inputs with no environment dependency, (b) the full
+/// pipeline is monotonic in the source: identical source → identical
+/// DFM → identical LLVM IR (modulo audited nondeterminism sources,
+/// fixed in Phase A) → identical object code, (c) hashing strings is
+/// orders of magnitude faster than running the full pipeline to
+/// produce DFM text, which is what makes the hot path actually fast.
 fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
+    // Sprint 37 — try the in-process cache first. The hot path doesn't
+    // even need to parse: a successful hit goes straight to
+    // `call_and_format` on the cached entry pointer.
+    let cache_key = nod_llvm::cache_key_for_dfm(wrapped);
+
+    if let Some(replay) = nod_llvm::in_process_get(cache_key) {
+        nod_llvm::record_hit();
+        let ty = decode_type_tag(replay.return_type_tag, replay.return_type_payload);
+        return Ok(call_and_format(replay.eval_entry_ptr as *const (), ty));
+    }
+    nod_llvm::record_miss();
+
     let mut sm = nod_reader::SourceMap::new();
     let file_id = sm
         .add("<eval>", wrapped.to_string())
@@ -231,19 +261,102 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
         .ok_or_else(|| EvalError::NoEntry("<eval-entry> missing after lowering".into()))?;
     let return_type = entry.return_type;
 
-    let ctx = Context::create();
-    let out = codegen_module(&ctx, &lm.functions, "__eval__").map_err(EvalError::Codegen)?;
-    let mut jit = Jit::new(&ctx).map_err(EvalError::Jit)?;
-    jit.add_module(out).map_err(EvalError::Jit)?;
-    register_methods(&jit, &lm.methods)?;
-    register_blocks(&jit, &lm.blocks)?;
-    register_top_level_functions(&jit, &lm)?;
+    // Sprint 37 — keep the LLVM Context and Jit alive forever so the
+    // in-process replay closure stays valid. Each cache miss leaks
+    // exactly one Context + Jit pair; on the next call to the same
+    // source the replay closure reuses them. Memory cost: ~few KB per
+    // distinct evaled source, capped in practice by the user's
+    // working set. (The 500MB LRU cap applies to the on-disk bitcode
+    // mirror, not the in-process table.)
+    let ctx_box: Box<Context> = Box::new(Context::create());
+    let ctx_ref: &'static Context = Box::leak(ctx_box);
+    let out = codegen_module(ctx_ref, &lm.functions, "__eval__").map_err(EvalError::Codegen)?;
+
+    // Capture the bitcode for the on-disk cache mirror before MCJIT
+    // consumes the module pointer. The bitcode is the canonical
+    // representation of the post-codegen IR; Sprint 38 will use it
+    // for cross-process replay once we have runtime-pointer fix-ups.
+    let bitcode_bytes = out.module.write_bitcode_to_memory();
+    let bitcode: Vec<u8> = bitcode_bytes.as_slice().to_vec();
+
+    let mut jit_box: Box<Jit<'static>> = Box::new(Jit::new(ctx_ref).map_err(EvalError::Jit)?);
+    jit_box.add_module(out).map_err(EvalError::Jit)?;
+    register_methods(&jit_box, &lm.methods)?;
+    register_blocks(&jit_box, &lm.blocks)?;
+    register_top_level_functions(&jit_box, &lm)?;
     initialize_module_winffi(&lm)?;
 
     // SAFETY: see `eval_expr_to_string`.
-    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+    let ptr = unsafe { jit_box.get_function_ptr("<eval-entry>") }
         .ok_or_else(|| EvalError::NoEntry("<eval-entry>".into()))?;
+
+    // Leak the Jit (it owns the engine pointers; MCJIT engines are
+    // never disposed, matching the existing `keep_forever` rationale
+    // in `nod-llvm/src/jit.rs`).
+    let jit_static: &'static Jit<'static> = Box::leak(jit_box);
+    let _ = jit_static; // engines are leak-by-omission; the borrow is for documentation
+
+    // Persist the bitcode + sidecar to disk. Best-effort: errors are
+    // logged but don't fail the JIT (the cache is an optimisation).
+    let dir = nod_llvm::default_cache_dir();
+    nod_llvm::write_cache_entry(&dir, cache_key, &bitcode);
+    // Run LRU eviction once on each insert if we're over the cap.
+    let cap = nod_llvm::cache_max_bytes();
+    if nod_llvm::cache_size_on_disk(&dir) > cap {
+        let _ = nod_llvm::evict_to(&dir, cap);
+    }
+
+    // Install the in-process replay closure. The closure captures the
+    // function pointer (`usize` to satisfy `Send + Sync` — pointers
+    // aren't `Send` but `usize` is) and the encoded return type.
+    let (ty_tag, ty_payload) = encode_type_tag(return_type);
+    let ptr_usize = ptr as usize;
+    nod_llvm::in_process_insert(
+        cache_key,
+        Box::new(move || nod_llvm::JitReplayResult {
+            eval_entry_ptr: ptr_usize,
+            return_type_tag: ty_tag,
+            return_type_payload: ty_payload,
+        }),
+    );
+
     Ok(call_and_format(ptr, return_type))
+}
+
+/// Sprint 37 — encode a `TypeEstimate` as a `(u32, u64)` pair that
+/// fits in the cache's `JitReplayResult` shape. Inverse of
+/// [`decode_type_tag`].
+fn encode_type_tag(ty: TypeEstimate) -> (u32, u64) {
+    match ty {
+        TypeEstimate::Integer => (0, 0),
+        TypeEstimate::Boolean => (1, 0),
+        TypeEstimate::String => (2, 0),
+        TypeEstimate::SingleFloat => (3, 0),
+        TypeEstimate::DoubleFloat => (4, 0),
+        TypeEstimate::Character => (5, 0),
+        TypeEstimate::Unit => (6, 0),
+        TypeEstimate::Top => (7, 0),
+        TypeEstimate::Bottom => (8, 0),
+        TypeEstimate::Class(id) => (9, id as u64),
+        TypeEstimate::Singleton(bits) => (10, bits),
+    }
+}
+
+fn decode_type_tag(tag: u32, payload: u64) -> TypeEstimate {
+    match tag {
+        0 => TypeEstimate::Integer,
+        1 => TypeEstimate::Boolean,
+        2 => TypeEstimate::String,
+        3 => TypeEstimate::SingleFloat,
+        4 => TypeEstimate::DoubleFloat,
+        5 => TypeEstimate::Character,
+        6 => TypeEstimate::Unit,
+        7 => TypeEstimate::Top,
+        8 => TypeEstimate::Bottom,
+        9 => TypeEstimate::Class(payload as u32),
+        10 => TypeEstimate::Singleton(payload),
+        _ => TypeEstimate::Top,
+    }
 }
 
 /// Parse + lower + codegen + JIT-call a single Dylan expression. Wraps

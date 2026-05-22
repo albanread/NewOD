@@ -2370,3 +2370,73 @@ and a few corner cases the seed-struct set didn't touch.
   interactive demo doesn't currently call `BeginPaint` /
   `EndPaint` (see the open carry-over above) but the struct
   shape is in place for when it's needed.
+
+## Carry-over from Sprint 37 (JIT object-code cache) — into Sprint 38+
+
+- **:open: True object-code-on-disk caching** — Sprint 37
+  landed an in-process JIT-output cache that delivers the 10×
+  speedup target plus on-disk bitcode mirroring for observability
+  and Sprint 38 AOT groundwork. The original "stash the MCJIT
+  output bytes on disk and skip MCJIT on hit" wire couldn't land
+  because LLVM-C exposes no `MCJIT::setObjectCache` — that surface
+  is C++ only. Sprint 38 picks between two paths:
+  - Add a thin C++ shim DLL (build.rs + cc crate) that wraps
+    `setObjectCache` and feeds an `LLVMObjectCache` instance back
+    through the C boundary. ~50 lines of C++.
+  - Migrate the JIT from MCJIT to ORC v2 LLJIT, which DOES
+    expose `LLVMOrcLLJITAddObjectFile` through the C API. Larger
+    refactor; aligns with LLVM's "MCJIT is legacy" stance.
+- **:open: Cross-process bitcode replay** — The on-disk `.bc`
+  file is identical for identical Dylan source (the cache key
+  guarantees this), but the bitcode references baked-in runtime
+  pointers (cache slots, generic function pointers, runtime shim
+  addresses) that are process-volatile. Cross-process replay
+  needs a fix-up pass at module-load time that rewrites those
+  i64 immediates to addresses valid in the new process. Sprint
+  38 AOT pulls this in.
+- **:open: Function-level / cross-module dependency tracking** —
+  Sprint 37 keys on the whole `LoweredModule` (one DFM-IR text
+  hash → one cache entry). Per-function granularity is Sprint
+  38+ once separate compilation lands. The cache key mechanism
+  doesn't change — the granularity just goes from "whole module"
+  to "single Dylan function" with dependency edges between
+  cached entries.
+- **:open: Source-file watch + hot-reload invalidation** — The
+  current cache is content-addressed: edit source → different
+  DFM text → different key → automatic miss. Hot-reload IDE
+  workflows want explicit file-system watches so the cache
+  warms before the user re-runs. Post-Sprint-38.
+- **:open: Bitcode compression** — `.bc` files compress well
+  (zstd commonly hits 4-8× on LLVM bitcode); a transparent
+  compression layer on disk would substantially reduce cache
+  footprint. Easy follow-up; not needed for Sprint 37's headline.
+- **:open: `%jit-cache-stats()` / `%jit-cache-clear()` /
+  `%jit-cache-evict-to(bytes)` Dylan-side primitives** — Sprint
+  37 ships Rust APIs (`nod_llvm::read_stats`, `in_process_clear`,
+  `clear_cache_dir`, `evict_to`) for tests to use; surfacing them
+  as `%`-primitives so Dylan source can introspect the cache is
+  mechanical. The IDE will want a "Show JIT cache" panel.
+- **:open: In-process eviction policy** — The 500 MB LRU cap
+  applies only to the on-disk bitcode mirror today. The
+  in-process `HashMap<CacheKey, ReplayFn>` grows unbounded
+  (each cache miss leaks one `Context` + one `Jit` engine + the
+  JIT'd object code memory). For a long-running IDE this needs
+  an LRU on the in-process table too — perhaps weak-pointer-based
+  so a least-recently-used JIT'd module can be released. The
+  existing code marks engines as "leak-by-omission" for
+  correctness; tightening that lifecycle is part of this work.
+- **:closed: Determinism audit of DFM IR generation** —
+  Sprint 37 Phase A. **Landed.** Two real nondeterminism
+  sources found and fixed: `block_id` (process-global counter
+  → `DefaultHasher(parent_name, thunk_seq)`); `dispatch
+  cache slot pointer` baked into LLVM IR (only affects
+  cross-process replay, which is out of scope this sprint).
+  Regression test (`dfm_ir_is_deterministic_across_two_eval_calls`)
+  in `tests/jit_cache.rs` enforces from here forward.
+- **:closed: Bumping `NOD_RUNTIME_ABI_VERSION`** — Sprint 37
+  introduced this constant (currently 1). **Bump on every
+  future `extern "C-unwind"` runtime ABI change.** Bumping
+  invalidates the entire on-disk cache; the in-process cache
+  is already invalidated by process restart. Test:
+  `cache_invalidates_on_runtime_abi_bump` in
+  `tests/jit_cache.rs`.

@@ -18,8 +18,8 @@ workspace = true
 # whichever backend is active.
 [features]
 default = ["newgc-backend"]
-newgc-backend = ["nod-runtime/newgc-backend", "nod-sema/newgc-backend"]
-semispace-backend = ["nod-runtime/semispace-backend", "nod-sema/semispace-backend"]
+newgc-backend = ["nod-runtime/newgc-backend", "nod-sema/newgc-backend", "nod-llvm/newgc-backend"]
+semispace-backend = ["nod-runtime/semispace-backend", "nod-sema/semispace-backend", "nod-llvm/semispace-backend"]
 
 [dev-dependencies]
 nod-reader = { path = "../../src/nod-reader" }
@@ -27,6 +27,7 @@ nod-macro = { path = "../../src/nod-macro" }
 nod-namespace = { path = "../../src/nod-namespace" }
 nod-dfm = { path = "../../src/nod-dfm" }
 nod-sema = { path = "../../src/nod-sema", default-features = false }
+nod-llvm = { path = "../../src/nod-llvm", default-features = false }
 nod-runtime = { path = "../../src/nod-runtime", default-features = false }
 nod-winapi = { path = "../../src/nod-winapi" }
 serial_test = "3"
