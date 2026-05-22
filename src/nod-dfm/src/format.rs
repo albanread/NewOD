@@ -279,6 +279,21 @@ fn fmt_const(v: &ConstValue, out: &mut String) {
         ConstValue::SymbolLiteralRef(name) => {
             let _ = write!(out, "SymbolLiteralRef({name:?})");
         }
+        ConstValue::StubEntryRef {
+            dll,
+            symbol,
+            signature_bytes,
+        } => {
+            // Render the signature as a stable hex string so two
+            // sites with the same (dll, symbol) but different
+            // marshaling shapes hash distinctly.
+            out.push_str("StubEntryRef(");
+            let _ = write!(out, "{dll:?}, {symbol:?}, sig=");
+            for b in signature_bytes {
+                let _ = write!(out, "{b:02x}");
+            }
+            out.push(')');
+        }
     }
 }
 

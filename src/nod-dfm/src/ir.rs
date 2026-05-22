@@ -296,6 +296,27 @@ pub enum ConstValue {
     /// Sprint 38c — a reference to an interned `<symbol>` literal.
     /// Same shape as `StringLiteralRef` but for Dylan symbols.
     SymbolLiteralRef(String),
+    /// Sprint 38d — a reference to a Win32 stub-entry pointer for the
+    /// `(dll, symbol)` pair carrying the marshaling signature.
+    ///
+    /// Codegen lowers to `load i64, ptr @nod_stub__<key>__<idx>` through
+    /// a per-module external global; the JIT-link path binds the
+    /// symbol's address to a stable `u64` slot whose contents are the
+    /// address of a freshly-allocated [`nod_runtime::ApiStubEntry`] in
+    /// the current process. The loaded value is the entry pointer the
+    /// trampoline (`nod_winffi_call_N`) takes as its first argument.
+    ///
+    /// `signature_bytes` is the bytewise-encoded
+    /// [`nod_runtime::ApiCallSignature`] (`#[repr(C)] Copy`); the
+    /// resolver round-trips it through `copy_nonoverlapping` before
+    /// allocating the entry. The bytes are part of the IR's
+    /// cache-key fingerprint, so two call sites with different
+    /// marshaling signatures emit distinct external globals.
+    StubEntryRef {
+        dll: String,
+        symbol: String,
+        signature_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

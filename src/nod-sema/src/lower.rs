@@ -799,6 +799,27 @@ fn c_return_kind_from_type_ref(t: &nod_winapi::TypeRef) -> Result<nod_runtime::C
     })
 }
 
+/// Sprint 38d — bytewise-encode an [`nod_runtime::ApiCallSignature`] for
+/// carriage in the DFM IR + the manifest sidecar. `ApiCallSignature` is
+/// `#[repr(C)] Copy` so a `transmute`-equivalent `copy_nonoverlapping`
+/// is well-defined; the inverse happens in
+/// `nod_llvm::jit::resolve_reloc_kind` on the warm-replay path.
+fn signature_to_bytes(sig: &nod_runtime::ApiCallSignature) -> Vec<u8> {
+    let n = std::mem::size_of::<nod_runtime::ApiCallSignature>();
+    let mut bytes = vec![0u8; n];
+    // SAFETY: `ApiCallSignature` is `#[repr(C)] Copy` (struct of bytes
+    // and a u8 array — no padding hazards on x86-64). The destination
+    // slice has the exact same length.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            sig as *const nod_runtime::ApiCallSignature as *const u8,
+            bytes.as_mut_ptr(),
+            n,
+        );
+    }
+    bytes
+}
+
 /// Sprint 31: walk a module's call sites collecting bare-name callees
 /// that are *candidates* for JIT materialization — i.e. names that
 /// aren't user-declared c-functions, aren't user-defined functions,
@@ -1584,16 +1605,25 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         c_function_stub_table_entries = Vec::new();
     }
     // Build the per-call lookup map: Dylan name -> entry pointer +
-    // arg count.
+    // arg count. Sprint 38d also carries (dll, symbol, signature_bytes)
+    // so the call-site lowering can emit a `ConstValue::StubEntryRef`
+    // (which the codegen turns into a `load i64, ptr @nod_stub__*`
+    // through a per-module external global instead of baking the
+    // per-process entry pointer as an `i64`).
     for (name, idx_opt, _) in &c_function_pre {
         if let Some(idx) = idx_opt {
             let p = entry_ptrs[*idx];
-            let sig = c_function_specs[*idx].signature;
+            let spec = &c_function_specs[*idx];
+            let sig = spec.signature;
+            let signature_bytes = signature_to_bytes(&sig);
             c_function_call_map.insert(
                 name.clone(),
                 CFunctionCallInfo {
                     entry_ptr: p as u64,
                     arg_count: sig.arg_count as usize,
+                    dll: spec.dll.clone(),
+                    symbol: spec.symbol.clone(),
+                    signature_bytes,
                 },
             );
         }
@@ -1611,11 +1641,15 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         }
         let p = entry_ptrs[spec.spec_idx];
         let sig = spec.signature;
+        let signature_bytes = signature_to_bytes(&sig);
         c_function_call_map
             .entry(spec.dylan_name.clone())
             .or_insert(CFunctionCallInfo {
                 entry_ptr: p as u64,
                 arg_count: sig.arg_count as usize,
+                dll: spec.library.clone(),
+                symbol: spec.c_name.clone(),
+                signature_bytes,
             });
         c_functions.push(CFunctionBinding {
             dylan_name: spec.dylan_name.clone(),
@@ -3008,14 +3042,40 @@ struct LowerCtx<'a> {
 /// Sprint 28: per-c-function metadata threaded through `LowerCtx` so
 /// call-site lowering can look up the stub-table entry pointer + the
 /// marshaling signature for a given Dylan-side name.
+///
+/// Sprint 38d: in addition to the (still-allocated) static-area entry
+/// pointer, carry `dll` / `symbol` / `signature_bytes` so the call-site
+/// lowering can emit a `ConstValue::StubEntryRef` instead of baking the
+/// per-process `entry_ptr` as an `i64`. The pre-allocation is kept
+/// because `nod-sema::lib::initialize_module_winffi` still walks the
+/// `c_function_stub_table` to drive cold-path resolution; switching that
+/// to go through the slot allocator is part of Sprint 38d's runtime
+/// integration but not strictly required (the slot allocator's
+/// `resolve_into_entry` call is idempotent, so the eager pre-resolve in
+/// sema becomes a no-op).
 #[derive(Clone, Debug)]
 struct CFunctionCallInfo {
     /// Static-area address of the resolved [`nod_runtime::ApiStubEntry`]
-    /// — baked into each call site as an `i64` constant.
+    /// — kept for back-compat with `c_function_stub_table` consumers.
+    /// Sprint 38d: no longer baked into the IR; codegen now reads
+    /// `dll` / `symbol` / `signature_bytes` and goes through the
+    /// `stub_entry_slot_addr` path.
+    #[allow(dead_code)]
     entry_ptr: u64,
     /// Argument count from the parsed signature. Drives which
     /// `nod_winffi_call_N` trampoline the call site emits.
     arg_count: usize,
+    /// Sprint 38d — DLL name carried verbatim into
+    /// `ConstValue::StubEntryRef`. The slot allocator lowercases this
+    /// for its case-insensitive key; we keep the original casing here
+    /// so debug dumps + sema-side diagnostics match the source.
+    dll: String,
+    /// Sprint 38d — symbol (effective C name).
+    symbol: String,
+    /// Sprint 38d — bytewise-encoded [`nod_runtime::ApiCallSignature`]
+    /// (`#[repr(C)] Copy`). Carried through into the manifest so the
+    /// warm-replay resolver reconstructs the same marshaling shape.
+    signature_bytes: Vec<u8>,
 }
 
 /// Sprint 24: per-body lowering state for cell-promotion + env access.
@@ -4868,8 +4928,14 @@ impl FunctionBuilder {
         if let Expr::Ident(_, name) = callee {
             // Sprint 28: c-function call — look up the per-module
             // stub table and emit `nod_winffi_call_N(entry_ptr_const,
-            // args...)`. The entry pointer is baked as a `WordBits`
-            // i64 constant so codegen lowers it to a literal LLVM i64.
+            // args...)`. Sprint 38d: the entry pointer is now baked
+            // as a `ConstValue::StubEntryRef { dll, symbol, sig }` so
+            // codegen lowers it to a `load i64, ptr @nod_stub__*`
+            // through a per-module external global. The JIT-link path
+            // binds the global's address to a stable `u64` slot whose
+            // contents are the address of the freshly-allocated
+            // `ApiStubEntry` in the current process (resolution is
+            // lazy and idempotent inside the slot allocator).
             if let Some(cf_map) = ctx.c_functions
                 && let Some(info) = cf_map.get(name)
             {
@@ -4892,13 +4958,22 @@ impl FunctionBuilder {
                         ),
                     });
                 }
-                // Materialise the entry pointer as a `WordBits` i64
-                // constant. The codegen layer emits this as a literal
-                // `i64` — no shifting, no tagging.
+                // Sprint 38d — emit a `StubEntryRef` const so codegen
+                // routes through the per-module external global.
+                // Pre-Sprint-38d code baked `info.entry_ptr` as a
+                // `WordBits` `i64` — that worked in-process only
+                // because the static-area address survived for the
+                // process lifetime, but it pinned the bitcode to one
+                // process (cache hits across processes saw stale
+                // addresses).
                 let entry_t = self.fresh_temp(TypeEstimate::Top);
                 self.push(Computation::Const {
                     dst: entry_t,
-                    value: ConstValue::WordBits(info.entry_ptr),
+                    value: ConstValue::StubEntryRef {
+                        dll: info.dll.clone(),
+                        symbol: info.symbol.clone(),
+                        signature_bytes: info.signature_bytes.clone(),
+                    },
                 });
                 let mut call_args = Vec::with_capacity(arg_temps.len() + 1);
                 call_args.push(entry_t);

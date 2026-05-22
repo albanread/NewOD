@@ -204,18 +204,36 @@ end;
     .unwrap_or_else(|e| panic!("dedupe test eval failed: {e:?}"));
     let _: i64 = s.parse().expect("integer return");
     let stats = nod_runtime::winffi_stats();
-    assert_eq!(
-        stats.entries, 1,
-        "deduplicated table must have exactly 1 entry, got {}",
+    // Sprint 28: two call sites of the same c-function must share ONE
+    // logical stub-table slot. Sprint 38d split that into two distinct
+    // physical entries — one allocated by the sema-side pre-allocation
+    // (kept for `LoweredModule::c_function_stub_table` analysis) and
+    // one by `stub_entry_slot_addr` (the slot allocator that owns the
+    // cross-process replay path). Both are deduplicated within their
+    // own layer (sema's `spec_dedupe`; the slot allocator's process-
+    // global HashMap keyed by `(dll.to_lowercase(), symbol)`), so
+    // **`stats.entries` is at most 2 per unique (dll, symbol)** —
+    // never N for N call sites. That preserves the original
+    // dedup-across-call-sites guarantee with one new fixed-overhead
+    // entry per API. The slot allocator's memoisation handles the
+    // cross-process replay invariant the original test predates.
+    assert!(
+        stats.entries <= 2,
+        "two call sites must produce ≤2 stub entries (Sprint 28 sema-side + Sprint 38d slot-allocator); got {}",
         stats.entries
+    );
+    assert!(
+        stats.entries >= 1,
+        "at least one stub entry must have been allocated"
     );
     assert!(
         stats.total_resolved >= 1,
         "at least one resolution must have happened"
     );
-    assert!(
-        stats.unique_symbols >= 1,
-        "at least one unique symbol must have resolved"
+    assert_eq!(
+        stats.unique_symbols, 1,
+        "exactly one unique (dll, symbol) pair must have resolved, got {}",
+        stats.unique_symbols
     );
 }
 

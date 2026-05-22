@@ -956,3 +956,220 @@ fn add_module_from_bitcode_round_trips_a_trivial_module() {
     nod_llvm::clear_cache_dir(&dir);
     nod_llvm::in_process_clear();
 }
+
+// ─── Sprint 38d — Win32 stub-entry bake sites ───────────────────────────────
+//
+// Same end-to-end shape as Sprint 38b/c: cold-compile a Dylan program
+// that calls a Win32 API, drop the in-process cache, reload from
+// bitcode + manifest, re-invoke, and assert the result.
+//
+// `GetTickCount()` is chosen as the headline because:
+//   • arity 0 → simplest trampoline path (no arg marshaling).
+//   • returns DWORD → no out-buffer, no string conversion.
+//   • available in every supported Windows SKU (Kernel32 export).
+//   • bare-name materialisation (Sprint 31) — no `define c-function`
+//     prelude needed, so the test's Dylan source is one line.
+//
+// The IR-shape test confirms `@nod_stub__*` external globals are emitted
+// (not baked `i64 <addr>` constants). The slot-allocator test exercises
+// the memoisation + case-insensitive DLL key.
+
+#[test]
+#[cfg(windows)]
+#[serial]
+fn sprint38d_stub_entry_globals_round_trip() {
+    // Cold-compile a Dylan expression that calls Win32 `GetTickCount()`.
+    // After cold compile completes, drop the in-process cache, reload
+    // the bitcode + manifest in a fresh `Jit` + `Context`, and assert:
+    //   1. The manifest carries ≥1 `RelocKind::StubEntry` entry whose
+    //      `(dll, symbol)` is `("kernel32.dll", "GetTickCount")`
+    //      (case-normalise the dll before comparing).
+    //   2. The replayed `<eval-entry>` returns a sensible integer
+    //      (GetTickCount varies; we accept any non-negative fixnum).
+    //   3. The replay path successfully resolves the named external
+    //      global via `stub_entry_slot_addr` — i.e. the cross-process
+    //      replay invariant the Sprint 38 cache was built to provide.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-stub-roundtrip");
+    nod_llvm::clear_cache_dir(&dir);
+    // SAFETY: env mutation is serialised by `#[serial]`.
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    // GetTickCount is materialised on-the-fly via Sprint 31's
+    // bare-name path — no `define c-function` prelude needed.
+    let cold = eval_expr_to_string("GetTickCount()").expect("cold eval");
+    let cold_n: i64 = cold.parse().expect("integer-shaped return");
+    assert!(cold_n >= 0, "GetTickCount cold result must be non-negative, got {cold_n}");
+
+    // Read back the bitcode + manifest from disk.
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    assert!(!bc_paths.is_empty(), "cache dir should contain ≥1 .bc");
+    let bc_path = bc_paths[0].path();
+    let manifest_path = bc_path.with_extension("manifest.json");
+    let bitcode = std::fs::read(&bc_path).expect("read bitcode");
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).expect("manifest.json must exist for Sprint 38d");
+    let manifest = nod_llvm::ModuleManifest::parse(&manifest_text).expect("manifest parses");
+
+    // Sprint 38d — codegen must have emitted ≥1 StubEntry reloc entry
+    // for GetTickCount@kernel32.dll (case-normalised compare on dll).
+    let stub_entries: Vec<(&str, &str)> = manifest
+        .entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            nod_llvm::RelocKind::StubEntry { dll, symbol, .. } => {
+                Some((dll.as_str(), symbol.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !stub_entries.is_empty(),
+        "manifest must carry ≥1 StubEntry RelocKind entry; got entries: {:?}",
+        manifest.entries
+    );
+    assert!(
+        stub_entries
+            .iter()
+            .any(|(dll, sym)| dll.to_lowercase() == "kernel32.dll" && *sym == "GetTickCount"),
+        "expected GetTickCount@kernel32.dll among stub entries; got {stub_entries:?}"
+    );
+
+    // Fresh JIT + Context — replay the bitcode through the JIT-link
+    // path. The manifest resolver invokes `stub_entry_slot_addr` for
+    // each StubEntry row, which allocates + resolves the entry in the
+    // current process and binds `LLVMAddGlobalMapping(@nod_stub__*, slot)`.
+    let ctx: &'static nod_llvm::LlvmContext =
+        Box::leak(Box::new(nod_llvm::LlvmContext::create()));
+    let mut jit = nod_llvm::Jit::new(ctx).expect("Jit::new");
+    jit.add_module_from_bitcode(ctx, &bitcode, "__replay_stub__", &manifest)
+        .expect("add_module_from_bitcode");
+
+    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+        .expect("<eval-entry> resolves from replayed bitcode");
+    assert!(!ptr.is_null(), "function pointer must be non-null");
+    // GetTickCount returns a DWORD — boxed as a tagged fixnum Word.
+    let f: extern "C-unwind" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+    let raw = f();
+    let untagged = raw >> 1;
+    assert!(
+        untagged >= 0,
+        "replayed GetTickCount result must be non-negative, got {untagged}"
+    );
+
+    // SAFETY: serialised by #[serial].
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[cfg(windows)]
+#[serial]
+fn sprint38d_emitted_ir_has_stub_external_global() {
+    // IR-shape test: confirm the cached `.bc` for an expression that
+    // calls a Win32 API contains an external global
+    // `@nod_stub__<key>__<idx>` and at least one `load i64, ptr
+    // @nod_stub__` site — NOT a baked `i64 <bits>` constant at the
+    // bake location.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-stub-irshape");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    let _ = eval_expr_to_string("GetTickCount()").expect("cold eval");
+
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    let bc_path = bc_paths[0].path();
+    let bitcode = std::fs::read(&bc_path).expect("read bc");
+    let ir = nod_llvm::bitcode_to_ir_text(&bitcode).expect("bitcode_to_ir_text");
+
+    let has_stub_decl = ir.contains("@nod_stub__");
+    assert!(
+        has_stub_decl,
+        "IR must declare an external global for the stub entry; IR:\n{ir}"
+    );
+    let has_load_through_stub = ir.contains("load i64, ptr @nod_stub__");
+    assert!(
+        has_load_through_stub,
+        "IR must contain a `load i64, ptr @nod_stub__*` instruction; IR:\n{ir}"
+    );
+    for line in ir.lines() {
+        if line.contains("nod_stub__") {
+            println!("[IR] {line}");
+        }
+    }
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[cfg(windows)]
+fn sprint38d_stub_entry_slot_addr_is_memoised() {
+    // Direct unit test of the Sprint 38d slot allocator:
+    //   • repeated calls with the same (dll, symbol) return the SAME
+    //     `&'static u64` address;
+    //   • distinct symbols (same dll) return distinct addresses;
+    //   • case-insensitive dll comparison — `Kernel32.dll` and
+    //     `kernel32.dll` share the same slot.
+    //
+    // This is the cross-process invariant that makes the slot allocator
+    // safe to call from multiple replayed modules: each unique Win32 API
+    // resolves to one entry, one fn_ptr, one slot.
+    let sig_get_tick_count = nod_runtime::ApiCallSignature {
+        arg_count: 0,
+        arg_kinds: [0; 12],
+        return_kind: nod_runtime::CReturnKind::UInt32 as u8,
+    };
+    let sig_get_last_error = nod_runtime::ApiCallSignature {
+        arg_count: 0,
+        arg_kinds: [0; 12],
+        return_kind: nod_runtime::CReturnKind::UInt32 as u8,
+    };
+
+    let a = nod_runtime::stub_entry_slot_addr("Kernel32.dll", "GetTickCount", &sig_get_tick_count)
+        as *const u64;
+    let b = nod_runtime::stub_entry_slot_addr("Kernel32.dll", "GetTickCount", &sig_get_tick_count)
+        as *const u64;
+    assert_eq!(a, b, "same (dll, symbol) → same slot address");
+
+    // Distinct symbol in the same DLL → distinct slot.
+    let c = nod_runtime::stub_entry_slot_addr("Kernel32.dll", "GetLastError", &sig_get_last_error)
+        as *const u64;
+    assert_ne!(a, c, "distinct symbols in same dll → distinct slot addresses");
+
+    // Case-insensitive dll: `kernel32.dll` (lowercase) and `Kernel32.dll`
+    // resolve to the same slot.
+    let d = nod_runtime::stub_entry_slot_addr("kernel32.dll", "GetTickCount", &sig_get_tick_count)
+        as *const u64;
+    assert_eq!(
+        a, d,
+        "case-different dll name → same slot (Win32 DLL names are case-insensitive)"
+    );
+
+    // Slot contents are non-null (they hold the address of an
+    // `ApiStubEntry`, freshly leaked at first lookup).
+    // SAFETY: `a` came from the slot allocator and lives for the
+    // process lifetime; dereferencing it reads the `u64` slot value.
+    let entry_ptr_bits = unsafe { *a };
+    assert!(
+        entry_ptr_bits != 0,
+        "slot must hold a non-null ApiStubEntry pointer"
+    );
+}

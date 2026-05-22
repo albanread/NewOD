@@ -395,6 +395,18 @@ static STRING_LITERAL_SLOTS: LazyLock<Mutex<HashMap<String, &'static u64>>> =
 static SYMBOL_LITERAL_SLOTS: LazyLock<Mutex<HashMap<String, &'static u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Sprint 38d — per-(dll, symbol) slot table for Win32 API stub-entry
+/// pointers. Each distinct `(dll.to_lowercase(), symbol)` maps to one
+/// stable `&'static u64` whose contents are the address of an
+/// [`ApiStubEntry`] freshly allocated + resolved in the current process.
+///
+/// **Case handling**: Win32 DLL names are case-insensitive (the
+/// `LoadLibrary` resolver normalises internally), so the slot table
+/// keys on `dll.to_lowercase()`. Symbol names are case-sensitive — the
+/// Windows linker matches them byte-for-byte, so we keep them verbatim.
+static STUB_ENTRY_SLOTS: LazyLock<Mutex<HashMap<(String, String), &'static u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Sprint 38c — stable address of a `u64` holding the raw metadata
 /// pointer (`class_metadata_ptr(id) as u64`) for `class_id`. Repeated
 /// calls with the same id return the SAME `*const u64`.
@@ -446,6 +458,63 @@ pub fn intern_symbol_literal_slot_addr(name: &str) -> *const u64 {
     let slot: &'static u64 = Box::leak(Box::new(bits));
     guard.insert(name.to_string(), slot);
     slot as *const u64
+}
+
+/// Sprint 38d — stable address of a `u64` holding the **address** of an
+/// [`ApiStubEntry`] for `(dll, symbol)`. Repeated calls with the same
+/// `(dll-case-insensitive, symbol)` return the SAME `*const u64` —
+/// multiple JIT-loaded modules referencing the same Win32 API share one
+/// underlying entry (and therefore one resolved `fn_ptr` cell).
+///
+/// The slot's contents are the entry pointer cast to `u64`; codegen
+/// emits `load i64, ptr @nod_stub__<key>__<idx>` to recover the entry
+/// pointer and passes it as the first arg of `nod_winffi_call_N`.
+///
+/// **Resolution failure semantics**: on first lookup we allocate the
+/// entry via [`allocate_stub_table`] and attempt
+/// [`resolve_into_entry`]. If the resolver fails (DLL missing, symbol
+/// not found), we still leak the slot — the entry's `fn_ptr` stays
+/// null, and the Win64 trampoline at call time notices that and
+/// signals `<c-ffi-error>` through the normal Dylan error path. This
+/// matches Sprint 28's at-call-time error discipline: the JIT-link
+/// step must not crash the loader on a missing Win32 export, because
+/// the user's program may handle the condition with `block`/`exception`.
+///
+/// Memoisation makes the second call's lookup a single map probe even
+/// across many call sites — and across processes that load multiple
+/// cached modules referencing the same `(dll, symbol)` pair.
+pub fn stub_entry_slot_addr(
+    dll: &str,
+    symbol: &str,
+    signature: &winffi::ApiCallSignature,
+) -> &'static u64 {
+    let key = (dll.to_lowercase(), symbol.to_string());
+    let mut guard = STUB_ENTRY_SLOTS
+        .lock()
+        .expect("stub entry slot table poisoned");
+    if let Some(&slot) = guard.get(&key) {
+        return slot;
+    }
+    // First lookup for this (dll, symbol): allocate a fresh stub-table
+    // entry in the static area, attempt to resolve it eagerly, and leak
+    // a `u64` slot whose contents are the entry pointer's bits.
+    let specs = vec![winffi::StubEntrySpec {
+        dll: dll.to_string(),
+        symbol: symbol.to_string(),
+        signature: *signature,
+    }];
+    let (_table, ptrs) = winffi::allocate_stub_table(&specs);
+    let entry_ptr = ptrs[0];
+    // SAFETY: `entry_ptr` was just allocated by `allocate_stub_table`
+    // and lives in the static area for the process lifetime.
+    // `resolve_into_entry` populates `fn_ptr` on success; on failure
+    // it leaves `fn_ptr` null and we silently absorb the error here.
+    // The Win64 trampoline at call time checks for null `fn_ptr` and
+    // signals `<c-ffi-error>` through the normal Dylan condition path.
+    let _ = unsafe { winffi::resolve_into_entry(entry_ptr, dll, symbol) };
+    let slot: &'static u64 = Box::leak(Box::new(entry_ptr as u64));
+    guard.insert(key, slot);
+    slot
 }
 
 /// Sprint 13: mint a fresh inline-cache slot in the static area and

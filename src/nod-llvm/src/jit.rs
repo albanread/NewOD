@@ -1090,6 +1090,21 @@ fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String>
             let g = nod_runtime::get_or_create_generic(name);
             g as *const _ as u64
         }
+        // Sprint 38d — same correction as Sprint 38b/c: return the
+        // *address* of a stable slot whose contents are the entry-pointer
+        // bits in the current process, NOT the entry pointer itself.
+        // The JIT-link path registers the slot's address via
+        // `LLVMAddGlobalMapping(@nod_stub__*, slot)`; the IR emits
+        // `load i64, ptr @nod_stub__*` to recover the entry pointer.
+        //
+        // The slot allocator
+        // (`nod_runtime::stub_entry_slot_addr`) handles allocation,
+        // resolution, and memoisation internally. Resolution failure is
+        // absorbed there — the entry's `fn_ptr` stays null and the
+        // Win64 trampoline at call time surfaces `<c-ffi-error>`. This
+        // matches Sprint 28's "errors at call time, not at JIT-link
+        // time" discipline so the loader never crashes on a missing
+        // Win32 export.
         RelocKind::StubEntry { dll, symbol, signature_bytes } => {
             // Reconstruct the ApiCallSignature from the manifest bytes
             // (it's `#[repr(C)] Copy` — bytewise round-trips).
@@ -1115,30 +1130,7 @@ fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String>
                     signature_bytes.len(),
                 );
             }
-            let specs = vec![nod_runtime::StubEntrySpec {
-                dll: dll.clone(),
-                symbol: symbol.clone(),
-                signature: sig,
-            }];
-            let (_table, ptrs) = nod_runtime::allocate_stub_table(&specs);
-            let entry_ptr = ptrs[0];
-            // SAFETY: `entry_ptr` was just allocated by
-            // `allocate_stub_table`; `dll`/`symbol` are valid UTF-8
-            // strings the caller produced. `resolve_into_entry` is
-            // idempotent — calling it on an already-resolved entry is
-            // a documented no-op.
-            unsafe {
-                if let Err(_w) = nod_runtime::resolve_into_entry(entry_ptr, dll, symbol) {
-                    // Resolution failure surfaces as a `<c-ffi-error>`
-                    // Word in the cold path; we surface it as a
-                    // JitError so the cache loader can fall back to
-                    // recompile.
-                    return Err(format!(
-                        "StubEntry resolve failed for `{symbol}@{dll}` in current process"
-                    ));
-                }
-            }
-            entry_ptr as u64
+            nod_runtime::stub_entry_slot_addr(dll, symbol, &sig) as *const u64 as u64
         }
     };
     Ok(addr as *mut std::ffi::c_void)

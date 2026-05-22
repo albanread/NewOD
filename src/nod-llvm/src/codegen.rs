@@ -67,7 +67,7 @@ use nod_runtime::ClassId;
 use crate::cache::CacheKey;
 use crate::symbols::{
     ModuleManifest, RelocKind, class_md_symbol, imm_false_symbol, imm_false_wrapper_symbol,
-    imm_nil_symbol, imm_true_symbol, strlit_symbol, symlit_symbol,
+    imm_nil_symbol, imm_true_symbol, strlit_symbol, stub_symbol, symlit_symbol,
 };
 
 /// Name of the JIT-side `nod_make` external declaration.
@@ -491,6 +491,13 @@ pub(crate) struct ModuleCodegenCtx {
     pub string_lit_idx: RefCell<HashMap<String, u32>>,
     /// Sprint 38c — same shape for `<symbol>` literals.
     pub symbol_lit_idx: RefCell<HashMap<String, u32>>,
+    /// Sprint 38d — per-module content-keyed dedup table for Win32
+    /// stub-entry pointers. Key is `(dll.to_lowercase(), symbol)` so
+    /// case differences in DLL names don't fragment the dedup (Win32
+    /// DLL names are case-insensitive). Symbol names are case-sensitive
+    /// and matched verbatim. The value is the per-module index used to
+    /// namespace the external global `@nod_stub__<key>__<idx>`.
+    pub stub_entry_idx: RefCell<HashMap<(String, String), u32>>,
 }
 
 impl ModuleCodegenCtx {
@@ -500,6 +507,7 @@ impl ModuleCodegenCtx {
             manifest: RefCell::new(ModuleManifest::new(key)),
             string_lit_idx: RefCell::new(HashMap::new()),
             symbol_lit_idx: RefCell::new(HashMap::new()),
+            stub_entry_idx: RefCell::new(HashMap::new()),
         }
     }
 
@@ -525,6 +533,21 @@ impl ModuleCodegenCtx {
         }
         let idx = map.len() as u32;
         map.insert(name.to_string(), idx);
+        idx
+    }
+
+    /// Sprint 38d — look up or assign the per-module index for a Win32
+    /// stub-entry pointer. The key is `(dll.to_lowercase(), symbol)` —
+    /// see `stub_entry_idx`'s doc comment for the case-sensitivity
+    /// rationale.
+    pub fn stub_entry_index(&self, dll: &str, symbol: &str) -> u32 {
+        let key = (dll.to_lowercase(), symbol.to_string());
+        let mut map = self.stub_entry_idx.borrow_mut();
+        if let Some(&idx) = map.get(&key) {
+            return idx;
+        }
+        let idx = map.len() as u32;
+        map.insert(key, idx);
         idx
     }
 }
@@ -650,6 +673,48 @@ fn get_or_add_symbol_literal_global<'ctx>(
         symbol,
         RelocKind::SymbolLiteral {
             name: name.to_string(),
+        },
+    );
+    g
+}
+
+/// Sprint 38d — per-module external global for a Win32 stub-entry
+/// pointer. The slot's contents at JIT-link time are the `u64`-cast
+/// address of an [`nod_runtime::ApiStubEntry`] freshly allocated in the
+/// current process (via [`nod_runtime::stub_entry_slot_addr`]); the
+/// loaded value is the entry pointer that `nod_winffi_call_N` takes
+/// as its first argument.
+///
+/// `idx` is the per-module content-keyed index assigned by
+/// `ModuleCodegenCtx::stub_entry_index`. Calls within one module dedup
+/// on `(dll.to_lowercase(), symbol)` so the global is created exactly
+/// once per distinct Win32 API. `signature_bytes` is bytewise-encoded
+/// [`nod_runtime::ApiCallSignature`] and is carried in the manifest so
+/// the warm-replay resolver can reconstruct the same marshaling shape
+/// without redoing sema-side type analysis.
+fn get_or_add_stub_entry_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    idx: u32,
+    dll: &str,
+    symbol: &str,
+    signature_bytes: &[u8],
+) -> GlobalValue<'ctx> {
+    let sym = stub_symbol(mctx.key, idx);
+    if let Some(g) = module.get_global(&sym) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &sym);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    mctx.manifest.borrow_mut().push(
+        sym,
+        RelocKind::StubEntry {
+            dll: dll.to_string(),
+            symbol: symbol.to_string(),
+            signature_bytes: signature_bytes.to_vec(),
         },
     );
     g
@@ -1067,6 +1132,40 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         Ok(v)
     }
 
+    /// Sprint 38d — load the address of an [`nod_runtime::ApiStubEntry`]
+    /// for `(dll, symbol)` from the per-module external global. The
+    /// loaded `i64` value is the entry pointer that `nod_winffi_call_N`
+    /// takes as its first argument — the trampoline then reads
+    /// `fn_ptr` and `signature` off the entry struct.
+    ///
+    /// `(dll, symbol)` is deduped within the module (case-insensitive
+    /// dll, case-sensitive symbol) so repeated references emit one
+    /// global, one manifest row, and one IR-level load per use.
+    fn load_stub_entry(
+        &self,
+        dll: &str,
+        symbol: &str,
+        signature_bytes: &[u8],
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let idx = self.mctx.stub_entry_index(dll, symbol);
+        let g = get_or_add_stub_entry_global(
+            self.ctx,
+            self.module,
+            self.mctx,
+            idx,
+            dll,
+            symbol,
+            signature_bytes,
+        );
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "stub_entry.load")
+            .map_err(map_err)?
+            .into_int_value();
+        Ok(v)
+    }
+
     /// Sprint 38b — convert an `i1` to a Sprint 10 tagged-boolean Dylan
     /// value. `#t` and `#f` are pointer-tagged Words referring to
     /// pinned heap wrappers; we load both via external globals (Sprint
@@ -1439,6 +1538,15 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             ConstValue::StringLiteralRef(text) => self.load_string_literal(text)?.into(),
             // Sprint 38c — interned `<symbol>` literal reference.
             ConstValue::SymbolLiteralRef(name) => self.load_symbol_literal(name)?.into(),
+            // Sprint 38d — Win32 stub-entry pointer reference. Loads the
+            // entry pointer via per-module external global; the slot's
+            // contents are bound to a freshly-allocated, eagerly-resolved
+            // `ApiStubEntry` in the current process by the JIT-link path.
+            ConstValue::StubEntryRef {
+                dll,
+                symbol,
+                signature_bytes,
+            } => self.load_stub_entry(dll, symbol, signature_bytes)?.into(),
         })
     }
 
