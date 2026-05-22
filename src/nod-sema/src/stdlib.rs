@@ -206,6 +206,10 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
     nod_runtime::ensure_conditions_registered();
     nod_runtime::ensure_collections_registered();
     nod_runtime::ensure_tables_registered();
+    // Sprint 34: register `<c-struct>` and the seed struct classes
+    // (`<point>`, `<rect>`, …) before the stdlib parses its field
+    // accessors. Idempotent.
+    nod_runtime::ensure_structs_registered();
 
     // Sprint 29: parse every file in `STDLIB_FILES` and merge their
     // items into a single module. The first file (stdlib.dylan)

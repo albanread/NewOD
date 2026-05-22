@@ -57,6 +57,7 @@ mod roots;
 mod stack_map;
 mod static_area;
 mod strings;
+mod structs;
 mod symbols;
 mod tables;
 mod tracer;
@@ -162,6 +163,14 @@ pub use roots::RootSet;
 pub use stack_map::{LiveSlot, ParkedFrame, StackMap, StackMapEntry, walk_parked_frame};
 pub use static_area::StaticArea;
 pub use strings::{ByteString, try_byte_string};
+pub use structs::{
+    c_struct_class_id, ensure_structs_registered, filetime_class_id, is_c_struct_instance,
+    msg_class_id, nod_struct_get_i32, nod_struct_get_i64, nod_struct_get_pointer,
+    nod_struct_get_u16, nod_struct_get_u32, nod_struct_get_u64, nod_struct_set_i32,
+    nod_struct_set_i64, nod_struct_set_pointer, nod_struct_set_u16, nod_struct_set_u32,
+    nod_struct_set_u64, point_class_id, rect_class_id, size_class_id, struct_layout_for,
+    systemtime_class_id,
+};
 pub use symbols::{Symbol, SymbolTable, try_symbol};
 pub use tables::{
     ensure_registered as ensure_tables_registered, is_table, make_not_hashable_error, make_table,

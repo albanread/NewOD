@@ -225,6 +225,24 @@ pub const NOD_ENV_CELL_SYMBOL: &str = "nod_env_cell";
 pub const NOD_MAKE_ENVIRONMENT_SYMBOL: &str = "nod_make_environment";
 pub const NOD_MAKE_CLOSURE_SYMBOL: &str = "nod_make_closure";
 
+// ─── Sprint 34 — <c-struct> field accessor primitives ─────────────────────
+//
+// Each (get, set) pair takes the struct Word and a byte offset and
+// returns/writes a typed value (fixnum-shaped). Wired into the stdlib
+// via `%struct-get-*` / `%struct-set-*` primitives.
+pub const NOD_STRUCT_GET_I32_SYMBOL: &str = "nod_struct_get_i32";
+pub const NOD_STRUCT_SET_I32_SYMBOL: &str = "nod_struct_set_i32";
+pub const NOD_STRUCT_GET_I64_SYMBOL: &str = "nod_struct_get_i64";
+pub const NOD_STRUCT_SET_I64_SYMBOL: &str = "nod_struct_set_i64";
+pub const NOD_STRUCT_GET_U16_SYMBOL: &str = "nod_struct_get_u16";
+pub const NOD_STRUCT_SET_U16_SYMBOL: &str = "nod_struct_set_u16";
+pub const NOD_STRUCT_GET_U32_SYMBOL: &str = "nod_struct_get_u32";
+pub const NOD_STRUCT_SET_U32_SYMBOL: &str = "nod_struct_set_u32";
+pub const NOD_STRUCT_GET_U64_SYMBOL: &str = "nod_struct_get_u64";
+pub const NOD_STRUCT_SET_U64_SYMBOL: &str = "nod_struct_set_u64";
+pub const NOD_STRUCT_GET_POINTER_SYMBOL: &str = "nod_struct_get_pointer";
+pub const NOD_STRUCT_SET_POINTER_SYMBOL: &str = "nod_struct_set_pointer";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -306,6 +324,21 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     // Sprint 32 — closure-to-C-callback trampoline registration.
     ("nod_register_wndproc", NOD_REGISTER_WNDPROC_SYMBOL, 1),
     ("nod_register_wndenumproc", NOD_REGISTER_WNDENUMPROC_SYMBOL, 1),
+    // Sprint 34 — <c-struct> field accessors. Each get/set is (s, offset)
+    // / (value, s, offset), with `offset` baked as a plain fixnum literal
+    // by the stdlib accessor body.
+    ("nod_struct_get_i32", NOD_STRUCT_GET_I32_SYMBOL, 2),
+    ("nod_struct_set_i32", NOD_STRUCT_SET_I32_SYMBOL, 3),
+    ("nod_struct_get_i64", NOD_STRUCT_GET_I64_SYMBOL, 2),
+    ("nod_struct_set_i64", NOD_STRUCT_SET_I64_SYMBOL, 3),
+    ("nod_struct_get_u16", NOD_STRUCT_GET_U16_SYMBOL, 2),
+    ("nod_struct_set_u16", NOD_STRUCT_SET_U16_SYMBOL, 3),
+    ("nod_struct_get_u32", NOD_STRUCT_GET_U32_SYMBOL, 2),
+    ("nod_struct_set_u32", NOD_STRUCT_SET_U32_SYMBOL, 3),
+    ("nod_struct_get_u64", NOD_STRUCT_GET_U64_SYMBOL, 2),
+    ("nod_struct_set_u64", NOD_STRUCT_SET_U64_SYMBOL, 3),
+    ("nod_struct_get_pointer", NOD_STRUCT_GET_POINTER_SYMBOL, 2),
+    ("nod_struct_set_pointer", NOD_STRUCT_SET_POINTER_SYMBOL, 3),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

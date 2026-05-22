@@ -988,6 +988,64 @@ Plus five in-module unit tests in `nod-runtime/src/callbacks.rs::tests` (`#[seri
 - **Unified `as-c-callback(closure, sig-symbol)` surface.** Pending Dylan-side `select` lowering for the symbol-dispatched form.
 - **`extern "system"` panic-on-unwind discipline.** Sprint 32 has the same UB exposure as Sprint 28's `nod_winffi_call_N` — a Dylan signal that crosses the OS callback boundary aborts (on Windows MSVC, panic crossing `extern "system"` is structurally unwound with a `STATUS_STACK_BUFFER_OVERRUN` abort). The mitigation is the same as Sprint 28's: trust callers to handle conditions before the closure returns. Tightening this (catching unwinds inside the dispatcher and returning a default value with a side-channel error) is a Sprint 33+ task.
 
+### Sprint 34 — Structs: `<c-struct>` family for IDE-essential Win32 shapes — landed
+
+**Goal:** `let pt = make(<point>); GetCursorPos(pt); point-x(pt) + point-y(pt)` runs through `eval_expr_to_string` and returns a real screen-cursor coordinate sum — empirical proof that struct allocation, address-of marshaling, field setters (by the C function via pointer), and field getters (Dylan reading the buffer back) all work end-to-end. The keystone IDE-essential FFI capability: `GetMessageW(LPMSG, …)`, `BeginPaint`, `GetCursorPos`, `GetClientRect`, `SetRect`, `GetSystemTime`, `GetLocalTime`, and every other Win32 API that takes a pointer to a caller-allocated struct.
+
+**A. `<c-struct>` infrastructure (`nod-runtime/src/structs.rs`).** A new module registers a `<c-struct>` parent class at process boot via `ensure_structs_registered`, then six concrete subclasses (`<point>`, `<rect>`, `<size>`, `<filetime>`, `<systemtime>`, `<msg>`). Each concrete class:
+
+- has `instance_size = 8 (wrapper) + struct_byte_size` matching the Win64 `sizeof` (POINT=8, RECT=16, SIZE=8, FILETIME=8, SYSTEMTIME=16, MSG=48);
+- carries `is_byte_payload: true` on the `ClassMetadata` so the GC's `DylanLayout` reports an opaque payload (same pattern as `<byte-string>`);
+- has a per-field layout table (`StructFieldInfo { name, offset, kind }`) accessible via `struct_layout_for(class_id)` for diagnostics.
+
+Concrete struct classes bypass `register_simple_user_class` (which fixes instance size at `8 + 8*slot_count` and forces `is_byte_payload = false`) and go through a Sprint 34–local `register_struct` helper that allocates a custom `ClassMetadata` directly in the static area.
+
+**B. Field accessor primitives (`nod-runtime/src/structs.rs`).** Each `nod_struct_get_*` / `nod_struct_set_*` pair takes a struct Word and a fixnum-tagged byte offset; the get returns a tagged fixnum, the set returns the value Word (Dylan setter convention). Sprint 34 wires six widths: i32, i64, u16, u32, u64, pointer. Unaligned reads/writes throughout so packed fields (e.g. `WPARAM` at MSG offset 16) need no extra alignment care.
+
+The primitives' `offset` arg is itself a fixnum-tagged Word (`n << 1`) — JIT-emitted code passes Dylan integer literals which lower to tagged Words; a `decode_offset` helper unpacks the tag. Sprint 34 caught this convention mismatch the hard way (initial implementation treated the raw u64 as the offset, which silently doubled every access; field roundtrips passed because set and get cancelled out, but Win32 calls — which write at the true offsets — surfaced the bug as wrong field positions when read back).
+
+**C. Stdlib field accessors (`nod-dylan/dylan-sources/stdlib.dylan`).** One getter and one setter per field of every seed struct, ~60 functions total, hand-generated. The setter signature follows the Sprint 12 unary-setter calling convention (`slot-getter(obj) := v` → `slot-getter-setter(obj, v)`): `point-x-setter(p, v)` forwards to `%struct-set-i32(v, p, 0)`. Sprint 35+ adds a `define c-struct` Dylan-side parser surface that emits these automatically.
+
+**D. Auto-coerce in marshaling (`nod-runtime/src/winffi.rs::unbox_arg`).** When a `<c-function>` parameter is declared `<c-pointer>` or `<c-handle>` AND the actual Dylan arg is a pointer-tagged `<c-struct>` subclass instance, the marshaler passes `wrapper_ptr + 8` (the byte-payload start) instead of the wrapper address itself. The recognition test is `is_c_struct_instance(w)`, which walks the wrapper's class through `is_subclass(class, <c-struct>)`. The walk is short (Sprint 34 seed structs have a 3-entry CPL: self → `<c-struct>` → `<object>`), and Sprint 34 measured no observable hot-path impact — the `OnceLock::get` for the c-struct class id is non-locking, and `is_subclass` is a linear scan of a 3-entry Vec.
+
+**E. Tests (`tests/nod-tests/tests/winffi_structs.rs`, plus inline `#[cfg(test)]` in `structs.rs`).**
+
+Pure-Dylan field roundtrips (no Win32):
+- `point_alloc_zeroes_fields` — `make(<point>)` zero-fills the payload; reading both fields returns `"0"`.
+- `point_field_setter_roundtrip` — `point-x(p) := 42; point-y(p) := 99; point-x(p) + point-y(p)` returns `"141"`.
+- `rect_all_four_fields` — set all four `<rect>` fields, compute width + height, expect `"270"`.
+- `systemtime_u16_field_roundtrip` — `<systemtime>` u16 fields roundtrip through `2026 + 5 + 22 = "2053"`.
+- `msg_mixed_width_fields_roundtrip` — `<msg>` exercises pointer, u32, u64, i64, i32 widths in one expression; sum `"15377"`.
+- `point_is_subclass_of_c_struct` — `instance?(make(<point>), <c-struct>)` returns `"#t"`.
+
+Rust-side metadata + GC:
+- `instance_sizes_match_win64_sizeof` — POINT=16, RECT=24, SIZE=16, FILETIME=16, SYSTEMTIME=24, MSG=56 (including 8-byte wrapper).
+- `point_survives_minor_gc` — root-installed `<point>` survives a `collect_minor()` cycle with its field intact.
+
+Win32 headlines:
+- **`get_cursor_pos_returns_screen_coords`** — **the Sprint 34 headline**. `GetCursorPos(pt)` writes real cursor x/y; Dylan reads them and the sum lands in a sensible `[−100k, 100k)` range. Run output: `[Sprint34 headline] GetCursorPos x+y = 44`.
+- **`get_system_time_returns_current_year`** — `GetSystemTime(st); systemtime-year(st)` returns the current UTC year. Run output: `[Sprint34 headline] GetSystemTime year = 2026`.
+- **`set_rect_populates_all_four_fields`** — `SetRect(r, 10, 20, 30, 40)` writes left/top/right/bottom; Dylan packs them as `left + top*10 + right*100 + bottom*1000 = 43210`. Run output: `[Sprint34 headline] SetRect packed sum = 43210`.
+- `get_local_time_returns_sensible_month_and_day` — month ∈ [1,12], day ∈ [1,31].
+
+**F. Verification.** 532 / 0 / 7 under `newgc-backend` default (512 → 532; +20 new tests across `winffi_structs.rs` integration suite and `structs.rs` inline unit tests). 5x sequential flake clean. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Headline acceptance:**
+- `GetCursorPos x+y = 44` — actual desktop cursor coordinates rendered through Dylan.
+- `GetSystemTime year = 2026` — Win32 wrote `2026` as a u16 at SYSTEMTIME offset 0; Dylan read it back.
+- `SetRect packed sum = 43210` — all four `<rect>` fields populated by the Win32 API and read back by Dylan in correct positions.
+
+**One existing fixture rename.** `tests/nod-tests/fixtures/point.dylan` defined a user-class `<point>` for the Sprint 12 distance-squared regression. With `<point>` now a seed struct, the fixture's class collided at lowering time (the `<point>` name resolves to the seed class, and a fresh `define class <point>` triggers `ClassRedefinitionNotSupported`). Renamed the fixture's class to `<user-point>` — purely a name change; no behavioural impact on the regression test.
+
+**Out of scope (deferred — see DEFERRED.md):**
+
+- `define c-struct` Dylan-side parser surface. Sprint 34 seeds six structs in Rust; the user surface for declaring new structs from Dylan source is a Sprint 35+ task.
+- **Struct-by-value marshaling.** Win64 ABI rules for ≤8-byte structs (passed in register) and >8-byte structs (passed via hidden pointer) are real but every IDE-essential Win32 API uses pointer parameters (`LPMSG`, `LPRECT`, `LPPOINT`). Defer until a real use case demands it.
+- **Nested struct field syntax.** MSG.pt is a POINT; Sprint 34 surfaces `msg-pt-x(m)` / `msg-pt-y(m)` as flat-offset accessors. Dotted-notation `msg.pt.x` access lands with the `define c-struct` parser.
+- **Variable-length structs.** `BITMAPINFO`'s `bmiColors[1]` header-trick layout (and similar APIs) requires a different allocation model. Sprint 35+.
+- **C → Dylan struct view.** Sprint 34 auto-coerces Dylan-struct → C-pointer one way only. A Win32 API that returns `LPRECT` and the Dylan caller wants to read its fields requires explicit `wrap-as-rect(ptr)` in Sprint 34 (deferred — no IDE-track API in the seed set returns a struct pointer that Dylan needs to read).
+- **Per-bucket "is-c-struct" Wrapper flag.** Sprint 34 uses `is_subclass(class, <c-struct>)` for the auto-coerce decision; the CPL walk is 3 entries deep so the cost is negligible. If a future profile shows the test as hot, switching to a dedicated bit on the Wrapper (parallel to Sprint 22's bucket-state byte) is a one-line change.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
@@ -1009,8 +1067,8 @@ Thread-local TLABs, parking protocol, lock primitives in Dylan-side code. Run `o
 ### Sprint 33 — Library-merge optimisation (v2 candidate moved up if cheap)
 DFM serialisation, cache-key extension with downstream library hashes, cross-library inlining gated on sealing. May slip to post-v1.
 
-### Sprint 34 — AOT mode — emit a standalone Windows executable
-JIT artefacts written out as a PE binary plus a shipped `nod-runtime` static lib. Cache key already covers it; mostly a packaging exercise.
+### Sprint 34b — AOT mode — emit a standalone Windows executable
+(Renumbered: Sprint 34 was reclaimed by the `<c-struct>` family work above — see "Sprint 34 — Structs".) JIT artefacts written out as a PE binary plus a shipped `nod-runtime` static lib. Cache key already covers it; mostly a packaging exercise.
 
 ### Sprint 35 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
 All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.

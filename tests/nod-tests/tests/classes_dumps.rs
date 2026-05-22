@@ -1,5 +1,5 @@
 //! Sprint 12 — supplementary dump helpers. Reads the point.dylan
-//! fixture and prints the LLVM IR for `<point>-getter-x` and the
+//! fixture and prints the LLVM IR for `<user-point>-getter-x` and the
 //! full `dump_classes()` listing. Used by the sprint-acceptance
 //! report (`cargo test -p nod-tests --test classes_dumps -- --nocapture`).
 
@@ -15,9 +15,9 @@ fn fixtures_dir() -> PathBuf {
 fn dump_point_llvm_and_classes() {
     let path = fixtures_dir().join("point.dylan");
     let ir = dump_llvm_for_file(&path).expect("dump LLVM IR for point.dylan");
-    println!("=== <point>-getter-x slice ===");
+    println!("=== <user-point>-getter-x slice ===");
     for line_block in split_llvm_functions(&ir) {
-        if line_block.contains("<point>-getter-x") {
+        if line_block.contains("<user-point>-getter-x") {
             println!("{line_block}");
         }
     }

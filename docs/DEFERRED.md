@@ -2087,3 +2087,92 @@ The remaining work is breadth (more signatures), lifecycle
   augmentation for cross-thread roots" would belt-and-brace
   this. Probably folded into the cross-thread callback work
   above.
+
+## Carry-over from Sprint 34 (`<c-struct>` family for IDE-essential Win32 shapes) — into Sprint 35+
+
+Sprint 34 closes the third keystone IDE-essential FFI capability:
+Dylan can now allocate caller-side structs, hand them to Win32 APIs by
+pointer, let the API populate the bytes, and read the fields back.
+Together with Sprint 28 (Win32 calls) and Sprint 32 (Win32 callbacks),
+this is the entire FFI surface the IDE message loop needs. The
+remaining work is breadth (more shapes via a Dylan-side parser surface)
+and a few corner cases the seed-struct set didn't touch.
+
+- **:open: `define c-struct` Dylan-side parser surface** — Sprint 34 →
+  Sprint 35+. Sprint 34 hard-codes six seed structs in Rust
+  (`structs.rs::ensure_structs_registered`). The Dylan-side syntax
+  for declaring new structs in user code is unimplemented. The shape:
+  ```dylan
+  define c-struct <my-struct>
+    slot field-a :: <c-int>;
+    slot field-b :: <c-pointer>;
+  end c-struct;
+  ```
+  lowers to: (a) sema computes field offsets per Win64 alignment
+  rules; (b) registers the class via `register_struct` (the helper
+  Sprint 34 used for the seed structs); (c) emits the per-field
+  accessor functions automatically (eliminates the ~60-line
+  hand-typed accessor block at the end of `stdlib.dylan`). The
+  surface and the codegen are both modest; the work is mostly
+  reader + sema plumbing.
+- **:open: Struct-by-value marshaling** — Sprint 34 → Sprint 35+ or
+  later. Win64 ABI rules for ≤8-byte structs (passed in register)
+  and >8-byte structs (passed via hidden pointer). Sprint 34
+  deliberately defers because every IDE-essential Win32 API uses
+  pointer parameters. A real use case (audio APIs that take a
+  `WAVEFORMATEX` by value? GDI APIs that return a `POINTL`?) would
+  motivate this; until one shows up, the cost-to-value ratio is
+  poor.
+- **:open: Nested struct field syntax (`msg.pt.x`)** — Sprint 34 →
+  Sprint 35+. MSG.pt is a nested POINT. Sprint 34 surfaces
+  `msg-pt-x(m)` and `msg-pt-y(m)` as flat-offset accessors. The
+  Dylan-idiomatic `msg.pt.x` form needs: (a) reader-level slot-dot
+  syntax that doesn't collide with method-call dot syntax; (b)
+  sema-level resolution that walks the field-tree per struct
+  metadata. Will land alongside the `define c-struct` surface.
+- **:open: Variable-length struct layouts** — Sprint 34 → Sprint
+  35+. APIs like `BITMAPINFO` declare a `BITMAPINFOHEADER bmiHeader`
+  + `RGBQUAD bmiColors[1]` and rely on the caller allocating
+  extra trailing bytes. Sprint 34's `instance_size` is fixed at
+  class-registration time. The fix needs a per-allocation size
+  override (similar to `<simple-object-vector>`'s `len`-driven
+  allocation) and a Dylan-side `make(<bitmap-info>, color-count:
+  N)` keyword. Defer until a real use case (the IDE's bitmap
+  rendering for the syntax-coloured pane is an obvious candidate).
+- **:open: C → Dylan struct view** — Sprint 34 → Sprint 35+. Sprint
+  34 auto-coerces Dylan-struct → C-pointer one way only (the
+  Dylan caller allocates, the C API populates). The reverse
+  direction — a Win32 API returns `LPRECT` and the Dylan caller
+  wants to read its fields without copying — requires a
+  `wrap-as-rect(ptr)` form that builds a Dylan struct Word
+  pointing at the existing C buffer. The catch is lifetime: the
+  buffer often belongs to the C heap (e.g. `GetMonitorInfoW` fills
+  a caller-owned buffer but `LockWindowUpdate`-style APIs hand
+  back library-owned memory) and Dylan-side GC mustn't touch it.
+  A Dylan `<c-struct-view>` shape that's NOT GC-managed (no
+  wrapper header, pure pointer wrapper) is the architectural
+  answer. Unblocked by the `define c-struct` surface — once
+  user code declares its own structs, the C-view form is a
+  natural extension.
+- **:open: `is-c-struct` flag on `Wrapper`** — Sprint 34 → polish
+  follow-up if profiling demands it. Sprint 34 uses
+  `is_subclass(class, <c-struct>)` to decide the marshaling
+  auto-coerce. The CPL walk is 3 entries deep for the seed
+  structs; a `define c-struct` user shape inherits from
+  `<c-struct>` directly, so it stays at 3 entries. If a
+  profile ever shows this as hot, the fix is a bit on the
+  `Wrapper`'s GC-bits region (parallel to Sprint 22's
+  bucket-state byte) flagging "this is a struct". Sprint 34
+  measured no observable cost; the flag is a one-line change
+  if needed later.
+- **:open: u64 fixnum truncation on struct field reads** —
+  Sprint 34 → Sprint 35+ (number-tower follow-up). Sprint 34's
+  `nod_struct_get_u64` masks the returned value into the 62-bit
+  fixnum positive range, matching Sprint 28's `box_return`
+  UInt64 convention. A `WPARAM` carrying a true 64-bit handle
+  larger than 2^62 silently truncates. The fix lives in the
+  number tower: a real `<big-integer>` Dylan type that supports
+  the full u64 range. Sprint 34's tests stay safely under the
+  threshold (the MSG roundtrip uses `wParam := 1000`, well within
+  62-bit positive). Same truncation already applied to FFI
+  return values; both lift together when the bignum lands.

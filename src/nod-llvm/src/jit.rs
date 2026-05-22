@@ -43,6 +43,11 @@ use crate::codegen::{
     NOD_WINFFI_CALL_6_SYMBOL, NOD_WINFFI_CALL_7_SYMBOL, NOD_WINFFI_CALL_8_SYMBOL,
     // Sprint 32 — closure-to-C-callback trampoline registration.
     NOD_REGISTER_WNDENUMPROC_SYMBOL, NOD_REGISTER_WNDPROC_SYMBOL,
+    // Sprint 34 — <c-struct> field accessor primitives.
+    NOD_STRUCT_GET_I32_SYMBOL, NOD_STRUCT_GET_I64_SYMBOL, NOD_STRUCT_GET_POINTER_SYMBOL,
+    NOD_STRUCT_GET_U16_SYMBOL, NOD_STRUCT_GET_U32_SYMBOL, NOD_STRUCT_GET_U64_SYMBOL,
+    NOD_STRUCT_SET_I32_SYMBOL, NOD_STRUCT_SET_I64_SYMBOL, NOD_STRUCT_SET_POINTER_SYMBOL,
+    NOD_STRUCT_SET_U16_SYMBOL, NOD_STRUCT_SET_U32_SYMBOL, NOD_STRUCT_SET_U64_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -349,6 +354,55 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_REGISTER_WNDENUMPROC_SYMBOL),
                 nod_runtime::nod_register_wndenumproc as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 34 — <c-struct> field accessor primitives.
+            (
+                module.get_function(NOD_STRUCT_GET_I32_SYMBOL),
+                nod_runtime::nod_struct_get_i32 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_SET_I32_SYMBOL),
+                nod_runtime::nod_struct_set_i32 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_GET_I64_SYMBOL),
+                nod_runtime::nod_struct_get_i64 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_SET_I64_SYMBOL),
+                nod_runtime::nod_struct_set_i64 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_GET_U16_SYMBOL),
+                nod_runtime::nod_struct_get_u16 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_SET_U16_SYMBOL),
+                nod_runtime::nod_struct_set_u16 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_GET_U32_SYMBOL),
+                nod_runtime::nod_struct_get_u32 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_SET_U32_SYMBOL),
+                nod_runtime::nod_struct_set_u32 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_GET_U64_SYMBOL),
+                nod_runtime::nod_struct_get_u64 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_SET_U64_SYMBOL),
+                nod_runtime::nod_struct_set_u64 as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_GET_POINTER_SYMBOL),
+                nod_runtime::nod_struct_get_pointer as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_STRUCT_SET_POINTER_SYMBOL),
+                nod_runtime::nod_struct_set_pointer as *const () as *mut std::ffi::c_void,
             ),
         ];
 

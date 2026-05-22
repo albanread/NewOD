@@ -283,6 +283,22 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // can call through the standard Win64 ABI.
     ("%register-wndproc", "nod_register_wndproc", 1, TypeEstimate::Top),
     ("%register-wndenumproc", "nod_register_wndenumproc", 1, TypeEstimate::Top),
+    // Sprint 34 — <c-struct> field accessors. Get primitives return an
+    // <integer>; set primitives return the value Word (Dylan setter
+    // convention). The offset arg is a fixnum literal baked into the
+    // stdlib accessor.
+    ("%struct-get-i32", "nod_struct_get_i32", 2, TypeEstimate::Integer),
+    ("%struct-set-i32", "nod_struct_set_i32", 3, TypeEstimate::Integer),
+    ("%struct-get-i64", "nod_struct_get_i64", 2, TypeEstimate::Integer),
+    ("%struct-set-i64", "nod_struct_set_i64", 3, TypeEstimate::Integer),
+    ("%struct-get-u16", "nod_struct_get_u16", 2, TypeEstimate::Integer),
+    ("%struct-set-u16", "nod_struct_set_u16", 3, TypeEstimate::Integer),
+    ("%struct-get-u32", "nod_struct_get_u32", 2, TypeEstimate::Integer),
+    ("%struct-set-u32", "nod_struct_set_u32", 3, TypeEstimate::Integer),
+    ("%struct-get-u64", "nod_struct_get_u64", 2, TypeEstimate::Integer),
+    ("%struct-set-u64", "nod_struct_set_u64", 3, TypeEstimate::Integer),
+    ("%struct-get-pointer", "nod_struct_get_pointer", 2, TypeEstimate::Integer),
+    ("%struct-set-pointer", "nod_struct_set_pointer", 3, TypeEstimate::Integer),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

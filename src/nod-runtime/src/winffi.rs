@@ -848,10 +848,30 @@ fn unbox_arg(w: Word, kind: u8, temps: &mut Vec<TempBuf>) -> u64 {
             // numeric handle (so callers can pass e.g. `$NULL` = 0).
             // A pointer-tagged Word carries an 8-byte-aligned address;
             // we strip the tag bit and pass the raw address.
+            //
+            // Sprint 34 auto-coerce: if the pointer-tagged Word is a
+            // `<c-struct>` subclass instance, pass the address of its
+            // byte payload (`wrapper_ptr + 8`) instead of the wrapper
+            // address itself. This is what every IDE-essential Win32
+            // API expects when it declares `LPRECT`, `LPMSG`, `LPPOINT`,
+            // etc. — a pointer to the caller-allocated bytes, not to a
+            // header-prefixed Dylan heap object.
+            //
+            // SAFETY: `is_c_struct_instance` checks the wrapper class is
+            // a registered <c-struct> subclass; `as_ptr` returns the
+            // wrapper's address; payload starts immediately after the
+            // 8-byte Wrapper header. The payload lifetime spans the
+            // call because the Dylan caller's stack frame keeps the
+            // struct alive (the JIT registers the struct slot as a GC
+            // root, exactly as for any other heap-allocated arg).
             if let Some(n) = w.as_fixnum() {
                 n as u64
             } else if let Some(p) = w.as_ptr::<u8>() {
-                p as u64
+                if crate::is_c_struct_instance(w) {
+                    (p as u64) + std::mem::size_of::<crate::Wrapper>() as u64
+                } else {
+                    p as u64
+                }
             } else {
                 0
             }
