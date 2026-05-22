@@ -41,6 +41,8 @@ use crate::codegen::{
     NOD_WINFFI_CALL_0_SYMBOL, NOD_WINFFI_CALL_1_SYMBOL, NOD_WINFFI_CALL_2_SYMBOL,
     NOD_WINFFI_CALL_3_SYMBOL, NOD_WINFFI_CALL_4_SYMBOL, NOD_WINFFI_CALL_5_SYMBOL,
     NOD_WINFFI_CALL_6_SYMBOL, NOD_WINFFI_CALL_7_SYMBOL, NOD_WINFFI_CALL_8_SYMBOL,
+    // Sprint 32 — closure-to-C-callback trampoline registration.
+    NOD_REGISTER_WNDENUMPROC_SYMBOL, NOD_REGISTER_WNDPROC_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -338,6 +340,15 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_WINFFI_CALL_8_SYMBOL),
                 nod_runtime::nod_winffi_call_8 as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 32 — closure-to-C-callback trampoline registration.
+            (
+                module.get_function(NOD_REGISTER_WNDPROC_SYMBOL),
+                nod_runtime::nod_register_wndproc as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_REGISTER_WNDENUMPROC_SYMBOL),
+                nod_runtime::nod_register_wndenumproc as *const () as *mut std::ffi::c_void,
             ),
         ];
 

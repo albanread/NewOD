@@ -33,5 +33,11 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Sprint 32: in-module callbacks unit tests must run serially since
+# they mutate the process-global callback registry. The test-runner
+# default runs tests in parallel across threads.
+serial_test = "3"
+
 [lints]
 workspace = true

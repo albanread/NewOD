@@ -433,6 +433,7 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "newgc-core",
+ "serial_test",
  "windows-sys 0.59.0",
 ]
 

@@ -209,6 +209,14 @@ pub const NOD_WINFFI_CALL_6_SYMBOL: &str = "nod_winffi_call_6";
 pub const NOD_WINFFI_CALL_7_SYMBOL: &str = "nod_winffi_call_7";
 pub const NOD_WINFFI_CALL_8_SYMBOL: &str = "nod_winffi_call_8";
 
+// ─── Sprint 32 — closure → C callback function-pointer trampolines ────────
+//
+// One extern per Win32 callback signature. Each takes a Dylan closure
+// Word and returns a `<c-pointer>` Word whose payload is the raw
+// trampoline address that Win32 will call through standard Win64 ABI.
+pub const NOD_REGISTER_WNDPROC_SYMBOL: &str = "nod_register_wndproc";
+pub const NOD_REGISTER_WNDENUMPROC_SYMBOL: &str = "nod_register_wndenumproc";
+
 // ─── Sprint 24 — closures: <cell> and <environment> ───────────────────────
 pub const NOD_MAKE_CELL_SYMBOL: &str = "nod_make_cell";
 pub const NOD_CELL_GET_SYMBOL: &str = "nod_cell_get";
@@ -295,6 +303,9 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_winffi_call_6", NOD_WINFFI_CALL_6_SYMBOL, 7),
     ("nod_winffi_call_7", NOD_WINFFI_CALL_7_SYMBOL, 8),
     ("nod_winffi_call_8", NOD_WINFFI_CALL_8_SYMBOL, 9),
+    // Sprint 32 — closure-to-C-callback trampoline registration.
+    ("nod_register_wndproc", NOD_REGISTER_WNDPROC_SYMBOL, 1),
+    ("nod_register_wndenumproc", NOD_REGISTER_WNDENUMPROC_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

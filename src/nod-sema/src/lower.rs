@@ -277,6 +277,12 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%table-values", "nod_table_values", 1, TypeEstimate::Top),
     ("%object-hash", "nod_object_hash", 1, TypeEstimate::Integer),
     ("%object-equal?", "nod_object_equal_p", 2, TypeEstimate::Boolean),
+    // Sprint 32 — closure → C function pointer trampolines. Each
+    // primitive takes a `<function>` Word and returns a fixnum-tagged
+    // `<c-pointer>` Word whose payload is the trampoline address Win32
+    // can call through the standard Win64 ABI.
+    ("%register-wndproc", "nod_register_wndproc", 1, TypeEstimate::Top),
+    ("%register-wndenumproc", "nod_register_wndenumproc", 1, TypeEstimate::Top),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

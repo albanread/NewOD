@@ -1591,11 +1591,19 @@ done.
   want `<c-pointer-to> (<c-int>)` etc. for out-parameters. The
   parser shape for type-parametric forms is `<c-pointer-to> (T)` —
   needs a parser extension.
-- **:open: Callback / function-pointer parameters** — Sprint 27 →
-  later FFI sprint. Many APIs (`EnumWindows`,
-  `SetUnhandledExceptionFilter`) take callback function pointers.
-  Sprint 27's projection filter drops them. Re-projecting + adding
-  the callback bridge is its own trajectory.
+- **:partial: Callback / function-pointer parameters** — Sprint 27
+  → Sprint 32 / later. **Partially landed Sprint 32.** The
+  callback BRIDGE (closure-to-C-function-pointer via the
+  trampoline pool) ships in Sprint 32 for `WNDPROC` and
+  `WNDENUMPROC`. The Sprint 27 PROJECTION filter still drops
+  every Win32 export with a callback param — re-projecting the
+  blob to include them (so bare-name materialization can pick up
+  `EnumWindows`, `EnumThreadWindows`, hook setters, etc.) is a
+  follow-up sprint. The Sprint 32 acceptance test uses an
+  explicit `define c-function EnumWindows ... library: "user32";
+  end;` to bridge that gap. The bridge itself supports more
+  signatures than the test exercises (Sprint 32 ships two; more
+  to come).
 - **:open: Struct-by-value parameters** — Sprint 27 → later FFI
   sprint. Sprint 27's projection drops every function with a
   struct-by-value param (RECT, POINT, …). Reconstituting takes
@@ -1689,11 +1697,15 @@ not yet done.
   baked into IR as `WordBits` constants. An AOT mode would emit the
   table as an LLVM `@global_var` and the trampoline call as a GEP,
   avoiding the "address baked at JIT time" coupling.
-- **:open: Callback / function-pointer parameters** — Sprint 28 →
-  Sprint 33. Many APIs (`EnumWindows`, `CreateThread`'s
-  `lpStartAddress`, window procs for `WndClassExW`) take callback
-  function pointers. The trampolines + signature shape need a
-  reverse direction.
+- **:closed: Callback / function-pointer parameters** — Sprint 28
+  → Sprint 32. **Landed Sprint 32.** Two signatures shipped:
+  `WNDPROC` (window procedure) and `WNDENUMPROC` (the
+  `EnumWindows` callback shape). The remaining work — more
+  signatures (TIMERPROC, THREADPROC, DLGPROC, hook procs),
+  unregistration, JIT-emitted trampolines instead of the fixed
+  32-slot pool, and re-projecting the `nod_winapi` blob to NOT
+  skip callback-bearing exports — moves to the Sprint 32
+  carry-over section below.
 - **:open: Struct-by-value parameters** — Sprint 28 → Sprint 34.
   `RECT`, `POINT`, `MSG`, `WNDCLASSEXW`. Needs `<c-struct>` class
   machinery + ABI-aware marshaling (Win64 passes 1/2/4/8-byte
@@ -1975,3 +1987,103 @@ it gates Sprint 32+ on its own.
   hook is platform-agnostic in shape; replacing the `nod_winapi`
   query with a per-platform indirection is mechanical when the
   second platform arrives.
+
+## Carry-over from Sprint 32 (callbacks — closure → C function pointer) — into Sprint 33+
+
+Sprint 32 closes the keystone IDE-essential FFI capability: Dylan
+closures can now be passed to Win32 as callback function pointers.
+The remaining work is breadth (more signatures), lifecycle
+(unregistration), and a cleaner trampoline emission strategy.
+
+- **:open: Callback unregistration** — Sprint 32 → Sprint 33+.
+  Sprint 32 registrations are leak-by-design: once
+  `as-wndenumproc-callback(closure)` consumes a slot, the slot
+  stays occupied for the process lifetime. `release-c-callback(ptr)`
+  semantics need: (1) a way to find the slot ID from the trampoline
+  address (small reverse map keyed by raw address); (2) safe-point
+  coordination so the OS isn't holding a stale trampoline mid-
+  callback when we free its slot. The Sprint 32 cap of 32 slots
+  per signature is high enough for the IDE message-loop use case
+  but won't survive long-running daemons that register and forget;
+  release is the structural answer.
+- **:open: Additional callback signatures** — Sprint 32 → Sprint
+  33+. Sprint 32 ships `WNDPROC` and `WNDENUMPROC`. The full
+  Win32 IDE bring-up wants `TIMERPROC` (`SetTimer`),
+  `THREADPROC` (`CreateThread::lpStartAddress`), `DLGPROC`
+  (`DialogBox*`), `EnumThreadWndProc`, `EnumDesktopWindowsProc`,
+  `EnumMonitorsProc`, the hook proc family (`SetWindowsHookEx`'s
+  per-hook-id procs: keyboard, mouse, low-level, etc.), CRT
+  `qsort_s` / `bsearch_s`. Each signature adds one
+  `make_*_slot!` macro invocation, one dispatcher, and one slot
+  table — mechanical work.
+- **:open: JIT-emitted per-callback trampolines** — Sprint 32 →
+  Sprint 33+ (alternative architecture). Sprint 32 ships a fixed
+  pool of 32 pre-compiled trampolines per signature. The
+  alternative is per-registration JIT-emission of a tiny
+  signature-shaped trampoline — eliminates the pool-size cap,
+  costs ~64 bytes of JIT-emitted code per callback. Memory
+  reclamation interacts with MCJIT engine lifetime (engines
+  outlive trampolines because every engine is leaked for the
+  process lifetime today). Sprint 32's fixed pool is simpler and
+  sufficient for IDE scale; the JIT-emitted variant matters when
+  pool saturation actually bites.
+- **:open: Re-project `nod_winapi` to include callback-bearing
+  exports** — Sprint 32 → Sprint 33+. The Sprint 27 projection
+  filter drops every Win32 export with a callback param
+  (5191 functions skipped, of which the callback skips are a
+  subset). Sprint 32 ships the callback BRIDGE but not the
+  projection update — so `EnumWindows` is reachable only via an
+  explicit `define c-function`, not via bare-name materialization.
+  Re-projecting takes: (a) build.rs change to include
+  callback-typed parameters as `<c-pointer>` at the bare ABI
+  level; (b) sema-level matching of `<c-pointer>` to the right
+  callback signature (Sprint 32's signatures are tracked
+  separately — `define c-function` declares the param as
+  `<c-pointer>` and the runtime trusts the caller to pass a
+  matching trampoline). The blob already supports the bare-ABI
+  shape; the change is filter relaxation.
+- **:open: Cross-thread callback semantics** — Sprint 32 → Sprint
+  32B+. If the OS invokes our trampoline on a thread different
+  from the mutator that registered the closure, Sprint 32's
+  per-thread root-installation handles GC reachability — every
+  thread that enters the dispatcher gets the registry cells
+  pinned in its `ROOT_STACK`. But closures with captured state
+  in the moveable heap touched concurrently with mutator
+  allocations need coarser locking. Sprint 32's tests run the
+  callback on the mutator thread (EnumWindows synchronously
+  calls us back), so cross-thread paths aren't exercised. The
+  Win32 hook procs that fire on injected threads will need this.
+- **:open: Unified `as-c-callback(closure, signature-symbol)`
+  surface** — Sprint 32 → minor follow-up. Sprint 32 ships
+  per-signature wrappers (`as-wndproc-callback`,
+  `as-wndenumproc-callback`). A unified
+  `as-c-callback(closure, #"wndproc")` form needs Dylan-side
+  `select` lowering to dispatch on the symbol arg. The
+  underlying mechanism is identical — pure surface change.
+- **:open: `extern "system"` panic-on-unwind discipline** —
+  Sprint 32 → Sprint 33+. Sprint 32 inherits Sprint 28's UB risk
+  on Windows MSVC: a Dylan `signal()` that escapes the closure
+  body unwinds through the `extern "system"` slot trampoline,
+  which on x64 Windows MSVC isn't `C-unwind` and aborts with
+  `STATUS_STACK_BUFFER_OVERRUN`. Mitigations: (a) wrap each
+  dispatcher in `catch_unwind` and return a default value;
+  (b) propagate the panic via a per-slot side channel that the
+  next mutator-thread call observes. Sprint 32 ships neither —
+  the same risk profile as the Sprint 28 winffi trampolines. A
+  hardening pass that lands both fixes simultaneously is
+  cleanest.
+- **:open: GC root reachability for closures registered on
+  thread A and invoked on thread B that never touched the
+  registry** — Sprint 32 → Sprint 32B+. The dispatcher
+  installs roots on entry, so the FIRST callback invocation on
+  a new thread reaches GC-safety before allocating. But a
+  collection triggered between callback registration and the
+  first OS invocation on thread B (e.g. a mutator thread that
+  shares the heap with the OS-callback thread) walks roots
+  from each thread's own stack; thread B's stack doesn't yet
+  have the cells. Closure stays alive because thread A's stack
+  has them. The problem is theoretical — Sprint 32's tests
+  never hit it — but a Sprint 32B "process-global root
+  augmentation for cross-thread roots" would belt-and-brace
+  this. Probably folded into the cross-thread callback work
+  above.

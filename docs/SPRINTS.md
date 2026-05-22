@@ -926,6 +926,68 @@ Plus 7 unit tests in `nod-sema::lower::sprint31_tests`: `winapi_dll_priority_ord
 - Materialize-by-pattern (`Get*`, `*A` / `*W` family expansions) for IDE auto-completion.
 - A/W resolution that walks back to a single canonical Dylan-name (currently `MessageBox` materializes to `MessageBoxW` and the synthesized binding's `dylan_name` stays `MessageBox` — the user code sees the bare name they wrote).
 
+### Sprint 32 — Callbacks: closure → C function pointer — landed
+
+**Goal:** `EnumWindows(callback, $NULL)` enumerates every top-level window on the test machine, invoking a Dylan closure (`method (hwnd, lp) ... #t end`) once per window, with the closure incrementing a captured-variable counter that survives across calls. The keystone IDE-essential FFI capability — `WNDPROC` for window procedures, `WNDENUMPROC` for `EnumWindows`. Sprint 28 wired Win32 → Dylan calls; Sprint 32 closes the reverse direction, Dylan-as-callback → Win32.
+
+**A. Pre-allocated trampoline pool per signature class (`nod-runtime/src/callbacks.rs`).** Each Win32 callback signature has a fixed pool of 32 slot trampolines, one `extern "system" fn` per slot. A macro generates `wndproc_slot_0` … `wndproc_slot_31` (and the `wndenumproc_slot_N` family); each slot trampoline knows its slot ID at compile time and forwards to a per-signature dispatcher that looks up the registered closure Word for that slot, marshals C args → Dylan `Word`s, calls the closure via Sprint 24's `nod_funcall_N`, and rebox the return.
+
+Sprint 32 ships two signatures:
+- `Wndproc`: `extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT` (the WNDPROC contract for `RegisterClass(W)`).
+- `Wndenumproc`: `extern "system" fn(HWND, LPARAM) -> BOOL` (the WNDENUMPROC contract for `EnumWindows` and family).
+
+The fixed pool of 32 slots per signature is the Sprint 32 cap; tunable later via build-time const. The slot trampolines occupy 64 `extern "system"` symbols in `nod-runtime` (32 × 2 signatures), each with `#[unsafe(no_mangle)]` so the linker pins their addresses.
+
+**B. Registry per signature (`OnceLock<Mutex<Registry>>`).** Each `Registry` holds `Box<[UnsafeCell<Word>; 32]>` — one stable closure-cell address per slot — plus an `occupied: [bool; 32]` bitmap. The slab address is stable for the process lifetime; the cell pointers are valid GC root targets.
+
+**C. GC root discipline — per-thread.** Sprint 11c's `register_root` is thread-local (each mutator's `ROOT_STACK` is its own `RefCell<Vec<*const Word>>`). The callback registry's cells must be in EVERY mutator thread's root stack — otherwise a collection on a thread that didn't install them misses the registered closures. `install_gc_roots_for_this_thread(sig, registry)` registers all 32 cells on first touch from each thread, idempotent-guarded via `thread_local! { static WNDPROC_ROOTS_INSTALLED: Cell<bool>; }`. Both `register_callback` and the dispatchers call it on entry — covering the mutator and the OS-callback thread.
+
+**D. JIT-callable externs.** `nod_register_wndproc(closure_word) -> Word` and `nod_register_wndenumproc(closure_word) -> Word`. Each is `unsafe extern "C-unwind"` to match the rest of the runtime's JIT ABI; the return is the slot's trampoline address packed into a fixnum-tagged `<c-pointer>` Word (the Sprint 28+ ABI for raw addresses). On pool exhaustion, surfaces a `<c-ffi-error>` via `nod_signal` (diverges).
+
+**E. Lowering wiring (`nod-sema/src/lower.rs::LOWER_PRIMITIVE_TABLE`).** Two new primitives:
+- `%register-wndproc(closure)` → `nod_register_wndproc`, arity 1, returns `<top>` (the `<c-pointer>` Word).
+- `%register-wndenumproc(closure)` → `nod_register_wndenumproc`, arity 1.
+
+**F. Stdlib wrappers (`nod-dylan/dylan-sources/stdlib.dylan`).** Two thin functions:
+
+```dylan
+define function as-wndproc-callback (closure) => (ptr)
+  %register-wndproc(closure)
+end function;
+
+define function as-wndenumproc-callback (closure) => (ptr)
+  %register-wndenumproc(closure)
+end function;
+```
+
+A unified `as-c-callback(closure, signature-symbol)` form is deferred until Dylan-side `select` lowers cleanly (the current macro layer doesn't reach `select` at stdlib-load time).
+
+**G. Codegen + JIT symbol bindings (`nod-llvm/src/codegen.rs`, `jit.rs`).** Two new symbol constants (`NOD_REGISTER_WNDPROC_SYMBOL`, `NOD_REGISTER_WNDENUMPROC_SYMBOL`) added to the `SPRINT_20B_PRIMITIVES` table; matching `LLVMAddGlobalMapping` entries in `jit.rs::add_module`. No new IR variants — the call lowers as a plain `DirectCall` against a `%`-prefixed primitive name, the same shape as every other runtime extern.
+
+**H. Tests.** Six integration tests in `tests/nod-tests/tests/winffi_callbacks.rs` (`#![cfg(windows)]`, all `#[serial]`):
+
+- **`enum_windows_invokes_callback_for_each_top_level_window`** — **the Sprint 32 headline**. `EnumWindows(callback, $NULL)` invokes a Dylan closure that increments a captured `count := count + 1` once per top-level desktop window; counter ends up positive (asserted `> 0` and `< 100_000` for sanity).
+- `register_wndenumproc_returns_non_null_pointer` — non-zero trampoline address.
+- `register_wndproc_returns_non_null_pointer` — same for WNDPROC (arity 4 closure body).
+- `two_callbacks_get_distinct_addresses` — two registrations land in distinct slots → distinct trampoline addresses → Dylan-side `a = b` is `#f`.
+- `callback_pool_full_signals_error` — 32 registrations succeed via the Rust API, the 33rd returns `Err(PoolFull)`; pool reset clears state for subsequent tests.
+- `closure_survives_gc_pressure` — register a closure, force two minor GCs, invoke the trampoline directly via an `extern "system"` fn-pointer transmute; the closure body still runs.
+
+Plus five in-module unit tests in `nod-runtime/src/callbacks.rs::tests` (`#[serial]`): synthetic dispatch via direct trampoline call (one each for WNDPROC and WNDENUMPROC), distinct-slot-addresses Rust check, pool-full Rust check, rebox-helper truth-table coverage.
+
+**Headline acceptance:** the EnumWindows test returned a count of top-level windows on the test machine — a positive integer reflecting the actual Windows shell state at test time.
+
+**Gate results:** 512 / 0 / 7 under newgc default (501 → 512; +11 new tests). 5x sequential flake clean. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Out of scope (deferred — see DEFERRED.md):**
+
+- **Callback unregistration.** Sprint 32 registrations are leak-by-design: once a closure is registered, its slot stays occupied for the process lifetime. A future sprint adds `release-c-callback(ptr)` semantics with safe-point coordination so the OS isn't holding a stale trampoline mid-callback.
+- **Additional signatures.** `TIMERPROC` (`SetTimer`), `THREADPROC` (`CreateThread`), `DLGPROC` (`DialogBox*`), Win32 hook procs (`SetWindowsHookEx`), CRT `qsort`/`bsearch`, and the various `EnumXxx` family beyond windows.
+- **JIT-emitted per-callback trampolines.** Alternative to the fixed pool — each registration emits a fresh trampoline via the JIT, eliminating the pool-size cap. Memory cost per callback grows; freed-trampoline reclamation interacts with MCJIT engine lifetime. Sprint 32 ships the simpler fixed-pool architecture; a JIT-emitted variant becomes valuable when 32-slot saturation actually bites.
+- **Cross-thread callback semantics.** If the OS invokes our trampoline on a thread different from the mutator that registered the closure, Sprint 32's per-thread root-installation handles GC root reachability, but a future cross-thread Sprint will need to lock the closure's environment frames (for closures with captured state in the moveable heap touched concurrently with mutator allocations).
+- **Unified `as-c-callback(closure, sig-symbol)` surface.** Pending Dylan-side `select` lowering for the symbol-dispatched form.
+- **`extern "system"` panic-on-unwind discipline.** Sprint 32 has the same UB exposure as Sprint 28's `nod_winffi_call_N` — a Dylan signal that crosses the OS callback boundary aborts (on Windows MSVC, panic crossing `extern "system"` is structurally unwound with a `STATUS_STACK_BUFFER_OVERRUN` abort). The mitigation is the same as Sprint 28's: trust callers to handle conditions before the closure returns. Tightening this (catching unwinds inside the dispatcher and returning a default value with a side-channel error) is a Sprint 33+ task.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
