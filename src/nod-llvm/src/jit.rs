@@ -13,6 +13,7 @@ use llvm_sys::execution_engine::{
     LLVMMCJITCompilerOptions,
 };
 
+use crate::symbols::{ModuleManifest, RelocKind};
 use crate::codegen::{
     CodegenOutput, FORMAT_OUT_SYMBOL, NOD_APPLY_SYMBOL, NOD_CARD_MARK_SYMBOL,
     NOD_COLLECTION_CONCATENATE_SYMBOL, NOD_COLLECTION_SIZE_SYMBOL, NOD_CONDITION_MESSAGE_SYMBOL,
@@ -812,6 +813,158 @@ impl<'ctx> Jit<'ctx> {
         Ok(())
     }
 
+    /// Sprint 38 — install a module from previously-saved LLVM bitcode
+    /// plus its [`ModuleManifest`]. This is the cross-process-replay
+    /// counterpart to [`Self::add_module`]: instead of receiving a
+    /// freshly-codegen'd module, it parses bitcode and registers each
+    /// manifest-declared external symbol against the **current
+    /// process's** runtime addresses before MCJIT finalises.
+    ///
+    /// On success the caller can resolve the entry function via
+    /// [`Self::get_function_ptr`] just as with a cold-compiled module.
+    ///
+    /// `bitcode` is the byte payload of a `.bc` file produced by
+    /// [`inkwell::module::Module::write_bitcode_to_memory`] during a
+    /// previous cold compile. `manifest` is the parallel
+    /// `<key>.manifest.json` sidecar describing the per-bake-site
+    /// relocation kinds.
+    ///
+    /// # Returns
+    /// `Ok(())` on success. On any error (verify failure, MCJIT engine
+    /// creation failure, relocation kind requiring an FFI symbol that
+    /// can't be resolved in this process) returns the appropriate
+    /// [`JitError`] and the engine isn't installed.
+    pub fn add_module_from_bitcode(
+        &mut self,
+        ctx: &'ctx Context,
+        bitcode: &[u8],
+        module_name: &str,
+        manifest: &ModuleManifest,
+    ) -> Result<(), JitError> {
+        // Parse bitcode into a fresh inkwell `Module` owned by `ctx`.
+        let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+            bitcode,
+            module_name,
+        );
+        let module = inkwell::module::Module::parse_bitcode_from_buffer(&buffer, ctx)
+            .map_err(|e| JitError::Verify(e.to_string()))?;
+        module
+            .verify()
+            .map_err(|e| JitError::Verify(format!("post-load verify: {e}")))?;
+
+        // Compute the current-process address for each manifest entry
+        // BEFORE we hand the module to MCJIT. After
+        // `LLVMCreateMCJITCompilerForModule` we lose the inkwell
+        // module accessor.
+        //
+        // For each entry, look up the named external global in the
+        // module. If present, capture the FunctionValue/GlobalValue
+        // along with its target address.
+        let mut reloc_bindings: Vec<(inkwell::values::GlobalValue<'ctx>, *mut std::ffi::c_void)> =
+            Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            let Some(global) = module.get_global(&entry.symbol) else {
+                // Symbol not present in the bitcode — IR may have been
+                // optimised in a way that eliminated the use. Skip
+                // silently; the load won't crash because the global
+                // isn't referenced.
+                continue;
+            };
+            let addr = match resolve_reloc_kind(&entry.kind) {
+                Ok(a) => a,
+                Err(e) => return Err(JitError::Create(format!("reloc {}: {e}", entry.symbol))),
+            };
+            reloc_bindings.push((global, addr));
+        }
+
+        // Capture all the standard extern shims the cold path resolves
+        // (FORMAT_OUT, nod_make, dispatch shims, etc.) so the loaded
+        // module's external decls bind correctly. We reuse the same
+        // resolver as `add_module` by collecting `(name, addr)` pairs
+        // and re-walking after MCJIT engine creation.
+        let standard_externs = standard_extern_addresses();
+        let mut standard_bindings: Vec<(inkwell::values::FunctionValue<'ctx>, *mut std::ffi::c_void)> =
+            Vec::new();
+        for (name, addr) in &standard_externs {
+            if let Some(f) = module.get_function(name) {
+                standard_bindings.push((f, *addr));
+            }
+        }
+        // Cross-module method body externs (mirrors `add_module`'s logic).
+        let mut cross_module_externs: Vec<(inkwell::values::FunctionValue<'ctx>, *mut std::ffi::c_void)> =
+            Vec::new();
+        {
+            let mut maybe = module.get_first_function();
+            while let Some(f) = maybe {
+                if f.count_basic_blocks() == 0 {
+                    let name = f.get_name().to_string_lossy().into_owned();
+                    if !name.is_empty()
+                        && nod_runtime::find_method_body_ptr(&name).is_some()
+                    {
+                        let addr = nod_runtime::find_method_body_ptr(&name).unwrap() as *mut std::ffi::c_void;
+                        cross_module_externs.push((f, addr));
+                    }
+                }
+                maybe = f.get_next_function();
+            }
+        }
+
+        // Install the module in a fresh MCJIT engine.
+        let mut opts: LLVMMCJITCompilerOptions = unsafe { std::mem::zeroed() };
+        unsafe {
+            LLVMInitializeMCJITCompilerOptions(&mut opts, size_of::<LLVMMCJITCompilerOptions>());
+        }
+        opts.OptLevel = 2;
+        opts.MCJMM = unsafe { jit_mm::make_mm() };
+
+        let mut engine: LLVMExecutionEngineRef = std::ptr::null_mut();
+        let mut err_msg: *mut std::ffi::c_char = std::ptr::null_mut();
+        let module_ptr = module.as_mut_ptr();
+        let rc = unsafe {
+            LLVMCreateMCJITCompilerForModule(
+                &mut engine,
+                module_ptr,
+                &mut opts,
+                size_of::<LLVMMCJITCompilerOptions>(),
+                &mut err_msg,
+            )
+        };
+        if rc != 0 || engine.is_null() {
+            let msg = if err_msg.is_null() {
+                "LLVMCreateMCJITCompilerForModule failed".to_string()
+            } else {
+                let s = unsafe { CStr::from_ptr(err_msg) }
+                    .to_string_lossy()
+                    .into_owned();
+                unsafe { llvm_sys::core::LLVMDisposeMessage(err_msg) };
+                s
+            };
+            return Err(JitError::Create(msg));
+        }
+        std::mem::forget(module);
+
+        // Register relocation globals against their current-process
+        // addresses. The named globals declared in IR have their
+        // physical addresses fixed at this point — `LLVMAddGlobalMapping`
+        // makes `&@symbol == addr` at runtime.
+        for (global, addr) in &reloc_bindings {
+            // SAFETY: `engine` is the live MCJIT engine; `global` is
+            // a GlobalValue captured before ownership transfer; `addr`
+            // is a process-local address valid for the engine's
+            // lifetime.
+            unsafe { LLVMAddGlobalMapping(engine, global.as_value_ref(), *addr) };
+        }
+        for (f, addr) in &standard_bindings {
+            unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), *addr) };
+        }
+        for (f, addr) in &cross_module_externs {
+            unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), *addr) };
+        }
+
+        self.engines.push(engine);
+        Ok(())
+    }
+
     /// Resolve a JIT'd symbol. The caller is responsible for transmuting
     /// the returned pointer to the correct function type.
     ///
@@ -829,4 +982,196 @@ impl<'ctx> Jit<'ctx> {
         }
         None
     }
+}
+
+/// Sprint 38 — compute the current-process address for one
+/// [`RelocKind`]. The cold-compile path baked the resolved address
+/// into IR as an `i64` constant; the cache-hit path calls this to
+/// recompute it against the new process's runtime state.
+fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String> {
+    let addr: u64 = match kind {
+        RelocKind::ImmTrue => nod_runtime::literal_pool_immediates().true_.raw(),
+        RelocKind::ImmFalse => nod_runtime::literal_pool_immediates().false_.raw(),
+        RelocKind::ImmNil => nod_runtime::literal_pool_immediates().nil.raw(),
+        RelocKind::ImmFalseWrapper => {
+            nod_runtime::literal_pool_immediates().false_.raw() & !1_u64
+        }
+        RelocKind::ClassMetadata { class_id } => {
+            let id = nod_runtime::ClassId(*class_id);
+            nod_runtime::class_metadata_ptr(id) as u64
+        }
+        RelocKind::StringLiteral { text } => nod_runtime::intern_string_literal(text).raw(),
+        RelocKind::SymbolLiteral { name } => nod_runtime::intern_symbol_literal(name).raw(),
+        RelocKind::CacheSlot { site_id } => {
+            nod_runtime::allocate_cache_slot(*site_id) as u64
+        }
+        RelocKind::Generic { name } => {
+            let g = nod_runtime::get_or_create_generic(name);
+            g as *const _ as u64
+        }
+        RelocKind::StubEntry { dll, symbol, signature_bytes } => {
+            // Reconstruct the ApiCallSignature from the manifest bytes
+            // (it's `#[repr(C)] Copy` — bytewise round-trips).
+            if signature_bytes.len() != size_of::<nod_runtime::ApiCallSignature>() {
+                return Err(format!(
+                    "StubEntry signature byte length mismatch: got {} expected {}",
+                    signature_bytes.len(),
+                    size_of::<nod_runtime::ApiCallSignature>()
+                ));
+            }
+            let mut sig = nod_runtime::ApiCallSignature {
+                arg_count: 0,
+                arg_kinds: [0; 12],
+                return_kind: 0,
+            };
+            // SAFETY: `ApiCallSignature` is `#[repr(C)] Copy`. We
+            // verified the length above. Source bytes come from the
+            // manifest JSON's hex-encoded signature field.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    signature_bytes.as_ptr(),
+                    &mut sig as *mut _ as *mut u8,
+                    signature_bytes.len(),
+                );
+            }
+            let specs = vec![nod_runtime::StubEntrySpec {
+                dll: dll.clone(),
+                symbol: symbol.clone(),
+                signature: sig,
+            }];
+            let (_table, ptrs) = nod_runtime::allocate_stub_table(&specs);
+            let entry_ptr = ptrs[0];
+            // SAFETY: `entry_ptr` was just allocated by
+            // `allocate_stub_table`; `dll`/`symbol` are valid UTF-8
+            // strings the caller produced. `resolve_into_entry` is
+            // idempotent — calling it on an already-resolved entry is
+            // a documented no-op.
+            unsafe {
+                if let Err(_w) = nod_runtime::resolve_into_entry(entry_ptr, dll, symbol) {
+                    // Resolution failure surfaces as a `<c-ffi-error>`
+                    // Word in the cold path; we surface it as a
+                    // JitError so the cache loader can fall back to
+                    // recompile.
+                    return Err(format!(
+                        "StubEntry resolve failed for `{symbol}@{dll}` in current process"
+                    ));
+                }
+            }
+            entry_ptr as u64
+        }
+    };
+    Ok(addr as *mut std::ffi::c_void)
+}
+
+/// Sprint 38 — list of `(symbol_name, runtime_address)` pairs for the
+/// standard runtime shims every JIT-compiled module potentially calls.
+/// Same set as the bindings installed inline by [`Jit::add_module`].
+fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
+    use crate::codegen::*;
+    let mut v: Vec<(&'static str, *mut std::ffi::c_void)> = vec![
+        (FORMAT_OUT_SYMBOL, nod_runtime::nod_format_out as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_SYMBOL, nod_runtime::nod_make as *const () as *mut std::ffi::c_void),
+        (NOD_IS_INSTANCE_OF_SYMBOL, nod_runtime::nod_is_instance_of as *const () as *mut std::ffi::c_void),
+        (NOD_DISPATCH_UNARY_SYMBOL, nod_runtime::nod_dispatch_unary as *const () as *mut std::ffi::c_void),
+        (NOD_DISPATCH_BINARY_SYMBOL, nod_runtime::nod_dispatch_binary as *const () as *mut std::ffi::c_void),
+        (NOD_DISPATCH_SYMBOL, nod_runtime::nod_dispatch as *const () as *mut std::ffi::c_void),
+        (NOD_CARD_MARK_SYMBOL, nod_runtime::nod_card_mark as *const () as *mut std::ffi::c_void),
+        (NOD_REGISTER_ROOT_SYMBOL, nod_runtime::nod_register_root as *const () as *mut std::ffi::c_void),
+        (NOD_UNREGISTER_ROOT_SYMBOL, nod_runtime::nod_unregister_root as *const () as *mut std::ffi::c_void),
+        (NOD_NEXT_METHOD_SYMBOL, nod_runtime::nod_next_method as *const () as *mut std::ffi::c_void),
+        (NOD_HAS_NEXT_METHOD_SYMBOL, nod_runtime::nod_has_next_method as *const () as *mut std::ffi::c_void),
+        (NOD_PUSH_SEALED_CHAIN_SYMBOL, nod_runtime::nod_push_sealed_chain_frame as *const () as *mut std::ffi::c_void),
+        (NOD_POP_SEALED_CHAIN_SYMBOL, nod_runtime::nod_pop_sealed_chain_frame as *const () as *mut std::ffi::c_void),
+        (NOD_PAIR_ALLOC_SYMBOL, nod_runtime::nod_pair_alloc as *const () as *mut std::ffi::c_void),
+        (NOD_PAIR_HEAD_SYMBOL, nod_runtime::nod_pair_head as *const () as *mut std::ffi::c_void),
+        (NOD_PAIR_TAIL_SYMBOL, nod_runtime::nod_pair_tail as *const () as *mut std::ffi::c_void),
+        (NOD_EMPTY_P_SYMBOL, nod_runtime::nod_empty_p as *const () as *mut std::ffi::c_void),
+        (NOD_NIL_SYMBOL, nod_runtime::nod_nil as *const () as *mut std::ffi::c_void),
+        (NOD_SIGNAL_SYMBOL, nod_runtime::nod_signal as *const () as *mut std::ffi::c_void),
+        (NOD_RUN_BLOCK_SYMBOL, nod_runtime::nod_run_block as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_EXIT_PROCEDURE_SYMBOL, nod_runtime::nod_make_exit_procedure as *const () as *mut std::ffi::c_void),
+        (NOD_INVOKE_EXIT_SYMBOL, nod_runtime::nod_invoke_exit as *const () as *mut std::ffi::c_void),
+        (NOD_CONDITION_MESSAGE_SYMBOL, nod_runtime::nod_condition_message as *const () as *mut std::ffi::c_void),
+        (NOD_COLLECTION_SIZE_SYMBOL, nod_runtime::nod_collection_size as *const () as *mut std::ffi::c_void),
+        (NOD_COLLECTION_CONCATENATE_SYMBOL, nod_runtime::nod_collection_concatenate as *const () as *mut std::ffi::c_void),
+        (NOD_RANGE_FROM_SYMBOL, nod_runtime::nod_range_from as *const () as *mut std::ffi::c_void),
+        (NOD_RANGE_TO_SYMBOL, nod_runtime::nod_range_to as *const () as *mut std::ffi::c_void),
+        (NOD_RANGE_BY_SYMBOL, nod_runtime::nod_range_by as *const () as *mut std::ffi::c_void),
+        (NOD_SOV_SIZE_SYMBOL, nod_runtime::nod_sov_size as *const () as *mut std::ffi::c_void),
+        (NOD_SOV_ELEMENT_SYMBOL, nod_runtime::nod_sov_element as *const () as *mut std::ffi::c_void),
+        (NOD_SOV_ELEMENT_SETTER_SYMBOL, nod_runtime::nod_sov_element_setter as *const () as *mut std::ffi::c_void),
+        (NOD_STRETCHY_VECTOR_SIZE_SYMBOL, nod_runtime::nod_stretchy_vector_size as *const () as *mut std::ffi::c_void),
+        (NOD_STRETCHY_VECTOR_ELEMENT_SYMBOL, nod_runtime::nod_stretchy_vector_element as *const () as *mut std::ffi::c_void),
+        (NOD_STRETCHY_VECTOR_ELEMENT_SETTER_SYMBOL, nod_runtime::nod_stretchy_vector_element_setter as *const () as *mut std::ffi::c_void),
+        (NOD_STRETCHY_VECTOR_PUSH_SYMBOL, nod_runtime::nod_stretchy_vector_push as *const () as *mut std::ffi::c_void),
+        (NOD_FIP_INIT_SYMBOL, nod_runtime::nod_fip_init as *const () as *mut std::ffi::c_void),
+        (NOD_FIP_FINISHED_P_SYMBOL, nod_runtime::nod_fip_finished_p as *const () as *mut std::ffi::c_void),
+        (NOD_FIP_CURRENT_ELEMENT_SYMBOL, nod_runtime::nod_fip_current_element as *const () as *mut std::ffi::c_void),
+        (NOD_FIP_ADVANCE_SYMBOL, nod_runtime::nod_fip_advance as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_RANGE_SYMBOL, nod_runtime::nod_make_range as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_STRETCHY_VECTOR_SYMBOL, nod_runtime::nod_make_stretchy_vector as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_FUNCTION_REF_SYMBOL, nod_runtime::nod_make_function_ref as *const () as *mut std::ffi::c_void),
+        (NOD_FUNCALL0_SYMBOL, nod_runtime::nod_funcall0 as *const () as *mut std::ffi::c_void),
+        (NOD_FUNCALL1_SYMBOL, nod_runtime::nod_funcall1 as *const () as *mut std::ffi::c_void),
+        (NOD_FUNCALL2_SYMBOL, nod_runtime::nod_funcall2 as *const () as *mut std::ffi::c_void),
+        (NOD_FUNCALL3_SYMBOL, nod_runtime::nod_funcall3 as *const () as *mut std::ffi::c_void),
+        (NOD_FUNCALL4_SYMBOL, nod_runtime::nod_funcall4 as *const () as *mut std::ffi::c_void),
+        (NOD_FUNCALL5_SYMBOL, nod_runtime::nod_funcall5 as *const () as *mut std::ffi::c_void),
+        (NOD_APPLY_SYMBOL, nod_runtime::nod_apply as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_SOV_LEN_SYMBOL, nod_runtime::nod_make_sov_len as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_TABLE_SYMBOL, nod_runtime::nod_make_table as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_SIZE_SYMBOL, nod_runtime::nod_table_size as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_ELEMENT_SYMBOL, nod_runtime::nod_table_element as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL, nod_runtime::nod_table_element_or_default as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_ELEMENT_SETTER_SYMBOL, nod_runtime::nod_table_element_setter as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_REMOVE_KEY_SYMBOL, nod_runtime::nod_table_remove_key as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_KEYS_SYMBOL, nod_runtime::nod_table_keys as *const () as *mut std::ffi::c_void),
+        (NOD_TABLE_VALUES_SYMBOL, nod_runtime::nod_table_values as *const () as *mut std::ffi::c_void),
+        (NOD_OBJECT_HASH_SYMBOL, nod_runtime::nod_object_hash as *const () as *mut std::ffi::c_void),
+        (NOD_OBJECT_EQUAL_P_SYMBOL, nod_runtime::nod_object_equal_p as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_CELL_SYMBOL, nod_runtime::nod_make_cell as *const () as *mut std::ffi::c_void),
+        (NOD_CELL_GET_SYMBOL, nod_runtime::nod_cell_get as *const () as *mut std::ffi::c_void),
+        (NOD_CELL_SET_SYMBOL, nod_runtime::nod_cell_set as *const () as *mut std::ffi::c_void),
+        (NOD_ENV_CELL_SYMBOL, nod_runtime::nod_env_cell as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_ENVIRONMENT_SYMBOL, nod_runtime::nod_make_environment as *const () as *mut std::ffi::c_void),
+        (NOD_MAKE_CLOSURE_SYMBOL, nod_runtime::nod_make_closure as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_0_SYMBOL, nod_runtime::nod_winffi_call_0 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_1_SYMBOL, nod_runtime::nod_winffi_call_1 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_2_SYMBOL, nod_runtime::nod_winffi_call_2 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_3_SYMBOL, nod_runtime::nod_winffi_call_3 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_4_SYMBOL, nod_runtime::nod_winffi_call_4 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_5_SYMBOL, nod_runtime::nod_winffi_call_5 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_6_SYMBOL, nod_runtime::nod_winffi_call_6 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_7_SYMBOL, nod_runtime::nod_winffi_call_7 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_8_SYMBOL, nod_runtime::nod_winffi_call_8 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_9_SYMBOL, nod_runtime::nod_winffi_call_9 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_10_SYMBOL, nod_runtime::nod_winffi_call_10 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_11_SYMBOL, nod_runtime::nod_winffi_call_11 as *const () as *mut std::ffi::c_void),
+        (NOD_WINFFI_CALL_12_SYMBOL, nod_runtime::nod_winffi_call_12 as *const () as *mut std::ffi::c_void),
+    ];
+    // Struct field accessors (Sprint 34) — same shape, kept in a
+    // second pass for clarity.
+    use crate::codegen::{
+        NOD_STRUCT_GET_I32_SYMBOL, NOD_STRUCT_GET_I64_SYMBOL, NOD_STRUCT_GET_POINTER_SYMBOL,
+        NOD_STRUCT_GET_U16_SYMBOL, NOD_STRUCT_GET_U32_SYMBOL, NOD_STRUCT_GET_U64_SYMBOL,
+        NOD_STRUCT_SET_I32_SYMBOL, NOD_STRUCT_SET_I64_SYMBOL, NOD_STRUCT_SET_POINTER_SYMBOL,
+        NOD_STRUCT_SET_U16_SYMBOL, NOD_STRUCT_SET_U32_SYMBOL, NOD_STRUCT_SET_U64_SYMBOL,
+    };
+    v.extend([
+        (NOD_STRUCT_GET_I32_SYMBOL, nod_runtime::nod_struct_get_i32 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_SET_I32_SYMBOL, nod_runtime::nod_struct_set_i32 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_GET_I64_SYMBOL, nod_runtime::nod_struct_get_i64 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_SET_I64_SYMBOL, nod_runtime::nod_struct_set_i64 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_GET_U16_SYMBOL, nod_runtime::nod_struct_get_u16 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_SET_U16_SYMBOL, nod_runtime::nod_struct_set_u16 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_GET_U32_SYMBOL, nod_runtime::nod_struct_get_u32 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_SET_U32_SYMBOL, nod_runtime::nod_struct_set_u32 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_GET_U64_SYMBOL, nod_runtime::nod_struct_get_u64 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_SET_U64_SYMBOL, nod_runtime::nod_struct_set_u64 as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_GET_POINTER_SYMBOL, nod_runtime::nod_struct_get_pointer as *const () as *mut std::ffi::c_void),
+        (NOD_STRUCT_SET_POINTER_SYMBOL, nod_runtime::nod_struct_set_pointer as *const () as *mut std::ffi::c_void),
+        (NOD_REGISTER_WNDPROC_SYMBOL, nod_runtime::nod_register_wndproc as *const () as *mut std::ffi::c_void),
+        (NOD_REGISTER_WNDENUMPROC_SYMBOL, nod_runtime::nod_register_wndenumproc as *const () as *mut std::ffi::c_void),
+    ]);
+    v
 }

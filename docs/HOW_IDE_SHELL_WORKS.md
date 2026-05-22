@@ -506,10 +506,17 @@ A few interesting future optimizations:
   10–20× on the cached re-eval. The same sprint also persists each
   cold compile's post-codegen LLVM bitcode to
   `$CARGO_TARGET_DIR/nod-jit-cache/<key>.bc` with a sidecar JSON
-  (LRU-evicted at 500 MB). Cross-process replay isn't wired yet — the
-  bitcode references baked-in runtime pointers that are process-volatile
-  — but the disk infrastructure is the foundation for Sprint 38 AOT,
-  which will add the fix-up pass needed to ship native code in a `.exe`.
+  (LRU-evicted at 500 MB). **Sprint 38 added the cross-process load
+  path infrastructure** — a manifest sidecar (`<key>.manifest.json`)
+  recording every process-volatile address bake site as a
+  `RelocKind`, plus a `Jit::add_module_from_bitcode` entry point that
+  registers each named external against the current process's
+  runtime addresses before MCJIT finalises. The codegen-side
+  conversion that emits those named externs is deferred to Sprint
+  38b; until it lands, the bitcode on disk still bakes process-local
+  addresses and the cross-process replay test runs in-process
+  shape only. Sprint 39 (AOT mode emitting `.exe`) uses the same
+  relocation machinery.
 
 - **D3D11 device creation costs ~80 ms.** Most of this is the GPU
   driver enumerating adapters, setting up command queues, allocating

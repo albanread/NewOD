@@ -1220,6 +1220,127 @@ Test counts: baseline 556 → 569 (+13: 5 cache.rs unit tests + 8 jit_cache.rs i
 - **Compressed cache files.** Bitcode compresses well; not done this sprint.
 - **`%jit-cache-stats()` / `%jit-cache-clear()` Dylan-side primitives.** Rust APIs exist; surfacing them as primitives is mechanical follow-up.
 
+### Sprint 38 — cross-process bitcode replay (partial — infrastructure landed; codegen conversion deferred to 38b)
+
+**Goal (as briefed):** two subprocess invocations of identical Dylan source — process 1 cold-compiles and writes bitcode; process 2 loads bitcode and produces the same answer ≥10× faster.
+
+**Outcome:** the **load-path infrastructure** landed in full — symbol-naming scheme, manifest sidecar JSON, JIT-link entry point that resolves named externs against current-process addresses, and a regression suite locking down the load path's correctness. The **codegen-side conversion** (replacing every i64-immediate runtime address bake with a `ptrtoint @global to i64` reference) is **deferred to Sprint 38b**. Without the codegen conversion the on-disk bitcode still bakes process-local addresses, so a fresh process loading that bitcode would see stale pointers. The right call given the realistic agent-session budget was to land the loader correctly + the manifest format the codegen sprint will produce, rather than half-convert the codegen sites and risk silent corruption of cache-hit paths.
+
+**Phase A — inventory (delivered).** Audit of every place in the codebase that bakes a runtime address into LLVM IR. The bake-site map:
+
+| # | Site | What gets baked | Sprint 38(b) replacement |
+|---|---|---|---|
+| 1 | `lower.rs::lower_call` (c-function path) | `info.entry_ptr` (`*const ApiStubEntry`) → `ConstValue::WordBits` | `nod_stub__<key8>__<slot>` external global; manifest `RelocKind::StubEntry { dll, symbol, signature_bytes }` |
+| 2 | `lower.rs::emit_class_ref` | `class_metadata_ptr(id) \| 1` (tagged) | `nod_class_md__<key8>__<class_id>` external global; manifest `RelocKind::ClassMetadata` |
+| 3 | `lower.rs::emit_class_metadata_ptr_const` | `class_metadata_ptr(id)` (raw) | same global as #2; codegen ORs the tag bit downstream |
+| 4 | `lower.rs::emit_string_literal` | `intern_string_literal(s).raw()` | `nod_strlit__<key8>__<idx>`; `RelocKind::StringLiteral { text }` |
+| 5 | `lower.rs::emit_symbol_literal` | `intern_symbol_literal(name).raw()` | `nod_symlit__<key8>__<idx>`; `RelocKind::SymbolLiteral { name }` |
+| 6 | `codegen.rs::emit_const` `ConstValue::String` | same as #4 | same as #4 |
+| 7 | `codegen.rs::retag_bool`, `untag_bool_to_i1`, `emit_const` (Bool/Integer→Boolean cases), `emit_word_class_id`, `emit_wrapper_class_check` | `imm.true_/false_/nil.raw()`, plus the untagged-wrapper variant used as fault-free fallback in branchless class-id reads | `nod_imm_true__<key8>`, `nod_imm_false__<key8>`, `nod_imm_nil__<key8>`, `nod_imm_false_wrapper__<key8>`; `RelocKind::ImmTrue/ImmFalse/ImmNil/ImmFalseWrapper` |
+| 8 | `codegen.rs::emit_dispatch` | `generic_ptr_raw`, `cache_slot_raw` (+ per-field offsets baked off them) | `nod_generic__<key8>__<name>`, `nod_cache_slot__<key8>__<site_id>`; manifest `RelocKind::Generic`, `RelocKind::CacheSlot`. Field offsets stay as static IR constants — they're struct layout, not addresses |
+
+Already process-deterministic (audited, no Sprint 38 action needed): `block_id` (Sprint 37 fix — derived from `hash(parent_name, thunk_seq)`); fixnum tag encodings; `ConstValue::Integer(n)` literals; class id field offsets within `ClassMetadata`; cache-slot field offsets within `CacheSlot`; `WordBits(0)` sentinels.
+
+**Phase B — symbol naming + manifest types (delivered).** New `nod_llvm::symbols` module:
+
+- `key_prefix(key)` — 16-character hex prefix derived from the Sprint 37 cache key, used as the per-module namespace component.
+- Eleven naming helpers: `stub_symbol`, `cache_slot_symbol`, `generic_symbol`, `class_md_symbol`, `imm_true_symbol`, `imm_false_symbol`, `imm_nil_symbol`, `imm_false_wrapper_symbol`, `strlit_symbol`, `symlit_symbol`.
+- `RelocKind` enum: `StubEntry { dll, symbol, signature_bytes }`, `CacheSlot { site_id }`, `Generic { name }`, `ClassMetadata { class_id }`, `ImmTrue`, `ImmFalse`, `ImmNil`, `ImmFalseWrapper`, `StringLiteral { text }`, `SymbolLiteral { name }`.
+- `ModuleManifest { manifest_version, key_prefix, entries: Vec<RelocEntry> }` with `to_json`/`parse` round-trip — hand-rolled JSON encoder/parser to avoid pulling `serde_json` into the dep tree (Sprint 37 sidecar precedent stands).
+
+Six unit tests in `nod-llvm`: `key_prefix_is_16_chars`, `sanitize_keeps_alphanumerics_and_underscore`, `stable_symbol_naming_is_collision_resistant` (~3000 distinct symbols, no collisions), `manifest_round_trips` (covering every `RelocKind` variant including non-ASCII string-literal text with escaped JSON characters), `manifest_version_mismatch_rejected`, `manifest_parse_rejects_garbage`.
+
+**Phase C — codegen conversion (deferred).** The codegen sites enumerated in Phase A still bake process-local addresses as `i64` immediates today. Converting them needs:
+
+1. A `RelocationCollector` (RefCell of `ModuleManifest`) threaded through the per-module codegen.
+2. New `ConstValue` variants for richer semantic intent (`ClassRefTagged`, `ClassMetaPtr`, `StringLit`, `SymbolLit`, `StubEntry { spec_idx }`), so the lower-side knows what *kind* of address it's baking — `WordBits(u64)` today is process-mixed.
+3. A `emit_reloc_addr(kind)` helper that emits `ptrtoint @nod_reloc_<symbol> to i64` instead of `i64 const_int`, and appends a `RelocEntry` to the per-module manifest.
+4. Care around the *minimum-viable* conversion — class metadata, immediates, string/symbol literals are touched by almost every test; stub entries are touched by FFI tests; cache slots are touched by dispatch tests. Each site is mechanical individually but the chain across crates (DFM IR shape change → format.rs → lower.rs callers → codegen.rs lowerer → JIT-link consumer) is substantial.
+
+Sprint 38b will land Phase C as a focused codegen refactor with the existing 584-test suite as the regression net. Sprint 38's symbol-naming + manifest infrastructure is the API contract Phase C codegens against.
+
+**Phase D — manifest sidecar I/O (delivered).** Cache layout extended with `<key>.manifest.json`:
+
+- `write_cache_entry_with_manifest(dir, key, bitcode, manifest)` — adds manifest sidecar to the existing Sprint 37 bitcode + `<key>.json` sidecar pair.
+- `read_cache_entry_with_manifest(dir, key) -> Option<(bytes, SidecarMeta, ModuleManifest)>` — returns `None` on any of (missing manifest, manifest version mismatch, manifest `key_prefix` ≠ key's actual prefix). Caller treats `None` as cache miss → fresh compile.
+- LRU eviction (`evict_to`) now also removes the sibling `.manifest.json` when it removes a `.bc` + `.json` pair — no orphan manifests on disk after LRU cycles.
+
+Sample manifest from a hypothetical FFI-touching module:
+
+```json
+{
+  "manifest_version": 1,
+  "key_prefix": "7856341278becdef",
+  "entries": [
+    {"symbol": "nod_imm_true__7856341278becdef", "kind": "imm_true"},
+    {"symbol": "nod_imm_false__7856341278becdef", "kind": "imm_false"},
+    {"symbol": "nod_imm_nil__7856341278becdef", "kind": "imm_nil"},
+    {"symbol": "nod_class_md__7856341278becdef__1", "kind": "class_md", "class_id": 1},
+    {"symbol": "nod_class_md__7856341278becdef__7", "kind": "class_md", "class_id": 7},
+    {"symbol": "nod_strlit__7856341278becdef__0", "kind": "strlit", "text": "hello"},
+    {"symbol": "nod_cache_slot__7856341278becdef__42", "kind": "cache_slot", "site_id": 42},
+    {"symbol": "nod_generic__7856341278becdef___", "kind": "generic", "name": "+"},
+    {"symbol": "nod_stub__7856341278becdef__0", "kind": "stub", "dll": "kernel32.dll", "sym": "Beep", "sig": "020707000000000000000005"}
+  ]
+}
+```
+
+**Phase E — JIT-link infrastructure (delivered).** New `Jit::add_module_from_bitcode(ctx, bitcode, module_name, manifest)`:
+
+1. Parses bitcode into a fresh inkwell `Module` (`MemoryBuffer::create_from_memory_range_copy` + `Module::parse_bitcode_from_buffer`).
+2. `module.verify()` rejects malformed payloads.
+3. For each manifest entry, looks up the named external global in the module. Computes the current-process address via `resolve_reloc_kind`:
+   - `ImmTrue/False/Nil` → `nod_runtime::literal_pool_immediates().{true_,false_,nil}.raw()`.
+   - `ImmFalseWrapper` → `false_.raw() & !1`.
+   - `ClassMetadata` → `class_metadata_ptr(ClassId(id)) as u64`.
+   - `StringLiteral` → `intern_string_literal(text).raw()`.
+   - `SymbolLiteral` → `intern_symbol_literal(name).raw()`.
+   - `CacheSlot` → `allocate_cache_slot(site_id) as u64`.
+   - `Generic` → `get_or_create_generic(name) as *const _ as u64`.
+   - `StubEntry` → reconstructs `ApiCallSignature` from manifest bytes, calls `allocate_stub_table` for a fresh entry, then `resolve_into_entry(dll, symbol)` to populate `fn_ptr`. Failure (DLL not present / symbol unresolved) surfaces as `JitError::Create`.
+4. Installs the module in a fresh MCJIT engine (`LLVMCreateMCJITCompilerForModule` with the same `MCJMM` / opt-level / options the cold path uses).
+5. After engine creation, walks each captured `(global, addr)` and calls `LLVMAddGlobalMapping` so MCJIT resolves the named external to the current-process address.
+6. Also registers every standard extern shim (`nod_make`, `nod_format_out`, dispatch shims, range/sov/table/closure/cell/winffi/com/wndproc — ~90 entries total via `standard_extern_addresses()`) and cross-module method body externs (Sprint 20b's `find_method_body_ptr` resolution).
+7. MCJIT finalises lazily on the first `LLVMGetFunctionAddress` call (same shape as cold path's `add_module`).
+
+**Phase F-G — tests (partial).** New `tests/nod-tests/tests/jit_cache_xprocess.rs` ships 9 `#[serial]` tests:
+
+1. `manifest_round_trips_through_disk` — write/read full manifest with every `RelocKind` variant.
+2. `read_returns_none_when_manifest_missing` — bitcode + sidecar present, manifest absent → cache miss.
+3. `read_returns_none_when_manifest_version_mismatches` — manifest with wrong `manifest_version` → cache miss.
+4. `empty_manifest_round_trips` — zero-entry manifest valid (means "no relocations").
+5. `lru_eviction_cleans_manifest_sidecars` — LRU eviction removes all three of `.bc` + `.json` + `.manifest.json`.
+6. `manifest_carries_stub_entry_signature_bytes` — raw `ApiCallSignature` bytes round-trip through manifest JSON's hex-encoded `sig` field.
+7. `manifest_version_constant_is_one` — Sprint 38 ships at v1.
+8. `runtime_abi_version_is_two_after_sprint38_bump` — `NOD_RUNTIME_ABI_VERSION` bumped from 1 to 2.
+9. **`add_module_from_bitcode_round_trips_a_trivial_module`** — **end-to-end smoke test of the JIT-link path**. Drives `eval_expr_to_string("1 + 2 + 3")` to cold-compile + write bitcode to disk; reads the bitcode back; creates a *fresh* `Jit` + `Context`; loads via `add_module_from_bitcode` with the empty manifest the cold path produces today; resolves `<eval-entry>` from the replayed JIT; invokes the function pointer; confirms the tagged-Word result is `6`. The test runs in-process (the cold-compiled bitcode's baked addresses are still valid because the static-area objects haven't moved) — what it proves is that the bitcode-parse + symbol-binding + finalize sequence the JIT-link path uses is sound. Once Sprint 38b lands the codegen-side conversion, this *same* code path becomes cross-process replay.
+
+The headline `cross_process_cache_hit_is_at_least_10x_faster` subprocess-spawn test is **deferred to Sprint 38b** because measuring a 10× ratio requires the codegen-side conversion to be in place. Without it, the cache-hit subprocess would link a module whose IR bakes process-1's addresses, and crash on first use.
+
+**Phase H — verification.**
+
+- `cargo build --workspace`: clean.
+- `cargo test --workspace --no-fail-fast`: **584 passed, 0 failed, 9 ignored** (up from 569 by +15: 6 unit tests in `nod-llvm::symbols`, 9 integration tests in `jit_cache_xprocess.rs`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- 5x sequential flake check: 584/0/9 every run.
+
+**Phase I — docs.** SPRINTS.md retrospective (this section). DEFERRED.md gets new Sprint 38b carry-overs (codegen-side conversion, subprocess-spawn headline test, AOT-mode emission groundwork). HOW_IDE_SHELL_WORKS.md Part 8 stays accurate at the in-process-cache description until Sprint 38b actually ships cross-process behavior.
+
+**Deviations / judgment calls.**
+
+- **The brief's "Phase A inventory → Phase C codegen surgery → Phase F headline test" pipeline doesn't fit a single agent-session budget.** A faithful conversion of every bake site is ~500-1000 lines across nod-dfm, nod-sema, nod-llvm with subtle correctness traps (every missed site silently corrupts cache-hit paths). The pragmatic landing: ship the infrastructure (symbols + manifest + loader) with regression tests locking down the load path, defer the codegen refactor to Sprint 38b. Same trade-off Sprint 37 made when LLVM-C's missing `setObjectCache` forced the in-process-cache landing.
+- **The brief considered a fall-back from subprocess-spawn tests to "fork the cache-loader code path manually."** The `add_module_from_bitcode_round_trips_a_trivial_module` test takes exactly this approach — fresh `Jit` + `Context`, replay bitcode through the new entry point, invoke the result. It's the in-process-shape proof that the loader works; Sprint 38b will turn it into the cross-process variant.
+- **`NOD_RUNTIME_ABI_VERSION` bumped 1 → 2** as a forward-compatibility hedge: when Sprint 38b lands the codegen conversion, Sprint 37-era cache entries (i64-baked addresses) become *actively wrong*, not just stale. The ABI bump invalidates them at the key layer so a stale `.bc` from before the bump can't accidentally match a fresh codegen output. The downside: existing in-flight `.bc` files on developer machines miss; first compile in a Sprint 38 workspace is a cold rebuild. Acceptable.
+
+**Out of scope (deferred — see DEFERRED.md):**
+
+- **Codegen-side conversion of every bake site to named-global references.** Sprint 38b.
+- **Subprocess-spawn cross-process headline test.** Sprint 38b — needs codegen conversion.
+- **AOT mode emitting `.exe`.** Sprint 39 — the relocation machinery built here is the foundation.
+- **Function-level / partial-invalidation caching.** Whole-module keying stands.
+- **Hot-reload-on-source-file-change.** IDE polish.
+- **Compressed bitcode files.** Sprint 38 ships uncompressed; bitcode compresses well, an LRU-cap follow-up.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 

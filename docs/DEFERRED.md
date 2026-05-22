@@ -2386,14 +2386,19 @@ and a few corner cases the seed-struct set didn't touch.
   - Migrate the JIT from MCJIT to ORC v2 LLJIT, which DOES
     expose `LLVMOrcLLJITAddObjectFile` through the C API. Larger
     refactor; aligns with LLVM's "MCJIT is legacy" stance.
-- **:open: Cross-process bitcode replay** — The on-disk `.bc`
-  file is identical for identical Dylan source (the cache key
-  guarantees this), but the bitcode references baked-in runtime
-  pointers (cache slots, generic function pointers, runtime shim
-  addresses) that are process-volatile. Cross-process replay
-  needs a fix-up pass at module-load time that rewrites those
-  i64 immediates to addresses valid in the new process. Sprint
-  38 AOT pulls this in.
+- **:half-closed: Cross-process bitcode replay** — Sprint 38
+  landed the **infrastructure** (symbol-naming scheme, manifest
+  sidecar JSON, `Jit::add_module_from_bitcode` JIT-link entry
+  point that resolves named externs to current-process addresses,
+  9 regression tests including end-to-end replay round-trip
+  with empty manifest). The codegen-side conversion that
+  replaces every i64-baked runtime address with a `ptrtoint
+  @global to i64` reference is **deferred to Sprint 38b** —
+  see new carry-overs below. Without the conversion, on-disk
+  bitcode still references process-local addresses, so a fresh
+  process loading the bitcode would see stale pointers. The
+  Sprint 38 retrospective in SPRINTS.md documents the scope cut
+  rationale.
 - **:open: Function-level / cross-module dependency tracking** —
   Sprint 37 keys on the whole `LoweredModule` (one DFM-IR text
   hash → one cache entry). Per-function granularity is Sprint
@@ -2439,4 +2444,72 @@ and a few corner cases the seed-struct set didn't touch.
   invalidates the entire on-disk cache; the in-process cache
   is already invalidated by process restart. Test:
   `cache_invalidates_on_runtime_abi_bump` in
-  `tests/jit_cache.rs`.
+  `tests/jit_cache.rs`. **Sprint 38 bumped to 2** — see Sprint
+  38 retrospective for rationale (named-global codegen path
+  invalidates Sprint 37 cache entries).
+
+## Carry-over from Sprint 38 (cross-process bitcode replay — partial) — into Sprint 38b+
+
+- **:open: Sprint 38b — codegen-side conversion of every bake
+  site to named-global references.** Sprint 38 enumerated the
+  ~8 bake-site categories in its Phase A inventory and shipped
+  the symbol-naming + manifest infrastructure plus the JIT-link
+  loader. The remaining work is the codegen surgery: thread a
+  `RelocationCollector` (RefCell<ModuleManifest>) through the
+  per-module codegen state; introduce richer `ConstValue`
+  variants in DFM IR (`ClassRefTagged`, `ClassMetaPtr`,
+  `StringLit`, `SymbolLit`, `StubEntry { spec_idx }`) so the
+  lower layer can disambiguate process-mixed `WordBits(u64)`
+  bakes by semantic intent; add an `emit_reloc_addr(kind)`
+  helper that emits `ptrtoint @nod_reloc_<symbol> to i64`
+  instead of `i64 const_int`; replace each bake site
+  identified in the Sprint 38 Phase A audit. The chain across
+  crates (DFM IR → format.rs → lower.rs → codegen.rs → JIT-link
+  consumer in jit.rs) is mechanical individually but
+  substantial in total. Sprint 38b uses the existing 584-test
+  suite plus the 9 `jit_cache_xprocess.rs` infrastructure
+  tests as the regression net.
+- **:open: Sprint 38b — subprocess-spawn cross-process
+  headline test.** Once Sprint 38b's codegen conversion lands,
+  the `cross_process_cache_hit_is_at_least_10x_faster` test
+  in `tests/jit_cache_xprocess.rs` becomes reachable. The brief's
+  pattern: `std::process::Command::new(env::current_exe())`
+  spawns two child subprocess invocations of identical Dylan
+  source; parent measures wall-time delta. Subtract a baseline
+  child-spawn-only measurement to isolate JIT cost. Brief's
+  fall-back if subprocess spawning proves flaky: simulate
+  fresh-process by clearing the in-process cache + re-init JIT
+  in a single process (which is what Sprint 38's `add_module_from_bitcode_round_trips_a_trivial_module`
+  already exercises in the limit). Both approaches measure the
+  same load-path cost.
+- **:open: AOT mode emitting standalone `.exe`** — Sprint 39.
+  The relocation machinery Sprint 38 built is the foundation:
+  the manifest becomes a static-data table linked into the
+  output binary; the JIT-link loader's `resolve_reloc_kind`
+  walks become startup code in the emitted EXE.
+- **:open: Function-level / partial-invalidation cache
+  granularity** — same as the Sprint 37 carry-over above; not
+  addressed by Sprint 38.
+- **:open: Hot-reload IDE workflow** — same as the Sprint 37
+  carry-over above; not addressed by Sprint 38.
+- **:open: Compressed bitcode files on disk** — same as the
+  Sprint 37 carry-over above; not addressed by Sprint 38.
+- **:open: Stub-entry deduplication across cache-hit modules** —
+  Sprint 38's `add_module_from_bitcode` `resolve_reloc_kind`
+  for `RelocKind::StubEntry` calls `allocate_stub_table([single
+  spec])` per entry, so a module with 10 distinct c-functions
+  allocates 10 single-entry stub tables. The cold path
+  deduplicates via `c_function_specs` aggregation. A future
+  refinement: a per-(dll, symbol) interning layer in the
+  runtime so duplicate StubEntry relocations share storage.
+  Not a correctness issue; a memory-tidiness one.
+- **:open: Bitcode integrity / signature verification** —
+  Sprint 38's `add_module_from_bitcode` does `module.verify()`
+  but doesn't verify the bitcode file was authored by a
+  matching codegen version. The `SidecarMeta`'s `nod_version`
+  field gates this at the read layer, but a malicious or
+  truncated bitcode file that passes LLVM's verify could
+  still be loaded. A SHA-256 of the bitcode bytes in the
+  manifest (cross-checked at load time) closes this. Low
+  priority — the cache directory is process-owned, not a
+  network endpoint.

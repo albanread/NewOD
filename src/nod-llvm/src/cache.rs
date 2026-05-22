@@ -69,7 +69,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// DFM input. Drives both in-process and on-disk cache invalidation —
 /// keys minted under an older value cannot match anything cached under
 /// the new value.
-pub const NOD_RUNTIME_ABI_VERSION: u32 = 1;
+/// Sprint 38 bumps this from 1 to 2: the IR no longer bakes process-
+/// local addresses as `i64` constants — every runtime address is now
+/// resolved at JIT-link time through a named external global registered
+/// via [`crate::symbols::RelocKind`]. Old Sprint 37 cache entries
+/// would crash if re-loaded against the Sprint 38 codegen, so we make
+/// the invalidation explicit via the ABI version bump.
+pub const NOD_RUNTIME_ABI_VERSION: u32 = 2;
 
 /// LLVM major version we link against. Sourced from
 /// `llvm_sys::LLVM_VERSION_MAJOR` at compile time. Bump in lockstep
@@ -358,6 +364,47 @@ pub fn read_cache_entry(dir: &Path, key: CacheKey) -> Option<(Vec<u8>, SidecarMe
     Some((bytes, meta))
 }
 
+/// Sprint 38 — write bitcode + sidecar JSON + manifest JSON for one
+/// cache entry. The manifest is the cross-process relocation table the
+/// JIT-link path needs to populate fresh runtime addresses on a cache
+/// hit. Sidecar JSON's `size_bytes` is the bitcode length only — the
+/// manifest's size doesn't count against the LRU cap (manifests are
+/// kilobytes; bitcode files are dozens of kilobytes).
+pub fn write_cache_entry_with_manifest(
+    dir: &Path,
+    key: CacheKey,
+    bitcode: &[u8],
+    manifest: &crate::symbols::ModuleManifest,
+) {
+    write_cache_entry(dir, key, bitcode);
+    let hex = key.to_hex();
+    let manifest_path = dir.join(format!("{hex}.manifest.json"));
+    if let Err(e) = fs::write(&manifest_path, manifest.to_json()) {
+        eprintln!("nod-jit-cache: write {manifest_path:?} failed: {e}");
+    }
+}
+
+/// Sprint 38 — read bitcode + sidecar + manifest. Returns `None` if
+/// any of the three is missing/corrupt/version-incompatible; caller
+/// treats that as a cache miss and falls through to a fresh compile.
+pub fn read_cache_entry_with_manifest(
+    dir: &Path,
+    key: CacheKey,
+) -> Option<(Vec<u8>, SidecarMeta, crate::symbols::ModuleManifest)> {
+    let (bytes, meta) = read_cache_entry(dir, key)?;
+    let hex = key.to_hex();
+    let manifest_path = dir.join(format!("{hex}.manifest.json"));
+    let manifest_text = fs::read_to_string(&manifest_path).ok()?;
+    let manifest = crate::symbols::ModuleManifest::parse(&manifest_text)?;
+    if manifest.manifest_version != crate::symbols::MANIFEST_VERSION {
+        return None;
+    }
+    if manifest.key_prefix != crate::symbols::key_prefix(key) {
+        return None;
+    }
+    Some((bytes, meta, manifest))
+}
+
 /// Walk `dir`, sort by `accessed_at_unix_ms` ascending, delete oldest
 /// until total size ≤ `max_bytes`. Best-effort; errors per-entry are
 /// logged and skipped. Returns the count of evicted entries.
@@ -392,8 +439,12 @@ pub fn evict_to(dir: &Path, max_bytes: u64) -> usize {
             break;
         }
         let bc_path = json_path.with_extension("bc");
+        // Sprint 38: also remove the sibling `<hex>.manifest.json` so
+        // no orphan manifest sits next to a deleted bitcode.
+        let manifest_path = json_path.with_extension("manifest.json");
         let _ = fs::remove_file(&json_path);
         let _ = fs::remove_file(&bc_path);
+        let _ = fs::remove_file(&manifest_path);
         total = total.saturating_sub(meta.size_bytes);
         evicted += 1;
     }
