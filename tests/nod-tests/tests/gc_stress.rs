@@ -187,23 +187,23 @@ fn forwarding_pointer_roundtrip() {
 
 // ─── (4) Large-object handling ─────────────────────────────────────────────
 
-/// Allocate a `<simple-object-vector>` near the single-page upper
-/// bound (4096 slots * 8 = 32 KB payload + wrapper + len ≈ 32 KB, well
-/// inside the 64-KB page-size cap NewGC's `try_alloc_boxed_in`
-/// enforces). Verify the alloc succeeds and a full GC after dropping
-/// the root reclaims the space.
+/// Allocate a `<simple-object-vector>` well past the one-page cap that
+/// constrained Sprint 23. Verify the alloc succeeds and a full GC
+/// after dropping the root reclaims the space.
 ///
-/// Sprint 23 NewGC structural finding: `PageHeap::try_alloc_boxed_in`
-/// caps at one page (8192 cells). Vectors bigger than that need a
-/// separate large-object code path — landed-in-NewGC's "sub-phase 7"
-/// per evac.rs comments, not yet exposed in our binding. Tracked in
-/// DEFERRED.md.
+/// Sprint 33 (NewGC VM-1 port): NewGC's `try_alloc_large` finds a
+/// contiguous free-page run, commits all pages, and pins large objects
+/// in place during evacuation. The Sprint 23 4096-slot workaround is
+/// removed; this test exercises 24,000 slots (~192 KB payload, well
+/// past the single-page boundary).
 #[test]
 #[serial]
 fn large_object_handling() {
     let heap = Heap::new();
     let ct = ClassTable::new();
-    let n_slots = 4096usize;
+    // 24,000 slots = ~192 KB payload, spans ~3 NewGC pages. The new
+    // large-object path is what makes this allocatable.
+    let n_slots = 24_000usize;
     let v_word = heap.alloc_simple_object_vector(n_slots, &ct);
     // Stable backing cell for the root pointer (a bare `&v_word` would
     // bind to a stack slot whose address might move; using a Box keeps
@@ -286,19 +286,22 @@ fn stress_mixed_workload() {
         heap.unregister_root(cell.get() as *const Word);
     }
     drop(anchors);
-    // NewGC structural finding: `collect_major` here is G1→Tenured
-    // then G0→G0; it does NOT recollect Tenured. Anchors that landed
-    // in Tenured during the stress loop's periodic major calls stay
-    // resident across this final collect. Tenured-only collection is
-    // a NewGC follow-up (not yet exposed in our binding); see
-    // DEFERRED.md. For now, assert merely that the major didn't grow
-    // the heap and the unrooted pairs/strings did get reclaimed.
+    // Sprint 33 (NewGC VM-2 port): collect_full now runs the
+    // three-pass algorithm — G0→G1 forced, G1→Tenured forced, then
+    // Tenured→Tenured with the live root closure. Objects that aged
+    // into Tenured during the stress loop AND have no remaining roots
+    // ARE now reclaimed. Strengthens the original Sprint 23 assertion
+    // from "didn't grow" to "≥75% reclaim".
     heap.collect_full();
     let live_end = heap.live_bytes();
     eprintln!("stress_mixed: live_during={live_during} live_end={live_end}");
     assert!(
         live_end <= live_during,
         "GC must not grow live bytes; live_end={live_end} live_during={live_during}"
+    );
+    assert!(
+        live_end * 4 <= live_during,
+        "expected ≥75% reclaim after dropping roots; live_during={live_during} live_end={live_end}"
     );
 }
 

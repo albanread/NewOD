@@ -1347,6 +1347,17 @@ mod newgc_backend {
                 inner.cumulative_objects += 1;
                 return p.as_ptr() as usize;
             }
+            // Sprint 33 (NewGC VM-1 port): the request may exceed the
+            // single-page cap of `try_alloc_boxed_in` (~8K cells). Fall
+            // back to `try_alloc_large`, which finds a contiguous
+            // free-page run and commits all pages at once. Large objects
+            // are pinned in place during evacuation — never copied — so
+            // their address is stable for the object's lifetime.
+            if let Some(p) = inner.heap.try_alloc_large(n_cells, Generation::Tenured) {
+                inner.cumulative_objects += 1;
+                inner.stats.young_bytes_allocated += (n_cells * 8) as u64;
+                return p.as_ptr() as usize;
+            }
             let stats = inner.heap.stats();
             panic!(
                 "heap exhausted: request {} cells ({} bytes); g0={} g1={} tenured={} free_pages={}",
@@ -1464,11 +1475,20 @@ mod newgc_backend {
         }
 
         pub(super) fn collect_full(&self) {
+            // Sprint 33 (NewGC VM-2 port): NewGC's `collect_full` runs a
+            // three-pass algorithm — G0→G1 forced, G1→Tenured forced,
+            // then Tenured→Tenured with the live root closure. Objects
+            // that aged into Tenured AND have no remaining roots are
+            // reclaimed. The old `collect_major` (G1→Tenured + G0→G0)
+            // never reclaimed Tenured residents; we replaced it.
             let start = Instant::now();
             let roots = snapshot_roots();
             {
                 let mut inner = self.inner.lock().expect("heap mutex poisoned");
-                inner.heap.collect_major(|evac| visit_roots(evac, &roots));
+                let _result = inner.heap.collect_full(|evac| visit_roots(evac, &roots));
+                // FullCollectResult carries per-pass EvacResults + freed
+                // bytes; Sprint 33 doesn't surface them yet — future
+                // diagnostics work can wire them into GcStats.
             }
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             let mut inner = self.inner.lock().expect("heap mutex poisoned");
