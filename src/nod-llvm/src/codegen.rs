@@ -66,8 +66,8 @@ use nod_runtime::ClassId;
 
 use crate::cache::CacheKey;
 use crate::symbols::{
-    ModuleManifest, RelocKind, imm_false_symbol, imm_false_wrapper_symbol, imm_nil_symbol,
-    imm_true_symbol,
+    ModuleManifest, RelocKind, class_md_symbol, imm_false_symbol, imm_false_wrapper_symbol,
+    imm_nil_symbol, imm_true_symbol, strlit_symbol, symlit_symbol,
 };
 
 /// Name of the JIT-side `nod_make` external declaration.
@@ -482,6 +482,15 @@ pub type FunctionMap<'ctx> = HashMap<String, FunctionValue<'ctx>>;
 pub(crate) struct ModuleCodegenCtx {
     pub key: CacheKey,
     pub manifest: RefCell<ModuleManifest>,
+    /// Sprint 38c — per-module content-keyed dedup table for string
+    /// literals. The first time a given UTF-8 text is referenced, we
+    /// assign it the next sequential index (used to namespace its
+    /// external global `@nod_strlit__<key>__<idx>`); subsequent
+    /// references to the same text reuse that index, so the IR has
+    /// exactly one external global per distinct literal per module.
+    pub string_lit_idx: RefCell<HashMap<String, u32>>,
+    /// Sprint 38c — same shape for `<symbol>` literals.
+    pub symbol_lit_idx: RefCell<HashMap<String, u32>>,
 }
 
 impl ModuleCodegenCtx {
@@ -489,7 +498,34 @@ impl ModuleCodegenCtx {
         Self {
             key,
             manifest: RefCell::new(ModuleManifest::new(key)),
+            string_lit_idx: RefCell::new(HashMap::new()),
+            symbol_lit_idx: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Sprint 38c — look up or assign the per-module index for a
+    /// `<byte-string>` literal. The returned index is stable across
+    /// repeated calls with the same `text` in the same module.
+    pub fn string_lit_index(&self, text: &str) -> u32 {
+        let mut map = self.string_lit_idx.borrow_mut();
+        if let Some(&idx) = map.get(text) {
+            return idx;
+        }
+        let idx = map.len() as u32;
+        map.insert(text.to_string(), idx);
+        idx
+    }
+
+    /// Sprint 38c — look up or assign the per-module index for a
+    /// `<symbol>` literal.
+    pub fn symbol_lit_index(&self, name: &str) -> u32 {
+        let mut map = self.symbol_lit_idx.borrow_mut();
+        if let Some(&idx) = map.get(name) {
+            return idx;
+        }
+        let idx = map.len() as u32;
+        map.insert(name.to_string(), idx);
+        idx
     }
 }
 
@@ -529,6 +565,93 @@ fn get_or_add_imm_global<'ctx>(
     // state; cold-compile in-process binding uses the same path
     // (see `Jit::add_module`'s Sprint 38b binding loop).
     mctx.manifest.borrow_mut().push(symbol, kind);
+    g
+}
+
+/// Sprint 38c — look up (or create) the per-module external global for
+/// a class-metadata pointer keyed by `class_id`. The global's value at
+/// runtime (after JIT-link mapping) is a `u64` slot whose contents are
+/// `class_metadata_ptr(class_id) as u64` (the raw, untagged metadata
+/// pointer in the current process). Codegen `load`s from the global
+/// to recover the pointer; the OR-with-1 pointer-tag (if needed) is
+/// applied at the use site.
+///
+/// Idempotent — same `class_id` reuses the same global and registers
+/// only one manifest row per module.
+fn get_or_add_class_metadata_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    class_id: u32,
+) -> GlobalValue<'ctx> {
+    let symbol = class_md_symbol(mctx.key, class_id);
+    if let Some(g) = module.get_global(&symbol) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &symbol);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    mctx.manifest
+        .borrow_mut()
+        .push(symbol, RelocKind::ClassMetadata { class_id });
+    g
+}
+
+/// Sprint 38c — per-module external global for an interned
+/// `<byte-string>` literal. The slot's contents are the Word's raw
+/// bits (tagged) in the current process.
+///
+/// `idx` is the per-module content-keyed index assigned by
+/// `ModuleCodegenCtx::string_lit_index`. Calls within one module
+/// dedup on `text` so the global is created exactly once.
+fn get_or_add_string_literal_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    idx: u32,
+    text: &str,
+) -> GlobalValue<'ctx> {
+    let symbol = strlit_symbol(mctx.key, idx);
+    if let Some(g) = module.get_global(&symbol) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &symbol);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    mctx.manifest.borrow_mut().push(
+        symbol,
+        RelocKind::StringLiteral {
+            text: text.to_string(),
+        },
+    );
+    g
+}
+
+/// Sprint 38c — per-module external global for an interned `<symbol>`
+/// literal.
+fn get_or_add_symbol_literal_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    idx: u32,
+    name: &str,
+) -> GlobalValue<'ctx> {
+    let symbol = symlit_symbol(mctx.key, idx);
+    if let Some(g) = module.get_global(&symbol) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &symbol);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    mctx.manifest.borrow_mut().push(
+        symbol,
+        RelocKind::SymbolLiteral {
+            name: name.to_string(),
+        },
+    );
     g
 }
 
@@ -878,6 +1001,72 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         Ok(v.into_int_value())
     }
 
+    /// Sprint 38c — load the runtime class-metadata pointer for
+    /// `class_id` from the per-module external global. If `tagged`
+    /// is true, OR `| 1` onto the loaded value to materialise a
+    /// pointer-tagged Dylan Word (`emit_class_ref` semantics); if
+    /// false, return the raw pointer bits (`nod_make`'s class-arg
+    /// shape, `emit_class_metadata_ptr_const` semantics).
+    fn load_class_metadata(
+        &self,
+        class_id: u32,
+        tagged: bool,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_class_metadata_global(self.ctx, self.module, self.mctx, class_id);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let i64_ty = self.ctx.i64_type();
+        let raw = self
+            .builder
+            .build_load(i64_ty, g.as_pointer_value(), "class_md.load")
+            .map_err(map_err)?
+            .into_int_value();
+        if tagged {
+            let one = i64_ty.const_int(1, false);
+            let v = self
+                .builder
+                .build_or(raw, one, "class_md.tagged")
+                .map_err(map_err)?;
+            Ok(v)
+        } else {
+            Ok(raw)
+        }
+    }
+
+    /// Sprint 38c — load the interned `<byte-string>` Word for `text`
+    /// from the per-module external global. The text is deduped within
+    /// the module so repeated references emit one global, one manifest
+    /// row, and one IR-level load instruction per use.
+    fn load_string_literal(
+        &self,
+        text: &str,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let idx = self.mctx.string_lit_index(text);
+        let g = get_or_add_string_literal_global(self.ctx, self.module, self.mctx, idx, text);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "strlit.load")
+            .map_err(map_err)?
+            .into_int_value();
+        Ok(v)
+    }
+
+    /// Sprint 38c — load the interned `<symbol>` Word for `name`.
+    fn load_symbol_literal(
+        &self,
+        name: &str,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let idx = self.mctx.symbol_lit_index(name);
+        let g = get_or_add_symbol_literal_global(self.ctx, self.module, self.mctx, idx, name);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "symlit.load")
+            .map_err(map_err)?
+            .into_int_value();
+        Ok(v)
+    }
+
     /// Sprint 38b — convert an `i1` to a Sprint 10 tagged-boolean Dylan
     /// value. `#t` and `#f` are pointer-tagged Words referring to
     /// pinned heap wrappers; we load both via external globals (Sprint
@@ -1222,25 +1411,34 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 .const_int(*c as u64, false)
                 .into(),
             // Sprint 10: a `<byte-string>` literal is interned in the
-            // process-global literal pool. The interned Word's raw bits
-            // are baked as an i64 constant — JIT-loaded as a tagged
-            // pointer to a `<byte-string>` heap object.
-            // (Sprint 38c will convert this site to a named global.)
-            ConstValue::String(s) => {
-                let w = nod_runtime::intern_string_literal(s);
-                self.ctx.i64_type().const_int(w.raw(), false).into()
-            }
+            // process-global literal pool. Sprint 38c — load the Word
+            // from the per-module external global keyed by content
+            // instead of baking the interned Word's bits as an i64
+            // constant. The bitcode round-trips across processes.
+            ConstValue::String(s) => self.load_string_literal(s)?.into(),
             // Sprint 10: `Unit` constants lower to `nil`'s pinned
             // singleton address. Sprint 38b: load from the per-module
             // external global instead of baking the raw bits.
             ConstValue::Unit => self.load_imm_nil()?.into(),
             // Sprint 12: raw 64-bit constant — used by lowering to
-            // bake `<class>` references, tagged class-metadata ptrs,
-            // and interned symbol Words straight into the IR.
-            // (Sprint 38c will convert these uses to named globals.)
+            // bake non-runtime-address Word patterns (block ids, the
+            // null sentinel, exit-procedure fixnums). Sprint 38c
+            // narrowed the class-ref / string / symbol literal cases
+            // to dedicated variants; only fixnum-shaped Word patterns
+            // and the legacy raw-bits scaffolding flow here today.
             ConstValue::WordBits(bits) => {
                 self.ctx.i64_type().const_int(*bits, false).into()
             }
+            // Sprint 38c — class-metadata pointer reference. Loads via
+            // per-module external global; ORs `| 1` if tagged.
+            ConstValue::ClassMetadataPtr { class_id, tagged } => {
+                self.load_class_metadata(*class_id, *tagged)?.into()
+            }
+            // Sprint 38c — interned `<byte-string>` literal reference.
+            // Loads the Word's bits via per-module external global.
+            ConstValue::StringLiteralRef(text) => self.load_string_literal(text)?.into(),
+            // Sprint 38c — interned `<symbol>` literal reference.
+            ConstValue::SymbolLiteralRef(name) => self.load_symbol_literal(name)?.into(),
         })
     }
 

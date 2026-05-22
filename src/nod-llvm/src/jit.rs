@@ -1061,12 +1061,28 @@ fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String>
         RelocKind::ImmFalse => nod_runtime::imm_false_slot_addr() as u64,
         RelocKind::ImmNil => nod_runtime::imm_nil_slot_addr() as u64,
         RelocKind::ImmFalseWrapper => nod_runtime::imm_false_wrapper_slot_addr() as u64,
+        // Sprint 38c — same correction as Sprint 38b: return the
+        // *address* of a stable slot whose contents are the runtime
+        // value, NOT the value itself. The JIT-link path registers the
+        // slot's address via `LLVMAddGlobalMapping(@sym, slot)`; the IR
+        // emits `load i64, ptr @sym` to recover the bits.
+        //
+        // Pre-Sprint-38c code in this match returned `class_metadata_ptr
+        // (id) as u64` directly (i.e. the metadata pointer as a value),
+        // which only worked because no IR site ever loaded through the
+        // named symbol — the bake site was still an `i64` constant.
+        // Sprint 38c switches the IR to a real `load` through the
+        // named global, which is what makes this correction load-bearing.
         RelocKind::ClassMetadata { class_id } => {
             let id = nod_runtime::ClassId(*class_id);
-            nod_runtime::class_metadata_ptr(id) as u64
+            nod_runtime::class_metadata_slot_addr(id) as u64
         }
-        RelocKind::StringLiteral { text } => nod_runtime::intern_string_literal(text).raw(),
-        RelocKind::SymbolLiteral { name } => nod_runtime::intern_symbol_literal(name).raw(),
+        RelocKind::StringLiteral { text } => {
+            nod_runtime::intern_string_literal_slot_addr(text) as u64
+        }
+        RelocKind::SymbolLiteral { name } => {
+            nod_runtime::intern_symbol_literal_slot_addr(name) as u64
+        }
         RelocKind::CacheSlot { site_id } => {
             nod_runtime::allocate_cache_slot(*site_id) as u64
         }

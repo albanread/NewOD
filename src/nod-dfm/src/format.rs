@@ -270,6 +270,15 @@ fn fmt_const(v: &ConstValue, out: &mut String) {
         ConstValue::WordBits(bits) => {
             let _ = write!(out, "WordBits({bits:#x})");
         }
+        ConstValue::ClassMetadataPtr { class_id, tagged } => {
+            let _ = write!(out, "ClassMetadataPtr({class_id}, tagged={tagged})");
+        }
+        ConstValue::StringLiteralRef(s) => {
+            let _ = write!(out, "StringLiteralRef({s:?})");
+        }
+        ConstValue::SymbolLiteralRef(name) => {
+            let _ = write!(out, "SymbolLiteralRef({name:?})");
+        }
     }
 }
 

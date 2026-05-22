@@ -426,6 +426,437 @@ fn sprint38b_bitcode_round_trip_reads_named_global() {
     nod_llvm::in_process_clear();
 }
 
+// ─── Sprint 38c — class metadata + string + symbol literal bake sites ──
+//
+// Same end-to-end shape as Sprint 38b's immediate-round-trip tests: cold
+// compile, drop the in-process cache, reload from bitcode + manifest,
+// re-invoke, and assert the result matches. Plus three IR-shape tests
+// that read the cached `.bc` back as IR text and confirm the named
+// external global is present (not a baked `i64 <bits>` constant).
+
+#[test]
+#[serial]
+fn sprint38c_class_metadata_globals_round_trip() {
+    // `make(<range>, from: 0, to: 5)` references the `<range>` class's
+    // raw metadata pointer at the `emit_class_metadata_ptr_const` bake
+    // site — Sprint 38c's class-metadata category. The pointer is
+    // genuinely needed at runtime (`nod_make`'s first arg) so the
+    // compiler can't fold it the way it folds `instance?(1, <integer>)`.
+    // Cold-compile, then reload the bitcode in a fresh JIT and prove
+    // the same result.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-class-md-roundtrip");
+    nod_llvm::clear_cache_dir(&dir);
+    // SAFETY: env mutation is serialised by `#[serial]`.
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    let cold = eval_expr_to_string("size(make(<range>, from: 0, to: 5))").expect("cold eval");
+    assert_eq!(cold, "6", "cold path returns 6 for size(make(<range>, from: 0, to: 5))");
+
+    // Read back the .bc + manifest.
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    assert!(!bc_paths.is_empty(), "cache dir should contain ≥1 .bc");
+    let bc_path = bc_paths[0].path();
+    let manifest_path = bc_path.with_extension("manifest.json");
+    let bitcode = std::fs::read(&bc_path).expect("read bitcode");
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).expect("manifest.json must exist");
+    let manifest = nod_llvm::ModuleManifest::parse(&manifest_text).expect("manifest parses");
+
+    // Sprint 38c — codegen must have emitted at least one ClassMetadata
+    // reloc entry (covering <range> at minimum).
+    let cm_kinds: Vec<&nod_llvm::RelocKind> = manifest
+        .entries
+        .iter()
+        .map(|e| &e.kind)
+        .filter(|k| matches!(k, nod_llvm::RelocKind::ClassMetadata { .. }))
+        .collect();
+    assert!(
+        !cm_kinds.is_empty(),
+        "manifest must carry ≥1 ClassMetadata RelocKind entry; got: {:?}",
+        manifest.entries
+    );
+
+    // Fresh JIT + Context.
+    let ctx: &'static nod_llvm::LlvmContext =
+        Box::leak(Box::new(nod_llvm::LlvmContext::create()));
+    let mut jit = nod_llvm::Jit::new(ctx).expect("Jit::new");
+    jit.add_module_from_bitcode(ctx, &bitcode, "__replay_class_md__", &manifest)
+        .expect("add_module_from_bitcode");
+
+    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+        .expect("<eval-entry> resolves from replayed bitcode");
+    assert!(!ptr.is_null());
+    // `size(...)` returns a fixnum; tagged Word = 6 << 1 = 12.
+    let f: extern "C-unwind" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+    let raw = f();
+    assert_eq!(raw >> 1, 6, "replayed size(make(<range>, from: 0, to: 5)) returns 6");
+
+    // SAFETY: serialised by #[serial].
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
+fn sprint38c_string_literal_globals_round_trip() {
+    // `"hello"` lowering exercises the `emit_string_literal` bake
+    // site (now `ConstValue::StringLiteralRef`). Cold-compile,
+    // reload, and confirm the bitcode replays correctly.
+    //
+    // The expression is just the literal string itself: `<eval-entry>`
+    // returns the interned `<byte-string>` Word's raw bits. We assert
+    // the replay yields the same Word as `intern_string_literal("hello")`
+    // in the current process — i.e. the slot allocator and the per-
+    // module external global mapping agree.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-strlit-roundtrip");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    // Cold path: returns the interned-string Word, which
+    // `eval_expr_to_string`'s pretty-printer renders as the bare
+    // string (Dylan's `print` shape).
+    let cold = eval_expr_to_string("\"hello\"").expect("cold eval");
+    assert_eq!(cold, "\"hello\"", "cold path returns the literal string");
+
+    // Read .bc + manifest.
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    assert!(!bc_paths.is_empty());
+    let bc_path = bc_paths[0].path();
+    let manifest_path = bc_path.with_extension("manifest.json");
+    let bitcode = std::fs::read(&bc_path).expect("read bitcode");
+    let manifest_text = std::fs::read_to_string(&manifest_path).expect("manifest exists");
+    let manifest = nod_llvm::ModuleManifest::parse(&manifest_text).expect("manifest parses");
+
+    let str_kinds: Vec<&nod_llvm::RelocKind> = manifest
+        .entries
+        .iter()
+        .map(|e| &e.kind)
+        .filter(|k| matches!(k, nod_llvm::RelocKind::StringLiteral { .. }))
+        .collect();
+    assert!(
+        !str_kinds.is_empty(),
+        "manifest must carry ≥1 StringLiteral RelocKind entry"
+    );
+    let texts: Vec<&str> = str_kinds
+        .iter()
+        .filter_map(|k| match k {
+            nod_llvm::RelocKind::StringLiteral { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.contains(&"hello"),
+        "expected `hello` among string literals; got {texts:?}"
+    );
+
+    let ctx: &'static nod_llvm::LlvmContext =
+        Box::leak(Box::new(nod_llvm::LlvmContext::create()));
+    let mut jit = nod_llvm::Jit::new(ctx).expect("Jit::new");
+    jit.add_module_from_bitcode(ctx, &bitcode, "__replay_strlit__", &manifest)
+        .expect("add_module_from_bitcode");
+
+    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+        .expect("<eval-entry> resolves");
+    assert!(!ptr.is_null());
+    // The eval entry returns the raw bits of the interned <byte-string>
+    // Word. The cold compile took the value from `intern_string_literal`
+    // (one allocation in the static area); subsequent calls to that
+    // helper allocate a *new* `<byte-string>` (no per-text dedup at
+    // that layer — Sprint 38c added dedup only at the slot allocator).
+    // So compare against the slot value, which is the canonical
+    // interned word for `"hello"` in this process.
+    let f: extern "C-unwind" fn() -> u64 = unsafe { std::mem::transmute(ptr) };
+    let raw = f();
+    let slot_addr = nod_runtime::intern_string_literal_slot_addr("hello");
+    // SAFETY: slot_addr is a stable `&'static u64` from the slot
+    // allocator; its lifetime is the process.
+    let expected = unsafe { *slot_addr };
+    assert_eq!(
+        raw, expected,
+        "replayed eval-entry must return the slot-cached interned `\"hello\"` Word"
+    );
+    // Tag invariant: the slot's Word is a pointer-tagged `<byte-string>`,
+    // so the low bit must be 1.
+    assert_eq!(raw & 1, 1, "interned byte-string Word must carry pointer tag");
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
+fn sprint38c_symbol_literal_globals_round_trip() {
+    // `make(<integer>, value: 42)` lowers the `value:` keyword as a
+    // `<symbol>` literal via `emit_symbol_literal`. We don't yet have
+    // a Dylan surface form for direct symbol comparison, but the
+    // bake site fires during `make`-keyword lowering — confirm that
+    // the resulting bitcode rounds through replay correctly.
+    //
+    // We pick `<range>` since it accepts `from: to:` keyword args
+    // and is part of the seed class set (no user-class registration
+    // needed in the warm process).
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-symlit-roundtrip");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    // `make(<range>, from: 0, to: 5)` produces a range; `size(...)`
+    // gives its length (6). The `make` lowering pushes a `value:`-style
+    // symbol literal Word for each keyword — exercising the symbol-
+    // literal bake site.
+    let cold = eval_expr_to_string("size(make(<range>, from: 0, to: 5))").expect("cold eval");
+    assert_eq!(cold, "6", "cold path returns 6");
+
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    assert!(!bc_paths.is_empty());
+    let bc_path = bc_paths[0].path();
+    let manifest_path = bc_path.with_extension("manifest.json");
+    let bitcode = std::fs::read(&bc_path).expect("read bitcode");
+    let manifest_text = std::fs::read_to_string(&manifest_path).expect("manifest exists");
+    let manifest = nod_llvm::ModuleManifest::parse(&manifest_text).expect("manifest parses");
+
+    let sym_kinds: Vec<&nod_llvm::RelocKind> = manifest
+        .entries
+        .iter()
+        .map(|e| &e.kind)
+        .filter(|k| matches!(k, nod_llvm::RelocKind::SymbolLiteral { .. }))
+        .collect();
+    assert!(
+        !sym_kinds.is_empty(),
+        "manifest must carry ≥1 SymbolLiteral RelocKind entry"
+    );
+    let names: Vec<&str> = sym_kinds
+        .iter()
+        .filter_map(|k| match k {
+            nod_llvm::RelocKind::SymbolLiteral { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    // `from` and `to` keywords should be among the symbol literals
+    // (emit_symbol_literal in the make-keyword lowering strips the
+    // trailing colon).
+    assert!(
+        names.iter().any(|n| *n == "from" || *n == "to"),
+        "expected `from`/`to` keywords; got {names:?}"
+    );
+
+    let ctx: &'static nod_llvm::LlvmContext =
+        Box::leak(Box::new(nod_llvm::LlvmContext::create()));
+    let mut jit = nod_llvm::Jit::new(ctx).expect("Jit::new");
+    jit.add_module_from_bitcode(ctx, &bitcode, "__replay_symlit__", &manifest)
+        .expect("add_module_from_bitcode");
+
+    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+        .expect("<eval-entry> resolves");
+    assert!(!ptr.is_null());
+    let f: extern "C-unwind" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+    let raw = f();
+    assert_eq!(raw >> 1, 6, "replayed eval-entry returns 6");
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
+fn sprint38c_emitted_ir_has_class_metadata_external_global() {
+    // IR-shape test: confirm the cached `.bc` for an expression that
+    // references a class metadata pointer contains an external global
+    // `@nod_class_md__<key>__<class_id>` and at least one `load i64,
+    // ptr @nod_class_md__` site, NOT a baked `i64 <bits>` constant at
+    // the bake location.
+    //
+    // `make(<range>, …)` is used (instead of `instance?(1, <integer>)`)
+    // because the latter constant-folds away — the compiler resolves
+    // `1`'s class statically. `make` genuinely needs the class
+    // metadata pointer at runtime.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-class-md-irshape");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    let cold =
+        eval_expr_to_string("size(make(<range>, from: 0, to: 5))").expect("cold eval");
+    assert_eq!(cold, "6");
+
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    let bc_path = bc_paths[0].path();
+    let bitcode = std::fs::read(&bc_path).expect("read bc");
+
+    let ir = nod_llvm::bitcode_to_ir_text(&bitcode).expect("bitcode_to_ir_text");
+    let has_class_md_decl = ir.contains("@nod_class_md__");
+    assert!(
+        has_class_md_decl,
+        "IR must declare an external global for class metadata; IR:\n{ir}"
+    );
+    let has_load_through_class_md = ir.contains("load i64, ptr @nod_class_md__");
+    assert!(
+        has_load_through_class_md,
+        "IR must contain a `load i64, ptr @nod_class_md__*` instruction; IR:\n{ir}"
+    );
+    for line in ir.lines() {
+        if line.contains("nod_class_md__") {
+            println!("[IR] {line}");
+        }
+    }
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
+fn sprint38c_emitted_ir_has_string_literal_external_global() {
+    // IR-shape test for string-literal externals.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-strlit-irshape");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    let _ = eval_expr_to_string("size(\"hello\")").expect("cold eval");
+
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    let bc_path = bc_paths[0].path();
+    let bitcode = std::fs::read(&bc_path).expect("read bc");
+    let ir = nod_llvm::bitcode_to_ir_text(&bitcode).expect("bitcode_to_ir_text");
+
+    let has_strlit_decl = ir.contains("@nod_strlit__");
+    assert!(
+        has_strlit_decl,
+        "IR must declare an external global for a string literal; IR:\n{ir}"
+    );
+    let has_load_through_strlit = ir.contains("load i64, ptr @nod_strlit__");
+    assert!(
+        has_load_through_strlit,
+        "IR must contain a `load i64, ptr @nod_strlit__*` instruction; IR:\n{ir}"
+    );
+    for line in ir.lines() {
+        if line.contains("nod_strlit__") {
+            println!("[IR] {line}");
+        }
+    }
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
+fn sprint38c_emitted_ir_has_symbol_literal_external_global() {
+    // IR-shape test for symbol-literal externals.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-symlit-irshape");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    let _ = eval_expr_to_string("size(make(<range>, from: 0, to: 5))").expect("cold eval");
+
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    let bc_path = bc_paths[0].path();
+    let bitcode = std::fs::read(&bc_path).expect("read bc");
+    let ir = nod_llvm::bitcode_to_ir_text(&bitcode).expect("bitcode_to_ir_text");
+
+    let has_symlit_decl = ir.contains("@nod_symlit__");
+    assert!(
+        has_symlit_decl,
+        "IR must declare an external global for a symbol literal; IR:\n{ir}"
+    );
+    let has_load_through_symlit = ir.contains("load i64, ptr @nod_symlit__");
+    assert!(
+        has_load_through_symlit,
+        "IR must contain a `load i64, ptr @nod_symlit__*` instruction; IR:\n{ir}"
+    );
+    for line in ir.lines() {
+        if line.contains("nod_symlit__") {
+            println!("[IR] {line}");
+        }
+    }
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+fn sprint38c_intern_string_literal_slot_addr_is_memoised() {
+    // Sanity check on the slot allocator: repeated calls with the same
+    // text return the SAME *const u64 address. This is what makes
+    // multiple JIT-loaded modules referencing the same literal share
+    // one underlying slot.
+    let a = nod_runtime::intern_string_literal_slot_addr("memoise-me");
+    let b = nod_runtime::intern_string_literal_slot_addr("memoise-me");
+    assert_eq!(a, b, "same text → same slot address");
+    let c = nod_runtime::intern_string_literal_slot_addr("different-text");
+    assert_ne!(a, c, "distinct text → distinct slot address");
+}
+
+#[test]
+fn sprint38c_intern_symbol_literal_slot_addr_is_memoised() {
+    let a = nod_runtime::intern_symbol_literal_slot_addr("memoise-me");
+    let b = nod_runtime::intern_symbol_literal_slot_addr("memoise-me");
+    assert_eq!(a, b, "same name → same slot address");
+    let c = nod_runtime::intern_symbol_literal_slot_addr("different-name");
+    assert_ne!(a, c, "distinct name → distinct slot address");
+}
+
+#[test]
+fn sprint38c_class_metadata_slot_addr_is_memoised() {
+    let a = nod_runtime::class_metadata_slot_addr(nod_runtime::ClassId::INTEGER);
+    let b = nod_runtime::class_metadata_slot_addr(nod_runtime::ClassId::INTEGER);
+    assert_eq!(a, b, "same class id → same slot address");
+    let c = nod_runtime::class_metadata_slot_addr(nod_runtime::ClassId::BOOLEAN);
+    assert_ne!(a, c, "distinct class id → distinct slot address");
+}
+
 #[test]
 #[serial]
 fn add_module_from_bitcode_round_trips_a_trivial_module() {

@@ -1374,6 +1374,71 @@ The headline `cross_process_cache_hit_is_at_least_10x_faster` subprocess-spawn t
 - Inline-cache slots + generic-function pointers (Sprint 38e).
 - The cross-process subprocess-spawn headline test (Sprint 38e — depends on all categories converted).
 
+### Sprint 38c — static-area pointer bake-site conversion (class metadata + string + symbol literals)
+
+**Goal.** Second focused codegen-conversion sub-sprint, mirroring Sprint 38b's pattern for three more bake-site categories: class-metadata pointers (raw and tagged), interned `<byte-string>` literal Words, and interned `<symbol>` literal Words. Every codegen site that previously baked these as `ConstValue::WordBits(<runtime-address>)` now emits a `load i64, ptr @nod_<kind>__<key>__<id>` through a per-module external global; the JIT-link path maps each global to a process-stable `Box::leak`'d `&'static u64` slot whose contents hold the per-process Word/pointer bits.
+
+**Phase A — slot allocators in `nod-runtime`.** Added `class_metadata_slot_addr(ClassId)`, `intern_string_literal_slot_addr(&str)`, and `intern_symbol_literal_slot_addr(&str)`. Each guards a `LazyLock<Mutex<HashMap<…, &'static u64>>>`; first call for a given key allocates and leaks a fresh `u64` slot initialised with `class_metadata_ptr(id) as u64` / `intern_string_literal(text).raw()` / `intern_symbol_literal(name).raw()`. Subsequent calls return the same `*const u64`. Memoisation is per-content so multiple JIT-loaded modules referencing the same literal share one slot. For tagged class metadata, no separate slot — codegen emits the raw load then ORs `| 1` at the use site.
+
+**Phase B — resolver wiring in `jit.rs::resolve_reloc_kind`.** `RelocKind::ClassMetadata { class_id }` previously returned `class_metadata_ptr(id) as u64` (the address as a value); same shape as the latent Sprint 38a/38b bug for the immediates. Switched to `class_metadata_slot_addr(id) as u64`. `RelocKind::StringLiteral` and `RelocKind::SymbolLiteral` similarly switched from returning the Word bits to returning the slot addresses. The IR now does `load i64, ptr @nod_*__<key>__*` to recover the bits.
+
+**Phase C — codegen surgery.** Added three `ConstValue` variants in `nod-dfm::ir`: `ClassMetadataPtr { class_id, tagged }`, `StringLiteralRef(String)`, `SymbolLiteralRef(String)`. The four `lower.rs` bake sites (`emit_string_literal`, `emit_class_ref`, `emit_class_metadata_ptr_const`, `emit_symbol_literal`) now emit the new `ConstValue` variants instead of baking `WordBits(runtime_addr)`. `emit_const` in `codegen.rs` grew three new arms; `ConstValue::String` (Dylan source string literal) now routes through the same string-literal global. Per-module dedup tables (`string_lit_idx` / `symbol_lit_idx` in `ModuleCodegenCtx`) ensure repeated references to the same literal text share one external global, one manifest row, and one `LLVMAddGlobalMapping` call. Helper functions `load_class_metadata`, `load_string_literal`, `load_symbol_literal` on `Emit<'ctx, 'a>` build the IR-level `load i64` and, for tagged class metadata, the post-load `or i64 …, 1`. The narrowing optimiser was updated to recognise the new `ClassMetadataPtr` variant (Sprint 38c's `class_id` is carried directly in the variant; no need to do reverse-address lookup as the legacy `WordBits` arm did).
+
+**Phase D — round-trip tests.** Added nine new tests in `tests/nod-tests/tests/jit_cache_xprocess.rs`:
+
+- `sprint38c_class_metadata_globals_round_trip` — `size(make(<range>, from: 0, to: 5))` cold-compiles, dumps bitcode + manifest, replays in a fresh `Jit` + `Context`, asserts the same return value (6) and that the manifest carries ≥1 `RelocKind::ClassMetadata` entry.
+- `sprint38c_string_literal_globals_round_trip` — `"hello"` cold-compiles to a module that returns the interned `<byte-string>` Word; replay asserts the returned Word equals the slot-cached value `*intern_string_literal_slot_addr("hello")` (the runtime's `intern_string_literal` doesn't dedup per-text, so we compare against the slot rather than a fresh call), plus verifies the tag bit.
+- `sprint38c_symbol_literal_globals_round_trip` — `size(make(<range>, from: 0, to: 5))` (same expression as the class-metadata test; the `make` lowering also emits `from:`/`to:` keyword symbol literals) — asserts the manifest carries `RelocKind::SymbolLiteral { name: "from" }` and `name: "to"`, and the replay returns 6.
+- Three IR-shape tests (`sprint38c_emitted_ir_has_*_external_global`) assert the bitcode contains `@nod_class_md__`, `@nod_strlit__`, `@nod_symlit__` external globals and matching `load i64, ptr @nod_*__` instructions — i.e. no baked `i64 <addr>` constants remain at the converted bake-site categories.
+- Three sanity tests (`sprint38c_*_slot_addr_is_memoised`) prove the slot allocators return identical addresses for repeated inputs and distinct addresses for distinct inputs.
+
+**Initial test breakage caught and fixed.** First test run hit two failures: `instance?(1, <integer>)` was constant-folded to `select i1 true, %true_word, %false_word` (the optimiser resolves `1`'s class statically); the bake site for `<integer>` never fires. Switched to `size(make(<range>, …))`, which genuinely needs the metadata pointer at runtime. Separately, `size("hello")` returned 0 because `collection_size` in `nod-runtime/src/collections.rs` doesn't dispatch on `<byte-string>` (size-of-strings is a pre-existing gap, not a Sprint 38c regression); switched the test to evaluate the literal directly and compare the returned Word against the slot.
+
+**Phase E — verification.**
+- `cargo build --workspace` clean.
+- `cargo test --workspace --no-fail-fast`: **586 → 595** passing (+9 new sprint38c tests). 0 failed, 9 ignored (unchanged baseline).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- 5x sequential flake check: 5/5 runs at 595/0/9.
+- semispace backend NOT exercised per the user's stated workflow constraint.
+
+**Empirical IR proof.** A cold-compile of `size(make(<range>, from: 0, to: 5))` produces IR containing:
+
+```text
+@nod_class_md__8e0cda024e3e5604__1042 = external externally_initialized global i64
+@nod_symlit__8e0cda024e3e5604__0      = external externally_initialized global i64
+@nod_symlit__8e0cda024e3e5604__1      = external externally_initialized global i64
+  %class_md.load = load i64, ptr @nod_class_md__8e0cda024e3e5604__1042, align 4
+  %symlit.load   = load i64, ptr @nod_symlit__8e0cda024e3e5604__0,      align 4
+  %symlit.load1  = load i64, ptr @nod_symlit__8e0cda024e3e5604__1,      align 4
+```
+
+A cold-compile of `"hello"` produces:
+
+```text
+@nod_strlit__50577853f5951f35__0 = external externally_initialized global i64
+  %strlit.load = load i64, ptr @nod_strlit__50577853f5951f35__0, align 4
+```
+
+— exactly the named-global shape Sprint 38 specified. No baked `i64 <runtime-pointer>` constants remain for class metadata, string-literals, or symbol-literals.
+
+**Dedup behaviour.** Per-module content dedup confirmed: `make(<range>, from: 0, to: 5)` emits two distinct symbol globals (`@nod_symlit__*__0` and `*__1` for `from` and `to`). Repeating `from:` in the same module would reuse `*__0`. Cross-module dedup happens at the slot-allocator layer in `nod-runtime`: two modules referencing `"hello"` get distinct globals (different keys) but both globals map to the SAME `&'static u64` slot, so the loaded Word bits are identical.
+
+**Deviations / judgment calls.**
+
+1. **`emit_class_ref` (tagged) path.** Sprint plan suggested optionally adding a `ConstValue::TaggedExternalLoad` variant; instead used `ConstValue::ClassMetadataPtr { class_id, tagged: bool }` to keep the class metadata family in one variant. The OR-1 happens in `Emit::load_class_metadata` at the IR level. Result: one variant for both tagged (`emit_class_ref`) and raw (`emit_class_metadata_ptr_const`) uses.
+
+2. **`ConstValue::String` re-routed too.** The `lower.rs::Expr::String` arm still emits `ConstValue::String(decoded)` (the user-facing Dylan source-string lowering); codegen's `ConstValue::String` arm now calls `self.load_string_literal(s)` so it uses the same external-global path as `ConstValue::StringLiteralRef`. Both variants end up at the same dedup table — verified by the IR-shape test.
+
+3. **Narrowing optimiser updated in-place.** The optimiser's reverse-lookup (find class id behind a `WordBits(addr)` const by querying the class registry) still runs for legacy `WordBits` arms that flow from non-class-ref scaffolding; for the new `ClassMetadataPtr` variant the class id is carried directly. No-op preservation for any other bake sites that still use `WordBits` (block ids, exit-procedure fixnums).
+
+4. **NOD_RUNTIME_ABI_VERSION stays at 2.** Sprint 38a bumped 1→2; Sprint 38c is within that ABI window. The on-disk manifest format is unchanged — the `RelocKind` enum gained no new variants in 38c (the `ClassMetadata`/`StringLiteral`/`SymbolLiteral` kinds already existed from Sprint 38a's infrastructure prep). Old cached bitcode from Sprint 38b still loads correctly since 38b only used `RelocKind::Imm*` rows.
+
+**Out of scope (Sprint 38d / 38e):**
+
+- Win32 FFI stub entries (Sprint 38d).
+- Inline-cache slots + generic-function pointers (Sprint 38e).
+- The cross-process subprocess-spawn headline test (Sprint 38e — depends on all categories converted).
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 

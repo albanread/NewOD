@@ -224,6 +224,7 @@ pub use winffi::{
 pub use word::{FIXNUM_MAX, FIXNUM_MIN, FixnumOverflow, Word};
 pub use wrapper::{GcBit, Wrapper};
 
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 /// Process-global literal pool. Sprint 11 pins string + symbol literals
@@ -358,6 +359,93 @@ pub fn imm_nil_slot_addr() -> *const u64 {
 /// Sprint 38b — stable address of the `#f` untagged-wrapper slot.
 pub fn imm_false_wrapper_slot_addr() -> *const u64 {
     IMMEDIATE_SLOTS.false_wrapper as *const u64
+}
+
+// ─── Sprint 38c — slot allocators for static-area pointers ─────────────
+//
+// Sprint 38b proved the named-external-global pattern for the four
+// immediate singletons. Sprint 38c extends it to three more bake-site
+// categories: class-metadata pointers, `<byte-string>` literal Words,
+// and `<symbol>` literal Words.
+//
+// Each category needs a **slot address** (stable `&'static u64`) whose
+// CONTENTS are the per-process Word/pointer bits. The JIT-link path
+// registers the slot's address via `LLVMAddGlobalMapping(@sym, slot)`;
+// codegen emits `load i64, ptr @sym` which reads the slot's value.
+//
+// Memoization is per-content (per class_id, per text, per symbol name)
+// so multiple JIT-loaded modules referencing the same literal share one
+// slot. All maps are guarded by a single mutex.
+
+/// Sprint 38c — per-class-id slot table mapping `ClassId.0` to the
+/// stable address of a `u64` holding `class_metadata_ptr(id) as u64`.
+/// The slot's bits are the raw (untagged) metadata pointer; codegen
+/// applies the pointer-tag at use (see `emit_class_ref`'s `| 1` after
+/// the load).
+static CLASS_METADATA_SLOTS: LazyLock<Mutex<HashMap<u32, &'static u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Sprint 38c — per-text slot table for `<byte-string>` literals. Each
+/// distinct UTF-8 text maps to one stable `&'static u64` whose contents
+/// are `intern_string_literal(text).raw()`.
+static STRING_LITERAL_SLOTS: LazyLock<Mutex<HashMap<String, &'static u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Sprint 38c — per-name slot table for `<symbol>` literals.
+static SYMBOL_LITERAL_SLOTS: LazyLock<Mutex<HashMap<String, &'static u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Sprint 38c — stable address of a `u64` holding the raw metadata
+/// pointer (`class_metadata_ptr(id) as u64`) for `class_id`. Repeated
+/// calls with the same id return the SAME `*const u64`.
+///
+/// Used by `Jit::add_module`/`add_module_from_bitcode` to map
+/// `@nod_class_md__<key>__<id>` to a stable address whose contents
+/// load as the metadata pointer in the current process.
+pub fn class_metadata_slot_addr(class_id: ClassId) -> *const u64 {
+    let mut guard = CLASS_METADATA_SLOTS
+        .lock()
+        .expect("class metadata slot table poisoned");
+    if let Some(&slot) = guard.get(&class_id.0) {
+        return slot as *const u64;
+    }
+    let md_addr = class_metadata_ptr(class_id) as u64;
+    let slot: &'static u64 = Box::leak(Box::new(md_addr));
+    guard.insert(class_id.0, slot);
+    slot as *const u64
+}
+
+/// Sprint 38c — stable address of a `u64` holding the raw bits of the
+/// interned `<byte-string>` Word for `text`. Repeated calls with the
+/// same text return the SAME `*const u64` (memoised). The interned
+/// Word itself is process-stable (pinned in the static area).
+pub fn intern_string_literal_slot_addr(text: &str) -> *const u64 {
+    let mut guard = STRING_LITERAL_SLOTS
+        .lock()
+        .expect("string literal slot table poisoned");
+    if let Some(&slot) = guard.get(text) {
+        return slot as *const u64;
+    }
+    let bits = intern_string_literal(text).raw();
+    let slot: &'static u64 = Box::leak(Box::new(bits));
+    guard.insert(text.to_string(), slot);
+    slot as *const u64
+}
+
+/// Sprint 38c — stable address of a `u64` holding the raw bits of the
+/// interned `<symbol>` Word for `name`. Repeated calls with the same
+/// name return the SAME `*const u64` (memoised).
+pub fn intern_symbol_literal_slot_addr(name: &str) -> *const u64 {
+    let mut guard = SYMBOL_LITERAL_SLOTS
+        .lock()
+        .expect("symbol literal slot table poisoned");
+    if let Some(&slot) = guard.get(name) {
+        return slot as *const u64;
+    }
+    let bits = intern_symbol_literal(name).raw();
+    let slot: &'static u64 = Box::leak(Box::new(bits));
+    guard.insert(name.to_string(), slot);
+    slot as *const u64
 }
 
 /// Sprint 13: mint a fresh inline-cache slot in the static area and

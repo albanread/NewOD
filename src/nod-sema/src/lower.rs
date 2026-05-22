@@ -4409,12 +4409,16 @@ impl FunctionBuilder {
     /// Emit a `<byte-string>` literal Word for the supplied Rust `&str`.
     /// The bake goes through the static-area-pinned literal pool so the
     /// address is stable across GC.
+    ///
+    /// Sprint 38c — emits `ConstValue::StringLiteralRef(text)` instead
+    /// of `ConstValue::WordBits(w.raw())`. Codegen lowers this to a
+    /// `load i64` through a per-module external global keyed by content,
+    /// so the bitcode round-trips across processes.
     fn emit_string_literal(&mut self, s: &str) -> TempId {
-        let w = nod_runtime::intern_string_literal(s);
         let t = self.fresh_temp(TypeEstimate::String);
         self.push(Computation::Const {
             dst: t,
-            value: ConstValue::WordBits(w.raw()),
+            value: ConstValue::StringLiteralRef(s.to_string()),
         });
         t
     }
@@ -4423,25 +4427,19 @@ impl FunctionBuilder {
     /// the class's `ClassMetadata` in the static area. We tag the
     /// address with bit 0 = 1 (pointer tag); slot-load/store codegen
     /// will untag.
+    ///
+    /// Sprint 38c — emits `ConstValue::ClassMetadataPtr { class_id,
+    /// tagged: true }`. Codegen lowers the load via the per-module
+    /// external global; the `| 1` pointer-tag is applied AFTER the
+    /// load (codegen handles the OR).
     fn emit_class_ref(&mut self, class_id: ClassId) -> TempId {
-        let addr = nod_runtime::class_metadata_ptr(class_id) as u64;
-        let tagged = addr | 1; // pointer tag.
         let t = self.fresh_temp(TypeEstimate::Top);
-        // Use a Const with Integer to encode the bit pattern. The
-        // codegen path for `TypeEstimate::Top` integer-const lowers
-        // to a tagged Word — but we want the raw bits straight, not
-        // shifted. Use a special const-value form via String + cast?
-        // Simpler: encode as a tagged-Word `Integer` whose value, when
-        // run through the codegen's `(n << 1)` machinery, yields the
-        // right bits. We can't do that here because codegen shifts.
-        // Workaround: bake the raw bits via a `PrimOp::AddInt(zero,
-        // raw)` of integer zero? Still shifts.
-        //
-        // The right answer: introduce a `ConstValue::WordBits(u64)`
-        // that codegen lowers as a raw i64 constant. Add it now.
         self.push(Computation::Const {
             dst: t,
-            value: ConstValue::WordBits(tagged),
+            value: ConstValue::ClassMetadataPtr {
+                class_id: class_id.0,
+                tagged: true,
+            },
         });
         t
     }
@@ -5161,11 +5159,17 @@ impl FunctionBuilder {
         // The class-metadata pointer is the raw address of the
         // `ClassMetadata` struct in the static area — NOT a tagged
         // Word. `nod_make`'s first param is a raw pointer.
-        let addr = nod_runtime::class_metadata_ptr(class_id) as u64;
+        //
+        // Sprint 38c — emits `ConstValue::ClassMetadataPtr { class_id,
+        // tagged: false }`. Codegen loads through the per-module
+        // external global without applying the pointer-tag OR.
         let t = self.fresh_temp(TypeEstimate::Top);
         self.push(Computation::Const {
             dst: t,
-            value: ConstValue::WordBits(addr),
+            value: ConstValue::ClassMetadataPtr {
+                class_id: class_id.0,
+                tagged: false,
+            },
         });
         t
     }
@@ -5173,11 +5177,13 @@ impl FunctionBuilder {
     fn emit_symbol_literal(&mut self, name: &str) -> TempId {
         // Symbol literal: pin `:name` in the literal pool's static
         // area and bake the tagged Word.
-        let sym_word = nod_runtime::intern_symbol_literal(name);
+        //
+        // Sprint 38c — emits `ConstValue::SymbolLiteralRef(name)` so
+        // codegen lowers via the per-module external global pattern.
         let t = self.fresh_temp(TypeEstimate::Top);
         self.push(Computation::Const {
             dst: t,
-            value: ConstValue::WordBits(sym_word.raw()),
+            value: ConstValue::SymbolLiteralRef(name.to_string()),
         });
         t
     }

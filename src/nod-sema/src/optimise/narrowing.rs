@@ -85,34 +85,45 @@ pub fn narrow_function(f: &Function) -> NarrowedEstimates {
         }
     }
 
-    // First, find every `Const::WordBits(addr)` and check whether the
-    // raw address points at a registered ClassMetadata. These are the
-    // class-ref temps emitted by `emit_class_metadata_ptr_const` and
-    // by `make`'s first-arg lowering. We use this map to narrow `%make`
-    // call results.
+    // First, find every class-ref Const and record the class id behind
+    // each temp. These are the class-ref temps emitted by
+    // `emit_class_metadata_ptr_const` and by `make`'s first-arg
+    // lowering. We use this map to narrow `%make` call results.
+    //
+    // Sprint 38c — the class-ref bake site now uses
+    // `ConstValue::ClassMetadataPtr { class_id, .. }` which carries
+    // the id directly (no address-lookup needed). Pre-Sprint-38c
+    // `ConstValue::WordBits(addr)` still flows here from legacy lowering
+    // paths (`emit_string_literal`, `emit_symbol_literal`, the
+    // %make/$NULL exit-procedure scaffolding); we keep that lookup arm
+    // for those — only true class-metadata-pointer bits will resolve.
     let mut class_ref_temps: HashMap<TempId, ClassId> = HashMap::new();
     for block in &f.blocks {
         for c in &block.computations {
-            if let Computation::Const {
-                dst,
-                value: ConstValue::WordBits(bits),
-            } = c
-            {
-                // The class-metadata pointer is the raw (untagged)
-                // address. `emit_class_ref` tags with bit 0; `emit_
-                // class_metadata_ptr_const` (used as `%make`'s first
-                // arg) doesn't tag. Try both.
-                let raw = *bits;
-                let candidates = [raw, raw & !1u64];
-                for cand in candidates {
-                    if cand == 0 {
-                        continue;
-                    }
-                    if let Some(cid) = class_id_for_metadata_addr(cand) {
-                        class_ref_temps.insert(*dst, cid);
-                        break;
+            match c {
+                Computation::Const {
+                    dst,
+                    value: ConstValue::ClassMetadataPtr { class_id, .. },
+                } => {
+                    class_ref_temps.insert(*dst, ClassId(*class_id));
+                }
+                Computation::Const {
+                    dst,
+                    value: ConstValue::WordBits(bits),
+                } => {
+                    let raw = *bits;
+                    let candidates = [raw, raw & !1u64];
+                    for cand in candidates {
+                        if cand == 0 {
+                            continue;
+                        }
+                        if let Some(cid) = class_id_for_metadata_addr(cand) {
+                            class_ref_temps.insert(*dst, cid);
+                            break;
+                        }
                     }
                 }
+                _ => {}
             }
         }
     }

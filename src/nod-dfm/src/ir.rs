@@ -276,6 +276,26 @@ pub enum ConstValue {
     /// Codegen lowers this to a literal `i64` constant — no
     /// shift, no encoding.
     WordBits(u64),
+    /// Sprint 38c — a reference to a class's `ClassMetadata` pointer.
+    /// Codegen lowers to a `load i64` through a per-module external
+    /// global `@nod_class_md__<key>__<class_id>`. The JIT-link path
+    /// binds the symbol to the address of a `u64` slot whose contents
+    /// are `class_metadata_ptr(class_id) as u64` (the raw, untagged
+    /// metadata pointer in the current process). If `tagged` is true,
+    /// codegen ORs `| 1` after the load to materialise the
+    /// pointer-tagged Word; if false, the loaded value is used as-is
+    /// (`nod_make`'s class arg expects an untagged pointer).
+    ClassMetadataPtr { class_id: u32, tagged: bool },
+    /// Sprint 38c — a reference to an interned `<byte-string>` literal.
+    /// Codegen lowers to a `load i64` through a per-module external
+    /// global `@nod_strlit__<key>__<idx>`, where `idx` is a per-module
+    /// counter assigned by codegen on first encounter and deduped by
+    /// content. The slot's contents are
+    /// `intern_string_literal(text).raw()` in the current process.
+    StringLiteralRef(String),
+    /// Sprint 38c — a reference to an interned `<symbol>` literal.
+    /// Same shape as `StringLiteralRef` but for Dylan symbols.
+    SymbolLiteralRef(String),
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
