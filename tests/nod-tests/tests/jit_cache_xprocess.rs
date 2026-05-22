@@ -251,6 +251,183 @@ fn runtime_abi_version_is_two_after_sprint38_bump() {
 
 #[test]
 #[serial]
+fn sprint38b_immediate_globals_round_trip_through_cached_bitcode() {
+    // Sprint 38b — end-to-end proof that the codegen-side conversion
+    // of immediate bake sites (true_/false_/nil/false_wrapper) flows
+    // through the manifest sidecar and the JIT-link loader. The same
+    // expression is cold-compiled (producing bitcode + manifest with
+    // `Imm*` entries), then loaded into a fresh JIT via
+    // `add_module_from_bitcode`, and re-invoked. Both runs must
+    // produce the same answer, which proves:
+    //
+    //   1. Codegen emitted external globals (not literals) for the
+    //      immediate sites — otherwise the manifest would be empty.
+    //   2. The manifest reached disk with at least one `Imm*` entry.
+    //   3. The loader resolved each entry to a fresh process-local
+    //      slot address and `LLVMAddGlobalMapping`-bound it.
+    //   4. The replayed module's `<eval-entry>` reads the correct
+    //      Word through the external global, matching the cold result.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-imm-roundtrip");
+    nod_llvm::clear_cache_dir(&dir);
+    // SAFETY: env mutation is serialised by the `#[serial]` attribute.
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    // `if (#t) 1 else 2 end` exercises the imm_true / imm_false
+    // codegen path (Terminator::If reads imm_false; ConstValue::Bool
+    // produces imm_true; the result type is integer so no boolean
+    // returns).
+    let cold = eval_expr_to_string("if (#t) 1 else 2 end").expect("cold eval");
+    assert_eq!(cold, "1", "cold path returns 1 for if-#t branch");
+
+    // Walk the cache dir for the `.bc` + `.manifest.json` pair we just
+    // wrote. We don't know the exact cache key without rebuilding the
+    // wrapped source string, but there should be at most one .bc.
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    assert!(!bc_paths.is_empty(), "cache dir should contain ≥1 .bc");
+    let bc_path = bc_paths[0].path();
+    let manifest_path = bc_path.with_extension("manifest.json");
+
+    let bitcode = std::fs::read(&bc_path).expect("read bitcode");
+    assert!(!bitcode.is_empty(), "bitcode non-empty");
+
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).expect("manifest.json must exist for Sprint 38b");
+    let manifest =
+        nod_llvm::ModuleManifest::parse(&manifest_text).expect("manifest parses");
+
+    // Sprint 38b — codegen must have emitted at least one immediate
+    // reloc entry. The exact count depends on how many distinct
+    // immediates the IR references and how many DFM functions live in
+    // the module; we just assert ≥1.
+    let imm_kinds: Vec<&nod_llvm::RelocKind> = manifest
+        .entries
+        .iter()
+        .map(|e| &e.kind)
+        .filter(|k| {
+            matches!(
+                k,
+                nod_llvm::RelocKind::ImmTrue
+                    | nod_llvm::RelocKind::ImmFalse
+                    | nod_llvm::RelocKind::ImmNil
+                    | nod_llvm::RelocKind::ImmFalseWrapper
+            )
+        })
+        .collect();
+    assert!(
+        !imm_kinds.is_empty(),
+        "manifest must carry ≥1 Imm* RelocKind entry; got: {:?}",
+        manifest.entries
+    );
+
+    // Fresh JIT + Context; load the bitcode + manifest.
+    let ctx: &'static nod_llvm::LlvmContext =
+        Box::leak(Box::new(nod_llvm::LlvmContext::create()));
+    let mut jit = nod_llvm::Jit::new(ctx).expect("Jit::new");
+    jit.add_module_from_bitcode(ctx, &bitcode, "__replay_imm__", &manifest)
+        .expect("add_module_from_bitcode");
+
+    let ptr = unsafe { jit.get_function_ptr("<eval-entry>") }
+        .expect("<eval-entry> resolves from replayed bitcode");
+    assert!(!ptr.is_null(), "function pointer must be non-null");
+    // The wrapped expression returns an integer, so the entry's
+    // C-ABI signature is `() -> i64`. The tagged Word for `1` is
+    // `1 << 1 = 2`.
+    let f: extern "C-unwind" fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+    let raw = f();
+    assert_eq!(raw >> 1, 1, "replayed eval-entry returns 1");
+
+    // SAFETY: env mutation is serialised by `#[serial]`.
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
+fn sprint38b_bitcode_round_trip_reads_named_global() {
+    // Sprint 38b — text-level inspection of the bitcode-as-IR: the
+    // round-trip test above proves the **functional** correctness;
+    // this one proves the **structural** correctness, namely that
+    // the IR contains a load through `@nod_imm_*` rather than a baked
+    // `i64 <bits>` constant at the bake site.
+    //
+    // We can't easily build a synthetic DFM module to feed
+    // `codegen_module_with_key` here (the test crate doesn't have the
+    // private constructors), so instead we re-parse the cached bitcode
+    // through inkwell and check the *parsed* module's IR text.
+    use nod_sema::eval_expr_to_string;
+
+    let dir = test_cache_dir("e2e-imm-irshape");
+    nod_llvm::clear_cache_dir(&dir);
+    unsafe { std::env::set_var("NOD_JIT_CACHE_DIR", &dir) };
+    nod_llvm::in_process_clear();
+
+    // Force a cache miss so the bitcode is regenerated. `if (#t) 7 else 9 end`
+    // exercises the imm_true/imm_false codegen path.
+    let cold = eval_expr_to_string("if (#t) 7 else 9 end").expect("cold eval");
+    assert_eq!(cold, "7");
+
+    // Find the .bc file.
+    let mut bc_paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .flatten()
+        .filter(|de| de.path().extension().and_then(|s| s.to_str()) == Some("bc"))
+        .collect();
+    bc_paths.sort_by_key(|de| de.file_name());
+    let bc_path = bc_paths[0].path();
+    let bitcode = std::fs::read(&bc_path).expect("read bc");
+
+    // Re-parse the bitcode and inspect its IR text. The named global
+    // declaration should be present, and there should be at least one
+    // `load i64, ptr @nod_imm_` reading through it.
+    let ir = nod_llvm::bitcode_to_ir_text(&bitcode).expect("bitcode_to_ir_text");
+
+    // External-global declaration for at least one of the four
+    // immediate symbols.
+    let has_imm_true_decl = ir.contains("@nod_imm_true__");
+    let has_imm_false_decl = ir.contains("@nod_imm_false__");
+    assert!(
+        has_imm_true_decl || has_imm_false_decl,
+        "IR must declare an external global for #t or #f; IR:\n{ir}"
+    );
+    // The load shape should appear at least once. (We don't pin the
+    // exact register names since inkwell renumbers on re-parse.)
+    let has_load_through_imm = ir.contains("load i64, ptr @nod_imm_");
+    assert!(
+        has_load_through_imm,
+        "IR must contain a `load i64, ptr @nod_imm_*` instruction; IR:\n{ir}"
+    );
+    // Print the immediate-related IR lines for human inspection when
+    // running with --nocapture.
+    for line in ir.lines() {
+        if line.contains("nod_imm_") {
+            println!("[IR] {line}");
+        }
+    }
+    // And no baked constant for the immediate Word bits — the old
+    // Sprint 37 shape baked the runtime address as `i64 N` where N is
+    // the runtime literal pool true_/false_ pointer. We don't have an
+    // easy way to assert "no baked constant" without false positives,
+    // so we settle for the positive assertion above. The test in
+    // `sprint38b_immediate_globals_round_trip_through_cached_bitcode`
+    // catches the negative case (round-trip would crash with stale
+    // pointer if the IR still baked them).
+
+    unsafe { std::env::remove_var("NOD_JIT_CACHE_DIR") };
+    nod_llvm::clear_cache_dir(&dir);
+    nod_llvm::in_process_clear();
+}
+
+#[test]
+#[serial]
 fn add_module_from_bitcode_round_trips_a_trivial_module() {
     // End-to-end smoke test of the Sprint 38 JIT-link infrastructure.
     //

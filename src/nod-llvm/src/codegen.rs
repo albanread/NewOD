@@ -45,6 +45,7 @@
 //!     `extern "C"` shim and binds `nod_format_out` via
 //!     `LLVMAddGlobalMapping` at JIT-engine creation time.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use inkwell::FloatPredicate;
@@ -52,16 +53,22 @@ use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PhiValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, GlobalValue, PhiValue,
 };
 use nod_dfm::{
     BlockId, ClassCheck, Computation, ConstValue, Function as DfmFunction, PrimOp, SlotTypeKind,
     TempId, Terminator, TypeEstimate,
 };
 use nod_runtime::ClassId;
+
+use crate::cache::CacheKey;
+use crate::symbols::{
+    ModuleManifest, RelocKind, imm_false_symbol, imm_false_wrapper_symbol, imm_nil_symbol,
+    imm_true_symbol,
+};
 
 /// Name of the JIT-side `nod_make` external declaration.
 pub const NOD_MAKE_SYMBOL: &str = "nod_make";
@@ -461,42 +468,78 @@ fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {
 
 pub type FunctionMap<'ctx> = HashMap<String, FunctionValue<'ctx>>;
 
-/// Convert an `i1` to a Sprint 10 tagged-boolean Dylan value.
-/// `#t` and `#f` are pointer-tagged Words referring to pinned heap
-/// wrappers; we materialise them as `i64` constants via the literal
-/// pool's `Immediates` and `select` between them on `i1`.
-fn retag_bool<'ctx>(
-    b: &Builder<'ctx>,
-    i64ty: inkwell::types::IntType<'ctx>,
-    i1: inkwell::values::IntValue<'ctx>,
-) -> Result<BasicValueEnum<'ctx>, CodegenError> {
-    let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
-    let imm = nod_runtime::literal_pool_immediates();
-    let true_c = i64ty.const_int(imm.true_.raw(), false);
-    let false_c = i64ty.const_int(imm.false_.raw(), false);
-    b.build_select(i1, true_c, false_c, "tag.bool.sel")
-        .map_err(map_err)
+/// Sprint 38b — module-level codegen state shared by every emitter.
+/// Holds the per-module cache key (for symbol naming) and the manifest
+/// builder (every emitted external global registers one [`RelocKind`]
+/// row here). Lives inside [`CodegenOutput`] so the caller can serialise
+/// the manifest next to the bitcode at cold-compile time.
+///
+/// The manifest is wrapped in a [`RefCell`] because the emitters that
+/// allocate external globals (e.g. inside `retag_bool`) only have
+/// `&self` access — we can't take `&mut Emit` through the call graph
+/// without restructuring every primop path. The borrow is always brief
+/// (push one entry, drop) so dynamic-borrow checking is fine in practice.
+pub(crate) struct ModuleCodegenCtx {
+    pub key: CacheKey,
+    pub manifest: RefCell<ModuleManifest>,
 }
 
-/// Build an `i1` from a Sprint 10 tagged-boolean Word: `cond != #f`.
-/// Used by `Terminator::If` and the boolean PrimOps. Dylan's truthiness
-/// is "everything except `#f` is true", so the comparison is purely
-/// pointer-identity against the pinned `#f` singleton.
-fn untag_bool_to_i1<'ctx>(
-    b: &Builder<'ctx>,
-    i64ty: inkwell::types::IntType<'ctx>,
-    v: inkwell::values::IntValue<'ctx>,
-) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
-    let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
-    let imm = nod_runtime::literal_pool_immediates();
-    let false_c = i64ty.const_int(imm.false_.raw(), false);
-    b.build_int_compare(IntPredicate::NE, v, false_c, "untag.bool")
-        .map_err(map_err)
+impl ModuleCodegenCtx {
+    fn new(key: CacheKey) -> Self {
+        Self {
+            key,
+            manifest: RefCell::new(ModuleManifest::new(key)),
+        }
+    }
+}
+
+/// Sprint 38b — look up (or create) a named external global for one
+/// of the four immediate-singleton Words (`#t`, `#f`, `nil`, the
+/// untagged `#f` wrapper). The global has type `i64` and is marked
+/// external + externally-initialized so MCJIT treats it as a relocation
+/// target. The caller `build_load`s through it to recover the runtime
+/// value; the JIT-link layer (`Jit::add_module_from_bitcode` and the
+/// cold path's symbol registration) maps the symbol to the actual
+/// in-process address before MCJIT finalises.
+///
+/// Idempotent: a second call with the same `kind` returns the existing
+/// global without duplicating the manifest row.
+fn get_or_add_imm_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    kind: RelocKind,
+) -> GlobalValue<'ctx> {
+    let symbol = match kind {
+        RelocKind::ImmTrue => imm_true_symbol(mctx.key),
+        RelocKind::ImmFalse => imm_false_symbol(mctx.key),
+        RelocKind::ImmNil => imm_nil_symbol(mctx.key),
+        RelocKind::ImmFalseWrapper => imm_false_wrapper_symbol(mctx.key),
+        _ => unreachable!("get_or_add_imm_global called with non-immediate kind: {kind:?}"),
+    };
+    if let Some(g) = module.get_global(&symbol) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &symbol);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    // Push one row to the manifest. The JIT-link path uses the kind to
+    // recompute the address against the current process's runtime
+    // state; cold-compile in-process binding uses the same path
+    // (see `Jit::add_module`'s Sprint 38b binding loop).
+    mctx.manifest.borrow_mut().push(symbol, kind);
+    g
 }
 
 pub struct CodegenOutput<'ctx> {
     pub module: Module<'ctx>,
     pub function_map: FunctionMap<'ctx>,
+    /// Sprint 38b — manifest of named-symbol → [`RelocKind`] rows for
+    /// every external global this module references. Empty if no
+    /// process-local addresses were materialised (e.g. a pure-arithmetic
+    /// module with no booleans / nil / class-id reads).
+    pub manifest: ModuleManifest,
 }
 
 #[derive(Debug)]
@@ -537,8 +580,31 @@ pub fn codegen_module<'ctx>(
     fns: &[DfmFunction],
     module_name: &str,
 ) -> Result<CodegenOutput<'ctx>, CodegenError> {
+    // Sprint 38b — synthesise a deterministic CacheKey from the module
+    // name + a digest of the function names. Callers that already have a
+    // real cache key (the eval pipeline) use
+    // [`codegen_module_with_key`] directly; this convenience wrapper
+    // covers stdlib-load / dump-llvm / bench / run_function_to_i64
+    // call sites that don't compute a key. Symbol namespacing only
+    // requires a 16-char prefix; collision-resistance is satisfied as
+    // long as distinct modules synthesize distinct keys.
+    let synth_key = synth_cache_key_from_module(module_name, fns);
+    codegen_module_with_key(ctx, fns, module_name, synth_key)
+}
+
+/// Sprint 38b — the canonical codegen entry point. `key` namespaces
+/// every emitted named external global via the symbol-naming scheme in
+/// [`crate::symbols`], and seeds the [`ModuleManifest`] returned in
+/// [`CodegenOutput::manifest`].
+pub fn codegen_module_with_key<'ctx>(
+    ctx: &'ctx Context,
+    fns: &[DfmFunction],
+    module_name: &str,
+    key: CacheKey,
+) -> Result<CodegenOutput<'ctx>, CodegenError> {
     let module = ctx.create_module(module_name);
     let builder = ctx.create_builder();
+    let mctx = ModuleCodegenCtx::new(key);
 
     // Pass 1: forward-declare every function so direct calls can resolve
     // regardless of declaration order (handles mutual recursion).
@@ -552,10 +618,28 @@ pub fn codegen_module<'ctx>(
     // Pass 2: emit each body.
     for f in fns {
         let fv = function_map[&f.name];
-        emit_function(ctx, &module, &builder, &function_map, f, fv)?;
+        emit_function(ctx, &module, &builder, &function_map, &mctx, f, fv)?;
     }
 
-    Ok(CodegenOutput { module, function_map })
+    Ok(CodegenOutput {
+        module,
+        function_map,
+        manifest: mctx.manifest.into_inner(),
+    })
+}
+
+/// Sprint 38b — produce a deterministic [`CacheKey`] from a module name
+/// and its DFM functions for the non-cache-aware codegen entry points.
+/// Uses the existing [`crate::cache::cache_key_for_dfm`] over the
+/// formatted DFM text so identical inputs produce identical keys (and
+/// therefore identical symbol namespaces in the resulting IR).
+fn synth_cache_key_from_module(module_name: &str, fns: &[DfmFunction]) -> CacheKey {
+    let mut text = String::with_capacity(64 + module_name.len());
+    text.push_str("module:");
+    text.push_str(module_name);
+    text.push('\n');
+    text.push_str(&nod_dfm::format_for_cache_key(fns));
+    crate::cache::cache_key_for_dfm(&text)
 }
 
 fn function_type<'ctx>(ctx: &'ctx Context, f: &DfmFunction) -> FunctionType<'ctx> {
@@ -620,6 +704,10 @@ struct Emit<'ctx, 'a> {
     module: &'a Module<'ctx>,
     builder: &'a Builder<'ctx>,
     function_map: &'a FunctionMap<'ctx>,
+    /// Sprint 38b — shared per-module codegen context (cache key +
+    /// manifest builder). Every emitter that allocates a named external
+    /// global pushes one [`RelocKind`] row here.
+    mctx: &'a ModuleCodegenCtx,
     func: &'a DfmFunction,
     llvm_fn: FunctionValue<'ctx>,
     blocks: HashMap<BlockId, BasicBlock<'ctx>>,
@@ -644,12 +732,13 @@ struct Emit<'ctx, 'a> {
     next_dispatch_site_id: u64,
 }
 
-fn emit_function<'ctx>(
+fn emit_function<'ctx, 'a>(
     ctx: &'ctx Context,
-    module: &Module<'ctx>,
-    builder: &Builder<'ctx>,
-    function_map: &FunctionMap<'ctx>,
-    func: &DfmFunction,
+    module: &'a Module<'ctx>,
+    builder: &'a Builder<'ctx>,
+    function_map: &'a FunctionMap<'ctx>,
+    mctx: &'a ModuleCodegenCtx,
+    func: &'a DfmFunction,
     llvm_fn: FunctionValue<'ctx>,
 ) -> Result<(), CodegenError> {
     let mut state = Emit {
@@ -657,6 +746,7 @@ fn emit_function<'ctx>(
         module,
         builder,
         function_map,
+        mctx,
         func,
         llvm_fn,
         blocks: HashMap::new(),
@@ -731,10 +821,100 @@ fn emit_function<'ctx>(
 }
 
 impl<'ctx, 'a> Emit<'ctx, 'a> {
+    /// Sprint 38b — load the runtime `#t` Word from the external global
+    /// declared (or reused) for this module. Replaces the Sprint 10
+    /// pattern of baking `imm.true_.raw()` as an `i64` constant.
+    fn load_imm_true(&self) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_imm_global(self.ctx, self.module, self.mctx, RelocKind::ImmTrue);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "imm.true.load")
+            .map_err(map_err)?;
+        Ok(v.into_int_value())
+    }
+
+    /// Sprint 38b — load the runtime `#f` Word from the external global.
+    fn load_imm_false(&self) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_imm_global(self.ctx, self.module, self.mctx, RelocKind::ImmFalse);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "imm.false.load")
+            .map_err(map_err)?;
+        Ok(v.into_int_value())
+    }
+
+    /// Sprint 38b — load the runtime `nil` (empty-list) Word.
+    fn load_imm_nil(&self) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_imm_global(self.ctx, self.module, self.mctx, RelocKind::ImmNil);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "imm.nil.load")
+            .map_err(map_err)?;
+        Ok(v.into_int_value())
+    }
+
+    /// Sprint 38b — load the runtime `#f` *untagged-wrapper* address
+    /// used as a fault-free fallback target in the branchless class-id
+    /// reads (see `emit_class_id_load` / `emit_wrapper_class_check`).
+    fn load_imm_false_wrapper(&self) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_imm_global(
+            self.ctx,
+            self.module,
+            self.mctx,
+            RelocKind::ImmFalseWrapper,
+        );
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(
+                self.ctx.i64_type(),
+                g.as_pointer_value(),
+                "imm.false_wrapper.load",
+            )
+            .map_err(map_err)?;
+        Ok(v.into_int_value())
+    }
+
+    /// Sprint 38b — convert an `i1` to a Sprint 10 tagged-boolean Dylan
+    /// value. `#t` and `#f` are pointer-tagged Words referring to
+    /// pinned heap wrappers; we load both via external globals (Sprint
+    /// 38b cross-process replay) and `select` between them on `i1`.
+    fn retag_bool(
+        &self,
+        i1: inkwell::values::IntValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let true_v = self.load_imm_true()?;
+        let false_v = self.load_imm_false()?;
+        self.builder
+            .build_select(i1, true_v, false_v, "tag.bool.sel")
+            .map_err(map_err)
+    }
+
+    /// Sprint 38b — build an `i1` from a Sprint 10 tagged-boolean Word:
+    /// `cond != #f`. Used by `Terminator::If` and the boolean PrimOps.
+    /// Dylan's truthiness is "everything except `#f` is true", so the
+    /// comparison is purely pointer-identity against the pinned `#f`
+    /// singleton — now loaded via an external global instead of baked
+    /// as an i64 constant.
+    fn untag_bool_to_i1(
+        &self,
+        v: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let false_v = self.load_imm_false()?;
+        self.builder
+            .build_int_compare(IntPredicate::NE, v, false_v, "untag.bool")
+            .map_err(map_err)
+    }
+
     fn emit_computation(&mut self, c: &Computation) -> Result<(), CodegenError> {
         match c {
             Computation::Const { dst, value } => {
-                let v = self.emit_const(*dst, value);
+                let v = self.emit_const(*dst, value)?;
                 self.temps.insert(*dst, v);
             }
             Computation::PrimOp { dst, op, args } => {
@@ -984,9 +1164,13 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         Ok(result)
     }
 
-    fn emit_const(&self, dst: TempId, v: &ConstValue) -> BasicValueEnum<'ctx> {
+    fn emit_const(
+        &self,
+        dst: TempId,
+        v: &ConstValue,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         let ty = self.func.temp_type(dst);
-        match v {
+        Ok(match v {
             ConstValue::Integer(n) => match ty {
                 // Sprint 09: `<integer>` literals lower to *tagged*
                 // fixnums. Bit 0 = 0, value shifted left by 1.
@@ -1001,11 +1185,16 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                     .into(),
                 // Sprint 10: a `Boolean` temp arrived via
                 // `ConstValue::Integer` — treat 0 as #f, anything else
-                // as #t, materialising as the pinned singleton address.
+                // as #t. Sprint 38b: materialise as a load from the
+                // per-module external global for `#t` / `#f` so
+                // bitcode round-trips across processes without baking
+                // a process-local address.
                 TypeEstimate::Boolean => {
-                    let imm = nod_runtime::literal_pool_immediates();
-                    let bits = if *n != 0 { imm.true_.raw() } else { imm.false_.raw() };
-                    self.ctx.i64_type().const_int(bits, false).into()
+                    if *n != 0 {
+                        self.load_imm_true()?.into()
+                    } else {
+                        self.load_imm_false()?.into()
+                    }
                 }
                 _ => {
                     let tagged = ((*n as i64) as u64).wrapping_shl(1);
@@ -1017,12 +1206,15 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 _ => self.ctx.f64_type().const_float(*f).into(),
             },
             // Sprint 10: `#t` / `#f` are pinned heap-shape singletons.
-            // Their addresses live in the process-global immediates
-            // struct; bake the tagged-Word bit pattern as an i64 const.
+            // Sprint 38b: emit a load from the per-module external
+            // global so cross-process replay binds the symbol to the
+            // new process's runtime address.
             ConstValue::Bool(b) => {
-                let imm = nod_runtime::literal_pool_immediates();
-                let bits = if *b { imm.true_.raw() } else { imm.false_.raw() };
-                self.ctx.i64_type().const_int(bits, false).into()
+                if *b {
+                    self.load_imm_true()?.into()
+                } else {
+                    self.load_imm_false()?.into()
+                }
             }
             ConstValue::Char(c) => self
                 .ctx
@@ -1033,26 +1225,23 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             // process-global literal pool. The interned Word's raw bits
             // are baked as an i64 constant — JIT-loaded as a tagged
             // pointer to a `<byte-string>` heap object.
+            // (Sprint 38c will convert this site to a named global.)
             ConstValue::String(s) => {
                 let w = nod_runtime::intern_string_literal(s);
                 self.ctx.i64_type().const_int(w.raw(), false).into()
             }
             // Sprint 10: `Unit` constants lower to `nil`'s pinned
-            // singleton address. The DFM only uses Unit for the
-            // never-returned value of a void function; baking nil
-            // gives downstream callers a well-formed Word if they
-            // accidentally read it.
-            ConstValue::Unit => {
-                let imm = nod_runtime::literal_pool_immediates();
-                self.ctx.i64_type().const_int(imm.nil.raw(), false).into()
-            }
+            // singleton address. Sprint 38b: load from the per-module
+            // external global instead of baking the raw bits.
+            ConstValue::Unit => self.load_imm_nil()?.into(),
             // Sprint 12: raw 64-bit constant — used by lowering to
             // bake `<class>` references, tagged class-metadata ptrs,
             // and interned symbol Words straight into the IR.
+            // (Sprint 38c will convert these uses to named globals.)
             ConstValue::WordBits(bits) => {
                 self.ctx.i64_type().const_int(*bits, false).into()
             }
-        }
+        })
     }
 
     fn emit_primop(
@@ -1164,101 +1353,101 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 let i1 = b
                     .build_int_compare(IntPredicate::EQ, l, r, "tag.eq")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::NeInt => {
                 let (l, r) = int2();
                 let i1 = b
                     .build_int_compare(IntPredicate::NE, l, r, "tag.ne")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::LtInt => {
                 let (l, r) = int2();
                 let i1 = b
                     .build_int_compare(IntPredicate::SLT, l, r, "tag.lt")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::GtInt => {
                 let (l, r) = int2();
                 let i1 = b
                     .build_int_compare(IntPredicate::SGT, l, r, "tag.gt")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::LeInt => {
                 let (l, r) = int2();
                 let i1 = b
                     .build_int_compare(IntPredicate::SLE, l, r, "tag.le")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::GeInt => {
                 let (l, r) = int2();
                 let i1 = b
                     .build_int_compare(IntPredicate::SGE, l, r, "tag.ge")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::EqFloat => {
                 let (l, r) = float2();
                 let i1 = b
                     .build_float_compare(FloatPredicate::OEQ, l, r, "fcmp.eq")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::LtFloat => {
                 let (l, r) = float2();
                 let i1 = b
                     .build_float_compare(FloatPredicate::OLT, l, r, "fcmp.lt")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::GtFloat => {
                 let (l, r) = float2();
                 let i1 = b
                     .build_float_compare(FloatPredicate::OGT, l, r, "fcmp.gt")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::LeFloat => {
                 let (l, r) = float2();
                 let i1 = b
                     .build_float_compare(FloatPredicate::OLE, l, r, "fcmp.le")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             PrimOp::GeFloat => {
                 let (l, r) = float2();
                 let i1 = b
                     .build_float_compare(FloatPredicate::OGE, l, r, "fcmp.ge")
                     .map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), i1)?
+                self.retag_bool(i1)?
             }
             // Sprint 10: booleans are pinned-pointer Words; pointer
             // identity (not bit patterns) carries truth. Untag to i1,
             // apply the LLVM bool op, retag.
             PrimOp::BoolAnd => {
                 let (l, r) = int2();
-                let li = untag_bool_to_i1(b, self.ctx.i64_type(), l)?;
-                let ri = untag_bool_to_i1(b, self.ctx.i64_type(), r)?;
+                let li = self.untag_bool_to_i1(l)?;
+                let ri = self.untag_bool_to_i1(r)?;
                 let both = b.build_and(li, ri, "bool.and.i1").map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), both)?
+                self.retag_bool(both)?
             }
             PrimOp::BoolOr => {
                 let (l, r) = int2();
-                let li = untag_bool_to_i1(b, self.ctx.i64_type(), l)?;
-                let ri = untag_bool_to_i1(b, self.ctx.i64_type(), r)?;
+                let li = self.untag_bool_to_i1(l)?;
+                let ri = self.untag_bool_to_i1(r)?;
                 let either = b.build_or(li, ri, "bool.or.i1").map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), either)?
+                self.retag_bool(either)?
             }
             PrimOp::BoolNot => {
                 let v = self.temp_val(args[0]).into_int_value();
-                let vi = untag_bool_to_i1(b, self.ctx.i64_type(), v)?;
+                let vi = self.untag_bool_to_i1(v)?;
                 let one_i1 = self.ctx.bool_type().const_int(1, false);
                 let not = b.build_xor(vi, one_i1, "bool.not.i1").map_err(map_err)?;
-                retag_bool(b, self.ctx.i64_type(), not)?
+                self.retag_bool(not)?
             }
         })
     }
@@ -1281,7 +1470,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 let i1 = b
                     .build_int_compare(IntPredicate::EQ, masked, zero, "tcheck.int.cmp")
                     .map_err(map_err)?;
-                retag_bool(b, i64ty, i1)
+                self.retag_bool(i1)
             }
             // Wrapper-tagged class tests against seed classes. The helper
             // returns an i1 that's true iff `v` is pointer-tagged AND
@@ -1354,8 +1543,10 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // Fallback address for fixnum inputs: pinned `#f` singleton's
         // wrapper. Used purely to keep the load fault-free; the result
         // is overwritten by the integer-class select below.
-        let fallback = nod_runtime::literal_pool_immediates().false_.raw() & !1_u64;
-        let fallback_const = i64ty.const_int(fallback, false);
+        // Sprint 38b: load the wrapper address from the per-module
+        // external global so cross-process replay binds the symbol to
+        // the new process's runtime wrapper.
+        let fallback_const = self.load_imm_false_wrapper()?;
 
         let masked = b.build_and(v, not_one, "cls.id.untag").map_err(map_err)?;
         let addr_i64 = b
@@ -1429,8 +1620,9 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // Replace with a known-safe pinned address (the `#f` singleton
         // wrapper). The AND with `is_ptr_i1` at the end discards the
         // load result anyway, but the load itself must not fault.
-        let fallback = nod_runtime::literal_pool_immediates().false_.raw() & !1_u64;
-        let fallback_const = i64ty.const_int(fallback, false);
+        // Sprint 38b: load the wrapper address from the per-module
+        // external global.
+        let fallback_const = self.load_imm_false_wrapper()?;
 
         let masked = b.build_and(v, not_one, "tcheck.cls.untag").map_err(map_err)?;
         let addr_i64 = b
@@ -1457,7 +1649,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .build_int_compare(IntPredicate::EQ, class_id, target, "tcheck.cls.eq")
             .map_err(map_err)?;
         let both = b.build_and(is_ptr_i1, class_eq_i1, "tcheck.cls.both").map_err(map_err)?;
-        retag_bool(b, i64ty, both)
+        self.retag_bool(both)
     }
 
     fn emit_direct_call(
@@ -2209,7 +2401,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 // Sprint 10: every Dylan value except `#f` is true.
                 // Compare against the pinned `#f` singleton address.
                 let c64 = self.temp_val(*cond).into_int_value();
-                let c1 = untag_bool_to_i1(self.builder, self.ctx.i64_type(), c64)?;
+                let c1 = self.untag_bool_to_i1(c64)?;
                 let then_bb = self.blocks[then_block];
                 let else_bb = self.blocks[else_block];
                 self.builder

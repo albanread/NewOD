@@ -19,8 +19,10 @@ pub use cache::{
     read_stats, record_hit, record_miss, reset_stats, target_triple, write_cache_entry,
     write_cache_entry_with_manifest,
 };
-pub use codegen::{CodegenError, CodegenOutput, FunctionMap, codegen_module};
-pub use jit::{Jit, JitError};
+pub use codegen::{
+    CodegenError, CodegenOutput, FunctionMap, codegen_module, codegen_module_with_key,
+};
+pub use jit::{Jit, JitError, bitcode_to_ir_text};
 
 /// Sprint 38 — re-export the LLVM `Context` so downstream tests can
 /// drive [`Jit::add_module_from_bitcode`] without depending on

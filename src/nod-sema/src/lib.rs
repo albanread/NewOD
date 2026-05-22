@@ -270,14 +270,20 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     // mirror, not the in-process table.)
     let ctx_box: Box<Context> = Box::new(Context::create());
     let ctx_ref: &'static Context = Box::leak(ctx_box);
-    let out = codegen_module(ctx_ref, &lm.functions, "__eval__").map_err(EvalError::Codegen)?;
+    // Sprint 38b — use the cache-key-aware codegen entry point so
+    // per-module symbol naming and the manifest both pick up the
+    // same key the on-disk cache uses for lookup.
+    let out = nod_llvm::codegen_module_with_key(ctx_ref, &lm.functions, "__eval__", cache_key)
+        .map_err(EvalError::Codegen)?;
 
-    // Capture the bitcode for the on-disk cache mirror before MCJIT
-    // consumes the module pointer. The bitcode is the canonical
-    // representation of the post-codegen IR; Sprint 38 will use it
-    // for cross-process replay once we have runtime-pointer fix-ups.
+    // Capture the bitcode + manifest for the on-disk cache mirror
+    // before MCJIT consumes the module pointer. Sprint 38b: cross-
+    // process replay needs both — the bitcode is the canonical IR
+    // shape and the manifest tells the loader how to recompute every
+    // process-volatile address at JIT-link time.
     let bitcode_bytes = out.module.write_bitcode_to_memory();
     let bitcode: Vec<u8> = bitcode_bytes.as_slice().to_vec();
+    let manifest = out.manifest.clone();
 
     let mut jit_box: Box<Jit<'static>> = Box::new(Jit::new(ctx_ref).map_err(EvalError::Jit)?);
     jit_box.add_module(out).map_err(EvalError::Jit)?;
@@ -296,10 +302,13 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     let jit_static: &'static Jit<'static> = Box::leak(jit_box);
     let _ = jit_static; // engines are leak-by-omission; the borrow is for documentation
 
-    // Persist the bitcode + sidecar to disk. Best-effort: errors are
-    // logged but don't fail the JIT (the cache is an optimisation).
+    // Persist the bitcode + sidecar + manifest to disk. Best-effort:
+    // errors are logged but don't fail the JIT (the cache is an
+    // optimisation). Sprint 38b: switched from `write_cache_entry` to
+    // `write_cache_entry_with_manifest` so cross-process replay has
+    // the relocation table it needs to bind external globals.
     let dir = nod_llvm::default_cache_dir();
-    nod_llvm::write_cache_entry(&dir, cache_key, &bitcode);
+    nod_llvm::write_cache_entry_with_manifest(&dir, cache_key, &bitcode, &manifest);
     // Run LRU eviction once on each insert if we're over the cap.
     let cap = nod_llvm::cache_max_bytes();
     if nod_llvm::cache_size_on_disk(&dir) > cap {

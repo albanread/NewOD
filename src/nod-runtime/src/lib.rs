@@ -302,6 +302,64 @@ pub fn literal_pool_immediates() -> Immediates {
     with_literal_pool(|pool| pool.immediates)
 }
 
+/// Sprint 38b — process-global stable storage holding the bit pattern
+/// of each of the four immediate-singleton Words. Sprint 38b's codegen
+/// emits external globals of `i64` type for `#t`, `#f`, `nil`, and the
+/// untagged `#f` wrapper; on cache load + cold compile the JIT-link
+/// path calls `LLVMAddGlobalMapping(symbol, address-of-slot)` so a
+/// `load i64, ptr @symbol` reads the slot's value.
+///
+/// The slots are initialised on first read and remain stable for the
+/// process lifetime. They are kept in a separate Box<u64> per slot so
+/// that taking `&u64` returns an address that is *not* invalidated by
+/// any subsequent mutation of the lazy-lock or literal pool.
+///
+/// Distinct from `literal_pool_immediates()`, which returns the Word
+/// **values** by-copy through the literal-pool mutex — those copies
+/// have no stable address (the mutex guard owns them transiently).
+struct ImmediateSlots {
+    true_: &'static u64,
+    false_: &'static u64,
+    nil: &'static u64,
+    false_wrapper: &'static u64,
+}
+
+static IMMEDIATE_SLOTS: LazyLock<ImmediateSlots> = LazyLock::new(|| {
+    let imm = literal_pool_immediates();
+    let t: &'static u64 = Box::leak(Box::new(imm.true_.raw()));
+    let f: &'static u64 = Box::leak(Box::new(imm.false_.raw()));
+    let n: &'static u64 = Box::leak(Box::new(imm.nil.raw()));
+    let fw: &'static u64 = Box::leak(Box::new(imm.false_.raw() & !1_u64));
+    ImmediateSlots {
+        true_: t,
+        false_: f,
+        nil: n,
+        false_wrapper: fw,
+    }
+});
+
+/// Sprint 38b — stable address of the i64 slot holding the `#t` Word
+/// bits. JIT-link path uses this as the relocation target for
+/// `RelocKind::ImmTrue`'s named global.
+pub fn imm_true_slot_addr() -> *const u64 {
+    IMMEDIATE_SLOTS.true_ as *const u64
+}
+
+/// Sprint 38b — stable address of the `#f` slot.
+pub fn imm_false_slot_addr() -> *const u64 {
+    IMMEDIATE_SLOTS.false_ as *const u64
+}
+
+/// Sprint 38b — stable address of the `nil` slot.
+pub fn imm_nil_slot_addr() -> *const u64 {
+    IMMEDIATE_SLOTS.nil as *const u64
+}
+
+/// Sprint 38b — stable address of the `#f` untagged-wrapper slot.
+pub fn imm_false_wrapper_slot_addr() -> *const u64 {
+    IMMEDIATE_SLOTS.false_wrapper as *const u64
+}
+
 /// Sprint 13: mint a fresh inline-cache slot in the static area and
 /// return its raw pointer. Each JIT-emitted `Dispatch` call site
 /// receives one via `dispatch::CacheSlot::cold(site_id)` baked into

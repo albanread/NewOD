@@ -129,8 +129,36 @@ impl<'ctx> Jit<'ctx> {
     /// Verify the codegen'd module, install it into a fresh MCJIT engine,
     /// and finalize so symbols become callable.
     pub fn add_module(&mut self, output: CodegenOutput<'ctx>) -> Result<(), JitError> {
-        let CodegenOutput { module, .. } = output;
+        let CodegenOutput { module, manifest, .. } = output;
         module.verify().map_err(|e| JitError::Verify(e.to_string()))?;
+
+        // Sprint 38b — capture (GlobalValue, current-process address)
+        // pairs for every manifest entry whose named global is present
+        // in the module. The bindings are installed via
+        // `LLVMAddGlobalMapping` after MCJIT engine creation.
+        //
+        // The cold-compile path takes the same resolver as the warm
+        // replay path (`add_module_from_bitcode`) so the JIT-link
+        // semantics are identical between the two: a fresh `RelocKind`
+        // lookup against the current process, then `LLVMAddGlobalMapping`
+        // to bind the IR symbol to that address.
+        let mut reloc_bindings: Vec<(inkwell::values::GlobalValue<'ctx>, *mut std::ffi::c_void)> =
+            Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            let Some(global) = module.get_global(&entry.symbol) else {
+                continue;
+            };
+            let addr = match resolve_reloc_kind(&entry.kind) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Err(JitError::Create(format!(
+                        "reloc {}: {e}",
+                        entry.symbol
+                    )));
+                }
+            };
+            reloc_bindings.push((global, addr));
+        }
 
         // Capture extern declarations BEFORE handing the module off to
         // the engine. After `LLVMCreateMCJITCompilerForModule` owns the
@@ -809,6 +837,19 @@ impl<'ctx> Jit<'ctx> {
             // don't appear in the dispatch table either.
         }
 
+        // Sprint 38b — register every manifest reloc against the
+        // captured current-process address. This makes the cold-compile
+        // path symmetric with `add_module_from_bitcode`'s warm replay:
+        // both bind named-symbol externals via `LLVMAddGlobalMapping`
+        // before MCJIT finalises.
+        for (global, addr) in &reloc_bindings {
+            // SAFETY: `engine` is the freshly-created MCJIT engine;
+            // `global` is a GlobalValue captured before the ownership
+            // transfer; `addr` is a process-local pointer kept alive
+            // for the engine's lifetime (the runtime's static area).
+            unsafe { LLVMAddGlobalMapping(engine, global.as_value_ref(), *addr) };
+        }
+
         self.engines.push(engine);
         Ok(())
     }
@@ -984,18 +1025,42 @@ impl<'ctx> Jit<'ctx> {
     }
 }
 
+/// Sprint 38b — parse LLVM bitcode and return its textual IR. Used
+/// by the cross-process round-trip test to inspect the cold-compiled
+/// module's shape without depending on `inkwell` directly.
+pub fn bitcode_to_ir_text(bitcode: &[u8]) -> Result<String, JitError> {
+    init_native_target_once();
+    let ctx = Context::create();
+    let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+        bitcode,
+        "ir-shape-read",
+    );
+    let module = inkwell::module::Module::parse_bitcode_from_buffer(&buffer, &ctx)
+        .map_err(|e| JitError::Verify(e.to_string()))?;
+    Ok(module.print_to_string().to_string())
+}
+
 /// Sprint 38 — compute the current-process address for one
 /// [`RelocKind`]. The cold-compile path baked the resolved address
 /// into IR as an `i64` constant; the cache-hit path calls this to
 /// recompute it against the new process's runtime state.
 fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String> {
     let addr: u64 = match kind {
-        RelocKind::ImmTrue => nod_runtime::literal_pool_immediates().true_.raw(),
-        RelocKind::ImmFalse => nod_runtime::literal_pool_immediates().false_.raw(),
-        RelocKind::ImmNil => nod_runtime::literal_pool_immediates().nil.raw(),
-        RelocKind::ImmFalseWrapper => {
-            nod_runtime::literal_pool_immediates().false_.raw() & !1_u64
-        }
+        // Sprint 38b — `Imm*` reloc kinds resolve to the *address* of a
+        // process-global slot holding the Word bits, NOT the bits
+        // themselves. The JIT-link path passes this address to
+        // `LLVMAddGlobalMapping(@nod_imm_*, addr)`, so a `load i64, ptr
+        // @nod_imm_*` reads the slot's contents and yields the Word.
+        // Pre-Sprint 38b code that "resolved" `RelocKind::ImmTrue` to
+        // the Word bits worked only because the manifest had no
+        // consumers in the loader path (the immediates were still
+        // baked as i64 literals in the IR); Sprint 38b switches the
+        // IR to a real `load` through the named global, which is what
+        // makes this correction load-bearing.
+        RelocKind::ImmTrue => nod_runtime::imm_true_slot_addr() as u64,
+        RelocKind::ImmFalse => nod_runtime::imm_false_slot_addr() as u64,
+        RelocKind::ImmNil => nod_runtime::imm_nil_slot_addr() as u64,
+        RelocKind::ImmFalseWrapper => nod_runtime::imm_false_wrapper_slot_addr() as u64,
         RelocKind::ClassMetadata { class_id } => {
             let id = nod_runtime::ClassId(*class_id);
             nod_runtime::class_metadata_ptr(id) as u64

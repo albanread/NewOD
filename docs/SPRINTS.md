@@ -1334,12 +1334,45 @@ The headline `cross_process_cache_hit_is_at_least_10x_faster` subprocess-spawn t
 
 **Out of scope (deferred — see DEFERRED.md):**
 
-- **Codegen-side conversion of every bake site to named-global references.** Sprint 38b.
-- **Subprocess-spawn cross-process headline test.** Sprint 38b — needs codegen conversion.
+- **Codegen-side conversion of every bake site to named-global references.** Sprint 38b (immediates), 38c (class metadata + string/symbol literals), 38d (stub entries), 38e (cache slots + generic pointers).
+- **Subprocess-spawn cross-process headline test.** Waits until 38e — needs every category converted.
 - **AOT mode emitting `.exe`.** Sprint 39 — the relocation machinery built here is the foundation.
 - **Function-level / partial-invalidation caching.** Whole-module keying stands.
 - **Hot-reload-on-source-file-change.** IDE polish.
 - **Compressed bitcode files.** Sprint 38 ships uncompressed; bitcode compresses well, an LRU-cap follow-up.
+
+### Sprint 38b — immediates bake-site conversion (true / false / nil / false-wrapper)
+
+**Goal.** First focused codegen-conversion sub-sprint following Sprint 38's infrastructure landing. The seven codegen sites that bake immediate Word values (`#t`, `#f`, `nil`, the untagged `#f` wrapper used as a fault-free fallback in branchless class-id reads) now emit external-global symbol references (`@nod_imm_true__<key>` etc.) instead of `i64` literal constants. The cold-compile path registers each external against a process-stable slot via `LLVMAddGlobalMapping`; the cross-process replay path resolves them through the manifest sidecar against fresh in-process slot addresses.
+
+**Phase A — codegen change pattern.** Introduced `ModuleCodegenCtx` (`CacheKey` + `RefCell<ModuleManifest>`) threaded through `codegen_module`/`emit_function`/`Emit`. Added four `Emit::load_imm_*` helpers (true, false, nil, false_wrapper) that call `get_or_add_imm_global` to declare-or-reuse the named external, emit a `load i64, ptr @symbol`, and push one `RelocKind::Imm*` row to the manifest on first emit. Converted `retag_bool` / `untag_bool_to_i1` from free functions taking `&Builder` to `Emit` methods so they have access to the module + manifest; updated all 21 call sites (PrimOp comparisons, BoolAnd/Or/Not, `Terminator::If`, `ClassCheck::Integer`'s retag, `emit_wrapper_class_check`'s final retag). Converted `emit_const` to return `Result<BasicValueEnum, CodegenError>` so the Bool/Integer-as-Bool/Unit arms can emit loads. Replaced the two `false_wrapper` baked-constant sites in `emit_word_class_id` and `emit_wrapper_class_check` with `self.load_imm_false_wrapper()` calls.
+
+**Phase B — manifest building.** `CodegenOutput` now carries a `manifest: ModuleManifest` field, populated as a by-product of `get_or_add_imm_global` calls. Added `codegen_module_with_key(ctx, fns, name, key)` as the canonical entry point; the existing `codegen_module(ctx, fns, name)` keeps its signature by synthesising a deterministic key from `cache_key_for_dfm(module_name + DFM-text)` for the four non-cache-aware call sites (stdlib load, dump-llvm, bench, run_function_to_i64). Cache-aware path (`eval_wrapped_source`) calls `codegen_module_with_key(cache_key)` directly.
+
+**Phase C — JIT-link integration.** `Jit::add_module` captures `(GlobalValue, current-process-address)` pairs from the manifest before MCJIT engine creation, then registers each via `LLVMAddGlobalMapping` after the engine is created — symmetric with `add_module_from_bitcode`'s warm-replay binding loop. `nod-sema::eval_wrapped_source` switched from `write_cache_entry` to `write_cache_entry_with_manifest` so the manifest sidecar reaches disk alongside the bitcode.
+
+**Phase D — process-stable immediate slots.** Discovered during first test pass: `resolve_reloc_kind` was returning the *Word bits* for `RelocKind::Imm*` (a holdover from when the manifest had no actual loader consumer). `LLVMAddGlobalMapping(@nod_imm_true, addr)` makes `&@nod_imm_true == addr`, so a `load i64, ptr @nod_imm_true` reads the i64 *at* `addr`. The Word bits are not a valid address to load from. Added `imm_*_slot_addr()` functions in `nod-runtime` exposing the stable address of a `Box::leak`ed `u64` initialised with the immediate's Word bits; `resolve_reloc_kind` now returns these slot addresses. The slots are initialised once on first read and live for the process lifetime.
+
+**Phase E — verification.** `cargo build --workspace` clean. `cargo test --workspace`: **584 → 586** passing (+ two new tests: `sprint38b_immediate_globals_round_trip_through_cached_bitcode` and `sprint38b_bitcode_round_trip_reads_named_global`), 0 failed, 9 ignored (unchanged baseline). `cargo clippy --workspace --all-targets -- -D warnings` clean (the only warnings come from the external `newgc-core` crate, unchanged). 5x sequential flake check — 5/5 runs at 586/0/9.
+
+**Empirical IR proof.** A cold-compile of `if (#t) 1 else 2 end` produces IR containing:
+
+```text
+@nod_imm_true__366bd96cb9a2992c = external externally_initialized global i64
+@nod_imm_false__366bd96cb9a2992c = external externally_initialized global i64
+  %imm.true.load = load i64, ptr @nod_imm_true__366bd96cb9a2992c, align 4
+  %imm.false.load = load i64, ptr @nod_imm_false__366bd96cb9a2992c, align 4
+```
+
+— exactly the named-global shape Sprint 38 specified, with the per-module 16-char key prefix isolating distinct modules from each other. No `i64 <baked-pointer>` constants remain at the four immediate bake-site categories.
+
+**Out of scope (Sprint 38c / 38d / 38e):**
+
+- Class metadata pointers (Sprint 38c).
+- `<byte-string>` and `<symbol>` literals (Sprint 38c).
+- Win32 FFI stub entries (Sprint 38d).
+- Inline-cache slots + generic-function pointers (Sprint 38e).
+- The cross-process subprocess-spawn headline test (Sprint 38e — depends on all categories converted).
 
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
