@@ -4885,11 +4885,11 @@ impl FunctionBuilder {
                         ),
                     });
                 }
-                if info.arg_count > 8 {
+                if info.arg_count > 12 {
                     return Err(LoweringError::Unsupported {
                         span,
                         message: format!(
-                            "c-function `{name}`: Sprint 28 caps arity at 8, got {}",
+                            "c-function `{name}`: Sprint 36b caps arity at 12, got {}",
                             info.arg_count
                         ),
                     });

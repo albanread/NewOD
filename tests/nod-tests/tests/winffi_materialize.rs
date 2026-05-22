@@ -236,33 +236,31 @@ fn user_define_c_function_overrides_materialization() {
 
 // ─── 8. Unsupported-signature decline ─────────────────────────────────────
 
-/// A bare-name call whose Win32 entry takes more than 8 params (Sprint
-/// 28's arity cap) must produce a sema-level error mentioning the
-/// function name and that its signature is unsupported. `CreateProcessW`
-/// has 10 params, exceeding the cap.
+/// Bare-name calls to functions whose signature isn't supported must
+/// surface a clean diagnostic, not silently succeed. Sprint 36b raised
+/// the arity cap from 8 → 12, so functions like `CreateProcessW`
+/// (arity 10) now materialise successfully; the test was updated to
+/// use a clearly-non-existent name that drives the UnknownCallee
+/// fallback path.
 ///
-/// The test accepts two error shapes:
-///   * Our Sprint 31 structured error ("unsupported types") — preferred.
-///   * `UnknownCallee` from codegen — acceptable fallback if the
-///     embedded blob's build.rs filter dropped the function entirely
-///     (the 5191 `bad_type` skips include callback-bearing entries).
-///
-/// Either way the call must NOT silently succeed.
+/// (The embedded blob's build.rs filter drops 5,191 functions for
+/// `bad_type` — struct-by-value, function-pointer, etc. — so any
+/// genuine "unsupported type" Win32 entry is already absent from the
+/// index. Sprint 37+ may add a path that surfaces those with a richer
+/// diagnostic rather than UnknownCallee.)
 #[test]
 #[serial]
-fn unsupported_signature_declines_materialization() {
+fn unsupported_name_declines_materialization() {
     setup();
-    let result = eval_expr_to_string("CreateProcessW(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)");
-    let err = result.expect_err("CreateProcessW must reject (>8 params)");
+    let result = eval_expr_to_string("NotARealWin32FunctionEverXyzzy42()");
+    let err = result.expect_err("nonexistent name must reject");
     let msg = format!("{err:?}");
-    let mentions_name = msg.contains("CreateProcessW");
-    let mentions_unsupported =
-        msg.contains("unsupported types") || msg.contains("unsupported") || msg.contains("arity");
-    let unknown_callee = msg.contains("UnknownCallee");
+    let mentions_name = msg.contains("NotARealWin32FunctionEverXyzzy42");
+    let unknown_or_unbound =
+        msg.contains("UnknownCallee") || msg.contains("Unbound") || msg.contains("undefined");
     assert!(
-        (mentions_name && mentions_unsupported) || unknown_callee,
-        "expected either a Sprint 31 'unsupported types' error or a fallback \
-         UnknownCallee; got: {msg}"
+        mentions_name && unknown_or_unbound,
+        "expected an UnknownCallee/Unbound error mentioning the name; got: {msg}"
     );
 }
 
