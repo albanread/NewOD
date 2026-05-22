@@ -48,6 +48,24 @@ use crate::codegen::{
     NOD_STRUCT_GET_U16_SYMBOL, NOD_STRUCT_GET_U32_SYMBOL, NOD_STRUCT_GET_U64_SYMBOL,
     NOD_STRUCT_SET_I32_SYMBOL, NOD_STRUCT_SET_I64_SYMBOL, NOD_STRUCT_SET_POINTER_SYMBOL,
     NOD_STRUCT_SET_U16_SYMBOL, NOD_STRUCT_SET_U32_SYMBOL, NOD_STRUCT_SET_U64_SYMBOL,
+    // Sprint 35 — COM shim symbols.
+    NOD_COM_RELEASE_SYMBOL, NOD_COM_REGISTRY_LEN_SYMBOL, NOD_COM_LAST_HRESULT_SYMBOL,
+    NOD_COM_CLEAR_LAST_HRESULT_SYMBOL,
+    NOD_DXGI_CREATE_FACTORY_SYMBOL, NOD_DXGI_DEVICE_FROM_D3D_DEVICE_SYMBOL,
+    NOD_DXGI_CREATE_SURFACE_FROM_TEXTURE_SYMBOL,
+    NOD_D3D11_CREATE_DEVICE_SYMBOL, NOD_D3D11_GET_IMMEDIATE_CONTEXT_SYMBOL,
+    NOD_D3D11_CREATE_TEXTURE_2D_SYMBOL, NOD_D3D11_COPY_TO_STAGING_AND_MAP_SYMBOL,
+    NOD_D3D11_LAST_STAGING_HANDLE_SYMBOL, NOD_D3D11_LAST_MAPPED_ROW_PITCH_SYMBOL,
+    NOD_D3D11_UNMAP_SYMBOL,
+    NOD_D2D_CREATE_FACTORY_SYMBOL, NOD_D2D_CREATE_DEVICE_SYMBOL,
+    NOD_D2D_CREATE_DEVICE_CONTEXT_SYMBOL, NOD_D2D_CREATE_BITMAP_FOR_TARGET_SYMBOL,
+    NOD_D2D_SET_TARGET_SYMBOL, NOD_D2D_BEGIN_DRAW_SYMBOL, NOD_D2D_END_DRAW_SYMBOL,
+    NOD_D2D_CLEAR_SYMBOL, NOD_D2D_SET_TRANSFORM_IDENTITY_SYMBOL,
+    NOD_D2D_CREATE_SOLID_COLOR_BRUSH_SYMBOL, NOD_D2D_DRAW_TEXT_LAYOUT_SYMBOL,
+    NOD_D2D_DRAW_RECTANGLE_SYMBOL, NOD_D2D_FILL_RECTANGLE_SYMBOL,
+    NOD_DWRITE_CREATE_FACTORY_SYMBOL, NOD_DWRITE_CREATE_TEXT_FORMAT_SYMBOL,
+    NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL, NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL,
+    NOD_COUNT_NON_ZERO_RED_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -132,7 +150,8 @@ impl<'ctx> Jit<'ctx> {
         // Names mirror `nod-llvm::codegen::SPRINT_20B_PRIMITIVES`. Capture
         // the FunctionValues here before MCJIT takes ownership of the
         // module pointer.
-        let sprint_20b_extern_decls: Vec<(Option<inkwell::values::FunctionValue<'_>>, *mut std::ffi::c_void)> = vec![
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut sprint_20b_extern_decls: Vec<(Option<inkwell::values::FunctionValue<'_>>, *mut std::ffi::c_void)> = vec![
             (
                 module.get_function(NOD_COLLECTION_SIZE_SYMBOL),
                 nod_runtime::nod_collection_size as *const () as *mut std::ffi::c_void,
@@ -405,6 +424,80 @@ impl<'ctx> Jit<'ctx> {
                 nod_runtime::nod_struct_set_pointer as *const () as *mut std::ffi::c_void,
             ),
         ];
+        // Sprint 35 — COM shim function-pointer mappings. Only built on
+        // Windows; the shim symbols are `#[cfg(windows)]` in nod-runtime.
+        // On non-Windows builds these mappings simply aren't added —
+        // the test layer guards every COM-touching test with
+        // `#![cfg(windows)]` so the symbols are never referenced.
+        #[cfg(windows)]
+        let com_mappings: Vec<(Option<inkwell::values::FunctionValue<'_>>, *mut std::ffi::c_void)> = vec![
+            (module.get_function(NOD_COM_RELEASE_SYMBOL),
+             nod_runtime::nod_com_release as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_COM_REGISTRY_LEN_SYMBOL),
+             nod_runtime::nod_com_registry_len as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_COM_LAST_HRESULT_SYMBOL),
+             nod_runtime::nod_com_last_hresult as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_COM_CLEAR_LAST_HRESULT_SYMBOL),
+             nod_runtime::nod_com_clear_last_hresult as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DXGI_CREATE_FACTORY_SYMBOL),
+             nod_runtime::nod_dxgi_create_factory as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DXGI_DEVICE_FROM_D3D_DEVICE_SYMBOL),
+             nod_runtime::nod_dxgi_device_from_d3d_device as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DXGI_CREATE_SURFACE_FROM_TEXTURE_SYMBOL),
+             nod_runtime::nod_dxgi_create_surface_from_texture as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_CREATE_DEVICE_SYMBOL),
+             nod_runtime::nod_d3d11_create_device as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_GET_IMMEDIATE_CONTEXT_SYMBOL),
+             nod_runtime::nod_d3d11_get_immediate_context as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_CREATE_TEXTURE_2D_SYMBOL),
+             nod_runtime::nod_d3d11_create_texture_2d as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_COPY_TO_STAGING_AND_MAP_SYMBOL),
+             nod_runtime::nod_d3d11_copy_to_staging_and_map as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_LAST_STAGING_HANDLE_SYMBOL),
+             nod_runtime::nod_d3d11_last_staging_handle as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_LAST_MAPPED_ROW_PITCH_SYMBOL),
+             nod_runtime::nod_d3d11_last_mapped_row_pitch as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D3D11_UNMAP_SYMBOL),
+             nod_runtime::nod_d3d11_unmap as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CREATE_FACTORY_SYMBOL),
+             nod_runtime::nod_d2d_create_factory as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CREATE_DEVICE_SYMBOL),
+             nod_runtime::nod_d2d_create_device as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CREATE_DEVICE_CONTEXT_SYMBOL),
+             nod_runtime::nod_d2d_create_device_context as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CREATE_BITMAP_FOR_TARGET_SYMBOL),
+             nod_runtime::nod_d2d_create_bitmap_for_target as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_SET_TARGET_SYMBOL),
+             nod_runtime::nod_d2d_set_target as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_BEGIN_DRAW_SYMBOL),
+             nod_runtime::nod_d2d_begin_draw as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_END_DRAW_SYMBOL),
+             nod_runtime::nod_d2d_end_draw as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CLEAR_SYMBOL),
+             nod_runtime::nod_d2d_clear as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_SET_TRANSFORM_IDENTITY_SYMBOL),
+             nod_runtime::nod_d2d_set_transform_identity as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_CREATE_SOLID_COLOR_BRUSH_SYMBOL),
+             nod_runtime::nod_d2d_create_solid_color_brush as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_DRAW_TEXT_LAYOUT_SYMBOL),
+             nod_runtime::nod_d2d_draw_text_layout as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_DRAW_RECTANGLE_SYMBOL),
+             nod_runtime::nod_d2d_draw_rectangle as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_D2D_FILL_RECTANGLE_SYMBOL),
+             nod_runtime::nod_d2d_fill_rectangle as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DWRITE_CREATE_FACTORY_SYMBOL),
+             nod_runtime::nod_dwrite_create_factory as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DWRITE_CREATE_TEXT_FORMAT_SYMBOL),
+             nod_runtime::nod_dwrite_create_text_format as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL),
+             nod_runtime::nod_dwrite_create_text_layout as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL),
+             nod_runtime::nod_dwrite_get_layout_metrics as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_COUNT_NON_ZERO_RED_SYMBOL),
+             nod_runtime::nod_count_non_zero_red as *const () as *mut std::ffi::c_void),
+        ];
+        #[cfg(windows)]
+        sprint_20b_extern_decls.extend(com_mappings);
 
         // Sprint 20b — capture any extern declarations whose names
         // match a registered method body. The codegen layer declares

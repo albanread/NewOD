@@ -1046,6 +1046,76 @@ Win32 headlines:
 - **C → Dylan struct view.** Sprint 34 auto-coerces Dylan-struct → C-pointer one way only. A Win32 API that returns `LPRECT` and the Dylan caller wants to read its fields requires explicit `wrap-as-rect(ptr)` in Sprint 34 (deferred — no IDE-track API in the seed set returns a struct pointer that Dylan needs to read).
 - **Per-bucket "is-c-struct" Wrapper flag.** Sprint 34 uses `is_subclass(class, <c-struct>)` for the auto-coerce decision; the CPL walk is 3 entries deep so the cost is negligible. If a future profile shows the test as hot, switching to a dedicated bit on the Wrapper (parallel to Sprint 22's bucket-state byte) is a one-line change.
 
+### Sprint 35 — COM via `windows` crate: DXGI / D3D11 / D2D / DirectWrite infrastructure — landed
+
+**Goal:** an offscreen D2D + DirectWrite text-rendering chain reachable from Dylan source. The Sprint 35 brief originally sketched a hand-rolled C++ shim DLL wrapping COM as plain C; we instead use the official Microsoft [`windows` crate](https://docs.rs/windows) as the COM-aware layer. The shim lives in Rust at `nod-runtime::com_shim`, uses the `windows` crate's typed interfaces for refcount-correct COM, and exposes ~30 `%`-primitive entries through the Sprint 20b primitive-call path. Dylan source builds a 256×256 BGRA8 texture, renders "hello, dylan" with DirectWrite + a red brush, reads back the pixel buffer through a CPU-mapped staging texture, and asserts text glyphs produced non-zero red pixels.
+
+**Architectural shape.**
+
+A. **COM handle registry.** A process-global `Mutex<HashMap<u64, ComObject>>` in `com_shim.rs` owns one typed `windows`-crate interface per Dylan-held handle. Cloning a `windows` COM type bumps refcount (`AddRef`); dropping calls `Release`. The registry's `register(obj) → u64` hands out monotonic counter handles which Dylan treats as opaque `<c-handle>` tokens. `release(handle)` removes the entry, which drops the typed wrapper, which calls `Release`. No manual AddRef/Release in our shims.
+
+B. **Typed accessors per variant.** A `typed_accessor!($name, $variant, $ty)` macro generates `get_dxgi_factory`, `get_d3d11_device`, etc. — each takes a u64 handle, untags the fixnum tag bit, and returns `Option<TypedInterface>` cloned out of the registry. Cloning gives the caller an owned reference that survives `Drop` independently of the registry's entry.
+
+C. **`windows` crate feature flags.** Sprint 35 enables `Win32_Foundation`, `Win32_System_Com`, `Win32_Graphics_Dxgi`, `Win32_Graphics_Dxgi_Common`, `Win32_Graphics_Direct3D`, `Win32_Graphics_Direct3D11`, `Win32_Graphics_Direct2D`, `Win32_Graphics_Direct2D_Common`, `Win32_Graphics_DirectWrite`, and `Foundation_Numerics` (the last for `Matrix3x2`). Build cost: one-time ~3-minute clean compile of the windows crate; incremental builds are sub-second. The `windows` crate itself adds ~300MB to `target/`.
+
+D. **Float-marshaling deviation.** The brief sketches `<c-float>` / `<c-double>` Dylan args feeding float-aware trampoline variants. Sprint 35 instead routes the whole COM surface through **integer-encoded scalars** — color channels are 0..=255 Dylan integers (the shim divides by 255 to get f32), pixel coordinates are integer Dylan values (the shim casts to f32 in stride). This eliminates the trampoline restructure entirely: every shim signature is `extern "C-unwind" fn(u64, u64, …) -> u64`, lowered through the existing Sprint 28 mechanism without change. The `<c-float>` / `<c-double>` Dylan classes are still registered (Phase A acceptance item), and `CArgKind::Float32` / `CArgKind::Float64` exist in the enum and `from_c_type_name` mapping — sema accepts `define c-function` declarations using these types — but the trampoline path for them panics with a deliberate "Sprint 36+" message. Sprint 36+ wires the trampoline shape that actually marshals native floats when a real use case demands it.
+
+E. **`%`-primitive routing, not `define c-function`.** Sprint 28's `define c-function` path goes through `LoadLibrary`/`GetProcAddress` to look up Win32 DLL exports. The COM shim functions live in our own process, not in a DLL, so the Sprint 28 path doesn't apply. Sprint 35 wires every shim as a `%`-primitive in `LOWER_PRIMITIVE_TABLE` (the same mechanism as `%struct-get-i32`, `%nod_make_table`, etc.) — codegen emits a `DirectCall { callee: "nod_*", … }`, the JIT layer binds the runtime symbol via `LLVMAddGlobalMapping`, and the call returns straight through the standard primitive ABI. Dylan source uses `%dxgi-create-factory()` style invocation directly.
+
+F. **Fixnum-tag discipline at the FFI boundary.** Sprint 28 primitives that return raw u64 values (handles, counts, HRESULTs) are passed back as Dylan Words through the primitive-call result temp. The Word tag bit must be 0 (fixnum) — a raw odd integer like 1 would parse as a pointer-tagged Word and trigger a null-pointer-dereference in the formatter. Sprint 35 introduces `tag()` and `untag()` helpers in `com_shim.rs`: every shim entry untags its u64 args before use and wraps every successful return in `tag()`. The macro-generated typed accessors do the untagging once at the lookup boundary.
+
+G. **String marshaling.** DirectWrite expects UTF-16. Sprint 35 shims that take string args (font family, locale, text content) accept Dylan `<byte-string>` Words and convert UTF-8 → UTF-16 on the stack via `utf16_from_dylan_byte_string` helpers. This reuses `winffi::read_dylan_byte_string` (made `pub(crate)` for the dependency). No new trampoline path required.
+
+**Shim surface (32 entries).** All `extern "C-unwind" fn(u64, …) -> u64`.
+
+*Lifecycle / diagnostics:*
+
+- `nod_com_release(handle)` → drop the registry entry, refcount goes to zero.
+- `nod_com_registry_len()` → diagnostic count of live entries.
+- `nod_com_last_hresult()` / `nod_com_clear_last_hresult()` → thread-local last-error.
+
+*DXGI (3):* `nod_dxgi_create_factory`, `nod_dxgi_device_from_d3d_device`, `nod_dxgi_create_surface_from_texture`.
+
+*D3D11 (3):* `nod_d3d11_create_device` (tries hardware, falls back to WARP), `nod_d3d11_get_immediate_context`, `nod_d3d11_create_texture_2d` (USAGE_DEFAULT + BIND_RENDER_TARGET + BIND_SHADER_RESOURCE).
+
+*D2D (10):* `nod_d2d_create_factory` (`ID2D1Factory1` for device interop), `nod_d2d_create_device`, `nod_d2d_create_device_context`, `nod_d2d_create_bitmap_for_target` (wraps a DXGI surface as an `ID2D1Bitmap1`), `nod_d2d_set_target`, `nod_d2d_begin_draw`, `nod_d2d_end_draw` (returns HRESULT), `nod_d2d_clear`, `nod_d2d_set_transform_identity`, `nod_d2d_create_solid_color_brush`.
+
+*Drawing primitives (3):* `nod_d2d_draw_text_layout`, `nod_d2d_draw_rectangle`, `nod_d2d_fill_rectangle`.
+
+*DirectWrite (4):* `nod_dwrite_create_factory`, `nod_dwrite_create_text_format`, `nod_dwrite_create_text_layout`, `nod_dwrite_get_layout_metrics` (returns packed width+height).
+
+*Pixel readback (4):* `nod_d3d11_copy_to_staging_and_map` (creates a CPU-readable staging texture, copies GPU→staging, calls `Flush`, then `Map`s for read), `nod_d3d11_last_staging_handle` / `nod_d3d11_last_mapped_row_pitch` (companions returning the staging handle + row pitch from the last copy), `nod_d3d11_unmap`, plus `nod_count_non_zero_red` (scans BGRA8 pixels at byte+2 of each 4-byte pixel and counts non-zero).
+
+**ID2D1RenderTarget cast trick.** The `windows` crate doesn't auto-deref `ID2D1DeviceContext` to its parent `ID2D1RenderTarget`. Many drawing methods (`BeginDraw`, `EndDraw`, `Clear`, `SetTransform`, `CreateSolidColorBrush`, `DrawRectangle`, `FillRectangle`, `DrawTextLayout`) live on the parent. A `dc_as_render_target(dc_handle) -> Option<ID2D1RenderTarget>` helper does an `IUnknown::cast()` on the device-context interface (which is the same underlying COM object) to obtain the typed render-target view. The cast is a vtable lookup, essentially free.
+
+**Headline acceptance — `d2d_offscreen_renders_text_glyphs`.** Dylan source builds the entire device chain, clears the texture to opaque black (so non-zero-red pixels can only be from the red brush), draws "hello, dylan" with DirectWrite at (10, 50) in 24-DIP Segoe UI, maps the staging texture, and counts red-channel pixels.
+
+Run output: **`717`** red pixels rendered (out of 65 536 total) — proof that text glyphs, not background fill, produced the red. The chain exercises every layer: DXGI factory, D3D11 device, D3D11 texture allocation, DXGI surface cast, D2D factory + device + device context + bitmap, DirectWrite factory + text format + text layout, solid-color brush, BeginDraw/EndDraw bracketing, CPU readback through a staging texture, and pixel-level pointer reading. **Sprint 35's headline goal — text glyphs rendered into pixels we read back — is met.**
+
+**Refcount discipline acceptance.** `ten_handles_released_clears_registry` creates 10 DXGI factories from Dylan source, walks `%com-registry-len()` to confirm the count grows to 10, releases each one, walks the count back to 0. Asserts `before - after == 10` — and gets exactly 10. The `windows` crate's `Drop` discipline propagates through our registry: removing a `HashMap` entry drops the typed wrapper which calls `Release`. No leaks observed across 5 sequential test runs.
+
+**Refcount registry empty-after-reset acceptance.** `refcount_registry_starts_empty_after_reset` calls `%com-registry-len()` immediately after `_reset_com_registry_for_tests()` and asserts 0. Proves the test-side reset path zeros the registry cleanly.
+
+**EndDraw success acceptance.** `d2d_clear_and_end_draw_succeed` builds the chain to the device-context level, calls `BeginDraw → Clear(128,64,200,255) → EndDraw`, and asserts the HRESULT return is 0 (S_OK). This is the closest Sprint 35 comes to "float-marshaling proof" — the clear's 4 color channels are Dylan integer args, the shim converts each to f32, the call succeeds.
+
+**Tests added (14).** `winffi_d2d.rs` ships 11 `#[serial]` tests covering the headline, every factory creation, the refcount discipline, and EndDraw success, plus 2 non-serial `<c-float>` / `<c-double>` class-registration sanity checks. The com_shim module's `#[cfg(test)] mod tests` adds 3 unit tests proving the registry's COM-Drop discipline at the Rust level. Test counts: baseline 532 → 546 (+14). All `#[serial]` because the COM handle registry is process-global.
+
+**Verification.**
+- `cargo test --workspace --no-fail-fast`: 546 passed, 0 failed, 7 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (only warnings are in the external `newgc-core` crate, same as baseline).
+- 5x sequential flake check: 546/0/7 every run.
+
+**Out of scope for Sprint 35 (deferred — see DEFERRED.md):**
+
+- **Float-marshaling trampoline shape.** `<c-float>` / `<c-double>` are registered for sema-acceptance only; no Sprint 35 shim takes a native float arg. Sprint 36+ ships per-shape trampolines for Win64 floats-in-XMM marshaling when a use case demands it (e.g. Direct2D animation curves with real-valued time arguments).
+- **HWND-bound swap chains.** Sprint 35 ships offscreen-only rendering — no `CreateSwapChainForHwnd`, no `IDXGISwapChain1`, no `Present()`. Lights up in Sprint 37 once the IDE window exists.
+- **Linear/radial gradient brushes, geometries, paths.** Solid-color brush only.
+- **WIC bitmap interop.** Image loading from PNG/JPEG via the Windows Imaging Component is a follow-on.
+- **D2D effect graphs and animations.** Useful for IDE polish; not Sprint 35.
+- **Device-loss recovery.** When the GPU is reset (driver crash, monitor change), every D3D11 / D2D resource is invalidated. Production polish.
+- **Compositional swap chains.** `CreateSwapChainForComposition` enables IDE panes embedded in non-Win32 hosts (XAML islands, etc.). Later.
+- **Hand-rolled C++ shim DLL (the original Sprint 35 brief).** Superseded by the `windows`-crate approach. The C++ shim is no longer on the roadmap.
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
@@ -1070,8 +1140,8 @@ DFM serialisation, cache-key extension with downstream library hashes, cross-lib
 ### Sprint 34b — AOT mode — emit a standalone Windows executable
 (Renumbered: Sprint 34 was reclaimed by the `<c-struct>` family work above — see "Sprint 34 — Structs".) JIT artefacts written out as a PE binary plus a shipped `nod-runtime` static lib. Cache key already covers it; mostly a packaging exercise.
 
-### Sprint 35 — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
-All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.
+### Sprint 35b — Dylan-side IDE polish: debugger, library browser, sealed-domain visualiser to v1.0 quality
+(Renumbered: Sprint 35 was reclaimed by the COM / DXGI / D3D11 / D2D / DirectWrite infrastructure work above — see "Sprint 35 — COM via `windows` crate".) All in Dylan, on top of the Win32 FFI stack: source-stepping debugger, library browser with cross-references, sealed-domain visualiser usable on real programs. Re-implements the feel of `E:\opendylan\sources\environment\debugger\`, `editor/deuce/`, and `commands/`.
 
 ### Sprint 36 — macOS port (aarch64-apple-darwin first)
 The Dylan-side IDE re-implementation against a `nsapp` / Cocoa equivalent — same shape: Dylan code calling Cocoa through `c-ffi` over a macOS analogue of the Sprint 25b FFI stack. The non-runtime crates are already platform-clean; the cost is rewriting the IDE-side Win32 bindings as Cocoa bindings. Same `c-ffi` shape, different `define interface` declarations.

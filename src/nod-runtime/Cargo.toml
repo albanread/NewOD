@@ -29,6 +29,25 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_Foundation",
 ] }
+# Sprint 35: typed COM bindings for DXGI / D3D11 / D2D / DirectWrite.
+# The `windows` crate (vs `windows-sys`) provides refcount-correct
+# wrappers — every interface type implements `Clone` (calls AddRef)
+# and `Drop` (calls Release), so a Rust-side `HashMap<u64, ComObject>`
+# is sufficient to own and lifetime-manage the GPU resources Dylan
+# refers to by opaque <c-handle>. Feature selection follows the
+# minimum surface area for offscreen-only Sprint 35:
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Foundation_Numerics",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

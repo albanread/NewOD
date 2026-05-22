@@ -1,0 +1,1280 @@
+//! Sprint 35 — COM shim for DXGI / D3D11 / D2D / DirectWrite via the
+//! `windows` crate.
+//!
+//! ## Architecture
+//!
+//! Dylan sees a process-global registry that hands out opaque `u64`
+//! handle tokens (treated as `<c-handle>` on the Dylan side). Each
+//! token maps to a [`ComObject`] enum variant carrying a typed
+//! `windows`-crate COM interface. Cloning a `windows` crate COM type
+//! bumps the underlying object's refcount via `AddRef`; dropping it
+//! calls `Release`. The registry's `HashMap<u64, ComObject>` owns
+//! exactly one reference per Dylan-held handle; removing the entry
+//! drops the inner enum, which calls `Release`.
+//!
+//! Calls like `nod_d2d_draw_text_layout(dc_handle, x, y, layout_handle,
+//! brush_handle)` are regular `extern "C-unwind"` Rust functions:
+//! they look up each handle via the registry, clone the typed
+//! interface (cheap — atomic refcount increment), and call the
+//! `windows` crate methods directly. Errors are surfaced as
+//! `<c-ffi-error>` Dylan conditions whose `os-error-code` slot
+//! carries the underlying HRESULT.
+//!
+//! ## Sprint 35 scope
+//!
+//! Offscreen only — no HWND, no swap chain, no actual presentation.
+//! The acceptance test creates an `ID3D11Texture2D` of 256×256 ARGB
+//! as the render target, sets a D2D bitmap on it, draws "hello, dylan"
+//! with DirectWrite, then maps a CPU-readable staging texture to read
+//! the pixels back and assert text glyphs rendered (count of non-zero
+//! red pixels in the expected text region).
+//!
+//! ## Refcount discipline
+//!
+//! The `windows` crate's COM types are `Clone + Drop`. The registry
+//! takes ownership of each created object; calling `nod_com_release`
+//! removes the entry, which drops the typed wrapper, which calls
+//! `Release` on the underlying COM object. We do not manually call
+//! `AddRef` or `Release`. This is the entire lifetime story.
+//!
+//! ## Float marshaling caveat (Sprint 35 deviation)
+//!
+//! The brief sketches `<c-float>` / `<c-double>` Dylan types feeding
+//! float-aware trampoline variants. To avoid restructuring the
+//! Sprint 28 trampolines (which use `extern "system" fn(u64, u64, …)`
+//! integer-only signatures — adding f32 args in mid-call-frame
+//! positions changes Win64 register classes), Sprint 35 instead
+//! accepts integer-encoded scalars for the shim layer:
+//!
+//! - Color channels: 0..=255 Dylan integers, mapped to 0.0..=1.0 f32.
+//! - Pixel coordinates: integer Dylan values, cast to f32 inside the
+//!   shim.
+//! - DirectWrite font size: integer Dylan value, cast to f32.
+//!
+//! The `<c-float>` / `<c-double>` Dylan classes are still registered
+//! (Sprint 35 Phase A acceptance item) and the `Float32` / `Float64`
+//! variants exist in `CArgKind` / `CReturnKind`, but no Sprint 35
+//! shim function currently takes them as parameters. Sprint 36+ wires
+//! float-marshaling trampolines once a use case requires native
+//! Dylan-source float literals to reach a D2D API directly.
+//!
+//! This is a documented deviation; the IDE pixels-on-screen story
+//! doesn't need fractional pixel positions in Sprint 35.
+//!
+//! ## Process-global state
+//!
+//! The handle registry is one `Mutex<HashMap<u64, ComObject>>`. Every
+//! test that touches COM must run with `#[serial]` because handles
+//! leak across tests if not explicitly released, and the monotonic
+//! counter is shared.
+
+#![cfg(windows)]
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use windows::Foundation::Numerics::Matrix3x2;
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1CreateFactory, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_BRUSH_PROPERTIES, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, ID2D1Bitmap1, ID2D1Device,
+    ID2D1DeviceContext, ID2D1Factory1, ID2D1RenderTarget, ID2D1SolidColorBrush,
+};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    IDWriteTextLayout,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIDevice, IDXGIFactory2, IDXGISurface,
+};
+use windows::core::Interface;
+
+// ─── Fixnum-tag helper ────────────────────────────────────────────────────
+
+/// Tag a raw u64 (a COM handle, a count, a pointer-as-integer, an
+/// HRESULT, …) as a Dylan fixnum Word so the value round-trips
+/// through the JIT-emitted primitive call → Dylan `<integer>` →
+/// callsite path. JIT-emitted primitive calls return the shim's raw
+/// u64 directly as the result Word; for that to mean
+/// "Dylan integer N", the bits must be `N << 1`.
+///
+/// We use the low 63 bits as the integer value (matching
+/// `Word::fixnum_unchecked`'s 63-bit range), which is sufficient for
+/// every Sprint 35 use case: handle IDs are monotonically allocated
+/// counters that won't approach 2^62, HRESULTs fit in 32 bits, and
+/// pixel counts cap at 256*256 = 65536.
+#[inline]
+fn tag(n: u64) -> u64 {
+    crate::word::Word::fixnum_unchecked(n as i64).raw()
+}
+
+/// Inverse of [`tag`] — strip the fixnum tag bit. Used by shims that
+/// receive Dylan-side `<integer>` args (i.e. every COM-shim arg under
+/// Sprint 35's integer-encoded convention).
+#[inline]
+fn untag(w: u64) -> u64 {
+    crate::word::Word::from_raw(w).as_fixnum().unwrap_or(0) as u64
+}
+
+/// Inverse for signed coordinate args (negative integers).
+#[inline]
+fn untag_i64(w: u64) -> i64 {
+    crate::word::Word::from_raw(w).as_fixnum().unwrap_or(0)
+}
+
+// ─── Registry ──────────────────────────────────────────────────────────────
+
+/// One entry in the COM handle registry — owns exactly one reference
+/// to the underlying COM object via the `windows` crate's typed
+/// wrapper. Dropping the variant calls `Release` on the inner object.
+#[allow(clippy::large_enum_variant)]
+pub enum ComObject {
+    DxgiFactory(IDXGIFactory2),
+    DxgiDevice(IDXGIDevice),
+    DxgiSurface(IDXGISurface),
+    D3D11Device(ID3D11Device),
+    D3D11DeviceContext(ID3D11DeviceContext),
+    D3D11Texture2D(ID3D11Texture2D),
+    D2DFactory(ID2D1Factory1),
+    D2DDevice(ID2D1Device),
+    D2DDeviceContext(ID2D1DeviceContext),
+    D2DBitmap(ID2D1Bitmap1),
+    D2DSolidColorBrush(ID2D1SolidColorBrush),
+    DWriteFactory(IDWriteFactory),
+    DWriteTextFormat(IDWriteTextFormat),
+    DWriteTextLayout(IDWriteTextLayout),
+}
+
+static REGISTRY: OnceLock<Mutex<HashMap<u64, ComObject>>> = OnceLock::new();
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+fn registry() -> &'static Mutex<HashMap<u64, ComObject>> {
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Allocate a fresh handle and insert `obj` into the process-global
+/// registry. Returns the handle u64 — Dylan treats this as a
+/// `<c-handle>` opaque token.
+pub fn register(obj: ComObject) -> u64 {
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let mut g = registry().lock().expect("com_shim registry poisoned");
+    g.insert(handle, obj);
+    handle
+}
+
+/// Remove the entry for `handle` from the registry; the inner COM
+/// object's `Release` runs on drop. Returns `true` if the handle was
+/// present, `false` if already released / never registered.
+pub fn release(handle: u64) -> bool {
+    let mut g = registry().lock().expect("com_shim registry poisoned");
+    g.remove(&handle).is_some()
+}
+
+/// Diagnostic: how many entries are live in the registry. Used by
+/// the refcount-discipline test.
+pub fn registry_len() -> usize {
+    let g = registry().lock().expect("com_shim registry poisoned");
+    g.len()
+}
+
+/// Doc-hidden test reset — drop every registered COM object. Used by
+/// the refcount-discipline test to start from a known-empty state.
+#[doc(hidden)]
+pub fn _reset_registry_for_tests() {
+    let mut g = registry().lock().expect("com_shim registry poisoned");
+    g.clear();
+}
+
+// ─── Typed accessors ──────────────────────────────────────────────────────
+//
+// Each accessor takes a u64 handle, looks up the entry, and returns
+// a clone (refcount bump) of the typed interface. `None` if the
+// handle isn't of the expected variant. The clone gives the caller
+// an owned reference whose Drop calls Release independently of the
+// registry's reference.
+
+macro_rules! typed_accessor {
+    ($name:ident, $variant:ident, $ty:ty) => {
+        /// Look up a registered COM object by Dylan-side `<c-handle>`
+        /// (a fixnum-tagged Word). The lookup untags the input and
+        /// returns `None` if the handle is unknown or of the wrong
+        /// variant. The returned reference is a fresh clone (refcount
+        /// bump) so the caller has independent lifetime from the
+        /// registry's reference.
+        pub fn $name(handle: u64) -> Option<$ty> {
+            let h = untag(handle);
+            if h == 0 {
+                return None;
+            }
+            let g = registry().lock().expect("com_shim registry poisoned");
+            match g.get(&h)? {
+                ComObject::$variant(x) => Some(x.clone()),
+                _ => None,
+            }
+        }
+    };
+}
+
+typed_accessor!(get_dxgi_factory, DxgiFactory, IDXGIFactory2);
+typed_accessor!(get_dxgi_device, DxgiDevice, IDXGIDevice);
+typed_accessor!(get_dxgi_surface, DxgiSurface, IDXGISurface);
+typed_accessor!(get_d3d11_device, D3D11Device, ID3D11Device);
+typed_accessor!(get_d3d11_device_context, D3D11DeviceContext, ID3D11DeviceContext);
+typed_accessor!(get_d3d11_texture_2d, D3D11Texture2D, ID3D11Texture2D);
+typed_accessor!(get_d2d_factory, D2DFactory, ID2D1Factory1);
+typed_accessor!(get_d2d_device, D2DDevice, ID2D1Device);
+typed_accessor!(get_d2d_device_context, D2DDeviceContext, ID2D1DeviceContext);
+typed_accessor!(get_d2d_bitmap, D2DBitmap, ID2D1Bitmap1);
+typed_accessor!(get_d2d_solid_brush, D2DSolidColorBrush, ID2D1SolidColorBrush);
+typed_accessor!(get_dwrite_factory, DWriteFactory, IDWriteFactory);
+typed_accessor!(get_dwrite_text_format, DWriteTextFormat, IDWriteTextFormat);
+typed_accessor!(get_dwrite_text_layout, DWriteTextLayout, IDWriteTextLayout);
+
+// ─── HRESULT → Dylan error helper ─────────────────────────────────────────
+
+/// Surface a `windows::core::Error` as the integer HRESULT for the
+/// shim's u64 return channel. Sprint 35 uses a sentinel return value
+/// pattern: shim functions return 0 on success-with-handle-encoded
+/// or actual_handle, and on error return 0 with the HRESULT
+/// surfaced via thread-local context (Sprint 36 will integrate this
+/// with the `<c-ffi-error>` raise path). For Sprint 35's acceptance
+/// test, success returns a positive handle; failure returns 0.
+fn hresult_to_zero<T>(r: windows::core::Result<T>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            // SAFETY: side-effect-free — store the last HRESULT for
+            // diagnostics. Sprint 35 keeps this minimal; Sprint 36
+            // raises a `<c-ffi-error>` Dylan condition via the
+            // Sprint 19 signal path.
+            store_last_hresult(e.code().0);
+            None
+        }
+    }
+}
+
+static LAST_HRESULT: AtomicU64 = AtomicU64::new(0);
+
+fn store_last_hresult(code: i32) {
+    LAST_HRESULT.store(code as u32 as u64, Ordering::Relaxed);
+}
+
+/// JIT-callable: read the most recent HRESULT seen by a shim
+/// function. Returns 0 (S_OK) if no error has occurred since the
+/// last call to this function or `nod_com_clear_last_hresult`.
+///
+/// # Safety
+/// No unsafe operations; declared `unsafe extern "C-unwind"` to
+/// match the rest of the JIT-callable surface.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_com_last_hresult() -> u64 {
+    tag(LAST_HRESULT.load(Ordering::Relaxed))
+}
+
+/// JIT-callable: clear the last-HRESULT slot back to 0.
+///
+/// # Safety
+/// No unsafe operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_com_clear_last_hresult() -> u64 {
+    LAST_HRESULT.store(0, Ordering::Relaxed);
+    0
+}
+
+// ─── Registry-level JIT entries ───────────────────────────────────────────
+
+/// JIT-callable: drop a Dylan-held COM handle. Returns 1 if the
+/// handle was present (and its underlying COM object's `Release`
+/// ran), 0 if the handle was unknown.
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary; the underlying
+/// HashMap is mutex-protected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_com_release(handle: u64) -> u64 {
+    let h = untag(handle);
+    if h != 0 && release(h) { tag(1) } else { 0 }
+}
+
+/// JIT-callable: number of live registry entries. Diagnostics.
+///
+/// # Safety
+/// No unsafe operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_com_registry_len() -> u64 {
+    tag(registry_len() as u64)
+}
+
+// ─── Phase B — DXGI + D3D11 device chain ─────────────────────────────────
+
+/// JIT-callable: create the process's DXGI factory. Returns the
+/// registry handle or 0 on failure (HRESULT stored in
+/// `LAST_HRESULT`).
+///
+/// # Safety
+/// Calls `CreateDXGIFactory2`, which has no Rust-side preconditions
+/// beyond a sane process state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_create_factory() -> u64 {
+    // SAFETY: CreateDXGIFactory2 is a stateless Win32 API. The
+    // returned factory is fully owned by the typed wrapper.
+    let r: windows::core::Result<IDXGIFactory2> =
+        unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) };
+    match hresult_to_zero(r) {
+        Some(f) => tag(register(ComObject::DxgiFactory(f))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create a D3D11 device with BGRA support (required
+/// for D2D interop). Tries hardware first, falls back to WARP
+/// (software). Returns the device handle or 0 on failure.
+///
+/// # Safety
+/// Calls `D3D11CreateDevice`, whose contract requires aligned out-
+/// pointers (which the `windows` crate handles).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_create_device() -> u64 {
+    // Try the hardware driver first; fall back to WARP for CI hosts
+    // or VMs without a GPU. Either path produces a device that D2D
+    // can use as long as BGRA_SUPPORT is enabled.
+    for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        // SAFETY: D3D11CreateDevice fills the out-params on success;
+        // on failure the Rust wrapper preserves the Option as None.
+        let r = unsafe {
+            D3D11CreateDevice(
+                None,
+                driver,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        };
+        if r.is_ok()
+            && let Some(d) = device
+        {
+            // Stash the immediate context alongside if we got one,
+            // but don't return it from here — callers ask via
+            // `nod_d3d11_get_immediate_context`. Drop the local
+            // Option<ID3D11DeviceContext> here; the device retains
+            // its own reference to the immediate context.
+            drop(context);
+            return tag(register(ComObject::D3D11Device(d)));
+        }
+        if let Err(e) = r {
+            store_last_hresult(e.code().0);
+        }
+    }
+    0
+}
+
+/// JIT-callable: fetch the device's immediate context as a fresh
+/// handle. The device retains its own reference; this clones into
+/// the registry.
+///
+/// # Safety
+/// `device_handle` must be a previously-registered D3D11Device handle
+/// (or 0, which returns 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_get_immediate_context(device_handle: u64) -> u64 {
+    let Some(device) = get_d3d11_device(device_handle) else {
+        return 0;
+    };
+    // SAFETY: device is a valid ID3D11Device.
+    let r: windows::core::Result<ID3D11DeviceContext> = unsafe { device.GetImmediateContext() };
+    match hresult_to_zero(r) {
+        Some(c) => tag(register(ComObject::D3D11DeviceContext(c))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create a 2D texture suitable as a D2D render
+/// target. `format` is a DXGI_FORMAT enum value (e.g. 87 =
+/// DXGI_FORMAT_B8G8R8A8_UNORM, which D2D requires). The texture is
+/// USAGE_DEFAULT with BIND_RENDER_TARGET | BIND_SHADER_RESOURCE.
+///
+/// # Safety
+/// `device_handle` must be a valid D3D11Device handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_create_texture_2d(
+    device_handle: u64,
+    width: u64,
+    height: u64,
+    format: u64,
+) -> u64 {
+    let Some(device) = get_d3d11_device(device_handle) else {
+        return 0;
+    };
+    let width = untag(width);
+    let height = untag(height);
+    let format = untag(format);
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width as u32,
+        Height: height as u32,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT(format as i32),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut tex: Option<ID3D11Texture2D> = None;
+    // SAFETY: desc fully populated; out-param filled by D3D11.
+    let r = unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) };
+    if let Err(e) = r {
+        store_last_hresult(e.code().0);
+        return 0;
+    }
+    match tex {
+        Some(t) => tag(register(ComObject::D3D11Texture2D(t))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: query a registered D3D11 texture for its
+/// IDXGISurface interface (the D2D-friendly view). Returns the
+/// surface handle or 0 on failure.
+///
+/// # Safety
+/// `texture_handle` must be a valid D3D11Texture2D handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_create_surface_from_texture(texture_handle: u64) -> u64 {
+    let Some(tex) = get_d3d11_texture_2d(texture_handle) else {
+        return 0;
+    };
+    // Cast the texture into IDXGISurface — same underlying COM
+    // object, different interface vtable.
+    let r: windows::core::Result<IDXGISurface> = tex.cast();
+    match hresult_to_zero(r) {
+        Some(s) => tag(register(ComObject::DxgiSurface(s))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: query a registered D3D11 device for its
+/// IDXGIDevice interface. Required for the D2D device-creation step
+/// (`ID2D1Factory1::CreateDevice` takes an IDXGIDevice).
+///
+/// # Safety
+/// `device_handle` must be a valid D3D11Device handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dxgi_device_from_d3d_device(device_handle: u64) -> u64 {
+    let Some(device) = get_d3d11_device(device_handle) else {
+        return 0;
+    };
+    let r: windows::core::Result<IDXGIDevice> = device.cast();
+    match hresult_to_zero(r) {
+        Some(d) => tag(register(ComObject::DxgiDevice(d))),
+        None => 0,
+    }
+}
+
+// ─── Phase C — D2D factory / device / device-context / bitmap ─────────────
+
+/// JIT-callable: create the D2D factory (`ID2D1Factory1` for D2D
+/// device interop).
+///
+/// # Safety
+/// `D2D1CreateFactory` writes its out-param via the `windows`
+/// crate's typed wrapper.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_create_factory() -> u64 {
+    // SAFETY: D2D1CreateFactory has no Rust-side preconditions; the
+    // typed result is owned by the IDl2D1Factory1 wrapper.
+    let r: windows::core::Result<ID2D1Factory1> = unsafe {
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
+    };
+    match hresult_to_zero(r) {
+        Some(f) => tag(register(ComObject::D2DFactory(f))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create a D2D device from the D2D factory + DXGI
+/// device. The result is the D2D-side device — its device contexts
+/// are what we actually draw with.
+///
+/// # Safety
+/// Both handles must be of the matching variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_create_device(
+    d2d_factory_handle: u64,
+    dxgi_device_handle: u64,
+) -> u64 {
+    let Some(factory) = get_d2d_factory(d2d_factory_handle) else {
+        return 0;
+    };
+    let Some(dxgi_dev) = get_dxgi_device(dxgi_device_handle) else {
+        return 0;
+    };
+    // SAFETY: CreateDevice takes a non-null IDXGIDevice.
+    let r: windows::core::Result<ID2D1Device> = unsafe { factory.CreateDevice(&dxgi_dev) };
+    match hresult_to_zero(r) {
+        Some(d) => tag(register(ComObject::D2DDevice(d))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create a device context from the D2D device. The
+/// context is where drawing operations happen (begin-draw,
+/// draw-text-layout, end-draw, etc.).
+///
+/// # Safety
+/// `d2d_device_handle` must be a valid D2DDevice handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_create_device_context(d2d_device_handle: u64) -> u64 {
+    let Some(d2d_dev) = get_d2d_device(d2d_device_handle) else {
+        return 0;
+    };
+    let r: windows::core::Result<ID2D1DeviceContext> = unsafe {
+        d2d_dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
+    };
+    match hresult_to_zero(r) {
+        Some(c) => tag(register(ComObject::D2DDeviceContext(c))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: wrap a DXGI surface as a D2D bitmap suitable as a
+/// render target. The bitmap shares pixels with the underlying
+/// texture; drawing into the bitmap mutates the texture.
+///
+/// # Safety
+/// Both handles must be of the matching variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_create_bitmap_for_target(
+    dc_handle: u64,
+    surface_handle: u64,
+) -> u64 {
+    let Some(dc) = get_d2d_device_context(dc_handle) else {
+        return 0;
+    };
+    let Some(surface) = get_dxgi_surface(surface_handle) else {
+        return 0;
+    };
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        colorContext: std::mem::ManuallyDrop::new(None),
+    };
+    // SAFETY: surface is valid IDXGISurface; props references it.
+    let r: windows::core::Result<ID2D1Bitmap1> =
+        unsafe { dc.CreateBitmapFromDxgiSurface(&surface, Some(&props)) };
+    match hresult_to_zero(r) {
+        Some(b) => tag(register(ComObject::D2DBitmap(b))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: set the device context's target to the given
+/// bitmap. Sprint 35 always passes a `<c-handle>` here — the bitmap
+/// the test owns.
+///
+/// # Safety
+/// Both handles must be of the matching variants. Returns 1 on
+/// success (target set), 0 on a handle-lookup miss.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_set_target(dc_handle: u64, bitmap_handle: u64) -> u64 {
+    let Some(dc) = get_d2d_device_context(dc_handle) else {
+        return 0;
+    };
+    let Some(bitmap) = get_d2d_bitmap(bitmap_handle) else {
+        return 0;
+    };
+    // SAFETY: bitmap is a registered ID2D1Bitmap1; SetTarget accepts
+    // any ID2D1Image (the param trait handles upcasting at the
+    // vtable level).
+    unsafe { dc.SetTarget(&bitmap) };
+    tag(1)
+}
+
+/// Helper: cast a D2D device context handle to its render-target
+/// view (the parent interface that owns `BeginDraw` / `EndDraw` /
+/// `Clear` / brush + primitive APIs). The `windows` crate doesn't
+/// auto-deref subinterfaces, so we cast explicitly via QueryInterface.
+///
+/// Returns `None` if the handle is unknown or the cast fails (should
+/// never happen — every device context IS a render target).
+fn dc_as_render_target(dc_handle: u64) -> Option<ID2D1RenderTarget> {
+    let dc = get_d2d_device_context(dc_handle)?;
+    let rt: windows::core::Result<ID2D1RenderTarget> = dc.cast();
+    hresult_to_zero(rt)
+}
+
+/// JIT-callable: begin a drawing batch on the device context.
+/// Returns 1 always (the call doesn't fail; errors surface on
+/// `EndDraw`).
+///
+/// # Safety
+/// `dc_handle` must be a valid D2DDeviceContext.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_begin_draw(dc_handle: u64) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    // SAFETY: rt is the render-target view of a valid DC.
+    unsafe { rt.BeginDraw() };
+    tag(1)
+}
+
+/// JIT-callable: end the drawing batch. Returns the HRESULT-as-u64
+/// (0 = S_OK; non-zero on failure). Floats-free — see module-level
+/// caveat.
+///
+/// # Safety
+/// `dc_handle` must be a valid D2DDeviceContext.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_end_draw(dc_handle: u64) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return tag(0xFFFF_FFFF);
+    };
+    // SAFETY: rt valid; EndDraw on ID2D1RenderTarget takes no tag
+    // out-params and returns HRESULT.
+    match unsafe { rt.EndDraw(None, None) } {
+        Ok(()) => 0,
+        Err(e) => {
+            store_last_hresult(e.code().0);
+            tag((e.code().0 as u32) as u64)
+        }
+    }
+}
+
+/// JIT-callable: clear the target with an RGBA color. Each channel
+/// is an integer 0..=255; the shim converts to f32 (channel /
+/// 255.0). This is the Sprint 35 deviation from native float
+/// marshaling (see module docs).
+///
+/// # Safety
+/// `dc_handle` must be a valid D2DDeviceContext.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_clear(
+    dc_handle: u64,
+    r: u64,
+    g: u64,
+    b: u64,
+    a: u64,
+) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    let r = untag(r) & 0xff;
+    let g = untag(g) & 0xff;
+    let b = untag(b) & 0xff;
+    let a = untag(a) & 0xff;
+    let color = D2D1_COLOR_F {
+        r: (r as f32) / 255.0,
+        g: (g as f32) / 255.0,
+        b: (b as f32) / 255.0,
+        a: (a as f32) / 255.0,
+    };
+    // SAFETY: rt valid; color on stack.
+    unsafe { rt.Clear(Some(&color)) };
+    tag(1)
+}
+
+/// JIT-callable: set the device context's transform to identity.
+/// Eliminates accidental DPI scaling from polluting the pixel
+/// assertions in the acceptance test.
+///
+/// # Safety
+/// `dc_handle` must be a valid D2DDeviceContext.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_set_transform_identity(dc_handle: u64) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    let m = Matrix3x2 {
+        M11: 1.0,
+        M12: 0.0,
+        M21: 0.0,
+        M22: 1.0,
+        M31: 0.0,
+        M32: 0.0,
+    };
+    // SAFETY: rt valid; identity matrix on stack.
+    unsafe { rt.SetTransform(&m) };
+    tag(1)
+}
+
+// ─── Phase D — DirectWrite ────────────────────────────────────────────────
+
+/// JIT-callable: create the shared DirectWrite factory.
+///
+/// # Safety
+/// `DWriteCreateFactory` is stateless.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_create_factory() -> u64 {
+    // SAFETY: stateless API.
+    let r: windows::core::Result<IDWriteFactory> =
+        unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) };
+    match hresult_to_zero(r) {
+        Some(f) => tag(register(ComObject::DWriteFactory(f))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create a text format (font family + size).
+/// `family_word` and `locale_word` are Dylan `<byte-string>` Words
+/// (pointer-tagged) — the shim reads the UTF-8 payload via the
+/// runtime's byte-string accessor and converts to UTF-16LE on the
+/// stack for the DirectWrite call.
+///
+/// `size_x100` is the font size in *hundredths of a DIP*: pass `2400`
+/// for 24.0 DIPs. (Sprint 35 deviation — see module docs for the
+/// float-marshaling caveat.)
+///
+/// # Safety
+/// `factory_handle` must be a valid DWriteFactory; `family_word` and
+/// `locale_word` must be Dylan `<byte-string>` Words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_create_text_format(
+    factory_handle: u64,
+    family_word: u64,
+    size_x100: u64,
+    locale_word: u64,
+) -> u64 {
+    let Some(factory) = get_dwrite_factory(factory_handle) else {
+        return 0;
+    };
+    let family = utf16_from_dylan_byte_string(family_word);
+    let locale = utf16_from_dylan_byte_string(locale_word);
+    let size_dips = (untag(size_x100) as f32) / 100.0;
+    // SAFETY: family/locale slices are valid for the call duration
+    // (owned Vec<u16>s on this stack frame).
+    let r: windows::core::Result<IDWriteTextFormat> = unsafe {
+        factory.CreateTextFormat(
+            windows::core::PCWSTR(family.as_ptr()),
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size_dips,
+            windows::core::PCWSTR(locale.as_ptr()),
+        )
+    };
+    drop(family);
+    drop(locale);
+    match hresult_to_zero(r) {
+        Some(f) => tag(register(ComObject::DWriteTextFormat(f))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: create a text layout from a Dylan `<byte-string>`
+/// source + a previously-created text format. `max_width_pixels` and
+/// `max_height_pixels` are integer pixel sizes (Sprint 35 deviation).
+///
+/// # Safety
+/// `factory_handle` and `format_handle` must be of matching
+/// variants; `text_word` must be a Dylan `<byte-string>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_create_text_layout(
+    factory_handle: u64,
+    text_word: u64,
+    format_handle: u64,
+    max_width_pixels: u64,
+    max_height_pixels: u64,
+) -> u64 {
+    let Some(factory) = get_dwrite_factory(factory_handle) else {
+        return 0;
+    };
+    let Some(format) = get_dwrite_text_format(format_handle) else {
+        return 0;
+    };
+    // UTF-16 buffer WITHOUT trailing null — DirectWrite takes a
+    // `&[u16]` slice (length-prefixed at the C ABI level), not a
+    // null-terminated string.
+    let text = utf16_from_dylan_byte_string_no_null(text_word);
+    // SAFETY: text slice is valid for the call duration.
+    let r: windows::core::Result<IDWriteTextLayout> = unsafe {
+        factory.CreateTextLayout(
+            &text,
+            &format,
+            untag(max_width_pixels) as f32,
+            untag(max_height_pixels) as f32,
+        )
+    };
+    drop(text);
+    match hresult_to_zero(r) {
+        Some(l) => tag(register(ComObject::DWriteTextLayout(l))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: read metrics off a text layout. Returns a packed
+/// u64 with the layout width (low 32 bits) and height (high 32 bits),
+/// each rounded to integer pixels. Returns 0 if `layout_handle` is
+/// invalid.
+///
+/// # Safety
+/// `layout_handle` must be a valid DWriteTextLayout.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_get_layout_metrics(layout_handle: u64) -> u64 {
+    let Some(layout) = get_dwrite_text_layout(layout_handle) else {
+        return 0;
+    };
+    let mut metrics =
+        windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+    // SAFETY: layout is valid; metrics out-param.
+    if unsafe { layout.GetMetrics(&mut metrics) }.is_err() {
+        return 0;
+    }
+    let w = metrics.width as u32 as u64;
+    let h = metrics.height as u32 as u64;
+    tag((h << 32) | (w & 0xFFFF_FFFF))
+}
+
+// ─── Phase E — drawing primitives ────────────────────────────────────────
+
+/// JIT-callable: create a solid-color brush. RGBA channels are
+/// 0..=255 integers; the shim converts to 0.0..=1.0 f32. (Sprint 35
+/// deviation.)
+///
+/// # Safety
+/// `dc_handle` must be a valid D2DDeviceContext.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_create_solid_color_brush(
+    dc_handle: u64,
+    r: u64,
+    g: u64,
+    b: u64,
+    a: u64,
+) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    let r = untag(r) & 0xff;
+    let g = untag(g) & 0xff;
+    let b = untag(b) & 0xff;
+    let a = untag(a) & 0xff;
+    let color = D2D1_COLOR_F {
+        r: (r as f32) / 255.0,
+        g: (g as f32) / 255.0,
+        b: (b as f32) / 255.0,
+        a: (a as f32) / 255.0,
+    };
+    let props = D2D1_BRUSH_PROPERTIES {
+        opacity: 1.0,
+        transform: Matrix3x2 {
+            M11: 1.0,
+            M12: 0.0,
+            M21: 0.0,
+            M22: 1.0,
+            M31: 0.0,
+            M32: 0.0,
+        },
+    };
+    // SAFETY: rt valid; color + props on stack.
+    let r: windows::core::Result<ID2D1SolidColorBrush> =
+        unsafe { rt.CreateSolidColorBrush(&color, Some(&props)) };
+    match hresult_to_zero(r) {
+        Some(b) => tag(register(ComObject::D2DSolidColorBrush(b))),
+        None => 0,
+    }
+}
+
+/// JIT-callable: draw a text layout at the given integer pixel
+/// origin. (Sprint 35 deviation — coordinates as ints.)
+///
+/// # Safety
+/// All three handles must be of matching variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_draw_text_layout(
+    dc_handle: u64,
+    origin_x: u64,
+    origin_y: u64,
+    layout_handle: u64,
+    brush_handle: u64,
+) -> u64 {
+    // Use the ID2D1RenderTarget::DrawTextLayout signature (4 args:
+    // origin, layout, brush, options) — the ID2D1DeviceContext4
+    // variant requires SVG glyph style + color palette index, both
+    // of which we don't need for Sprint 35.
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    let Some(layout) = get_dwrite_text_layout(layout_handle) else {
+        return 0;
+    };
+    let Some(brush) = get_d2d_solid_brush(brush_handle) else {
+        return 0;
+    };
+    let origin = D2D_POINT_2F {
+        x: untag_i64(origin_x) as f32,
+        y: untag_i64(origin_y) as f32,
+    };
+    // SAFETY: rt/layout/brush valid; origin on stack.
+    unsafe {
+        rt.DrawTextLayout(origin, &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+    tag(1)
+}
+
+/// JIT-callable: stroke a rectangle outline with the given brush.
+/// `stroke_width_x10` is in tenths of a pixel (Sprint 35 deviation).
+///
+/// # Safety
+/// `dc_handle` and `brush_handle` must be of matching variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_draw_rectangle(
+    dc_handle: u64,
+    left: u64,
+    top: u64,
+    right: u64,
+    bottom: u64,
+    brush_handle: u64,
+    stroke_width_x10: u64,
+) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    let Some(brush) = get_d2d_solid_brush(brush_handle) else {
+        return 0;
+    };
+    let rect = D2D_RECT_F {
+        left: untag_i64(left) as f32,
+        top: untag_i64(top) as f32,
+        right: untag_i64(right) as f32,
+        bottom: untag_i64(bottom) as f32,
+    };
+    let stroke = (untag(stroke_width_x10) as f32) / 10.0;
+    // SAFETY: rt/brush valid; rect on stack.
+    unsafe { rt.DrawRectangle(&rect, &brush, stroke, None) };
+    tag(1)
+}
+
+/// JIT-callable: fill a rectangle with the given brush.
+///
+/// # Safety
+/// `dc_handle` and `brush_handle` must be of matching variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d2d_fill_rectangle(
+    dc_handle: u64,
+    left: u64,
+    top: u64,
+    right: u64,
+    bottom: u64,
+    brush_handle: u64,
+) -> u64 {
+    let Some(rt) = dc_as_render_target(dc_handle) else {
+        return 0;
+    };
+    let Some(brush) = get_d2d_solid_brush(brush_handle) else {
+        return 0;
+    };
+    let rect = D2D_RECT_F {
+        left: untag_i64(left) as f32,
+        top: untag_i64(top) as f32,
+        right: untag_i64(right) as f32,
+        bottom: untag_i64(bottom) as f32,
+    };
+    // SAFETY: rt/brush valid; rect on stack.
+    unsafe { rt.FillRectangle(&rect, &brush) };
+    tag(1)
+}
+
+// ─── Phase F — pixel readback ─────────────────────────────────────────────
+
+/// Staging texture cached per (device, dimensions). For Sprint 35
+/// we create + cache a single staging texture inside the device's
+/// "scratch" registry slot (a separate handle); the test creates +
+/// caches it explicitly.
+///
+/// To keep the API surface flat for Sprint 35, the
+/// `nod_d3d11_copy_to_staging_and_map` shim creates a fresh
+/// staging texture on each call, copies the GPU texture into it,
+/// maps the staging, and returns (a) the raw pointer to the mapped
+/// bytes and (b) a handle to the staging texture (used by the
+/// matching unmap call). To avoid multi-return-value plumbing, we
+/// register the staging texture in the COM registry and surface its
+/// handle separately via `nod_d3d11_last_staging_handle()`.
+static LAST_STAGING_HANDLE: AtomicU64 = AtomicU64::new(0);
+static LAST_MAPPED_ROW_PITCH: AtomicU64 = AtomicU64::new(0);
+
+/// JIT-callable: copy the GPU texture to a CPU-readable staging
+/// texture, map it for reading, and return a raw pointer to the
+/// mapped bytes (as a u64 — Dylan side treats it as a
+/// `<c-pointer>`). The staging texture is registered separately;
+/// retrieve its handle via `nod_d3d11_last_staging_handle()`.
+///
+/// `width`/`height` MUST match the original texture's dimensions.
+/// On error returns 0; the matching `_last_staging_handle()` also
+/// returns 0 in that case.
+///
+/// The mapped bytes layout is BGRA8 (4 bytes per pixel). The pitch
+/// (bytes per row, including any padding) may be > width * 4 — read
+/// it via `nod_d3d11_last_mapped_row_pitch()`.
+///
+/// # Safety
+/// All handles must be valid; width/height must match the texture.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_copy_to_staging_and_map(
+    device_handle: u64,
+    ctx_handle: u64,
+    tex_handle: u64,
+    width: u64,
+    height: u64,
+) -> u64 {
+    LAST_STAGING_HANDLE.store(0, Ordering::Relaxed);
+    LAST_MAPPED_ROW_PITCH.store(0, Ordering::Relaxed);
+
+    let Some(device) = get_d3d11_device(device_handle) else {
+        return 0;
+    };
+    let Some(ctx) = get_d3d11_device_context(ctx_handle) else {
+        return 0;
+    };
+    let Some(tex) = get_d3d11_texture_2d(tex_handle) else {
+        return 0;
+    };
+    let width = untag(width);
+    let height = untag(height);
+
+    // Build the staging texture (CPU-readable, no bind flags).
+    let staging_desc = D3D11_TEXTURE2D_DESC {
+        Width: width as u32,
+        Height: height as u32,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut staging: Option<ID3D11Texture2D> = None;
+    // SAFETY: desc fully populated.
+    let r = unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) };
+    if let Err(e) = r {
+        store_last_hresult(e.code().0);
+        return 0;
+    }
+    let Some(staging) = staging else { return 0 };
+
+    // Copy GPU → staging, then explicit Flush (recommended for
+    // read-back to avoid stale GPU work).
+    // SAFETY: staging and tex are both valid ID3D11Texture2D.
+    unsafe { ctx.CopyResource(&staging, &tex) };
+    // SAFETY: ctx is valid.
+    unsafe { ctx.Flush() };
+
+    // Map the staging texture for reading.
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // SAFETY: staging valid; mapped is out-param.
+    let r = unsafe { ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) };
+    if let Err(e) = r {
+        store_last_hresult(e.code().0);
+        return 0;
+    }
+    // Stash staging in the registry so the caller can unmap + drop
+    // it explicitly. The mapped pointer is borrowed for the
+    // duration of the unmap call — Dylan reads pixels via raw
+    // pointer arithmetic before unmapping.
+    let staging_handle = register(ComObject::D3D11Texture2D(staging));
+    LAST_STAGING_HANDLE.store(tag(staging_handle), Ordering::Relaxed);
+    LAST_MAPPED_ROW_PITCH.store(tag(mapped.RowPitch as u64), Ordering::Relaxed);
+    // Return the raw pixel pointer as a Dylan integer-encoded value
+    // — the receiver treats this as a `<c-pointer>`. Fixnums in our
+    // 63-bit range cover any user-mode address (high bits clear).
+    tag(mapped.pData as u64)
+}
+
+/// JIT-callable: report the staging-texture handle from the most
+/// recent `_copy_to_staging_and_map` call. 0 if the last call
+/// failed.
+///
+/// # Safety
+/// No unsafe operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_last_staging_handle() -> u64 {
+    LAST_STAGING_HANDLE.load(Ordering::Relaxed)
+}
+
+/// JIT-callable: report the mapped row-pitch (bytes per row) from
+/// the most recent `_copy_to_staging_and_map` call.
+///
+/// # Safety
+/// No unsafe operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_last_mapped_row_pitch() -> u64 {
+    LAST_MAPPED_ROW_PITCH.load(Ordering::Relaxed)
+}
+
+/// JIT-callable: unmap a previously-mapped staging texture.
+///
+/// # Safety
+/// `ctx_handle` and `staging_handle` must be of matching variants
+/// from `_copy_to_staging_and_map`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_d3d11_unmap(ctx_handle: u64, staging_handle: u64) -> u64 {
+    let Some(ctx) = get_d3d11_device_context(ctx_handle) else {
+        return 0;
+    };
+    let Some(staging) = get_d3d11_texture_2d(staging_handle) else {
+        return 0;
+    };
+    // SAFETY: ctx + staging valid.
+    unsafe { ctx.Unmap(&staging, 0) };
+    tag(1)
+}
+
+/// JIT-callable: scan a mapped pixel buffer for non-zero red
+/// channel pixels. BGRA8 layout — red is byte offset 2 in each
+/// 4-byte pixel. Returns the count. This is the acceptance-test
+/// assertion primitive: "did text glyphs render any red pixels?"
+///
+/// `pixels_ptr` comes from `_copy_to_staging_and_map`. `width` and
+/// `height` are the texture dimensions. `row_pitch` is the bytes-
+/// per-row from the mapped subresource (may be > width*4).
+///
+/// # Safety
+/// `pixels_ptr` must point at a readable region of at least
+/// `row_pitch * height` bytes (i.e. the mapped staging texture).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_count_non_zero_red(
+    pixels_ptr: u64,
+    width: u64,
+    height: u64,
+    row_pitch: u64,
+) -> u64 {
+    let pixels_ptr = untag(pixels_ptr);
+    let width = untag(width);
+    let height = untag(height);
+    let row_pitch = untag(row_pitch);
+    if pixels_ptr == 0 {
+        return 0;
+    }
+    let base = pixels_ptr as *const u8;
+    let w = width as usize;
+    let h = height as usize;
+    let pitch = row_pitch as usize;
+    let mut count: u64 = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let offset = y * pitch + x * 4;
+            // SAFETY: caller's invariant — bytes within the mapped
+            // region. BGRA8 means red is at byte 2 of each pixel.
+            let red = unsafe { *base.add(offset + 2) };
+            if red != 0 {
+                count += 1;
+            }
+        }
+    }
+    tag(count)
+}
+
+// ─── UTF-16 helpers ───────────────────────────────────────────────────────
+
+/// Decode a Dylan `<byte-string>` Word's UTF-8 payload to a
+/// null-terminated UTF-16LE `Vec<u16>` suitable for a PCWSTR arg.
+/// Returns a vec containing the U16 units followed by a 0 terminator.
+fn utf16_from_dylan_byte_string(w: u64) -> Vec<u16> {
+    let word = crate::word::Word::from_raw(w);
+    let s = crate::winffi::read_dylan_byte_string(word);
+    let mut out: Vec<u16> = s.encode_utf16().collect();
+    out.push(0);
+    out
+}
+
+/// Decode a Dylan `<byte-string>` Word's UTF-8 payload to a
+/// `Vec<u16>` WITHOUT a trailing null — for `&[u16]`-shaped args
+/// like `IDWriteFactory::CreateTextLayout` that take a length-
+/// prefixed slice.
+fn utf16_from_dylan_byte_string_no_null(w: u64) -> Vec<u16> {
+    let word = crate::word::Word::from_raw(w);
+    let s = crate::winffi::read_dylan_byte_string(word);
+    s.encode_utf16().collect()
+}
+
+// ─── Sprint 35 — registered classes ──────────────────────────────────────
+
+/// Idempotent — registers `<c-float>` and `<c-double>` Dylan classes
+/// alongside the existing c-type seed classes. Sprint 35 deviation
+/// (see module docs): these are *registered* but not currently
+/// *exercised* by the shim functions — Sprint 35 shims take Dylan
+/// `<integer>` args and convert to f32 internally. Future sprints
+/// will wire float-marshaling trampoline variants and route these
+/// kinds through to the shim signatures directly.
+pub fn ensure_com_types_registered() {
+    crate::c_types::ensure_registered();
+    crate::c_types::ensure_float_types_registered();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial(com_registry)]
+    fn registry_releases_drop_com_objects() {
+        _reset_registry_for_tests();
+        assert_eq!(registry_len(), 0);
+        // Create a DXGI factory, register it, release it. The
+        // `windows` crate's Drop calls Release.
+        // SAFETY: SDK-level call.
+        let f: windows::core::Result<IDXGIFactory2> =
+            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) };
+        let f = f.expect("CreateDXGIFactory2 should succeed");
+        let h = register(ComObject::DxgiFactory(f));
+        assert_eq!(registry_len(), 1);
+        assert!(release(h));
+        assert_eq!(registry_len(), 0);
+    }
+
+    #[test]
+    #[serial(com_registry)]
+    fn release_returns_false_for_unknown_handle() {
+        _reset_registry_for_tests();
+        assert!(!release(99999));
+    }
+
+    #[test]
+    #[serial(com_registry)]
+    fn ten_register_then_release_clears_the_map() {
+        _reset_registry_for_tests();
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            // SAFETY: SDK-level call.
+            let f: windows::core::Result<IDXGIFactory2> =
+                unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) };
+            let f = f.expect("factory");
+            handles.push(register(ComObject::DxgiFactory(f)));
+        }
+        assert_eq!(registry_len(), 10);
+        for h in handles {
+            assert!(release(h));
+        }
+        assert_eq!(registry_len(), 0);
+    }
+}

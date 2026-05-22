@@ -299,6 +299,43 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%struct-set-u64", "nod_struct_set_u64", 3, TypeEstimate::Integer),
     ("%struct-get-pointer", "nod_struct_get_pointer", 2, TypeEstimate::Integer),
     ("%struct-set-pointer", "nod_struct_set_pointer", 3, TypeEstimate::Integer),
+    // Sprint 35 — COM shim: DXGI / D3D11 / D2D / DirectWrite primitives.
+    // All return a fixnum-tagged opaque handle (or 0 on error). Sprint 35
+    // uses integer-encoded floats throughout (color channels as
+    // 0..=255, coordinates as integer pixels) — see
+    // `nod-runtime::com_shim` module docs for the deviation rationale.
+    ("%com-release", "nod_com_release", 1, TypeEstimate::Integer),
+    ("%com-registry-len", "nod_com_registry_len", 0, TypeEstimate::Integer),
+    ("%com-last-hresult", "nod_com_last_hresult", 0, TypeEstimate::Integer),
+    ("%com-clear-last-hresult", "nod_com_clear_last_hresult", 0, TypeEstimate::Integer),
+    ("%dxgi-create-factory", "nod_dxgi_create_factory", 0, TypeEstimate::Integer),
+    ("%dxgi-device-from-d3d-device", "nod_dxgi_device_from_d3d_device", 1, TypeEstimate::Integer),
+    ("%dxgi-create-surface-from-texture", "nod_dxgi_create_surface_from_texture", 1, TypeEstimate::Integer),
+    ("%d3d11-create-device", "nod_d3d11_create_device", 0, TypeEstimate::Integer),
+    ("%d3d11-get-immediate-context", "nod_d3d11_get_immediate_context", 1, TypeEstimate::Integer),
+    ("%d3d11-create-texture-2d", "nod_d3d11_create_texture_2d", 4, TypeEstimate::Integer),
+    ("%d3d11-copy-to-staging-and-map", "nod_d3d11_copy_to_staging_and_map", 5, TypeEstimate::Integer),
+    ("%d3d11-last-staging-handle", "nod_d3d11_last_staging_handle", 0, TypeEstimate::Integer),
+    ("%d3d11-last-mapped-row-pitch", "nod_d3d11_last_mapped_row_pitch", 0, TypeEstimate::Integer),
+    ("%d3d11-unmap", "nod_d3d11_unmap", 2, TypeEstimate::Integer),
+    ("%d2d-create-factory", "nod_d2d_create_factory", 0, TypeEstimate::Integer),
+    ("%d2d-create-device", "nod_d2d_create_device", 2, TypeEstimate::Integer),
+    ("%d2d-create-device-context", "nod_d2d_create_device_context", 1, TypeEstimate::Integer),
+    ("%d2d-create-bitmap-for-target", "nod_d2d_create_bitmap_for_target", 2, TypeEstimate::Integer),
+    ("%d2d-set-target", "nod_d2d_set_target", 2, TypeEstimate::Integer),
+    ("%d2d-begin-draw", "nod_d2d_begin_draw", 1, TypeEstimate::Integer),
+    ("%d2d-end-draw", "nod_d2d_end_draw", 1, TypeEstimate::Integer),
+    ("%d2d-clear", "nod_d2d_clear", 5, TypeEstimate::Integer),
+    ("%d2d-set-transform-identity", "nod_d2d_set_transform_identity", 1, TypeEstimate::Integer),
+    ("%d2d-create-solid-color-brush", "nod_d2d_create_solid_color_brush", 5, TypeEstimate::Integer),
+    ("%d2d-draw-text-layout", "nod_d2d_draw_text_layout", 5, TypeEstimate::Integer),
+    ("%d2d-draw-rectangle", "nod_d2d_draw_rectangle", 7, TypeEstimate::Integer),
+    ("%d2d-fill-rectangle", "nod_d2d_fill_rectangle", 6, TypeEstimate::Integer),
+    ("%dwrite-create-factory", "nod_dwrite_create_factory", 0, TypeEstimate::Integer),
+    ("%dwrite-create-text-format", "nod_dwrite_create_text_format", 4, TypeEstimate::Integer),
+    ("%dwrite-create-text-layout", "nod_dwrite_create_text_layout", 5, TypeEstimate::Integer),
+    ("%dwrite-get-layout-metrics", "nod_dwrite_get_layout_metrics", 1, TypeEstimate::Integer),
+    ("%count-non-zero-red", "nod_count_non_zero_red", 4, TypeEstimate::Integer),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

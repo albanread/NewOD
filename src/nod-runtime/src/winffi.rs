@@ -97,6 +97,16 @@ pub enum CArgKind {
     /// The trampoline converts the Dylan `<byte-string>` from UTF-8 to
     /// UTF-16LE, appends a null u16, and passes the resulting pointer.
     WideString = 13,
+    /// Sprint 35: 32-bit IEEE float argument. Registered for Dylan
+    /// `<c-float>` declarations. **Not currently exercised by any
+    /// Sprint 35 shim** — the shim layer takes Dylan `<integer>` args
+    /// and converts to f32 internally (see `com_shim.rs` module
+    /// docs for the deviation). Trampoline support for native float
+    /// args ships in Sprint 36+.
+    Float32 = 14,
+    /// Sprint 35: 64-bit IEEE float argument. Registered for Dylan
+    /// `<c-double>` declarations. See [`CArgKind::Float32`] caveat.
+    Float64 = 15,
 }
 
 impl CArgKind {
@@ -116,6 +126,8 @@ impl CArgKind {
             11 => CArgKind::Handle,
             12 => CArgKind::NarrowString,
             13 => CArgKind::WideString,
+            14 => CArgKind::Float32,
+            15 => CArgKind::Float64,
             _ => panic!("nod-runtime/winffi: unknown CArgKind byte {b}"),
         }
     }
@@ -142,6 +154,11 @@ impl CArgKind {
             "<c-handle>" => CArgKind::Handle,
             "<c-string>" => CArgKind::NarrowString,
             "<c-wide-string>" => CArgKind::WideString,
+            // Sprint 35: float types registered but not yet exercised
+            // by any shim. Sema accepts them in `define c-function`
+            // declarations; the trampoline path for them is Sprint 36+.
+            "<c-float>" => CArgKind::Float32,
+            "<c-double>" => CArgKind::Float64,
             _ => return None,
         })
     }
@@ -173,6 +190,13 @@ pub enum CReturnKind {
     /// the null u16, UTF-16 → UTF-8 converted, copied into a fresh
     /// Dylan `<byte-string>`.
     WideString = 9,
+    /// Sprint 35: 32-bit IEEE float return. Registered for `<c-float>`
+    /// returns from future float-aware shim functions. Sprint 35 itself
+    /// doesn't use this — no shim returns a native float.
+    Float32 = 10,
+    /// Sprint 35: 64-bit IEEE float return. Registered for `<c-double>`
+    /// returns. See [`CReturnKind::Float32`] caveat.
+    Float64 = 11,
 }
 
 impl CReturnKind {
@@ -188,6 +212,8 @@ impl CReturnKind {
             7 => CReturnKind::Handle,
             8 => CReturnKind::NarrowString,
             9 => CReturnKind::WideString,
+            10 => CReturnKind::Float32,
+            11 => CReturnKind::Float64,
             _ => panic!("nod-runtime/winffi: unknown CReturnKind byte {b}"),
         }
     }
@@ -209,6 +235,10 @@ impl CReturnKind {
             "<c-handle>" => CReturnKind::Handle,
             "<c-string>" => CReturnKind::NarrowString,
             "<c-wide-string>" => CReturnKind::WideString,
+            // Sprint 35: float types registered for sema. Trampoline
+            // path for them is Sprint 36+.
+            "<c-float>" => CReturnKind::Float32,
+            "<c-double>" => CReturnKind::Float64,
             _ => return None,
         })
     }
@@ -764,7 +794,7 @@ fn marshal_wide_string(w: Word, temps: &mut Vec<TempBuf>) -> u64 {
 /// Read the bytes of a Dylan `<byte-string>` Word as `&str`. Panics if
 /// the Word isn't a `<byte-string>` (the sema layer enforces the type
 /// before lowering the call).
-fn read_dylan_byte_string(w: Word) -> String {
+pub(crate) fn read_dylan_byte_string(w: Word) -> String {
     // SAFETY: the Word is type-checked by sema as a `<byte-string>`
     // (the only Dylan-side representation of `<c-string>` /
     // `<c-wide-string>` literals in Sprint 30). We resolve the
@@ -878,6 +908,21 @@ fn unbox_arg(w: Word, kind: u8, temps: &mut Vec<TempBuf>) -> u64 {
         }
         CArgKind::NarrowString => marshal_narrow_string(w, temps),
         CArgKind::WideString => marshal_wide_string(w, temps),
+        CArgKind::Float32 | CArgKind::Float64 => {
+            // Sprint 35: float kinds are *registered* in the enum but
+            // the trampoline path for them is Sprint 36+. The Sprint
+            // 35 COM shim uses integer-encoded scalar conventions
+            // (color channels as 0..=255, coordinates as integer
+            // pixels), so no `define c-function` declaration in the
+            // Sprint 35 stdlib reaches this branch. We deliberately
+            // panic rather than silently corrupt a float arg.
+            panic!(
+                "winffi: <c-float>/<c-double> arg encountered (kind {k:?}); \
+                 Sprint 35 doesn't ship float-marshaling trampolines — \
+                 the COM shim uses integer-encoded scalars. \
+                 Native float args land in Sprint 36+."
+            );
+        }
     }
 }
 
@@ -938,6 +983,16 @@ fn box_return(raw: u64, kind: u8) -> Word {
             let bytes = unsafe { scan_cstr_bytes(raw as *const u8, 1 << 20) };
             let s = String::from_utf8_lossy(bytes).into_owned();
             crate::intern_string_literal(&s)
+        }
+        CReturnKind::Float32 | CReturnKind::Float64 => {
+            // Sprint 35: see CArgKind::Float32 note. No Sprint 35
+            // shim returns a native float; the kinds are registered
+            // for sema-side acceptance of `<c-float>` / `<c-double>`
+            // in `define c-function` declarations only.
+            panic!(
+                "winffi: <c-float>/<c-double> return encountered (kind {k:?}); \
+                 Sprint 35 doesn't ship float-marshaling trampolines."
+            );
         }
         CReturnKind::WideString => {
             // Sprint 30: API returned an LPCWSTR pointer (e.g.

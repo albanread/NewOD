@@ -1710,8 +1710,25 @@ not yet done.
   `RECT`, `POINT`, `MSG`, `WNDCLASSEXW`. Needs `<c-struct>` class
   machinery + ABI-aware marshaling (Win64 passes 1/2/4/8-byte
   aggregates in registers; bigger ones by hidden pointer).
-- **:open: COM interface dispatch** — Sprint 28 → Sprint 35. Vtable
-  calls plus `AddRef` / `Release` / `QueryInterface` semantics.
+- **:closed: COM interface dispatch** — Sprint 28 → Sprint 35.
+  **Landed Sprint 35** via the official Microsoft `windows` crate
+  rather than a hand-rolled C++ shim DLL. The crate's typed COM
+  interfaces handle vtable dispatch + `AddRef`/`Release` natively
+  through Rust's `Clone`/`Drop`. `nod-runtime::com_shim` registers
+  ~30 `extern "C-unwind"` shim functions that take + return Dylan
+  fixnum-tagged opaque handles (`<c-handle>`); each shim looks up a
+  typed COM interface from a process-global `Mutex<HashMap<u64,
+  ComObject>>`, calls the `windows`-crate method, and returns a
+  fresh handle. `QueryInterface` is expressed via the crate's
+  `Interface::cast()` (e.g. `ID3D11Device → IDXGIDevice`,
+  `ID3D11Texture2D → IDXGISurface`). Sprint 35 lights up the DXGI +
+  D3D11 + D2D + DirectWrite chain offscreen; HWND-bound swap chains
+  + `Present()` ship in Sprint 37 with the IDE window.
+- **:closed: COM via hand-rolled C++ shim DLL** — Sprint 35 brief
+  superseded by the `windows`-crate approach. The original brief
+  sketched a per-process shim DLL written in C++ exposing each COM
+  method as a plain C function; the `windows` crate makes that
+  unnecessary. No C++ shim is on the roadmap.
 - **:open: Variadic functions** — Sprint 28 → later FFI sprint.
   `sprintf`-family. Win64 ABI is uniform between fixed + variadic
   positions (no register-class shuffling), so this is more about
@@ -2176,3 +2193,84 @@ and a few corner cases the seed-struct set didn't touch.
   threshold (the MSG roundtrip uses `wParam := 1000`, well within
   62-bit positive). Same truncation already applied to FFI
   return values; both lift together when the bignum lands.
+
+## Carry-over from Sprint 35 (COM via `windows` crate — DXGI/D3D11/D2D/DirectWrite) — into Sprint 36+
+
+- **:open: Float-marshaling trampoline shape** — Sprint 35 → Sprint
+  36+. Sprint 35 registers `<c-float>` / `<c-double>` Dylan classes
+  and the `CArgKind::Float32` / `Float64` enum variants, but no
+  Sprint 35 shim takes a native float arg — the COM surface routes
+  every float through integer-encoded scalars (color channels as
+  0..=255 integers, coordinates as integer pixels, font size as
+  hundredths-of-a-DIP integer). The trampoline path for native
+  floats panics with a "Sprint 36+" message. Wiring real float
+  args requires per-shape trampolines because Win64's calling
+  convention puts float args in XMM registers (XMM0-3) interleaved
+  with integer args in RCX/RDX/R8/R9 by source position — a
+  `extern "system" fn(u64, u64, f32, f32)` signature is
+  ABI-incompatible with `extern "system" fn(u64, u64, u64, u64)`.
+  Sprint 36+ adds the typed trampoline family when a real use case
+  (e.g. D2D animation curves with `f64` time parameters, gradient
+  brush stops) demands it.
+- **:open: HWND-bound swap chains** — Sprint 35 → Sprint 37.
+  `CreateSwapChainForHwnd`, `IDXGISwapChain1::Present`, the
+  resize-on-`WM_SIZE` dance. Sprint 35 renders offscreen only; the
+  IDE window doesn't exist yet. Sprint 37 brings up the IDE window
+  and wires the swap chain — the device-chain infrastructure
+  Sprint 35 ships is the prerequisite.
+- **:open: Linear/radial gradient brushes, geometries, paths** —
+  Sprint 35 → Sprint 36+. Sprint 35 ships solid-color brush only
+  (`ID2D1SolidColorBrush`). `ID2D1LinearGradientBrush`,
+  `ID2D1RadialGradientBrush`, `ID2D1PathGeometry`,
+  `ID2D1GeometrySink` come with their own COM shapes; each adds
+  one `ComObject` variant and 3-5 shim functions. IDE syntax
+  highlighting and shape rendering live here.
+- **:open: WIC bitmap interop** — Sprint 35 → later. Loading PNG /
+  JPEG / GIF / TIFF from disk via the Windows Imaging Component.
+  Adds `IWICImagingFactory`, `IWICBitmapDecoder`, the
+  `CreateBitmapFromWicBitmap` D2D path. The `windows` crate's
+  `Win32_Graphics_Imaging` feature is already capable; Sprint 35
+  doesn't enable it (avoiding the extra build cost). IDE icons
+  + image-pane support unblock with this.
+- **:open: D2D effect graphs and animations** — Sprint 35 → later
+  IDE polish. `ID2D1Effect`, `D2D1_PIXEL_SHADER_*`,
+  blur/shadow/transform effects. Useful for the IDE's visual
+  polish, not for the v1 ship.
+- **:open: Device-loss recovery** — Sprint 35 → production polish.
+  When the GPU is reset (driver crash, monitor reconfiguration),
+  every D3D11 / D2D / DXGI resource is invalidated. The recovery
+  path is "drop every cached device/context/bitmap, recreate from
+  scratch, redraw". Not on the v1 acceptance critical path.
+- **:open: Compositional swap chains** — Sprint 35 → later. The
+  `CreateSwapChainForComposition` flavor enables IDE panes embedded
+  in non-Win32 hosts (XAML islands, Direct Composition trees).
+  Useful for hosting the Dylan IDE inside a Windows 11 modern app
+  surface. Sprint 37+ once the basic HWND-bound case ships.
+- **:open: D2D / DirectWrite error → `<c-ffi-error>` raise** —
+  Sprint 35 stores the last HRESULT in a thread-local atomic and
+  exposes it via `%com-last-hresult()`; Dylan code can check
+  manually. The Sprint 19 condition-class machinery is available
+  to raise `<c-ffi-error>` automatically on HRESULT < 0 — Sprint
+  35 stayed minimal because the acceptance tests never hit a
+  failing path. Hook this up when a Dylan-side IDE pane needs to
+  surface a "your GPU choked" message to the user.
+- **:open: Per-class typed-accessor traits** — Sprint 35 uses a
+  `typed_accessor!` macro to generate one accessor function per
+  `ComObject` variant. The 14 variants Sprint 35 ships are
+  hand-rolled; growing the set to dozens (with brushes,
+  geometries, effects, WIC bitmaps) might want a trait + blanket
+  impl to dedupe the lookup pattern. Minor refactor; not blocking.
+- **:open: Multi-handle batch release** — Sprint 35's
+  `nod_com_release` releases one handle per call. Tests that
+  release 10 handles make 10 mutex lock/unlock pairs. A
+  `nod_com_release_batch(handles_sov)` would take a Dylan SOV of
+  handles and release them under one lock. Trivial follow-up if
+  profiling demands it.
+- **:open: `nod_dwrite_get_layout_metrics` packed-u64 return** —
+  Sprint 35 packs width (low 32 bits) and height (high 32 bits)
+  into a single u64 to avoid a multi-return shape. Dylan code
+  reads via `%logand` + `%logshift` (not yet wired — currently
+  inaccessible from the Dylan surface). The proper fix is either
+  a `<c-struct>`-shaped return (Sprint 34 territory — wrap the
+  packed bits into a `<size>` instance) or true multi-value
+  returns from primitives. Minor; the field's diagnostic-only.

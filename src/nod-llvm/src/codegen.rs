@@ -243,6 +243,40 @@ pub const NOD_STRUCT_SET_U64_SYMBOL: &str = "nod_struct_set_u64";
 pub const NOD_STRUCT_GET_POINTER_SYMBOL: &str = "nod_struct_get_pointer";
 pub const NOD_STRUCT_SET_POINTER_SYMBOL: &str = "nod_struct_set_pointer";
 
+// ─── Sprint 35 — COM shim symbols ────────────────────────────────────────
+pub const NOD_COM_RELEASE_SYMBOL: &str = "nod_com_release";
+pub const NOD_COM_REGISTRY_LEN_SYMBOL: &str = "nod_com_registry_len";
+pub const NOD_COM_LAST_HRESULT_SYMBOL: &str = "nod_com_last_hresult";
+pub const NOD_COM_CLEAR_LAST_HRESULT_SYMBOL: &str = "nod_com_clear_last_hresult";
+pub const NOD_DXGI_CREATE_FACTORY_SYMBOL: &str = "nod_dxgi_create_factory";
+pub const NOD_DXGI_DEVICE_FROM_D3D_DEVICE_SYMBOL: &str = "nod_dxgi_device_from_d3d_device";
+pub const NOD_DXGI_CREATE_SURFACE_FROM_TEXTURE_SYMBOL: &str = "nod_dxgi_create_surface_from_texture";
+pub const NOD_D3D11_CREATE_DEVICE_SYMBOL: &str = "nod_d3d11_create_device";
+pub const NOD_D3D11_GET_IMMEDIATE_CONTEXT_SYMBOL: &str = "nod_d3d11_get_immediate_context";
+pub const NOD_D3D11_CREATE_TEXTURE_2D_SYMBOL: &str = "nod_d3d11_create_texture_2d";
+pub const NOD_D3D11_COPY_TO_STAGING_AND_MAP_SYMBOL: &str = "nod_d3d11_copy_to_staging_and_map";
+pub const NOD_D3D11_LAST_STAGING_HANDLE_SYMBOL: &str = "nod_d3d11_last_staging_handle";
+pub const NOD_D3D11_LAST_MAPPED_ROW_PITCH_SYMBOL: &str = "nod_d3d11_last_mapped_row_pitch";
+pub const NOD_D3D11_UNMAP_SYMBOL: &str = "nod_d3d11_unmap";
+pub const NOD_D2D_CREATE_FACTORY_SYMBOL: &str = "nod_d2d_create_factory";
+pub const NOD_D2D_CREATE_DEVICE_SYMBOL: &str = "nod_d2d_create_device";
+pub const NOD_D2D_CREATE_DEVICE_CONTEXT_SYMBOL: &str = "nod_d2d_create_device_context";
+pub const NOD_D2D_CREATE_BITMAP_FOR_TARGET_SYMBOL: &str = "nod_d2d_create_bitmap_for_target";
+pub const NOD_D2D_SET_TARGET_SYMBOL: &str = "nod_d2d_set_target";
+pub const NOD_D2D_BEGIN_DRAW_SYMBOL: &str = "nod_d2d_begin_draw";
+pub const NOD_D2D_END_DRAW_SYMBOL: &str = "nod_d2d_end_draw";
+pub const NOD_D2D_CLEAR_SYMBOL: &str = "nod_d2d_clear";
+pub const NOD_D2D_SET_TRANSFORM_IDENTITY_SYMBOL: &str = "nod_d2d_set_transform_identity";
+pub const NOD_D2D_CREATE_SOLID_COLOR_BRUSH_SYMBOL: &str = "nod_d2d_create_solid_color_brush";
+pub const NOD_D2D_DRAW_TEXT_LAYOUT_SYMBOL: &str = "nod_d2d_draw_text_layout";
+pub const NOD_D2D_DRAW_RECTANGLE_SYMBOL: &str = "nod_d2d_draw_rectangle";
+pub const NOD_D2D_FILL_RECTANGLE_SYMBOL: &str = "nod_d2d_fill_rectangle";
+pub const NOD_DWRITE_CREATE_FACTORY_SYMBOL: &str = "nod_dwrite_create_factory";
+pub const NOD_DWRITE_CREATE_TEXT_FORMAT_SYMBOL: &str = "nod_dwrite_create_text_format";
+pub const NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL: &str = "nod_dwrite_create_text_layout";
+pub const NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL: &str = "nod_dwrite_get_layout_metrics";
+pub const NOD_COUNT_NON_ZERO_RED_SYMBOL: &str = "nod_count_non_zero_red";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -339,6 +373,43 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_struct_set_u64", NOD_STRUCT_SET_U64_SYMBOL, 3),
     ("nod_struct_get_pointer", NOD_STRUCT_GET_POINTER_SYMBOL, 2),
     ("nod_struct_set_pointer", NOD_STRUCT_SET_POINTER_SYMBOL, 3),
+    // Sprint 35 — COM shim primitives. All take and return integer-shaped
+    // u64 handles (see nod-runtime::com_shim module docs for the integer-
+    // encoded color/coordinate convention). Each arity matches the C-ABI
+    // signature: zero `nod_*_release()` style probes take no args, every
+    // other shim takes 1..=7 args.
+    ("nod_com_release", NOD_COM_RELEASE_SYMBOL, 1),
+    ("nod_com_registry_len", NOD_COM_REGISTRY_LEN_SYMBOL, 0),
+    ("nod_com_last_hresult", NOD_COM_LAST_HRESULT_SYMBOL, 0),
+    ("nod_com_clear_last_hresult", NOD_COM_CLEAR_LAST_HRESULT_SYMBOL, 0),
+    ("nod_dxgi_create_factory", NOD_DXGI_CREATE_FACTORY_SYMBOL, 0),
+    ("nod_dxgi_device_from_d3d_device", NOD_DXGI_DEVICE_FROM_D3D_DEVICE_SYMBOL, 1),
+    ("nod_dxgi_create_surface_from_texture", NOD_DXGI_CREATE_SURFACE_FROM_TEXTURE_SYMBOL, 1),
+    ("nod_d3d11_create_device", NOD_D3D11_CREATE_DEVICE_SYMBOL, 0),
+    ("nod_d3d11_get_immediate_context", NOD_D3D11_GET_IMMEDIATE_CONTEXT_SYMBOL, 1),
+    ("nod_d3d11_create_texture_2d", NOD_D3D11_CREATE_TEXTURE_2D_SYMBOL, 4),
+    ("nod_d3d11_copy_to_staging_and_map", NOD_D3D11_COPY_TO_STAGING_AND_MAP_SYMBOL, 5),
+    ("nod_d3d11_last_staging_handle", NOD_D3D11_LAST_STAGING_HANDLE_SYMBOL, 0),
+    ("nod_d3d11_last_mapped_row_pitch", NOD_D3D11_LAST_MAPPED_ROW_PITCH_SYMBOL, 0),
+    ("nod_d3d11_unmap", NOD_D3D11_UNMAP_SYMBOL, 2),
+    ("nod_d2d_create_factory", NOD_D2D_CREATE_FACTORY_SYMBOL, 0),
+    ("nod_d2d_create_device", NOD_D2D_CREATE_DEVICE_SYMBOL, 2),
+    ("nod_d2d_create_device_context", NOD_D2D_CREATE_DEVICE_CONTEXT_SYMBOL, 1),
+    ("nod_d2d_create_bitmap_for_target", NOD_D2D_CREATE_BITMAP_FOR_TARGET_SYMBOL, 2),
+    ("nod_d2d_set_target", NOD_D2D_SET_TARGET_SYMBOL, 2),
+    ("nod_d2d_begin_draw", NOD_D2D_BEGIN_DRAW_SYMBOL, 1),
+    ("nod_d2d_end_draw", NOD_D2D_END_DRAW_SYMBOL, 1),
+    ("nod_d2d_clear", NOD_D2D_CLEAR_SYMBOL, 5),
+    ("nod_d2d_set_transform_identity", NOD_D2D_SET_TRANSFORM_IDENTITY_SYMBOL, 1),
+    ("nod_d2d_create_solid_color_brush", NOD_D2D_CREATE_SOLID_COLOR_BRUSH_SYMBOL, 5),
+    ("nod_d2d_draw_text_layout", NOD_D2D_DRAW_TEXT_LAYOUT_SYMBOL, 5),
+    ("nod_d2d_draw_rectangle", NOD_D2D_DRAW_RECTANGLE_SYMBOL, 7),
+    ("nod_d2d_fill_rectangle", NOD_D2D_FILL_RECTANGLE_SYMBOL, 6),
+    ("nod_dwrite_create_factory", NOD_DWRITE_CREATE_FACTORY_SYMBOL, 0),
+    ("nod_dwrite_create_text_format", NOD_DWRITE_CREATE_TEXT_FORMAT_SYMBOL, 4),
+    ("nod_dwrite_create_text_layout", NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL, 5),
+    ("nod_dwrite_get_layout_metrics", NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL, 1),
+    ("nod_count_non_zero_red", NOD_COUNT_NON_ZERO_RED_SYMBOL, 4),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

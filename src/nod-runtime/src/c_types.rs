@@ -44,7 +44,17 @@ struct CTypeClasses {
     c_wide_string: ClassId,
 }
 
+/// Sprint 35: float types are kept in a separate `OnceLock` so the
+/// registration story is independent of the c-types seed set above —
+/// some Sprint 35 tests want only `<c-float>` / `<c-double>` without
+/// also pulling in the integer family.
+struct CFloatTypes {
+    c_float: ClassId,
+    c_double: ClassId,
+}
+
 static C_TYPE_CLASSES: OnceLock<CTypeClasses> = OnceLock::new();
+static C_FLOAT_TYPES: OnceLock<CFloatTypes> = OnceLock::new();
 
 /// Idempotently register the FFI c-type classes. Safe to call from
 /// `nod-sema` lowering before validating a `define c-function`
@@ -108,6 +118,35 @@ pub fn c_string_class_id() -> ClassId {
 pub fn c_wide_string_class_id() -> ClassId {
     ensure_registered();
     C_TYPE_CLASSES.get().expect("c-type classes registered").c_wide_string
+}
+
+/// Sprint 35: idempotently register `<c-float>` (32-bit) and
+/// `<c-double>` (64-bit) Dylan classes. These are the marshaling-
+/// layer placeholders for float arguments — Sprint 35 shims do not
+/// currently take native floats (see `com_shim.rs` module docs for
+/// the deviation), but the classes are registered so Dylan sources
+/// can name them in `define c-function` declarations against future
+/// COM APIs that need fractional precision.
+pub fn ensure_float_types_registered() {
+    let _ = C_FLOAT_TYPES.get_or_init(|| {
+        let mk = |n: &str| crate::register_simple_user_class(n, None, Vec::new()).0;
+        CFloatTypes {
+            c_float: mk("<c-float>"),
+            c_double: mk("<c-double>"),
+        }
+    });
+}
+
+/// `<c-float>` ClassId — Sprint 35.
+pub fn c_float_class_id() -> ClassId {
+    ensure_float_types_registered();
+    C_FLOAT_TYPES.get().expect("c-float types registered").c_float
+}
+
+/// `<c-double>` ClassId — Sprint 35.
+pub fn c_double_class_id() -> ClassId {
+    ensure_float_types_registered();
+    C_FLOAT_TYPES.get().expect("c-float types registered").c_double
 }
 
 // Stub helpers to keep clippy happy — we'll grow them once Sprint 28

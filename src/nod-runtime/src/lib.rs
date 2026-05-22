@@ -41,6 +41,8 @@ mod callbacks;
 mod classes;
 mod closures;
 mod collections;
+#[cfg(windows)]
+mod com_shim;
 mod conditions;
 mod dispatch;
 mod winffi;
@@ -95,9 +97,29 @@ pub use collections::{
     stretchy_vector_class_id, stretchy_vector_fields, stretchy_vector_push,
 };
 pub use c_types::{
-    c_bool_class_id, c_dword_class_id, c_handle_class_id, c_int_class_id, c_pointer_class_id,
-    c_string_class_id, c_wide_string_class_id,
-    ensure_registered as ensure_c_types_registered,
+    c_bool_class_id, c_double_class_id, c_dword_class_id, c_float_class_id, c_handle_class_id,
+    c_int_class_id, c_pointer_class_id, c_string_class_id, c_wide_string_class_id,
+    ensure_float_types_registered, ensure_registered as ensure_c_types_registered,
+};
+#[cfg(windows)]
+pub use com_shim::{
+    ComObject, _reset_registry_for_tests as _reset_com_registry_for_tests,
+    ensure_com_types_registered, get_d2d_bitmap, get_d2d_device, get_d2d_device_context,
+    get_d2d_factory, get_d2d_solid_brush, get_d3d11_device, get_d3d11_device_context,
+    get_d3d11_texture_2d, get_dwrite_factory, get_dwrite_text_format, get_dwrite_text_layout,
+    get_dxgi_device, get_dxgi_factory, get_dxgi_surface, nod_com_clear_last_hresult,
+    nod_com_last_hresult, nod_com_registry_len, nod_com_release, nod_count_non_zero_red,
+    nod_d2d_begin_draw, nod_d2d_clear, nod_d2d_create_bitmap_for_target,
+    nod_d2d_create_device, nod_d2d_create_device_context, nod_d2d_create_factory,
+    nod_d2d_create_solid_color_brush, nod_d2d_draw_rectangle, nod_d2d_draw_text_layout,
+    nod_d2d_end_draw, nod_d2d_fill_rectangle, nod_d2d_set_target,
+    nod_d2d_set_transform_identity, nod_d3d11_copy_to_staging_and_map,
+    nod_d3d11_create_device, nod_d3d11_create_texture_2d, nod_d3d11_get_immediate_context,
+    nod_d3d11_last_mapped_row_pitch, nod_d3d11_last_staging_handle, nod_d3d11_unmap,
+    nod_dwrite_create_factory, nod_dwrite_create_text_format,
+    nod_dwrite_create_text_layout, nod_dwrite_get_layout_metrics,
+    nod_dxgi_create_factory, nod_dxgi_create_surface_from_texture,
+    nod_dxgi_device_from_d3d_device, register as com_register, registry_len as com_registry_len,
 };
 pub use callbacks::{
     CallbackSignature, POOL_SIZE as CALLBACK_POOL_SIZE, RegisterError as CallbackRegisterError,
