@@ -73,6 +73,20 @@ define c-function GetMessageW
   library: \"user32.dll\";
 end;
 
+define c-function PeekMessageW
+    (lpMsg :: <c-pointer>, hwnd :: <c-pointer>,
+     wMsgFilterMin :: <c-int>, wMsgFilterMax :: <c-int>,
+     wRemoveMsg :: <c-int>)
+ => (has-message :: <c-int>);
+  library: \"user32.dll\";
+end;
+
+define c-function Sleep
+    (ms :: <c-int>)
+ => ();
+  library: \"kernel32.dll\";
+end;
+
 define c-function TranslateMessage
     (lpMsg :: <c-pointer>)
  => (success :: <c-bool>);
@@ -172,21 +186,40 @@ fn ide_shell_window_renders_hello_dylan() {
         ShowWindow(hwnd, 5); \
         UpdateWindow(hwnd); \
         \
+        \
+        \
         let msg = make(<msg>); \
         let exit-code = 0; \
+        \
+        \
+        \
+        \
+        \
+        \
+        \
+        \
+        \
+        \
+        \
         let pumping = #t; \
+        let iters = 0; \
         while (pumping) \
-          let result = GetMessageW(msg, 0, 0, 0); \
-          if (result = 0) \
+          let has-msg = PeekMessageW(msg, 0, 0, 0, 1); \
+          if (has-msg ~= 0) \
+            let msg-id = msg-message(msg); \
+            if (msg-id = 18) \
+              pumping := #f; \
+              exit-code := 0; \
+            else \
+              TranslateMessage(msg); \
+              DispatchMessageW(msg); \
+            end; \
+          else 0 end; \
+          Sleep(10); \
+          iters := iters + 1; \
+          if (iters > 3000) \
             pumping := #f; \
-            exit-code := 0; \
-          elseif (result = -1) \
-            pumping := #f; \
-            exit-code := -1; \
-          else \
-            TranslateMessage(msg); \
-            DispatchMessageW(msg); \
-          end; \
+          else 0 end; \
         end; \
         \
         exit-code";
