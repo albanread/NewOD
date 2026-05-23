@@ -480,6 +480,13 @@ pub struct LoweredModule {
     /// not present in the embedded `nod-winapi` index. The driver
     /// prints them; they don't block compilation.
     pub warnings: Vec<LoweringWarning>,
+    /// Sprint 40a — every `define class` registered during lowering,
+    /// in declaration / registration order. Used by the AOT pipeline
+    /// (`compile_file_for_aot` → `build_aot_registrations`) to emit
+    /// `nod_aot_register_user_class` calls inside the EXE's startup
+    /// resolver. The JIT path ignores this field — it registers user
+    /// classes inline as `register_class` runs in `lower_module_full`.
+    pub user_classes: Vec<UserClassRegistration>,
 }
 
 /// Sprint 27: information captured for a single `define c-function`
@@ -1180,6 +1187,50 @@ pub struct BlockHandlerRegistration {
     pub body_fn_name: String,
 }
 
+/// Sprint 40a — a single `define class` registration captured during
+/// lowering. The JIT path doesn't need this (it calls
+/// `nod_runtime::register_simple_user_class` / `register_mi_user_class`
+/// inline as `register_class` runs); the AOT path serialises this shape
+/// into the EXE's startup so a fresh process can replay the same
+/// registrations with the same class IDs in the same order.
+///
+/// All offsets / CPL / slot_origin entries are already fully resolved
+/// by the lowering pass (mirroring what `register_user_class_metadata`
+/// pins into the static area on the JIT side). The EXE-side shim
+/// (`nod_aot_register_user_class`) reconstructs a `UserClassSpec` from
+/// these fields and calls `register_user_class_metadata` directly.
+///
+/// # Class-id determinism
+///
+/// The JIT/compiler process allocated `class_id` via
+/// `allocate_user_class_id()` in monotonic order. The EXE-side
+/// `nod_aot_resolve_relocs` calls `nod_aot_register_user_class` in the
+/// SAME order this `Vec` was populated, so the EXE's
+/// `allocate_user_class_id` produces the exact same sequence of IDs.
+/// The shim asserts the returned id matches `class_id` and panics on
+/// drift — a panic here would be a codegen bug, not a user error.
+#[derive(Clone, Debug)]
+pub struct UserClassRegistration {
+    pub name: String,
+    pub class_id: ClassId,
+    /// Direct supers in declaration order. Empty for `<object>` (which
+    /// the AOT path never emits — it's a seed class). For user classes
+    /// with no explicit super list, this is `[<object>]` per Dylan
+    /// convention (matching `register_class`'s default).
+    pub parents: Vec<ClassId>,
+    /// Full C3-linearised class precedence list including self at
+    /// index 0.
+    pub cpl: Vec<ClassId>,
+    /// All slots (own + inherited) in layout order, with offsets +
+    /// init-keyword strings + type kinds already populated.
+    pub slots: Vec<SlotInfo>,
+    /// For each `slots[i]`, the class id that introduced that slot
+    /// (`class_id` for own slots; some ancestor's id for inherited).
+    pub slot_origin: Vec<ClassId>,
+    pub own_slot_count: usize,
+    pub inherited_slot_count: usize,
+}
+
 pub fn lower_module(m: &Module) -> Result<Vec<Function>, Vec<LoweringError>> {
     lower_module_full(m).map(|lm| lm.functions)
 }
@@ -1220,6 +1271,10 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
 
     let mut errors: Vec<LoweringError> = Vec::new();
     let mut user_classes: HashMap<String, ClassId> = HashMap::new();
+    // Sprint 40a: capture each registered user class's metadata for
+    // the AOT pipeline. The JIT path ignores this; the driver / AOT
+    // codegen reads it through `LoweredModule::user_classes`.
+    let mut user_class_registrations: Vec<UserClassRegistration> = Vec::new();
 
     // Phase 1a: walk define-class items and register metadata. The
     // sealing flag flip is deferred to Phase 1c so subclassing a
@@ -1234,6 +1289,28 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
             match register_class(name, supers, slots, *span) {
                 Ok(id) => {
                     user_classes.insert(name.clone(), id);
+                    // Sprint 40a: snapshot the freshly-registered
+                    // metadata for the AOT pipeline. Reading from the
+                    // canonical static-area entry guarantees the
+                    // persisted offsets / CPL / slot_origin match
+                    // exactly what the JIT path resolved through the
+                    // class table — no parallel computation, no drift.
+                    let md_ptr = class_metadata_ptr(id);
+                    if !md_ptr.is_null() {
+                        // SAFETY: pointer is to static-area metadata
+                        // (process-lived); we just registered it.
+                        let md = unsafe { &*md_ptr };
+                        user_class_registrations.push(UserClassRegistration {
+                            name: md.name.clone(),
+                            class_id: id,
+                            parents: md.parents.clone(),
+                            cpl: md.cpl.clone(),
+                            slots: md.slots.clone(),
+                            slot_origin: md.slot_origin.clone(),
+                            own_slot_count: md.own_slot_count,
+                            inherited_slot_count: md.inherited_slot_count,
+                        });
+                    }
                 }
                 Err(e) => errors.push(e),
             }
@@ -1990,6 +2067,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         c_functions,
         c_function_stub_table: c_function_stub_table_entries,
         warnings,
+        user_classes: user_class_registrations,
     })
 }
 

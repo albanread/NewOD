@@ -37,7 +37,8 @@ use nod_llvm::{Jit, codegen_module};
 pub use lower::{
     BindingSource, BlockHandlerRegistration, BlockRegistration, CFunctionBinding, ClosureInfo,
     ClosureRegistry, LoweredModule, LoweringError, LoweringWarning, MethodRegistration,
-    SealingViolation, dump_classes, lower_function, lower_module, lower_module_full,
+    SealingViolation, UserClassRegistration, dump_classes, lower_function, lower_module,
+    lower_module_full,
 };
 
 /// Sprint 17: parse + macro-expand + lower in one shot. Existing
@@ -732,6 +733,22 @@ fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
 /// `stdlib.obj` linked into every EXE. The minimum-viable-correctness
 /// approach here keeps the AOT pipeline honest.
 pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
+    // Sprint 40a — eagerly run the EXE-side `nod_runtime_init` BEFORE
+    // anything else touches the class registry. This is the same
+    // initialisation the codegen-emitted resolver in the EXE calls;
+    // running it here guarantees both processes seed their user-class
+    // id counter (`next_user_id` in `nod-runtime/src/classes.rs`)
+    // identically. Without this, Sprint 40a's
+    // `nod_aot_register_user_class` assert fires on class-id drift:
+    // e.g. `nod_runtime_init` calls `ensure_float_types_registered`
+    // (2 extra user classes — `<c-float>` / `<c-double>`) that the
+    // compiler-side's stdlib loader path doesn't, so EXE-side
+    // allocations land 2 IDs higher than compiler-side. Calling
+    // `nod_runtime_init` here flattens that delta.
+    //
+    // `nod_runtime_init` is idempotent (backed by a `LazyLock`); the
+    // first call pays the cost, subsequent calls are an atomic load.
+    nod_runtime::nod_runtime_init();
     stdlib::ensure_loaded();
     let src = std::fs::read_to_string(path).map_err(EvalError::Io)?;
     let mut sm = nod_reader::SourceMap::new();
@@ -765,9 +782,48 @@ pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
 pub fn build_aot_registrations(lm: &LoweredModule) -> nod_llvm::AotRegistrations {
     use nod_llvm::{
         AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
-        AotMethodRegistration, AotRegistrations,
+        AotMethodRegistration, AotRegistrations, AotSlotRegistration,
+        AotUserClassRegistration,
     };
+    use nod_runtime::{SlotDefault, SlotType};
     let mut out = AotRegistrations::default();
+    // Sprint 40a — user classes (replayed FIRST inside the resolver
+    // so subsequent method registrations see live class metadata).
+    for c in &lm.user_classes {
+        let slots: Vec<AotSlotRegistration> = c
+            .slots
+            .iter()
+            .map(|s| {
+                let (type_tag, type_class_id) = encode_slot_type(s.type_kind);
+                let (default_init_tag, default_init_value) = match s.default_init {
+                    SlotDefault::Unbound => (0u8, 0u64),
+                    SlotDefault::Value(w) => (1u8, w.raw()),
+                };
+                AotSlotRegistration {
+                    name: s.name.clone(),
+                    offset: s.offset,
+                    type_tag,
+                    type_class_id,
+                    init_keyword: s.init_keyword.clone(),
+                    required_init_keyword: s.required_init_keyword,
+                    default_init_tag,
+                    default_init_value,
+                    has_setter: s.has_setter,
+                }
+            })
+            .collect();
+        out.user_classes.push(AotUserClassRegistration {
+            name: c.name.clone(),
+            class_id: c.class_id.0,
+            parent_class_ids: c.parents.iter().map(|p| p.0).collect(),
+            cpl: c.cpl.iter().map(|p| p.0).collect(),
+            slots,
+            slot_origin: c.slot_origin.iter().map(|p| p.0).collect(),
+            own_slot_count: c.own_slot_count,
+            inherited_slot_count: c.inherited_slot_count,
+        });
+        let _ = SlotType::Top; // touch the import so it survives clippy
+    }
     // Methods.
     for m in &lm.methods {
         out.methods.push(AotMethodRegistration {
@@ -833,6 +889,29 @@ pub fn build_aot_registrations(lm: &LoweredModule) -> nod_llvm::AotRegistrations
         });
     }
     out
+}
+
+/// Sprint 40a — encode a [`nod_runtime::SlotType`] as the `(tag,
+/// class_id)` pair the AOT shim consumes. The tag value matches the
+/// `AOT_SLOT_TYPE_*` constants in `nod-runtime::aot`; the payload
+/// `class_id` is meaningful only for `Class(_)` (zero otherwise).
+///
+/// Keep this in lockstep with the decoder in `nod-runtime::aot`. The
+/// tag space is dense and stable; new variants append.
+fn encode_slot_type(t: nod_runtime::SlotType) -> (u8, u32) {
+    use nod_runtime::SlotType::*;
+    match t {
+        Integer => (0, 0),
+        DoubleFloat => (1, 0),
+        Boolean => (2, 0),
+        Character => (3, 0),
+        String => (4, 0),
+        Symbol => (5, 0),
+        Vector => (6, 0),
+        Object => (7, 0),
+        Class(c) => (8, c.0),
+        Top => (9, 0),
+    }
 }
 
 /// Sprint 39c — append the stdlib's lowered DFM artefacts onto the
@@ -904,6 +983,24 @@ fn merge_stdlib_into_user_module(lm: &mut LoweredModule) {
             .cell_locals_per_function
             .entry(k.clone())
             .or_insert_with(|| v.clone());
+    }
+    // Sprint 40a — user classes. The current stdlib doesn't define
+    // any (every built-in class is registered by `nod_runtime_init`'s
+    // `ensure_*_registered` seeds), but a future stdlib that uses
+    // `define class` would surface its entries here. Prepend stdlib
+    // classes ahead of the user's so the registration sequence in the
+    // EXE matches the JIT path's: stdlib loader registered its classes
+    // first, allocating the lowest user ClassIds; the user's classes
+    // followed. The EXE-side `nod_aot_resolve_relocs` walks
+    // `lm.user_classes` in order, calling `nod_aot_register_user_class`
+    // for each — preserving that order keeps the freshly-allocated
+    // `ClassId`s in lockstep with what the compiler observed.
+    if !stdlib_lm.user_classes.is_empty() {
+        let mut merged: Vec<UserClassRegistration> =
+            Vec::with_capacity(stdlib_lm.user_classes.len() + lm.user_classes.len());
+        merged.extend(stdlib_lm.user_classes.iter().cloned());
+        merged.append(&mut lm.user_classes);
+        lm.user_classes = merged;
     }
 }
 

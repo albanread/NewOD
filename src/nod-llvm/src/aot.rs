@@ -57,6 +57,12 @@ pub struct AotRegistrations {
     pub methods: Vec<AotMethodRegistration>,
     pub blocks: Vec<AotBlockRegistration>,
     pub functions: Vec<AotFunctionRegistration>,
+    /// Sprint 40a — user-defined classes captured from
+    /// `LoweredModule::user_classes`. The EXE's resolver replays these
+    /// FIRST (before methods, blocks, functions), so dispatch / method
+    /// specialiser lookups against user-class IDs find live metadata
+    /// by the time those later registrations run.
+    pub user_classes: Vec<AotUserClassRegistration>,
 }
 
 /// One method registration. Codegen emits one `nod_aot_register_method`
@@ -98,6 +104,60 @@ pub struct AotFunctionRegistration {
     pub name: String,
     pub arity: usize,
     pub body_fn_name: String,
+}
+
+/// Sprint 40a — one `define class` registration emitted into the
+/// EXE's startup resolver. Mirrors `nod_runtime::UserClassSpec` but
+/// flattens every field into primitives the C-ABI shim can consume:
+/// strings as `(ptr, len)` pairs, `ClassId(u32)` arrays as raw `u32`
+/// slices, slots as a flat `[AotSlotRegistration]`.
+///
+/// The codegen pass bakes each user class's name + parents + slots
+/// into private LLVM globals, then emits a single
+/// `nod_aot_register_user_class(...)` call in `nod_aot_resolve_relocs`
+/// per entry. The runtime shim asserts the registered id matches
+/// `class_id`; a mismatch would mean the AOT path's registration order
+/// diverged from the JIT path's, which the shim's panic surfaces as a
+/// hard codegen bug rather than a silent dispatch failure.
+#[derive(Clone, Debug)]
+pub struct AotUserClassRegistration {
+    pub name: String,
+    pub class_id: u32,
+    pub parent_class_ids: Vec<u32>,
+    /// Full CPL, self at index 0. The compile-time entry stores the
+    /// real `class_id` here (no sentinel) so the runtime shim can pass
+    /// it through verbatim — `register_user_class_metadata` rebinds
+    /// `cpl[0]` to the freshly-allocated id, but since they match, the
+    /// rebind is a no-op.
+    pub cpl: Vec<u32>,
+    pub slots: Vec<AotSlotRegistration>,
+    /// For each slot in `slots`, the class id that introduced it.
+    pub slot_origin: Vec<u32>,
+    pub own_slot_count: usize,
+    pub inherited_slot_count: usize,
+}
+
+/// Sprint 40a — one slot's worth of metadata, serialised into the
+/// EXE. Mirrors `nod_runtime::SlotInfo` plus a `type_tag` describing
+/// the `SlotType` variant, plus the optional `init_keyword` flattened
+/// into a `(ptr, len)` byte slice.
+#[derive(Clone, Debug)]
+pub struct AotSlotRegistration {
+    pub name: String,
+    pub offset: usize,
+    /// Encodes the `SlotType` variant. See
+    /// `nod_runtime::aot::AOT_SLOT_TYPE_*` constants for the mapping.
+    pub type_tag: u8,
+    /// Payload for `SlotType::Class(_)` — the class id. Zero for all
+    /// other variants (the shim ignores it).
+    pub type_class_id: u32,
+    pub init_keyword: Option<String>,
+    pub required_init_keyword: bool,
+    /// Encodes `SlotDefault`: 0 = `Unbound`, 1 = `Value(default_value)`.
+    pub default_init_tag: u8,
+    /// Raw `Word` bits for `SlotDefault::Value`. Zero for `Unbound`.
+    pub default_init_value: u64,
+    pub has_setter: bool,
 }
 
 /// The renamed user `main` symbol the staticlib's
@@ -628,6 +688,24 @@ fn emit_resolve_relocs_function<'ctx>(
         .build_call(runtime_init, &[], "")
         .map_err(|e| AotError::Llvm(format!("call runtime_init: {e}")))?;
 
+    // Sprint 40a — register user classes BEFORE the manifest-entry
+    // loop. `RelocKind::ClassMetadata { class_id }` slots in the
+    // manifest can reference user-class IDs (any `make(<C>, …)` site
+    // bakes the class's metadata pointer through such a slot); if the
+    // class isn't in the runtime table when `nod_aot_set_class_md`
+    // calls `class_metadata_ptr(id)`, the lookup returns null and the
+    // slot stays zero — observable later as `make: class metadata
+    // pointer is null`. Registering user classes first guarantees
+    // every later metadata lookup hits a live entry.
+    //
+    // User-class allocations bump `next_user_id`; the EXE-side
+    // `nod_aot_register_user_class` shim asserts the freshly-allocated
+    // id matches the compiler's expected id. Pairing this with the
+    // `nod_runtime::nod_runtime_init()` call inside
+    // `compile_file_for_aot` keeps `next_user_id` aligned between the
+    // two processes.
+    emit_user_class_registrations(module, &builder, &ctx, registrations, isize_ty, i32_ty)?;
+
     // Per-manifest-entry call emission. Each entry resolves its slot
     // and invokes the appropriate helper. Entries that reference symbols
     // not present in the module (eliminated by codegen / opt) are
@@ -744,12 +822,17 @@ fn emit_resolve_relocs_function<'ctx>(
         }
     }
 
-    // Sprint 39c — emit the merged-stdlib registration calls. Order
-    // matters in two ways:
+    // Sprint 39c — the remaining three categories (functions, methods,
+    // blocks) emit after the manifest-entry loop. Sprint 40a already
+    // emitted user-class registrations BEFORE the manifest loop (see
+    // the call above `for entry in &manifest.entries` — class metadata
+    // must exist before `RelocKind::ClassMetadata` slots populate).
     //
-    // 1. Top-level functions register first so a method body that
-    //    references `\name` (via a function-ref construction site)
-    //    can resolve at runtime. The function-ref registry is
+    // Order matters in two ways:
+    //
+    // 1. Top-level functions register before methods so a method body
+    //    that references `\name` (via a function-ref construction
+    //    site) can resolve at runtime. The function-ref registry is
     //    consulted lazily by the call-site, so technically registering
     //    after methods would still work — but the visit-order here
     //    matches the JIT path's `register_top_level_functions →
@@ -769,6 +852,276 @@ fn emit_resolve_relocs_function<'ctx>(
         .build_return(None)
         .map_err(|e| AotError::Llvm(format!("resolver build_return: {e}")))?;
     Ok(resolver_fn)
+}
+
+/// Sprint 40a — for each [`AotUserClassRegistration`] emit a call to
+/// `nod_aot_register_user_class(...)` inside the resolver. Bake the
+/// per-class arrays (parents, cpl, slots, slot_origin) as private
+/// LLVM globals so the resolver hands raw pointer + length pairs to
+/// the runtime shim.
+///
+/// `%AotSlotEntry` layout MUST match `nod_runtime::aot::AotSlotEntry`'s
+/// `#[repr(C)]` shape exactly. We construct one struct value per slot
+/// and bake them into a `[AotSlotEntry; N]` per class.
+#[allow(clippy::too_many_arguments)]
+fn emit_user_class_registrations<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::builder::Builder<'ctx>,
+    ctx: &inkwell::context::ContextRef<'ctx>,
+    registrations: &AotRegistrations,
+    isize_ty: inkwell::types::IntType<'ctx>,
+    i32_ty: inkwell::types::IntType<'ctx>,
+) -> Result<(), AotError> {
+    if registrations.user_classes.is_empty() {
+        return Ok(());
+    }
+    let void_ty = ctx.void_type();
+    let i8_ty = ctx.i8_type();
+    let i64_ty = ctx.i64_type();
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+
+    // `%AotSlotEntry` layout (matches `nod_runtime::aot::AotSlotEntry`
+    // exactly — 56 bytes total on x86_64, 8-aligned):
+    //   off 0   ptr     name_ptr
+    //   off 8   isize   name_len
+    //   off 16  isize   offset
+    //   off 24  i8      type_tag
+    //   off 25  i8      required_init_keyword
+    //   off 26  i8      default_init_tag
+    //   off 27  i8      has_setter
+    //   off 28  i32     _pad (so type_class_id is 4-aligned)
+    //   off 32  i32     type_class_id
+    //   off 36  i32     _pad2 (so default_init_value is 8-aligned)
+    //   off 40  i64     default_init_value
+    //   off 48  ptr     init_keyword_ptr
+    //   off 56  isize   init_keyword_len
+    //
+    // Inkwell's `struct_type(&[...], packed=false)` lays out fields
+    // naturally; the two explicit `i32` padding fields handle the
+    // alignment gaps the Rust side spells out so the codegen layout
+    // matches the runtime `#[repr(C)]` byte-for-byte. Total: 64 bytes.
+    let slot_struct_ty = ctx.struct_type(
+        &[
+            ptr_ty.into(),    // name_ptr
+            isize_ty.into(),  // name_len
+            isize_ty.into(),  // offset
+            i8_ty.into(),     // type_tag
+            i8_ty.into(),     // required_init_keyword
+            i8_ty.into(),     // default_init_tag
+            i8_ty.into(),     // has_setter
+            i32_ty.into(),    // _pad
+            i32_ty.into(),    // type_class_id
+            i32_ty.into(),    // _pad2
+            i64_ty.into(),    // default_init_value
+            ptr_ty.into(),    // init_keyword_ptr
+            isize_ty.into(),  // init_keyword_len
+        ],
+        false,
+    );
+
+    // `void nod_aot_register_user_class(
+    //     ptr name, isize name_len, i32 class_id,
+    //     ptr parents, isize n_parents,
+    //     ptr cpl, isize n_cpl,
+    //     ptr slots, isize n_slots,
+    //     ptr slot_origin, isize n_slot_origin,
+    //     isize own_slot_count, isize inherited_slot_count)`.
+    let helper_ty = void_ty.fn_type(
+        &[
+            ptr_ty.into(),
+            isize_ty.into(),
+            i32_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            isize_ty.into(),
+            isize_ty.into(),
+        ],
+        false,
+    );
+    let helper = module
+        .get_function("nod_aot_register_user_class")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "nod_aot_register_user_class",
+                helper_ty,
+                Some(Linkage::External),
+            )
+        });
+
+    for (idx, reg) in registrations.user_classes.iter().enumerate() {
+        // Bake the class name as a private `[N x i8]`.
+        let (name_ptr, name_len) =
+            emit_byte_constant(module, builder, ctx, reg.name.as_bytes())?;
+
+        // Bake parents / cpl / slot_origin as `[N x i32]` private
+        // globals. `emit_u32_array_constant` returns a base pointer
+        // suitable for passing into the helper as `ptr`.
+        let parents_ptr = emit_u32_array_constant(
+            module,
+            builder,
+            i32_ty,
+            &reg.parent_class_ids,
+            &format!("__nod_aot_class_parents_{idx}"),
+        )?;
+        let cpl_ptr = emit_u32_array_constant(
+            module,
+            builder,
+            i32_ty,
+            &reg.cpl,
+            &format!("__nod_aot_class_cpl_{idx}"),
+        )?;
+        let slot_origin_ptr = emit_u32_array_constant(
+            module,
+            builder,
+            i32_ty,
+            &reg.slot_origin,
+            &format!("__nod_aot_class_slot_origin_{idx}"),
+        )?;
+
+        // Bake the slot array. Each entry's strings (`name`,
+        // `init_keyword`) become private LLVM globals; the struct
+        // literal points at them.
+        let slots_ptr = if reg.slots.is_empty() {
+            ptr_ty.const_null()
+        } else {
+            let mut slot_inits: Vec<inkwell::values::StructValue<'ctx>> =
+                Vec::with_capacity(reg.slots.len());
+            for (sidx, slot) in reg.slots.iter().enumerate() {
+                let slot_name_arr_ty = i8_ty.array_type(slot.name.len() as u32);
+                let slot_name_global = module.add_global(
+                    slot_name_arr_ty,
+                    Some(AddressSpace::default()),
+                    &format!("__nod_aot_class_{idx}_slot_{sidx}_name"),
+                );
+                slot_name_global.set_linkage(Linkage::Private);
+                slot_name_global.set_constant(true);
+                let bytes: Vec<_> = slot
+                    .name
+                    .as_bytes()
+                    .iter()
+                    .map(|b| i8_ty.const_int(*b as u64, false))
+                    .collect();
+                slot_name_global.set_initializer(&i8_ty.const_array(&bytes));
+
+                let (init_kw_ptr_const, init_kw_len_const) = match &slot.init_keyword {
+                    Some(kw) => {
+                        let kw_arr_ty = i8_ty.array_type(kw.len() as u32);
+                        let kw_global = module.add_global(
+                            kw_arr_ty,
+                            Some(AddressSpace::default()),
+                            &format!("__nod_aot_class_{idx}_slot_{sidx}_initkw"),
+                        );
+                        kw_global.set_linkage(Linkage::Private);
+                        kw_global.set_constant(true);
+                        let kw_bytes: Vec<_> = kw
+                            .as_bytes()
+                            .iter()
+                            .map(|b| i8_ty.const_int(*b as u64, false))
+                            .collect();
+                        kw_global.set_initializer(&i8_ty.const_array(&kw_bytes));
+                        (
+                            kw_global.as_pointer_value(),
+                            isize_ty.const_int(kw.len() as u64, false),
+                        )
+                    }
+                    None => (ptr_ty.const_null(), isize_ty.const_zero()),
+                };
+
+                let init = slot_struct_ty.const_named_struct(&[
+                    slot_name_global.as_pointer_value().into(),
+                    isize_ty.const_int(slot.name.len() as u64, false).into(),
+                    isize_ty.const_int(slot.offset as u64, false).into(),
+                    i8_ty.const_int(slot.type_tag as u64, false).into(),
+                    i8_ty.const_int(if slot.required_init_keyword { 1 } else { 0 }, false).into(),
+                    i8_ty.const_int(slot.default_init_tag as u64, false).into(),
+                    i8_ty.const_int(if slot.has_setter { 1 } else { 0 }, false).into(),
+                    i32_ty.const_zero().into(), // _pad
+                    i32_ty.const_int(slot.type_class_id as u64, false).into(),
+                    i32_ty.const_zero().into(), // _pad2
+                    i64_ty.const_int(slot.default_init_value, false).into(),
+                    init_kw_ptr_const.into(),
+                    init_kw_len_const.into(),
+                ]);
+                slot_inits.push(init);
+            }
+            let arr_ty = slot_struct_ty.array_type(reg.slots.len() as u32);
+            let arr_init = slot_struct_ty.const_array(&slot_inits);
+            let arr_global = module.add_global(
+                arr_ty,
+                Some(AddressSpace::default()),
+                &format!("__nod_aot_class_slots_{idx}"),
+            );
+            arr_global.set_linkage(Linkage::Private);
+            // Not `const` — the struct fields are immutable but the
+            // pointer values themselves are link-time constants;
+            // marking the array constant is fine but we leave it
+            // mutable for symmetry with the handlers array, which the
+            // GC may eventually need to keep mutable.
+            arr_global.set_constant(false);
+            arr_global.set_initializer(&arr_init);
+            arr_global.as_pointer_value()
+        };
+
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
+            name_ptr.into(),
+            isize_ty.const_int(name_len as u64, false).into(),
+            i32_ty.const_int(reg.class_id as u64, false).into(),
+            parents_ptr.into(),
+            isize_ty.const_int(reg.parent_class_ids.len() as u64, false).into(),
+            cpl_ptr.into(),
+            isize_ty.const_int(reg.cpl.len() as u64, false).into(),
+            slots_ptr.into(),
+            isize_ty.const_int(reg.slots.len() as u64, false).into(),
+            slot_origin_ptr.into(),
+            isize_ty.const_int(reg.slot_origin.len() as u64, false).into(),
+            isize_ty.const_int(reg.own_slot_count as u64, false).into(),
+            isize_ty.const_int(reg.inherited_slot_count as u64, false).into(),
+        ];
+        builder
+            .build_call(helper, &args, "")
+            .map_err(|e| AotError::Llvm(format!("call register_user_class: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Sprint 40a — bake a `[N x i32]` array as a private constant
+/// global, return a pointer to its first element. Used for the
+/// per-class parents / CPL / slot_origin arrays passed to
+/// `nod_aot_register_user_class`. Empty arrays return a null pointer
+/// (the shim treats `n == 0` as "no entries").
+fn emit_u32_array_constant<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::builder::Builder<'ctx>,
+    i32_ty: inkwell::types::IntType<'ctx>,
+    values: &[u32],
+    name: &str,
+) -> Result<inkwell::values::PointerValue<'ctx>, AotError> {
+    if values.is_empty() {
+        let ptr_ty = module.get_context().ptr_type(AddressSpace::default());
+        return Ok(ptr_ty.const_null());
+    }
+    let arr_ty = i32_ty.array_type(values.len() as u32);
+    let g = module.add_global(arr_ty, Some(AddressSpace::default()), name);
+    g.set_linkage(Linkage::Private);
+    g.set_constant(true);
+    let elts: Vec<_> = values
+        .iter()
+        .map(|v| i32_ty.const_int(*v as u64, false))
+        .collect();
+    g.set_initializer(&i32_ty.const_array(&elts));
+    let zero = i32_ty.const_zero();
+    let ptr = unsafe {
+        builder
+            .build_gep(arr_ty, g.as_pointer_value(), &[zero, zero], "")
+            .map_err(|e| AotError::Llvm(format!("build_gep u32 array: {e}")))?
+    };
+    Ok(ptr)
 }
 
 /// Sprint 39c — for each [`AotFunctionRegistration`] emit a call to

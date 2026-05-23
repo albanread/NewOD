@@ -46,7 +46,8 @@ pub use symbols::{
 
 // Sprint 39c — registration payload types so `nod-sema` can build
 // the merged-stdlib registrations and hand them to the AOT pipeline.
+// Sprint 40a — extended with user-class registrations.
 pub use aot::{
     AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
-    AotMethodRegistration, AotRegistrations,
+    AotMethodRegistration, AotRegistrations, AotSlotRegistration, AotUserClassRegistration,
 };

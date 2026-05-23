@@ -318,6 +318,259 @@ pub struct AotHandlerEntry {
     pub body: *const u8,
 }
 
+// ─── Sprint 40a — user-defined class registration ─────────────────────────────
+//
+// Sprint 39c shipped registration for methods / top-level functions /
+// blocks. Sprint 40a closes the last gap: user-defined `define class`
+// in AOT user code. The JIT path calls `register_simple_user_class` /
+// `register_mi_user_class` inline as `register_class` runs during
+// lowering; the AOT path replays the same registrations inside the
+// EXE's startup resolver so the freshly-allocated `ClassId`s match
+// the values the compiler baked into IR.
+//
+// ## Layout-correctness
+//
+// Slot offsets are computed by sema during lowering (Sprint 12). The
+// compiler-side persistence layer (`UserClassRegistration` in
+// `nod-sema/src/lower.rs`) snapshots the canonical offsets that the
+// JIT path's `register_user_class_metadata` pinned in the static area.
+// The AOT shim re-uses those offsets verbatim via
+// `register_user_class_metadata`, which trusts its `UserClassSpec`'s
+// `slots` field rather than re-computing.
+//
+// ## Class-id determinism
+//
+// `allocate_user_class_id()` returns monotonic `ClassId(FIRST_USER + N)`
+// in the order it's called. The EXE's `nod_aot_resolve_relocs` calls
+// `nod_aot_register_user_class` once per merged-LM entry in the same
+// order the compiler called `register_class`. With both processes
+// starting from the same seeded `next_user_id` (since stdlib carries
+// no `define class` today), the resulting IDs match. The shim asserts
+// this — a panic here would be a codegen bug, never a user error.
+
+/// Sprint 40a — encoding for [`crate::SlotType`] across the AOT C-ABI
+/// boundary. Keep in lockstep with `nod-sema::encode_slot_type` (the
+/// sender). The codegen layer emits an `i8` per slot; this module
+/// decodes back into the runtime enum.
+const AOT_SLOT_TYPE_INTEGER: u8 = 0;
+const AOT_SLOT_TYPE_DOUBLE_FLOAT: u8 = 1;
+const AOT_SLOT_TYPE_BOOLEAN: u8 = 2;
+const AOT_SLOT_TYPE_CHARACTER: u8 = 3;
+const AOT_SLOT_TYPE_STRING: u8 = 4;
+const AOT_SLOT_TYPE_SYMBOL: u8 = 5;
+const AOT_SLOT_TYPE_VECTOR: u8 = 6;
+const AOT_SLOT_TYPE_OBJECT: u8 = 7;
+const AOT_SLOT_TYPE_CLASS: u8 = 8;
+/// Kept for documentation + decoder symmetry — the decoder's
+/// catch-all arm uses this value implicitly via the `_` pattern, but
+/// keeping the constant named makes the sender side (`nod-sema`'s
+/// `encode_slot_type`) easier to read.
+#[allow(dead_code)]
+const AOT_SLOT_TYPE_TOP: u8 = 9;
+
+/// Sprint 40a — one slot's worth of metadata, laid out for the
+/// codegen-emitted resolver. `#[repr(C)]` matches what
+/// `nod-llvm::aot::emit_user_class_registrations` bakes as a constant
+/// `[AotSlotEntry; N]` array.
+///
+/// Strings (`name`, `init_keyword`) are `(ptr, len)` pairs pointing at
+/// private LLVM globals in the EXE's read-only data section. A null
+/// `init_keyword_ptr` (with `init_keyword_len == 0`) means "no init
+/// keyword". The padding fields keep the struct size aligned with what
+/// LLVM emits for the `struct_type` declared in `emit_user_class_registrations`.
+#[repr(C)]
+pub struct AotSlotEntry {
+    pub name_ptr: *const u8,
+    pub name_len: usize,
+    pub offset: usize,
+    /// One of `AOT_SLOT_TYPE_*` above.
+    pub type_tag: u8,
+    /// Bools as `u8` (0/1) — easier for codegen than packing into a
+    /// bit field.
+    pub required_init_keyword: u8,
+    /// `SlotDefault` encoding: 0 = Unbound, 1 = Value(default_value).
+    pub default_init_tag: u8,
+    pub has_setter: u8,
+    /// 4-byte hole so `type_class_id` lands at a 4-byte boundary
+    /// without LLVM tail-padding shenanigans.
+    pub _pad: u32,
+    /// Payload for `SlotType::Class(_)`; zero otherwise.
+    pub type_class_id: u32,
+    /// Padding so the next pointer (`init_keyword_ptr`) is 8-byte
+    /// aligned regardless of struct base address.
+    pub _pad2: u32,
+    /// Raw `Word` bits for `SlotDefault::Value`; zero for `Unbound`.
+    pub default_init_value: u64,
+    pub init_keyword_ptr: *const u8,
+    pub init_keyword_len: usize,
+}
+
+fn decode_slot_type(tag: u8, class_id: u32) -> crate::SlotType {
+    use crate::SlotType;
+    match tag {
+        AOT_SLOT_TYPE_INTEGER => SlotType::Integer,
+        AOT_SLOT_TYPE_DOUBLE_FLOAT => SlotType::DoubleFloat,
+        AOT_SLOT_TYPE_BOOLEAN => SlotType::Boolean,
+        AOT_SLOT_TYPE_CHARACTER => SlotType::Character,
+        AOT_SLOT_TYPE_STRING => SlotType::String,
+        AOT_SLOT_TYPE_SYMBOL => SlotType::Symbol,
+        AOT_SLOT_TYPE_VECTOR => SlotType::Vector,
+        AOT_SLOT_TYPE_OBJECT => SlotType::Object,
+        AOT_SLOT_TYPE_CLASS => SlotType::Class(crate::ClassId(class_id)),
+        // AOT_SLOT_TYPE_TOP and any out-of-range tag fall through to
+        // Top, the safe over-conservative choice for the GC scanner.
+        _ => SlotType::Top,
+    }
+}
+
+/// Sprint 40a — register a user-defined Dylan class with the runtime.
+/// Called from the codegen-emitted resolver once per
+/// `LoweredModule::user_classes` entry, in the order the compiler
+/// registered them, so class-id allocation in the EXE process mirrors
+/// what the compiler observed.
+///
+/// Arguments mirror the C-ABI shapes the codegen layer can pass
+/// directly (`(ptr, len)` byte slices, raw u32 arrays, a
+/// `#[repr(C)]` slot-entry array).
+///
+/// # Safety
+///
+/// - `name_ptr` + `name_len` must describe a valid UTF-8 byte slice.
+/// - `parents_ptr` + `n_parents` must describe a contiguous `[u32]`.
+/// - `cpl_ptr` + `n_cpl` must describe a contiguous `[u32]` whose
+///   first element equals `expected_class_id` (compiler-side self id).
+/// - `slot_origin_ptr` + `n_slot_origin` must describe a contiguous
+///   `[u32]` of length `n_slots`.
+/// - `slots_ptr` + `n_slots` must describe a contiguous
+///   `[AotSlotEntry]` array; each entry's string pointers (`name_ptr`,
+///   `init_keyword_ptr`) must point at valid UTF-8 byte slices (or be
+///   null for `init_keyword_ptr` when `init_keyword_len == 0`).
+///
+/// # Panics
+///
+/// Panics if `expected_class_id` differs from the freshly-allocated
+/// `ClassId` returned by `register_user_class_metadata`. A mismatch
+/// indicates the AOT registration order drifted from the compile-time
+/// order — a hard codegen bug. Failing fast at startup beats silent
+/// dispatch failure later.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_register_user_class(
+    name_ptr: *const u8,
+    name_len: usize,
+    expected_class_id: u32,
+    parents_ptr: *const u32,
+    n_parents: usize,
+    cpl_ptr: *const u32,
+    n_cpl: usize,
+    slots_ptr: *const AotSlotEntry,
+    n_slots: usize,
+    slot_origin_ptr: *const u32,
+    n_slot_origin: usize,
+    own_slot_count: usize,
+    inherited_slot_count: usize,
+) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len))
+    };
+    // SAFETY: caller asserts the arrays are valid for their lengths.
+    // The codegen layer passes `null` for empty arrays (e.g. a class
+    // with no own slots gets a null `slots_ptr` with `n_slots == 0`);
+    // `slice::from_raw_parts` requires a non-null + aligned pointer
+    // even at length zero, so we route empty arrays through an
+    // explicit empty slice to avoid UB on the null-pointer path.
+    let parents_raw: &[u32] = if n_parents == 0 || parents_ptr.is_null() {
+        &[]
+    } else {
+        // SAFETY: caller guarantees the array is valid for `n_parents`.
+        unsafe { std::slice::from_raw_parts(parents_ptr, n_parents) }
+    };
+    let cpl_raw: &[u32] = if n_cpl == 0 || cpl_ptr.is_null() {
+        &[]
+    } else {
+        // SAFETY: caller guarantees the array is valid for `n_cpl`.
+        unsafe { std::slice::from_raw_parts(cpl_ptr, n_cpl) }
+    };
+    let slot_origin_raw: &[u32] = if n_slot_origin == 0 || slot_origin_ptr.is_null() {
+        &[]
+    } else {
+        // SAFETY: caller guarantees the array is valid for `n_slot_origin`.
+        unsafe { std::slice::from_raw_parts(slot_origin_ptr, n_slot_origin) }
+    };
+    let slots_raw: &[AotSlotEntry] = if n_slots == 0 || slots_ptr.is_null() {
+        &[]
+    } else {
+        // SAFETY: caller guarantees the array is valid for `n_slots`.
+        unsafe { std::slice::from_raw_parts(slots_ptr, n_slots) }
+    };
+
+    let parents: Vec<crate::ClassId> =
+        parents_raw.iter().copied().map(crate::ClassId).collect();
+    let cpl: Vec<crate::ClassId> = cpl_raw.iter().copied().map(crate::ClassId).collect();
+    let slot_origin: Vec<crate::ClassId> =
+        slot_origin_raw.iter().copied().map(crate::ClassId).collect();
+    let slots: Vec<crate::SlotInfo> = slots_raw
+        .iter()
+        .map(|e| {
+            // SAFETY: caller asserts each entry's strings are valid UTF-8.
+            let slot_name = unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(e.name_ptr, e.name_len))
+            };
+            let init_keyword = if e.init_keyword_len == 0 || e.init_keyword_ptr.is_null() {
+                None
+            } else {
+                // SAFETY: caller asserts valid UTF-8.
+                let s = unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        e.init_keyword_ptr,
+                        e.init_keyword_len,
+                    ))
+                };
+                Some(s.to_string())
+            };
+            let default_init = match e.default_init_tag {
+                1 => crate::SlotDefault::Value(crate::Word::from_raw(e.default_init_value)),
+                _ => crate::SlotDefault::Unbound,
+            };
+            crate::SlotInfo {
+                name: slot_name.to_string(),
+                offset: e.offset,
+                type_kind: decode_slot_type(e.type_tag, e.type_class_id),
+                init_keyword,
+                required_init_keyword: e.required_init_keyword != 0,
+                default_init,
+                has_setter: e.has_setter != 0,
+            }
+        })
+        .collect();
+
+    // Build the UserClassSpec. The CPL's first entry IS the compiler's
+    // expected class id — `register_user_class_metadata` doesn't rewrite
+    // the cpl[0] sentinel because we provided the real id. The
+    // sema-side persistence already substituted the real id into cpl[0].
+    let parent = parents.first().copied();
+    let spec = crate::UserClassSpec {
+        name: name.to_string(),
+        parent,
+        parents,
+        cpl,
+        slots,
+        slot_origin,
+        own_slot_count,
+        inherited_slot_count,
+    };
+    let (assigned_id, _md_ptr) = crate::register_user_class_metadata(spec);
+    assert_eq!(
+        assigned_id.0, expected_class_id,
+        "nod_aot_register_user_class: class id drift — compiler expected \
+         {expected_class_id} but runtime allocated {} for class `{name}`. \
+         This indicates the AOT registration sequence diverged from the \
+         compile-time sequence; the codegen path is buggy.",
+        assigned_id.0
+    );
+}
+
 /// Sprint 39c — register a `block` form's lifted thunks with the
 /// global block registry. Mirrors `register_block_fns` but accepts
 /// raw inputs the codegen-emitted resolver can pass without

@@ -35,16 +35,15 @@
 //!
 //! ## User-defined classes
 //!
-//! `define class` in user source is **deferred to a future sprint**.
-//! Sprint 39c only ensures the stdlib's methods reach the dispatch
-//! table at AOT-runtime; user-class registration requires baking the
-//! slot / CPL / parent metadata into the EXE (the
-//! `register_user_class_metadata` machinery is non-trivial to
-//! serialize), which is its own sprint slice. The stdlib doesn't
-//! currently declare any user classes (every built-in class is
-//! seeded in Rust via `ensure_*_registered`), so Sprint 39c can land
-//! the headline `aot_dispatch` (stdlib-defined methods on seed
-//! classes) without it.
+//! Sprint 40a lands user-defined `define class` registration in the
+//! AOT pipeline. The `aot_user_classes_and_dispatch` test below
+//! exercises the full slot / CPL / parent metadata serialisation
+//! into the EXE (a per-class `nod_aot_register_user_class` call
+//! baked into `nod_aot_resolve_relocs` at startup, fed by the
+//! `LoweredModule::user_classes` capture). Class-id determinism is
+//! preserved by registering in compile-time order in both processes
+//! (compiler-side via `register_class`; EXE-side via the resolver
+//! walking the persisted list).
 //!
 //! ## User-defined `for (i from N to M)`
 //!
@@ -257,6 +256,60 @@ fn aot_range_size_through_helper() {
     let (stdout, stderr, code) = build_and_run("range-helper", source);
     assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
     assert_eq!(stdout, "11\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// Sprint 40a — user-defined classes through the AOT pipeline.
+/// Headline test: `<shape>` → `<circle>` / `<square>` two-level
+/// hierarchy with `init-keyword:` slots, a user-declared generic
+/// `area`, two specialised methods, `make` invocation, and dispatch
+/// on user-class instances.
+///
+/// This exercises **everything** Sprint 40a added:
+///   * The `LoweredModule::user_classes` capture in `register_class`.
+///   * The merge path picking the user's classes through to
+///     `build_aot_registrations`.
+///   * The codegen-emitted `nod_aot_register_user_class` calls in
+///     `nod_aot_resolve_relocs` (running BEFORE method registrations
+///     so the dispatch table sees live class metadata for `<circle>`
+///     / `<square>` when it walks `area`'s specialisers).
+///   * The runtime shim reconstructing a `UserClassSpec` from the
+///     baked C-ABI inputs and calling `register_user_class_metadata`.
+///   * Slot init-keywords (`radius:` / `side:`) flowing through to
+///     `nod_make`'s slot lookup so `make(<circle>, radius: 5)`
+///     deposits the radius into the right slot.
+///   * Dispatch on user classes (the existing Sprint 38e inline
+///     cache + Sprint 12 class metadata) reaching `area`'s two
+///     bodies via the merged dispatch table.
+#[test]
+#[ignore]
+#[serial]
+fn aot_user_classes_and_dispatch() {
+    let source = "Module: user-class\n\n\
+        define class <shape> (<object>) end class;\n\
+        define class <circle> (<shape>)\n  \
+            slot circle-radius :: <integer>, init-keyword: radius:;\n\
+        end class;\n\
+        define class <square> (<shape>)\n  \
+            slot square-side :: <integer>, init-keyword: side:;\n\
+        end class;\n\
+        define generic area (shape :: <shape>) => (n :: <integer>);\n\
+        define method area (c :: <circle>) => (n :: <integer>)\n  \
+            3 * circle-radius(c) * circle-radius(c)\n\
+        end method;\n\
+        define method area (s :: <square>) => (n :: <integer>)\n  \
+            square-side(s) * square-side(s)\n\
+        end method;\n\
+        define function main () => ()\n  \
+            let c = make(<circle>, radius: 5);\n  \
+            let s = make(<square>, side: 4);\n  \
+            format-out(\"circle: %d, square: %d\\n\", area(c), area(s));\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("user-class", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(
+        stdout, "circle: 75, square: 16\n",
+        "stdout mismatch; stderr=\n{stderr}"
+    );
 }
 
 /// Sprint 30's MessageBoxW headline reborn for AOT. Shows a real
