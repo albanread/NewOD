@@ -36,6 +36,16 @@ compile_error!(
     "nod-runtime: one of `newgc-backend` (default) or `semispace-backend` must be enabled."
 );
 
+// Sprint 39a — AOT entry surface. Defines `nod_runtime_init` and
+// `nod_aot_main_wrapper`, the two `#[unsafe(no_mangle)]` extern symbols
+// the codegen-emitted `i32 @main()` stub calls. Pure code; depends on
+// every other module being already initialisable.
+mod aot;
+// Sprint 39a — separate `.obj` carrying the `nod_user_main` default
+// stub. Lives outside `aot` so MSVC's archive-extraction rule can drop
+// it when a real AOT EXE supplies its own `nod_user_main`. See the
+// file-level doc for the long-form rationale.
+mod aot_user_main_stub;
 mod c_types;
 mod callbacks;
 mod classes;
@@ -67,6 +77,10 @@ mod vectors;
 mod word;
 mod wrapper;
 
+// Sprint 39a — AOT entry-point symbols. Re-exported so test code can
+// reference them (the `#[unsafe(no_mangle)]` extern surface is what the
+// linker sees; the `pub use` is just to give cargo-test callers a path).
+pub use aot::{nod_aot_main_wrapper, nod_runtime_init};
 pub use classes::{
     ClassId, ClassMetadata, ClassTable, LayoutFn, ScanFn, SizeFn, SlotDefault, SlotInfo,
     SlotType, _reset_user_classes_for_tests, allocate_user_class_id, class_metadata_for,

@@ -5,6 +5,10 @@
 //! back raw function pointers. No `gc.statepoint`, no opt passes — those
 //! land in Sprints 11 and 11/12 respectively.
 
+// Sprint 39a — AOT support: entry-stub injection + object-file emission.
+// Imported here so `nod-driver`'s `build` subcommand can call
+// `nod_llvm::aot::emit_aot_object` directly.
+pub mod aot;
 pub mod cache;
 pub mod codegen;
 pub mod jit;
@@ -30,6 +34,10 @@ pub use jit::{Jit, JitError, bitcode_to_ir_text};
 /// bitcode into; the cold-compile path threads one through
 /// `eval_wrapped_source`.
 pub use inkwell::context::Context as LlvmContext;
+/// Sprint 39a — re-export `OptimizationLevel` so `nod-driver` can pass
+/// it through to `aot::emit_aot_object` without an explicit `inkwell`
+/// dependency in `nod-driver`'s `Cargo.toml`.
+pub use inkwell::OptimizationLevel;
 pub use symbols::{
     MANIFEST_VERSION, ModuleManifest, RelocEntry, RelocKind, cache_slot_symbol, class_md_symbol,
     generic_symbol, imm_false_symbol, imm_false_wrapper_symbol, imm_nil_symbol, imm_true_symbol,

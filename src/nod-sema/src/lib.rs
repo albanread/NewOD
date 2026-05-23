@@ -713,6 +713,37 @@ fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// Sprint 39a — full parse + macro-expand + lower of a Dylan source
+/// file, returning the [`LoweredModule`] ready for codegen + AOT
+/// object emission. The pipeline matches `run_function_to_i64`'s
+/// front-end but stops before JIT installation; the driver hands the
+/// resulting module to `nod_llvm::aot::emit_aot_object`.
+///
+/// Includes `stdlib::ensure_loaded()` so the stdlib's macros and seed
+/// generics are present in the parser + lowering tables before the
+/// user file is processed.
+///
+/// **Sprint 39a scope**: the lowered module is suitable for AOT only
+/// when it doesn't reference Win32 APIs (Sprint 39b) and doesn't rely
+/// on stdlib bodies being separately compiled (Sprint 39c — for now,
+/// every AOT build inlines the entire stdlib into the user module's
+/// IR, which is wasteful but correct).
+pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
+    stdlib::ensure_loaded();
+    let src = std::fs::read_to_string(path).map_err(EvalError::Io)?;
+    let mut sm = nod_reader::SourceMap::new();
+    let file_id = sm
+        .add(path.to_path_buf(), src.clone())
+        .map_err(EvalError::SourceMap)?;
+    let toks = nod_reader::lex(&src, file_id);
+    let pre = nod_reader::scan_preamble(&src);
+    let mut module =
+        parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
+    expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
+    let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    Ok(lm)
+}
+
 /// Sprint 31: parse the same `items + expr` shape as
 /// [`eval_expr_with_items_to_string`] but stop after lowering and
 /// return the module's c-function bindings. Tests use this to inspect

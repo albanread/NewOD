@@ -373,9 +373,12 @@ dependencies = [
 name = "nod-driver"
 version = "0.0.1"
 dependencies = [
+ "cc",
  "clap",
+ "nod-llvm",
  "nod-namespace",
  "nod-reader",
+ "nod-runtime",
  "nod-sema",
 ]
 

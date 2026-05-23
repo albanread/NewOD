@@ -1,0 +1,368 @@
+//! Sprint 39a — ahead-of-time (AOT) entry surface.
+//!
+//! When a Dylan program is linked as a standalone `.exe` (Sprint 39a's
+//! goal, see `nod-driver`'s `build` subcommand), Rust's `cargo run`
+//! lifecycle is no longer in the picture: the OS loader hands control to
+//! `mainCRTStartup` which calls `int main(void)`. That `main` is emitted
+//! by `nod-llvm` as a tiny LLVM-IR stub that does two things:
+//!
+//! 1. Call `nod_runtime_init()` (defined here) to eagerly run every
+//!    initialisation the JIT path defers until first use — class
+//!    registration, condition classes, the C-FFI error type, etc.
+//! 2. Call the user's Dylan `main` (renamed to `nod_user_main` by the
+//!    AOT post-processing pass in `nod-llvm::aot`) and propagate its
+//!    `i64` return value as the process exit code.
+//!
+//! Both entry points are `extern "C-unwind"` so an uncaught Dylan
+//! condition's panic-based NLX (Sprint 19) unwinds the stack normally
+//! and Rust's default panic handler aborts the process with a
+//! diagnostic — exactly the same observable behaviour as a panicking
+//! Rust binary, which is the right default for a Dylan EXE that didn't
+//! install its own top-level handler.
+//!
+//! ## Why this lives in `nod-runtime` (not `nod-driver`)
+//!
+//! The wrapper symbol (`nod_aot_main_wrapper`) must be reachable by
+//! the linker when building the user's EXE. The linker pulls in
+//! `nod_runtime.lib` (the Sprint 39a Phase A staticlib output), so
+//! defining the wrapper here means the user's emitted `i32 @main()`
+//! stub finds it via a normal static-library link.
+//!
+//! ## Idempotency
+//!
+//! `nod_runtime_init()` may be called more than once (e.g. a host
+//! embedding the staticlib who isn't sure whether a previous Dylan EXE
+//! linked into the same process already ran it). Every `ensure_*`
+//! helper it calls is already idempotent — they use `OnceLock`,
+//! `LazyLock`, or a `_REGISTERED` static — so double-calling here is
+//! safe. The first call pays the cost; subsequent calls are O(1).
+//!
+//! ## Why no `catch_unwind`
+//!
+//! Sprint 19's `block`/`exception`/`cleanup` is implemented on top of
+//! Rust's `panic_unwind` machinery: an unhandled `signal()` panics up
+//! to the nearest `nod_run_block` frame. If `nod_aot_main_wrapper`
+//! wrapped `nod_user_main()` in `catch_unwind`, an uncaught condition
+//! would be swallowed and the EXE would exit with a misleading status
+//! code. The right semantics — and the same as the JIT path — is to
+//! let the panic propagate out of `main`, where the standard Rust
+//! panic handler logs the message and aborts with exit code 101.
+
+// ─── Sprint 39a — relocation resolvers ────────────────────────────────────
+//
+// The JIT path resolves Sprint 38's `RelocKind` entries via
+// `LLVMAddGlobalMapping`: each named external global is bound to a
+// current-process slot address at MCJIT-finalise time. The AOT path
+// can't do that — the codegen-emitted `.obj` ships with strong storage
+// for each global, and we populate that storage at startup via these
+// C-ABI helpers. `nod-llvm::aot::emit_aot_entry_stubs` rewrites the
+// IR to emit defining `i64 0` storage per entry, and adds a synthesised
+// `nod_aot_resolve_relocs` LLVM function that calls one of these
+// helpers per entry before `nod_user_main` runs.
+//
+// Each helper:
+//   1. Computes the same per-process slot value the JIT path would
+//      resolve via `resolve_reloc_kind`.
+//   2. Loads that value (a `u64`).
+//   3. Stores it into the user's `slot` storage.
+//
+// The user's IR then does `load i64, ptr @<sym>` against that storage
+// and observes the same bits the JIT path would observe.
+
+/// Sprint 39a — copy the runtime's `#t` Word bits into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_imm_true(slot: *mut u64) {
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::imm_true_slot_addr() };
+}
+
+/// Sprint 39a — copy the runtime's `#f` Word bits into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_imm_false(slot: *mut u64) {
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::imm_false_slot_addr() };
+}
+
+/// Sprint 39a — copy the runtime's `nil` Word bits into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_imm_nil(slot: *mut u64) {
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::imm_nil_slot_addr() };
+}
+
+/// Sprint 39a — copy the runtime's `#f` untagged-wrapper bits into
+/// `slot`. Used by codegen's branchless class-id read fallback.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_imm_false_wrapper(slot: *mut u64) {
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::imm_false_wrapper_slot_addr() };
+}
+
+/// Sprint 39a — copy the metadata pointer for `class_id` into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_class_md(slot: *mut u64, class_id: u32) {
+    let id = crate::ClassId(class_id);
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::class_metadata_slot_addr(id) };
+}
+
+/// Sprint 39a — intern `text` as a `<byte-string>` literal in the
+/// runtime's literal pool, then store its tagged-Word bits into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`. `text` +
+/// `len` must describe a valid UTF-8 byte slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_strlit(slot: *mut u64, text: *const u8, len: usize) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(text, len)) };
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::intern_string_literal_slot_addr(s) };
+}
+
+/// Sprint 39a — intern `name` as a `<symbol>` literal and store its
+/// tagged-Word bits into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`. `name` +
+/// `len` must describe a valid UTF-8 byte slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_symlit(slot: *mut u64, name: *const u8, len: usize) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) };
+    // SAFETY: per caller.
+    unsafe { *slot = *crate::intern_symbol_literal_slot_addr(s) };
+}
+
+/// Sprint 39a — allocate (or look up) a cache slot keyed on
+/// `(key_prefix, site_id)` and store its address into `slot`.
+///
+/// # Safety
+///
+/// `slot` must point at a writable, naturally-aligned `u64`.
+/// `key_prefix` + `key_prefix_len` must describe a valid UTF-8 byte
+/// slice (the 16-char hex prefix codegen embedded in symbol names).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_cache_slot(
+    slot: *mut u64,
+    key_prefix: *const u8,
+    key_prefix_len: usize,
+    site_id: u64,
+) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let kp = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(key_prefix, key_prefix_len))
+    };
+    let v: &'static u64 = crate::cache_slot_slot_addr(kp, site_id);
+    // SAFETY: per caller.
+    unsafe { *slot = *v };
+}
+
+/// Sprint 39a — allocate (or look up) the `<generic>` function for
+/// `name` and store its address into `slot`.
+///
+/// # Safety
+/// `slot` must point at a writable, naturally-aligned `u64`. `name` +
+/// `name_len` must describe a valid UTF-8 byte slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_set_generic(
+    slot: *mut u64,
+    name: *const u8,
+    name_len: usize,
+) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, name_len)) };
+    let v: &'static u64 = crate::generic_function_slot_addr(s);
+    // SAFETY: per caller.
+    unsafe { *slot = *v };
+}
+
+/// Sprint 39a — eagerly perform every initialisation the JIT path defers
+/// until first use. Called from the codegen-emitted `i32 @main()` stub
+/// (via [`nod_aot_main_wrapper`]) before the user's Dylan body runs.
+///
+/// Idempotent. Each `ensure_*_registered` helper is independently
+/// idempotent (backed by `OnceLock` / `LazyLock`); the outer
+/// `LazyLock<()>` guard collapses repeated calls to a single atomic
+/// load on the steady state.
+///
+/// # Why eager
+///
+/// In the JIT path each subsystem registers its classes lazily on first
+/// Dylan use, threaded through `nod-sema` lowering. In the AOT path the
+/// codegen-emitted `@main` enters the user's body directly — no
+/// lowering happens at run time, so the lazy hooks never fire. Calling
+/// every `ensure_*` here forces the same final state the JIT would
+/// reach after touching every subsystem.
+///
+/// # Stability
+///
+/// The set of subsystems below mirrors what `nod-sema`'s lowering pass
+/// touches when it sees `define class`, `define condition`, `define
+/// c-function`, etc. If a future sprint adds a new subsystem with its
+/// own `ensure_*_registered`, this list must grow to match — otherwise
+/// the AOT path will diverge from the JIT path for programs using the
+/// new feature. The Sprint 39a invariant is "every JIT-discoverable
+/// runtime feature is eagerly registered by `nod_runtime_init`".
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn nod_runtime_init() {
+    use std::sync::LazyLock;
+
+    static INIT: LazyLock<()> = LazyLock::new(|| {
+        // ORDER MATTERS — class IDs are content-deterministic only if
+        // the registration sequence matches the codegen-time order. The
+        // codegen process loads `stdlib.dylan` through `nod-sema`'s
+        // `stdlib::load_stdlib`, which calls (in order):
+        //   1. `ensure_conditions_registered`
+        //   2. `ensure_collections_registered`
+        //   3. `ensure_tables_registered`
+        //   4. `ensure_structs_registered`
+        // Then `lower_module_full` (called from inside the stdlib loader
+        // for stdlib.dylan, and once more for the user's module) calls:
+        //   5. `ensure_functions_registered`
+        //   6. `ensure_closures_registered`
+        //   7. `ensure_c_types_registered`
+        // And `define c-function` lowering calls:
+        //   8. `ensure_c_ffi_error_registered` (lazy — only if user code
+        //       declares a c-function, which Sprint 39a forbids anyway)
+        //
+        // Float types, structs (extended), COM, operator shims, and
+        // floats register additional seed classes; we replicate that
+        // pre-Sprint-39c-stdlib-pre-compile order here so seed class IDs
+        // align with what codegen baked into the manifest.
+        //
+        // Any drift from the codegen-time order produces silent
+        // `ClassId` mismatches — `make(<range>, …)` resolves the wrong
+        // class metadata, dispatch on `<range>` fails. This was Sprint
+        // 39a's `aot_dispatch` red gate during initial bringup.
+        crate::conditions::ensure_registered();
+        crate::collections::ensure_registered();
+        crate::tables::ensure_registered();
+        crate::structs::ensure_structs_registered();
+        crate::functions::ensure_registered();
+        crate::closures::ensure_registered();
+        crate::c_types::ensure_registered();
+        // Float-type seeds + c-ffi-error are downstream of the above —
+        // their IDs only matter if user code touches them, which Sprint
+        // 39a's hello-world doesn't but `aot_arithmetic` /
+        // `aot_dispatch` might via the `<float>` / `<c-ffi-error>`
+        // baked into stdlib lowering paths.
+        crate::c_types::ensure_float_types_registered();
+        crate::winffi::ensure_c_ffi_error_registered();
+        // Sprint 35 — COM-shim seed classes register AFTER c-ffi-error
+        // because `<c-handle>` (a COM-shim seed) extends `<c-pointer>`
+        // which is in `c_types`.
+        #[cfg(windows)]
+        crate::com_shim::ensure_com_types_registered();
+        // Sprint 21 — operator shim *functions* (`+`, `*`, `<`, …) are
+        // a registry of `<function>` instances, not classes. Order
+        // doesn't affect ClassId allocation; run last.
+        crate::functions::ensure_operator_shims_registered();
+        // Touch the literal-pool singleton so `#t`/`#f`/`nil` Words
+        // exist before the resolver populates the immediate slots.
+        // SAFETY: `nod_nil` is `extern "C" fn() -> u64`, infallible.
+        let _ = unsafe { crate::nod_nil() };
+    });
+
+    LazyLock::force(&INIT);
+}
+
+unsafe extern "C-unwind" {
+    /// Sprint 39a — the user's Dylan top-level `main`, renamed by
+    /// `nod-llvm::aot::emit_aot_entry_stubs` from the Dylan-source name
+    /// (`main`) to a namespaced symbol the AOT-emitted `i32 @main()`
+    /// stub can call without name-collision against the C `main`.
+    ///
+    /// Signature: `() -> i64`. The Dylan return value (`#t`, `#f`,
+    /// `nil`, fixnum, or any tagged Word) is cast to `i32` and returned
+    /// as the process exit code. Most Dylan `main` functions return
+    /// `#f` (the unit-like value) which is a non-zero Word — but
+    /// codegen emits a stub that **discards** the user's return value
+    /// and returns 0 unconditionally, so the exit code is always
+    /// success unless the user's `main` panics out.
+    ///
+    /// The actual link resolution happens at EXE-link time: `link.exe`
+    /// pulls in the user's `.obj` (which defines `nod_user_main`) and
+    /// `nod_runtime.lib` (which references it as `extern`).
+    fn nod_user_main() -> i64;
+}
+
+/// Sprint 39a — the actual entry-point body invoked from the
+/// codegen-emitted `i32 @main()` LLVM stub.
+///
+/// Runs eager initialisation, then calls the user's renamed Dylan
+/// `main`. The return value is the process exit code; we return `0`
+/// unconditionally because the Dylan `main` body's natural return is
+/// a Word (e.g. `#f`'s bit pattern), which is meaningless as a Unix-
+/// style exit code. A future sprint can extend the Dylan ABI to let
+/// `main` declare an integer return type and surface it here; Sprint
+/// 39a's `hello.dylan` returns `#f` and exits 0, which matches the
+/// brief.
+///
+/// # Why no `catch_unwind`
+///
+/// Sprint 19's NLX panics out of unhandled `signal()` calls. Catching
+/// the panic here would swallow the diagnostic — better to let Rust's
+/// default panic handler abort the process with the usual `thread
+/// 'main' panicked at ...` message. See the module-level doc for the
+/// long-form rationale.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn nod_aot_main_wrapper() -> i32 {
+    nod_runtime_init();
+    // SAFETY: `nod_user_main` is link-time-resolved from the user's
+    // `.obj` produced by `nod-llvm::aot::emit_object_file`. The AOT
+    // post-processing pass guarantees a symbol of that exact name + the
+    // `() -> i64` signature is present in the linked object.
+    let _rc = unsafe { nod_user_main() };
+    // The Dylan return value is a tagged Word, not a Unix exit code.
+    // Sprint 39a returns 0 on a normal (non-panic) exit; an uncaught
+    // Dylan condition panics out of `nod_user_main` before this line.
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Double-call must be a no-op. The `LazyLock` guard collapses
+    /// repeat calls to an atomic load; the individual `ensure_*`
+    /// helpers each have their own idempotency story (covered by their
+    /// own tests in their respective modules). This test just verifies
+    /// the outer dispatch.
+    #[test]
+    fn nod_runtime_init_is_idempotent() {
+        nod_runtime_init();
+        nod_runtime_init();
+        nod_runtime_init();
+        // No panic, no double-registration — and the class table
+        // observes every seed class. We probe one as a smoke check.
+        assert!(
+            crate::classes::find_class_id_by_name("<c-ffi-error>").is_some(),
+            "expected <c-ffi-error> to be registered after nod_runtime_init"
+        );
+    }
+
+    /// `nod_aot_main_wrapper` calls `nod_runtime_init` then
+    /// `nod_user_main`; in tests `nod_user_main` is the stub above
+    /// returning 0. End-to-end: wrapper returns 0.
+    #[test]
+    fn nod_aot_main_wrapper_returns_zero_via_stub() {
+        let rc = nod_aot_main_wrapper();
+        assert_eq!(rc, 0);
+    }
+}

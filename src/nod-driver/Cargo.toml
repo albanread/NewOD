@@ -21,3 +21,17 @@ clap          = { workspace = true }
 nod-reader    = { path = "../nod-reader" }
 nod-namespace = { path = "../nod-namespace" }
 nod-sema      = { path = "../nod-sema", default-features = false }
+# Sprint 39a — the `build` subcommand needs to emit object files and
+# locate the dual-output staticlib produced by `nod-runtime`. We depend
+# on `nod-llvm` for its `aot::emit_aot_object` helper and the LLVM
+# `Context`. `nod-runtime` itself is a transitive dep through `nod-llvm`
+# but adding it explicitly here keeps the resolver path obvious.
+nod-llvm      = { path = "../nod-llvm", default-features = false }
+nod-runtime   = { path = "../nod-runtime", default-features = false }
+# Sprint 39a — `cc-rs`'s `Tool` finder locates MSVC's `link.exe` across
+# every Visual Studio install layout (VS 2017 vswhere, VS 2019/22 standard
+# paths, Build Tools, env-var override). Per the Sprint 39a brief, this
+# dependency is **only** added to `nod-driver`; `nod-llvm` and
+# `nod-runtime` stay dependency-clean. Pinned at 1.x — cc-rs is on a long
+# stable train and the workspace's other no-dep crates never see it.
+cc            = "1"
