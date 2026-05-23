@@ -380,6 +380,7 @@ dependencies = [
  "nod-reader",
  "nod-runtime",
  "nod-sema",
+ "nod-winapi",
 ]
 
 [[package]]
@@ -458,6 +459,7 @@ dependencies = [
 name = "nod-tests"
 version = "0.0.1"
 dependencies = [
+ "cc",
  "nod-dfm",
  "nod-llvm",
  "nod-macro",

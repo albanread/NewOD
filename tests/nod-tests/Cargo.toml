@@ -31,3 +31,7 @@ nod-llvm = { path = "../../src/nod-llvm", default-features = false }
 nod-runtime = { path = "../../src/nod-runtime", default-features = false }
 nod-winapi = { path = "../../src/nod-winapi" }
 serial_test = "3"
+# Sprint 39b — `aot_win32.rs` uses `cc::windows_registry::find` to
+# locate dumpbin.exe in whatever MSVC install layout the dev box has.
+# Mirrors the dep that nod-driver itself uses for link.exe location.
+cc = "1"

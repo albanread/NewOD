@@ -133,6 +133,25 @@ fn main() -> ExitCode {
 // minimal: no -O dial, no cross-compile, no incremental builds. A
 // future sprint can layer those on without disturbing the shape here.
 
+/// Sprint 39b — walk the manifest's `RelocKind::StubEntry` rows and
+/// return the unique DLL names referenced (case-insensitive dedup).
+/// The driver then asks `nod_winapi::import_lib_for_dll` for each one
+/// and appends the resulting `.lib` to the `link.exe` arg list.
+///
+/// Returns DLLs in the lowercased form `nod-winapi` expects. Ordering
+/// is deterministic (lowercase-sorted) so verbose link.exe args /
+/// debug output are stable across runs.
+fn collect_user_dlls(manifest: &nod_llvm::ModuleManifest) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for entry in &manifest.entries {
+        if let nod_llvm::RelocKind::StubEntry { dll, .. } = &entry.kind {
+            set.insert(dll.to_ascii_lowercase());
+        }
+    }
+    set.into_iter().collect()
+}
+
 /// Default `<input stem>.exe` next to the input file. Mirrors `rustc`'s
 /// behaviour when `-o` is omitted.
 fn default_exe_path(input: &std::path::Path) -> PathBuf {
@@ -217,18 +236,11 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
             return ExitCode::from(1);
         }
     };
-    // Sprint 39a doesn't support `define c-function` yet — that's
-    // Sprint 39b. Fail fast with a clear message rather than letting
-    // `link.exe` surface a cryptic "unresolved external".
-    if !lm.c_function_stub_table.is_empty() {
-        eprintln!(
-            "nod build: `define c-function` is not supported in Sprint 39a \
-             (the user's program declares {} c-function bindings). \
-             Win32 imports are scheduled for Sprint 39b.",
-            lm.c_function_stub_table.len()
-        );
-        return ExitCode::from(2);
-    }
+    // Sprint 39b — `define c-function` (and bare-name Win32 calls
+    // materialized via Sprint 31's hook) are supported. Each unique
+    // `(dll, symbol)` reference becomes a manifest `StubEntry` row;
+    // we collect the DLLs from the manifest after codegen and pass
+    // the matching import libraries to `link.exe`.
 
     // Sprint 39a: the user's `define function main` must be present
     // for `nod-llvm::aot::emit_aot_entry_stubs` to find it. Surface a
@@ -267,6 +279,14 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
         p.set_extension("obj");
         p
     };
+
+    // Sprint 39b — collect the unique DLLs referenced by `RelocKind::StubEntry`
+    // entries BEFORE handing the manifest to `emit_aot_object`. The
+    // returned set drives the extra `kernel32.lib` / `user32.lib` / etc.
+    // import-library args we pass to `link.exe`. Manifest entries are
+    // immutable across emission, so reading them here is order-independent.
+    let user_dlls = collect_user_dlls(&manifest);
+
     if let Err(e) =
         nod_llvm::aot::emit_aot_object(&module, &manifest, &obj_path, OptimizationLevel::Default)
     {
@@ -327,6 +347,23 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
     link_cmd.arg("/NXCOMPAT");
     link_cmd.arg("/DYNAMICBASE");
     link_cmd.arg("/HIGHENTROPYVA");
+    // Sprint 39b — pass an import lib for every DLL the user's program
+    // references via `define c-function` / bare-name Win32 calls. The
+    // Windows loader resolves these symbols from the named DLLs at EXE
+    // load, populating the IAT before any user code runs. Duplicates
+    // against the hard-coded list below are harmless — `link.exe`
+    // dedupes by file name.
+    for dll in &user_dlls {
+        let Some(lib) = nod_winapi::import_lib_for_dll(dll) else {
+            eprintln!(
+                "nod build: WARN: cannot derive import lib for DLL `{dll}` \
+                 (manifest entry skipped). The linker will likely surface \
+                 an unresolved external for this DLL's exports."
+            );
+            continue;
+        };
+        link_cmd.arg(&lib);
+    }
     // The libs Rust's MSVC std + windows-sys need at link time. cc-rs's
     // discovered link.exe Command already has %LIB% set so these
     // resolve from the SDK's lib directory.

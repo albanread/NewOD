@@ -188,3 +188,57 @@ pub fn stats() -> Stats {
 pub fn embedded_blob_bytes() -> &'static [u8] {
     WINAPI_BLOB
 }
+
+/// Sprint 39b — map a Windows DLL name to its MSVC import-library name.
+///
+/// The mapping is purely mechanical: lowercase the DLL name and replace
+/// the trailing `.dll` with `.lib`. `kernel32.dll` -> `kernel32.lib`,
+/// `USER32.DLL` -> `user32.lib`, `Ole32.dll` -> `ole32.lib`.
+///
+/// Returns `None` if `dll` does not end with `.dll` (case-insensitive)
+/// or is otherwise empty. The actual existence of the resulting `.lib`
+/// on the linker's search path is **not** checked here — the linker
+/// surfaces a clear error if a required import lib isn't present in
+/// `%LIB%`, which is the right place for that diagnostic.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(nod_winapi::import_lib_for_dll("kernel32.dll"), Some("kernel32.lib".to_string()));
+/// assert_eq!(nod_winapi::import_lib_for_dll("USER32.DLL"), Some("user32.lib".to_string()));
+/// assert_eq!(nod_winapi::import_lib_for_dll("not_a_dll"), None);
+/// ```
+pub fn import_lib_for_dll(dll: &str) -> Option<String> {
+    let lower = dll.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".dll")?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(format!("{stem}.lib"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_lib_for_dll_basic() {
+        assert_eq!(import_lib_for_dll("kernel32.dll"), Some("kernel32.lib".to_string()));
+        assert_eq!(import_lib_for_dll("user32.dll"), Some("user32.lib".to_string()));
+        assert_eq!(import_lib_for_dll("ole32.dll"), Some("ole32.lib".to_string()));
+    }
+
+    #[test]
+    fn import_lib_for_dll_case_insensitive() {
+        assert_eq!(import_lib_for_dll("KERNEL32.DLL"), Some("kernel32.lib".to_string()));
+        assert_eq!(import_lib_for_dll("User32.Dll"), Some("user32.lib".to_string()));
+    }
+
+    #[test]
+    fn import_lib_for_dll_rejects_non_dll() {
+        assert_eq!(import_lib_for_dll("kernel32"), None);
+        assert_eq!(import_lib_for_dll(""), None);
+        assert_eq!(import_lib_for_dll(".dll"), None);
+        assert_eq!(import_lib_for_dll("foo.exe"), None);
+    }
+}

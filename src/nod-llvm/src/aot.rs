@@ -24,15 +24,17 @@
 //! function. The trade-off — re-walking the module to find `main` —
 //! is negligible because module sizes are small at this sprint stage.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use inkwell::OptimizationLevel;
 use inkwell::AddressSpace;
+use inkwell::DLLStorageClass;
 use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::values::BasicMetadataValueEnum;
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, GlobalValue};
 
 use crate::jit::JitError;
 use crate::symbols::{ModuleManifest, RelocKind};
@@ -161,15 +163,28 @@ pub fn emit_aot_entry_stubs<'ctx>(
 
     let ctx = module.get_context();
 
-    // Step 3: convert every manifest-mentioned external global into a
-    // defining `i64 0` global with internal linkage. The runtime
-    // resolver (synthesised below) populates each at startup.
-    convert_externals_to_defining_storage(module, manifest)?;
+    // Step 3a: emit dllimport externs + static `ApiStubEntry` globals
+    // for every `RelocKind::StubEntry`. The Windows loader fills the
+    // dllimport's IAT slot before any code in this EXE runs; our
+    // resolver later copies `&<symbol>` (the linker-emitted thunk) into
+    // each entry's `fn_ptr` field. Returns a `(symbol → stub-entry-global,
+    // dllimport-fn)` map so step 3b and step 4 can reach them.
+    let stub_entries = emit_stub_entry_globals(module, manifest)?;
+
+    // Step 3b: convert every manifest-mentioned external global into a
+    // defining `i64` global with internal linkage. For non-StubEntry
+    // kinds the initialiser is zero (resolver populates at startup).
+    // For StubEntry the initialiser is `ptrtoint(@__nod_stub_entry_X to i64)`
+    // — a constant expression LLVM can fold, so the slot's contents
+    // start out pointing at the static stub-entry global from the
+    // first instruction of `main()` onward.
+    convert_externals_to_defining_storage(module, manifest, &stub_entries)?;
 
     // Step 4: emit the resolver function. It calls a per-RelocKind
     // C-ABI helper for each manifest entry, passing the global's
-    // address and any per-kind parameters.
-    let resolver_fn = emit_resolve_relocs_function(module, manifest)?;
+    // address and any per-kind parameters. For StubEntry the resolver
+    // stores `&<dllimport_symbol>` into each entry's `fn_ptr` field.
+    let resolver_fn = emit_resolve_relocs_function(module, manifest, &stub_entries)?;
 
     // Step 5: emit `i32 @main()` that calls the resolver, then the
     // wrapper, then returns the wrapper's rc.
@@ -208,16 +223,23 @@ pub fn emit_aot_entry_stubs<'ctx>(
     Ok(())
 }
 
-/// Sprint 39a — walk the manifest and convert each external global into
-/// a defining `i64 0` global with internal linkage. The runtime-side
-/// resolver (emitted by [`emit_resolve_relocs_function`]) populates
-/// each at startup.
+/// Sprint 39a/b — walk the manifest and convert each external global into
+/// a defining `i64` global with internal linkage. For most kinds the
+/// runtime-side resolver (emitted by [`emit_resolve_relocs_function`])
+/// populates each at startup. For `StubEntry` kinds the initialiser is
+/// already `ptrtoint(@__nod_stub_entry_X to i64)` — the linker resolves
+/// that constant expression at link time, so the slot's contents start
+/// out pointing at the static `ApiStubEntry` from the first instruction
+/// of `main()`. The Windows loader has already populated the IAT slot
+/// the entry's `fn_ptr` will reference by the time `nod_aot_resolve_relocs`
+/// runs.
 ///
 /// Skips symbols that aren't actually present in the module (this
 /// happens when optimisation eliminates a load through the global).
 fn convert_externals_to_defining_storage<'ctx>(
     module: &Module<'ctx>,
     manifest: &ModuleManifest,
+    stub_entries: &StubEntryInfoMap<'ctx>,
 ) -> Result<(), AotError> {
     let ctx = module.get_context();
     let i64_ty = ctx.i64_type();
@@ -226,23 +248,225 @@ fn convert_externals_to_defining_storage<'ctx>(
             continue;
         };
         // The global was declared `external` + `externally_initialized`
-        // by codegen. Switch to internal storage with a zero initialiser.
-        // `set_initializer` removes the external flag at the IR level
-        // for the global to be a definition.
-        g.set_initializer(&i64_ty.const_zero());
+        // by codegen. Switch to internal storage with the appropriate
+        // initialiser. `set_initializer` removes the external flag at
+        // the IR level for the global to be a definition.
+        let init = match &entry.kind {
+            RelocKind::StubEntry { symbol, .. } => {
+                // Use `ptrtoint @__nod_stub_entry_<symbol> to i64` so the
+                // slot's contents are the address of the static entry
+                // from EXE-load onward. No runtime work required for
+                // *this* slot; `fn_ptr` inside the entry is still
+                // populated at startup by the resolver.
+                let info = stub_entries.get(symbol).ok_or_else(|| {
+                    AotError::Conflict(format!(
+                        "internal: stub-entry global missing for `{symbol}`"
+                    ))
+                })?;
+                info.entry_global
+                    .as_pointer_value()
+                    .const_to_int(i64_ty)
+            }
+            _ => i64_ty.const_zero(),
+        };
+        g.set_initializer(&init);
         g.set_linkage(Linkage::Internal);
         g.set_externally_initialized(false);
     }
     Ok(())
 }
 
-/// Sprint 39a — emit the `void @nod_aot_resolve_relocs()` function that
+/// Sprint 39b — per-unique `(dll, symbol)` info threaded between the
+/// stub-entry emission step, the global-conversion step (which points
+/// the `@nod_stub__<key>__<idx>` slot at the static entry), and the
+/// resolver-function step (which stores `&<symbol>` into the entry's
+/// `fn_ptr` field at startup).
+struct StubEntryInfo<'ctx> {
+    /// The static `%ApiStubEntry`-typed global named
+    /// `__nod_stub_entry_<symbol>`, defined in the EXE's data section.
+    /// Multiple manifest rows for the same symbol share one.
+    entry_global: GlobalValue<'ctx>,
+    /// The dllimport extern declared as `declare dllimport i64 @<symbol>(...)`.
+    /// Its address is what gets stored into `entry_global`'s `fn_ptr`
+    /// field at startup. The Windows loader resolves the symbol via the
+    /// import library named in the manifest's `dll` field.
+    dllimport_fn: inkwell::values::FunctionValue<'ctx>,
+}
+
+type StubEntryInfoMap<'ctx> = HashMap<String, StubEntryInfo<'ctx>>;
+
+/// Sprint 39b — for each `RelocKind::StubEntry { dll, symbol, signature_bytes }`
+/// in the manifest, emit:
+///
+/// 1. A dllimport extern function declaration. The exact signature we
+///    declare doesn't have to match the Win32 API's true signature
+///    bytewise — the trampoline at `nod_winffi_call_N` performs the
+///    real Win64 marshaling using the recorded [`ApiCallSignature`].
+///    All we need is *some* signature that lets LLVM emit the dllimport
+///    reference; we use `i64 (...)` varargs-style which the linker
+///    accepts as a symbol reference.
+///
+/// 2. A static `%ApiStubEntry`-typed global named `__nod_stub_entry_<symbol>`.
+///    The struct's field layout reproduces the `#[repr(C)]` shape of
+///    [`nod_runtime::ApiStubEntry`] exactly (see comments in
+///    `nod-runtime/src/winffi.rs`).  The `signature` field is baked
+///    from `signature_bytes` (which is the `#[repr(C)]` byte dump from
+///    sema); `fn_ptr` starts null and is populated at startup by the
+///    resolver. The `dll_name_*` / `symbol_name_*` fields are left
+///    null — the AOT path doesn't need them for marshaling (only for
+///    the JIT-path error message on null `fn_ptr`).
+///
+/// Multiple manifest rows referencing the same `(dll, symbol)` reuse
+/// the same dllimport extern and static stub-entry global — the
+/// per-module `nod_stub__<key>__<idx>` slot indices are distinct but
+/// each points at the same `__nod_stub_entry_<symbol>` global.
+fn emit_stub_entry_globals<'ctx>(
+    module: &Module<'ctx>,
+    manifest: &ModuleManifest,
+) -> Result<StubEntryInfoMap<'ctx>, AotError> {
+    let ctx = module.get_context();
+    let mut out: StubEntryInfoMap<'ctx> = HashMap::new();
+
+    // ApiCallSignature is 14 bytes: { i8, [12 x i8], i8 } with align 1.
+    let i8_ty = ctx.i8_type();
+    let i16_ty = ctx.i16_type();
+    let i32_ty = ctx.i32_type();
+    let i64_ty = ctx.i64_type();
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    let arr12 = i8_ty.array_type(12);
+
+    // %ApiStubEntry layout (matches `nod_runtime::ApiStubEntry`
+    // 56-byte / 8-aligned struct exactly):
+    //   off 0  ptr    dll_name_ptr
+    //   off 8  i32    dll_name_len
+    //   off 12 i32    [padding]
+    //   off 16 ptr    symbol_name_ptr
+    //   off 24 i32    symbol_name_len
+    //   off 28 i32    [padding]
+    //   off 32 ptr    fn_ptr (AtomicPtr<u8>, ABI-identical to ptr on x64)
+    //   off 40 i8     arg_count
+    //   off 41 [12xi8] arg_kinds
+    //   off 53 i8     return_kind
+    //   off 54 i16    [tail padding to align size to 8]
+    let entry_struct_ty = ctx.struct_type(
+        &[
+            ptr_ty.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+            ptr_ty.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+            ptr_ty.into(),
+            i8_ty.into(),
+            arr12.into(),
+            i8_ty.into(),
+            i16_ty.into(),
+        ],
+        false, // not packed; rely on natural alignment matching repr(C)
+    );
+
+    for entry in &manifest.entries {
+        let RelocKind::StubEntry {
+            dll: _,
+            symbol,
+            signature_bytes,
+        } = &entry.kind
+        else {
+            continue;
+        };
+        if out.contains_key(symbol) {
+            continue;
+        }
+        if signature_bytes.len() != 14 {
+            return Err(AotError::Conflict(format!(
+                "StubEntry signature for `{symbol}` is {} bytes; expected 14",
+                signature_bytes.len()
+            )));
+        }
+        // Build the dllimport extern. We declare it as `i64 @sym(...)` —
+        // the actual ABI is honoured by the trampoline at call time.
+        // The dllimport storage class tells LLVM to emit a reference
+        // through the IAT (`__imp_<symbol>`). We never call this fn
+        // directly from IR; the only IR use is taking its address.
+        let dllimport_fn = match module.get_function(symbol) {
+            Some(f) => f,
+            None => {
+                let fn_ty = i64_ty.fn_type(&[], /*varargs=*/ true);
+                let f = module.add_function(symbol, fn_ty, Some(Linkage::External));
+                f.as_global_value()
+                    .set_dll_storage_class(DLLStorageClass::Import);
+                f
+            }
+        };
+        // Build the static ApiStubEntry global.
+        let entry_global_name = format!("__nod_stub_entry_{}", crate::symbols::sanitize(symbol));
+        let entry_global = match module.get_global(&entry_global_name) {
+            Some(g) => g,
+            None => {
+                let g = module.add_global(
+                    entry_struct_ty,
+                    Some(AddressSpace::default()),
+                    &entry_global_name,
+                );
+                g.set_linkage(Linkage::Internal);
+
+                // Initialiser: zero strings, null fn_ptr, baked signature.
+                let arg_count = i8_ty.const_int(signature_bytes[0] as u64, false);
+                let arg_kinds_vals: Vec<_> = signature_bytes[1..13]
+                    .iter()
+                    .map(|b| i8_ty.const_int(*b as u64, false))
+                    .collect();
+                let arg_kinds = i8_ty.const_array(&arg_kinds_vals);
+                let return_kind = i8_ty.const_int(signature_bytes[13] as u64, false);
+
+                let zero_i32 = i32_ty.const_zero();
+                let zero_i16 = i16_ty.const_zero();
+                let null_ptr = ptr_ty.const_null();
+
+                let init = entry_struct_ty.const_named_struct(&[
+                    null_ptr.into(),     // dll_name_ptr
+                    zero_i32.into(),     // dll_name_len
+                    zero_i32.into(),     // padding
+                    null_ptr.into(),     // symbol_name_ptr
+                    zero_i32.into(),     // symbol_name_len
+                    zero_i32.into(),     // padding
+                    null_ptr.into(),     // fn_ptr — written at startup
+                    arg_count.into(),    // signature.arg_count
+                    arg_kinds.into(),    // signature.arg_kinds
+                    return_kind.into(),  // signature.return_kind
+                    zero_i16.into(),     // tail padding
+                ]);
+                g.set_initializer(&init);
+                g
+            }
+        };
+        out.insert(
+            symbol.clone(),
+            StubEntryInfo {
+                entry_global,
+                dllimport_fn,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Sprint 39a/b — emit the `void @nod_aot_resolve_relocs()` function that
 /// the `main` stub calls before the user's `main`. The function iterates
-/// over every manifest entry and calls the corresponding `nod_aot_set_*`
-/// runtime helper to populate the slot with its in-process bits.
+/// over every manifest entry and:
+///
+/// - For most kinds: calls the corresponding `nod_aot_set_*` runtime
+///   helper to populate the slot with its in-process bits.
+/// - For `RelocKind::StubEntry`: emits an inline `store ptr @<symbol>,
+///   ptr <fn_ptr_field>` so the static `ApiStubEntry`'s `fn_ptr` field
+///   carries the dllimport function's address. The Windows loader has
+///   already populated the IAT slot by the time this code runs, so
+///   `@<symbol>` is a stable, valid function pointer for the rest of
+///   the process's lifetime.
 fn emit_resolve_relocs_function<'ctx>(
     module: &Module<'ctx>,
     manifest: &ModuleManifest,
+    stub_entries: &StubEntryInfoMap<'ctx>,
 ) -> Result<inkwell::values::FunctionValue<'ctx>, AotError> {
     let ctx = module.get_context();
     let void_ty = ctx.void_type();
@@ -399,16 +623,38 @@ fn emit_resolve_relocs_function<'ctx>(
                     .build_call(set_generic, &args, "")
                     .map_err(|e| AotError::Llvm(format!("call set_generic: {e}")))?;
             }
-            RelocKind::StubEntry { .. } => {
-                // Sprint 39a does not support `define c-function`. The
-                // driver already errors out earlier if the lowered module
-                // has stub entries — reaching this arm indicates a
-                // sema/driver bug.
-                return Err(AotError::Conflict(format!(
-                    "AOT cannot resolve StubEntry relocation `{}` — Win32 imports \
-                     are Sprint 39b's job. The driver should have rejected the input.",
-                    entry.symbol
-                )));
+            RelocKind::StubEntry { symbol, .. } => {
+                // Sprint 39b — populate the static ApiStubEntry's
+                // `fn_ptr` field with the dllimport function's address.
+                // The Windows loader has already filled the IAT slot
+                // for `__imp_<symbol>` by the time this code runs;
+                // taking the address of `@<symbol>` yields a stable
+                // function pointer (either the symbol itself or a
+                // linker-emitted thunk that jumps through the IAT).
+                //
+                // Skip if we have no record of this symbol — should be
+                // impossible given `emit_stub_entry_globals` walks the
+                // same manifest, but a clear no-op beats panicking.
+                let Some(info) = stub_entries.get(symbol) else { continue };
+                // `fn_ptr` lives at struct field index 6 (offset 32).
+                let entry_ptr = info.entry_global.as_pointer_value();
+                let entry_struct_ty =
+                    info.entry_global.get_value_type().into_struct_type();
+                let fn_ptr_field = unsafe {
+                    builder
+                        .build_in_bounds_gep(
+                            entry_struct_ty,
+                            entry_ptr,
+                            &[i32_ty.const_zero(), i32_ty.const_int(6, false)],
+                            "stub.fn_ptr",
+                        )
+                        .map_err(|e| AotError::Llvm(format!("gep stub.fn_ptr: {e}")))?
+                };
+                let fn_ptr_value: BasicValueEnum<'ctx> =
+                    info.dllimport_fn.as_global_value().as_pointer_value().into();
+                builder
+                    .build_store(fn_ptr_field, fn_ptr_value)
+                    .map_err(|e| AotError::Llvm(format!("store stub.fn_ptr: {e}")))?;
             }
         }
     }

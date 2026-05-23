@@ -28,6 +28,11 @@ nod-sema      = { path = "../nod-sema", default-features = false }
 # but adding it explicitly here keeps the resolver path obvious.
 nod-llvm      = { path = "../nod-llvm", default-features = false }
 nod-runtime   = { path = "../nod-runtime", default-features = false }
+# Sprint 39b — the `build` subcommand walks the lowered manifest's
+# `RelocKind::StubEntry` entries and asks `nod-winapi` for the matching
+# import library name (`kernel32.dll` -> `kernel32.lib`). Workspace-local
+# dep, doesn't grow the external footprint.
+nod-winapi    = { path = "../nod-winapi" }
 # Sprint 39a — `cc-rs`'s `Tool` finder locates MSVC's `link.exe` across
 # every Visual Studio install layout (VS 2017 vswhere, VS 2019/22 standard
 # paths, Build Tools, env-var override). Per the Sprint 39a brief, this
