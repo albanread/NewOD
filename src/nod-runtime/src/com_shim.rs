@@ -2205,6 +2205,235 @@ pub unsafe extern "C-unwind" fn nod_show_open_file_dialog(hwnd_word: u64) -> u64
     crate::intern_string_literal(&s).raw()
 }
 
+// ─── Sprint 41g — write-file + save-file dialog ──────────────────────────
+
+/// JIT-callable: write a Dylan `<byte-string>` payload to the file
+/// whose UTF-8 path is also a Dylan `<byte-string>` Word. Returns
+/// fixnum-tagged 1 on success, fixnum-tagged 0 on any I/O error.
+///
+/// Mirrors `nod_read_file_to_string` exactly: decode both Words via
+/// `read_dylan_byte_string`, then call `std::fs::write` which creates
+/// the file if absent or truncates and overwrites if present. The
+/// write is binary — bytes go to disk verbatim, no CRLF translation,
+/// no encoding mangling, no trailing-newline normalization. Round-
+/// tripping a file with `%read-file` followed by `%write-file` to a
+/// fresh path produces byte-identical content.
+///
+/// Sprint 41g uses this to support File → Save / Save As; the editor
+/// is still read-only so the typical usage is "rewrite the file with
+/// its own current contents", but the plumbing is ready for when
+/// editing arrives (Sprint 41h+).
+///
+/// # Safety
+/// `path_word` and `content_word` must be valid Dylan
+/// `<byte-string>` Words. `read_dylan_byte_string` panics if either
+/// is the wrong class — sema's type-checking is responsible for
+/// catching that at the Dylan-source level.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_write_file_from_string(
+    path_word: u64,
+    content_word: u64,
+) -> u64 {
+    let path = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(path_word));
+    let content = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(content_word));
+    match std::fs::write(&path, content.as_bytes()) {
+        Ok(()) => tag(1),
+        Err(_) => tag(0),
+    }
+}
+
+/// JIT-callable: show the Win32 common file-SAVE dialog and return the
+/// chosen path as a fresh Dylan `<byte-string>` Word, or the `nil`
+/// immediate if the user cancelled (or any system error). The dialog
+/// is owned by `hwnd_word` (so it modals against the IDE window).
+///
+/// Mirrors `nod_show_open_file_dialog` exactly except it calls
+/// `GetSaveFileNameW` (not `GetOpenFileNameW`) and the OFN flags are
+/// `OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST`:
+///   * `OFN_OVERWRITEPROMPT` — if the user picks an existing file
+///     name, ask them to confirm overwrite. This is the standard
+///     Windows save-dialog UX.
+///   * `OFN_PATHMUSTEXIST` — the *directory* in the chosen path must
+///     exist. The file itself may not yet (that's the whole point of
+///     "save as"). We deliberately do NOT pass `OFN_FILEMUSTEXIST`
+///     here; the open dialog uses that flag, the save dialog must not.
+///
+/// # Safety
+/// `hwnd_word` must be a Dylan fixnum encoding a valid (or 0 = no
+/// owner) HWND. The dialog blocks the calling thread until the user
+/// confirms or cancels.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_show_save_file_dialog(hwnd_word: u64) -> u64 {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let hwnd_raw = untag_i64(hwnd_word);
+    let hwnd_h = HWND(hwnd_raw as *mut std::ffi::c_void);
+
+    // Same filter shape as the open-dialog shim — keeps the IDE's
+    // save / open dialogs feeling consistent.
+    let filter_utf8 =
+        "Dylan (*.dylan)\0*.dylan\0Text (*.txt)\0*.txt\0All (*.*)\0*.*\0\0";
+    let filter: Vec<u16> = filter_utf8.encode_utf16().collect();
+
+    // 260 = MAX_PATH on classic Win32; same buffer sizing rationale
+    // as the open-dialog shim.
+    let mut path_buf: [u16; 260] = [0u16; 260];
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd_h,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(path_buf.as_mut_ptr()),
+        nMaxFile: path_buf.len() as u32,
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        ..unsafe { std::mem::zeroed() }
+    };
+
+    // SAFETY: ofn fully populated; lpstrFile points to path_buf which
+    // lives for the duration of this call; lpstrFilter points to the
+    // filter Vec which also lives for the duration.
+    let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+    drop(filter);
+
+    if !ok.as_bool() {
+        // Cancel or error — both surface as nil (the Dylan-side
+        // caller's `result = nil` check covers both).
+        return crate::literal_pool_immediates().nil.raw();
+    }
+
+    let len = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+    let s = String::from_utf16_lossy(&path_buf[..len]);
+    crate::intern_string_literal(&s).raw()
+}
+
+// ─── Sprint 41g — Recent-files persistence + basename ────────────────────
+//
+// The brief sketches the recent-list helpers as "pure Dylan, using existing
+// %read-file / new %write-file" — but that path needs per-byte string
+// access plus byte-string equality, and the runtime currently exposes
+// neither to Dylan. Adding either would be a substantial detour (FIP arm
+// for `<byte-string>` + an `element` method + equality dispatch); the path
+// of least resistance is three small shims that do the recent-list
+// machinery in Rust and surface the result as a Dylan `<pair>`-spined
+// list of `<byte-string>`s. The Dylan-side IDE code stays trivial: it
+// reads the recent list, walks the spine to populate the submenu, and on
+// each Open / Save As call asks the shim to prepend the new path. The
+// dedup + cap-at-5 logic lives in one place (here), which is also where
+// the file I/O lives.
+
+const RECENT_FILE_PATH: &str = r"F:\scratch\nod-ide-recent.txt";
+const RECENT_MAX_ENTRIES: usize = 5;
+
+/// Read the recent-file list from `F:\scratch\nod-ide-recent.txt`. Returns
+/// a Vec of paths, most-recent first, capped at `RECENT_MAX_ENTRIES`.
+/// Missing file / read error / empty file all return an empty Vec.
+fn read_recent_list() -> Vec<String> {
+    let raw = match std::fs::read_to_string(RECENT_FILE_PATH) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    raw.lines()
+        .filter(|line| !line.is_empty())
+        .take(RECENT_MAX_ENTRIES)
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Build a Dylan `<pair>`-spined list from a slice of paths. Each path
+/// is interned as a `<byte-string>` literal (long-lived static-area
+/// allocation, same lifetime story as `nod_read_file_to_string`'s
+/// return value). The spine itself is heap-allocated via `alloc_pair`.
+fn paths_to_dylan_list(paths: &[String]) -> u64 {
+    let nil = crate::literal_pool_immediates().nil;
+    let mut tail = nil;
+    for s in paths.iter().rev() {
+        let head = crate::intern_string_literal(s);
+        tail = crate::with_literal_pool(|pool| pool.heap.alloc_pair(head, tail, &pool.classes));
+    }
+    tail.raw()
+}
+
+/// JIT-callable: read the recent-files list from disk and return it as
+/// a Dylan list (`<pair>` spine, `<byte-string>` heads, `nil`-terminated).
+/// Most-recent first, capped at 5 entries. Missing file or empty file
+/// returns the `nil` immediate (which Dylan's `empty?` recognises as
+/// "empty list").
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary; literal-pool allocation
+/// is mutex-protected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_load_recent() -> u64 {
+    let paths = read_recent_list();
+    paths_to_dylan_list(&paths)
+}
+
+/// JIT-callable: prepend `new_path_word` to the recent-files list,
+/// dedup (remove any existing occurrence of the same path), cap the
+/// result at 5 entries, write it back to disk, and return the new list
+/// as a Dylan `<pair>`-spined list. If `new_path_word` is nil or an
+/// empty string, the list is loaded + returned unchanged.
+///
+/// The disk write goes to `F:\scratch\nod-ide-recent.txt`, one path per
+/// line, no trailing newline gymnastics (`writeln`-style with one `\n`
+/// after every entry except the last). On a write error the in-memory
+/// list is still returned — the IDE keeps working, the next launch just
+/// won't see the new entry. (We don't surface the error to Dylan; the
+/// failure mode is "you didn't persist", not "your program is broken".)
+///
+/// # Safety
+/// `new_path_word` must be a valid Dylan Word. If it's a `<byte-string>`
+/// the path is read via `read_dylan_byte_string`; otherwise it's
+/// ignored (treated as nil — the load-and-return path).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_add_recent(new_path_word: u64) -> u64 {
+    let mut paths = read_recent_list();
+    let nil_raw = crate::literal_pool_immediates().nil.raw();
+    if new_path_word != nil_raw {
+        let new_path = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(new_path_word));
+        if !new_path.is_empty() {
+            paths.retain(|p| p != &new_path);
+            paths.insert(0, new_path);
+            paths.truncate(RECENT_MAX_ENTRIES);
+            let serialized = paths.join("\n");
+            // Best-effort write. Swallow errors — recent-list persistence
+            // is a quality-of-life feature, not a correctness gate.
+            let _ = std::fs::write(RECENT_FILE_PATH, serialized);
+        }
+    }
+    paths_to_dylan_list(&paths)
+}
+
+/// JIT-callable: return the basename (last path component) of a
+/// `<byte-string>` path. Splits on '\\' or '/' — Windows accepts both —
+/// and returns the substring after the final separator. If there's no
+/// separator, returns the full path. If the input is the `nil` immediate
+/// or an empty string, returns the empty `<byte-string>`.
+///
+/// Used by the IDE to compute the window title (e.g.
+/// `"F:\scratch\foo.dylan" -> "foo.dylan"`).
+///
+/// # Safety
+/// `path_word` must be a valid Dylan Word. Same convention as
+/// `nod_add_recent` — nil short-circuits, anything else is read as a
+/// `<byte-string>`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_basename(path_word: u64) -> u64 {
+    let nil_raw = crate::literal_pool_immediates().nil.raw();
+    if path_word == nil_raw {
+        return crate::intern_string_literal("").raw();
+    }
+    let full = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(path_word));
+    let base = match full.rfind(['\\', '/']) {
+        Some(i) => &full[i + 1..],
+        None => full.as_str(),
+    };
+    crate::intern_string_literal(base).raw()
+}
+
 // ─── UTF-16 helpers ───────────────────────────────────────────────────────
 
 /// Decode a Dylan `<byte-string>` Word's UTF-8 payload to a

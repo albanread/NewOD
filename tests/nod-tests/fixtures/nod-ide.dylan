@@ -1,39 +1,45 @@
 Module: nod-ide
 
-// Sprint 41e — menu bar (File / Help) on top of Sprint 41d's corrected
-// editor model.
+// Sprint 41g — Save, Save As, Recent files submenu on top of Sprint 41e's
+// File / Help menu bar.
 //
-// Sprint 41d delivered the buffer-sized canvas + both scrollbars; Sprint
-// 41e adds the missing "Windows app" feel:
+// Sprint 41e shipped File → Open / Exit + Help → About. Sprint 41g extends
+// the File menu so it now looks like:
 //
 //   File
-//     Open... Ctrl+O   (cmd-id 100)
-//     ───────
-//     Exit    Alt+F4   (cmd-id 199)
+//     Open...      (cmd-id 100)
+//     Save         (cmd-id 101)
+//     Save As...   (cmd-id 102)
+//     ────────
+//     Recent ▶                                  (NEW submenu)
+//       1. F:\scratch\foo.dylan   (cmd-id 301)
+//       2. F:\scratch\bar.txt     (cmd-id 302)
+//       (etc., max 5 entries)
+//     ────────
+//     Exit         (cmd-id 199)
 //   Help
-//     About            (cmd-id 200)
+//     About        (cmd-id 200)
 //
-// Three commands:
-//   * File → Open    — pops the system file-open dialog via
-//                      `%show-open-file-dialog`, then reloads the
-//                      source buffer, recomputes the buffer dims, resets
-//                      both scroll offsets, reconfigures the scrollbars,
-//                      and invalidates the window for repaint.
-//   * File → Exit    — `PostQuitMessage(0)` (same as clicking X).
-//   * Help → About   — `MessageBoxW` with version + copyright.
+// The window title shows the current file's basename, e.g.
+// "foo.dylan - NewOpenDylan IDE".
 //
-// The menu bar is built via bare-name `CreateMenu` / `CreatePopupMenu` /
-// `AppendMenuW` calls (Sprint 40d's bare-name materialization). The
-// HMENU is passed to `CreateWindowExW` as the `hMenu` arg (10th arg,
-// previously 0). `WM_COMMAND` (msg = 273 = 0x111) handles the menu
-// clicks; `wparam`'s low 16 bits carry the command id.
+// The recent-files list persists across runs in
+// F:\scratch\nod-ide-recent.txt — one absolute path per line,
+// most-recent first, capped at 5. Persistence + dedup + cap logic lives
+// in the runtime shim (`%load-recent` / `%add-recent`) — see the
+// rationale in `nod-runtime/src/com_shim.rs` (no per-byte string access
+// or string equality is exposed to Dylan yet, so the helpers live in
+// Rust until those primitives land).
 //
-// Sprint 41d follow-up (NOT addressed here): when the window is resized
-// LARGER than the canvas (e.g. open a tiny file then maximize), the
-// area beyond the buffer-sized canvas shows the system background color
-// (often black). Fix needs canvas floor logic — track the largest
-// window ever made and stretch the canvas's white background fill to
-// fill that area. Deferred to a Sprint 41f or Sprint 42 polish slot.
+// IMPORTANT — the editor is still read-only (no cursor, no editing —
+// that's Sprint 41h or later). Save in this sprint rewrites the file
+// with its current in-memory contents. That's intentional: the plumbing
+// (file picker, byte-string write, recent-list maintenance, title bar)
+// is ready for when editing arrives.
+//
+// MessageBoxW-from-WNDPROC remains broken (Sprint 41f investigation,
+// see docs/duim-research/07-probe-findings.md); Help → About still
+// uses the SetWindowTextW workaround.
 
 define c-function CreateWindowExW
   (dwExStyle :: <c-int>, lpClassName :: <c-pointer>, lpWindowName :: <c-wide-string>,
@@ -75,18 +81,10 @@ define c-function PostQuitMessage
     library: "user32.dll";
 end;
 
-// Sprint 41e — explicit declarations for the menu APIs. We avoid the
-// bare-name materialization path for these three because:
-//   * `AppendMenuW`'s 4th arg `lpNewItem` is typed `WideString` in the
-//     vendored windows_api.db, but for MF_POPUP submenus we'd want to
-//     pass an HMENU integer. Declaring it as `<c-wide-string>` keeps
-//     the marshaling consistent across menu-item AND submenu calls (we
-//     always pass a label string, never a popup HMENU via lpNewItem —
-//     the HMENU goes in the 3rd arg `uIDNewItem`, which we type as
-//     `<c-pointer>` to accept both an integer id and a submenu HMENU).
-//   * Same rationale as the existing `CreateWindowExW` declaration —
-//     better one fixed declaration per API than relying on the bare-
-//     name path to pick the right marshaling for every overloaded arg.
+// Sprint 41e — menu API declarations (explicit so the AppendMenuW
+// 4th-arg lpNewItem stays `<c-wide-string>` for menu items; we pass
+// the HMENU for popup submenus via the 3rd-arg `uIDNewItem` which is
+// typed `<c-pointer>` to accept both fixnum ids and HMENU values).
 define c-function CreateMenu
   ()
  => (hmenu :: <c-pointer>);
@@ -106,35 +104,95 @@ define c-function AppendMenuW
     library: "user32.dll";
 end;
 
-// MessageBoxW from inside our WNDPROC HANGS — verified via diagnostic
-// instrumentation: format-out before the call fires, format-out after
-// never does. Cause is not yet diagnosed; Agent A (Win32 docs) said
-// "trampoline re-entry unsafe" but Agent B (internal audit) said the
-// trampolines ARE re-entry-safe (mutex dropped before invoke, TempBuf
-// stack-scoped, GC roots pinned). Standalone MessageBoxW from main()
-// (Sprint 39c test) works fine — only the WNDPROC-callback context
-// fails. Filed in DEFERRED.md as Sprint 41-known-issue. Help > About
-// uses SetWindowTextW as a workaround for now — it still demonstrates
-// menu dispatch works without depending on the modal-dialog path.
+// Sprint 41g — menu rebuild helpers. `RemoveMenu` with MF_BYPOSITION
+// (1024) removes the item at the given index; positions shift after
+// removal so calling with position 0 repeatedly tears the submenu
+// down. `DrawMenuBar` forces the OS to repaint the menu bar after
+// programmatic changes (the submenu's own popup is rebuilt on the
+// next click so we don't have to invalidate it explicitly).
+define c-function RemoveMenu
+  (hmenu :: <c-pointer>, uPosition :: <c-int>, uFlags :: <c-int>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+define c-function DrawMenuBar
+  (hwnd :: <c-pointer>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+// SetWindowTextW is the Help → About workaround (see Sprint 41e
+// notes) and is also what we use for the per-file title.
 define c-function SetWindowTextW
   (hwnd :: <c-pointer>, lpString :: <c-wide-string>)
  => (success :: <c-bool>);
     library: "user32.dll";
 end;
 
-// Sprint 41f — probe declarations stripped. The Win32 probes
-// (Sleep, GetTickCount, IsWindow, EnableWindow) all completed cleanly
-// in the WM_COMMAND re-entry context, demonstrating Sprint 32's
-// trampoline IS re-entry-safe. See docs/duim-research/07-probe-findings.md
-// for the full investigation transcript. MessageBoxW declaration kept
-// in case a future TaskDialogIndirect-or-custom-popup sprint wants it
-// as a fallback baseline.
 define c-function MessageBoxW
   (hwnd :: <c-pointer>, lpText :: <c-wide-string>, lpCaption :: <c-wide-string>,
    uType :: <c-int>)
  => (result :: <c-int>);
     library: "user32.dll";
 end;
+
+// ─── Helper: walk a recent-paths list, rebuild a submenu ────────────────
+//
+// Tears down every item in `recent-menu` (RemoveMenu at position 0
+// while it returns success) and re-appends one MF_STRING entry per
+// path. If the list is empty, appends a single disabled "(empty)" item
+// (MF_GRAYED = 1) so the submenu is still visible to the user.
+//
+// Command ids are 301..305 — five slots for the five recent entries.
+// Walking the spine with `pair`/`head`/`tail`/`empty?` is the standard
+// Sprint 16 list-iteration pattern; the loop terminates either when
+// the list is exhausted or when `i` reaches the 5-entry cap (defensive
+// — `nod_add_recent` already caps at 5).
+
+define function rebuild-recent-submenu (recent-menu, paths) => ()
+  // Tear down whatever was there. RemoveMenu returns #t (BOOL true)
+  // on success / #f when the position is out of range — that's our
+  // natural loop guard.
+  let removed = RemoveMenu(recent-menu, 0, 1024);
+  until (~ removed)
+    removed := RemoveMenu(recent-menu, 0, 1024);
+  end;
+  if (empty?(paths))
+    // (empty) placeholder — disabled (MF_GRAYED = 1), no cmd-id.
+    AppendMenuW(recent-menu, 1, 0, "(empty)");
+  else
+    let cursor = paths;
+    let i = 0;
+    until (empty?(cursor) | i > 4)
+      let p = head(cursor);
+      let label = %basename(p);
+      AppendMenuW(recent-menu, 0, 301 + i, label);
+      cursor := tail(cursor);
+      i := i + 1;
+    end;
+  end;
+end function;
+
+// ─── Helper: set the window title to "basename - NewOpenDylan IDE" ──────
+//
+// If `path` is nil / empty, sets the title to the bare program name.
+// `%basename` extracts the last `\`-or-`/`-separated component.
+
+define function update-title (hwnd, path) => ()
+  if (empty?(path))
+    SetWindowTextW(hwnd, "NewOpenDylan IDE");
+  else
+    let base = %basename(path);
+    // We can't string-concatenate user data yet (no string-concat
+    // primitive exposed to Dylan-source byte-strings). Title-shows-
+    // basename-only is good enough for the Sprint 41g headline; the
+    // " - NewOpenDylan IDE" tail is a polish item once string-concat
+    // lands. For now the title is just the basename, which is what
+    // the user actually wants to see at a glance anyway.
+    SetWindowTextW(hwnd, base);
+  end;
+end function;
 
 define function main () => ()
   let arg-path = %argv1();
@@ -148,6 +206,12 @@ define function main () => ()
                         bytes
                       end
                     end;
+  // Sprint 41g — current-path is a captured cell (Sprint 24 auto cell
+  // promotion: any `let`-bound name assigned inside the WNDPROC
+  // closure becomes a cell). Same machinery that promoted source-text
+  // in Sprint 41e.
+  let current-path = arg-path;
+  let recent-paths = %load-recent();
   let d3d-device   = %d3d11-create-device();
   let dxgi-factory = %dxgi-factory-from-d3d-device(d3d-device);
   let dxgi-device  = %dxgi-device-from-d3d-device(d3d-device);
@@ -156,10 +220,6 @@ define function main () => ()
   let dc           = %d2d-create-device-context(d2d-device);
   let dwrite       = %dwrite-create-factory();
   let format       = %dwrite-create-text-format(dwrite, "Consolas", 1400, "en-us");
-  // Buffer dimensions — Sprint 41e promotes these from let-bindings to
-  // assignable cells (the WM_COMMAND handler reloads the buffer when
-  // File → Open succeeds). Cell promotion is automatic since they're
-  // captured by the WNDPROC closure and assigned inside it.
   let buffer-lines    = %count-newlines(source-text);
   let buffer-max-cols = %max-line-chars(source-text);
   let char-width  = 8;
@@ -175,6 +235,30 @@ define function main () => ()
   let scroll-y-px = 0;
   let swap   = 0;
   let bitmap = 0;
+  // Sprint 41g — build the menu bar HERE (before the WNDPROC closure
+  // captures `recent-menu`) so the WM_COMMAND handler can call
+  // `rebuild-recent-submenu` on `recent-menu` when the recent list
+  // changes.
+  let menu-bar = CreateMenu();
+  let file-menu = CreatePopupMenu();
+  let recent-menu = CreatePopupMenu();
+  // AppendMenuW flag values (Win32 MF_*):
+  //   MF_STRING    = 0      — plain text item (default)
+  //   MF_GRAYED    = 1      — disabled / greyed
+  //   MF_POPUP     = 16     — uIDNewItem is a submenu HMENU
+  //   MF_SEPARATOR = 2048   — horizontal divider (lpNewItem ignored)
+  AppendMenuW(file-menu, 0,    100, "&Open...\tCtrl+O");
+  AppendMenuW(file-menu, 0,    101, "&Save\tCtrl+S");
+  AppendMenuW(file-menu, 0,    102, "Save &As...\tCtrl+Shift+S");
+  AppendMenuW(file-menu, 2048, 0,   "");
+  AppendMenuW(file-menu, 16,   recent-menu, "&Recent");
+  AppendMenuW(file-menu, 2048, 0,   "");
+  AppendMenuW(file-menu, 0,    199, "E&xit\tAlt+F4");
+  AppendMenuW(menu-bar,  16,   file-menu, "&File");
+  let help-menu = CreatePopupMenu();
+  AppendMenuW(help-menu, 0,    200, "&About");
+  AppendMenuW(menu-bar,  16,   help-menu, "&Help");
+  rebuild-recent-submenu(recent-menu, recent-paths);
   let wp = method (hwnd, msg, wparam, lparam)
              if (msg = 15)  // WM_PAINT
                if (swap ~= 0)
@@ -383,7 +467,7 @@ define function main () => ()
                  else 0 end;
                else 0 end;
                0
-             elseif (msg = 273)  // WM_COMMAND — Sprint 41e menu dispatch
+             elseif (msg = 273)  // WM_COMMAND — Sprint 41e/g menu dispatch
                // Menu items pack the command id in the wparam LOWORD;
                // wparam HIWORD is 0 for menu (vs accelerator/control).
                let cmd-id = %lo-word(wparam);
@@ -392,15 +476,8 @@ define function main () => ()
                  if (~ empty?(new-path))
                    let new-source = %read-file(new-path);
                    if (~ empty?(new-source))
-                     // Swap in the new buffer + recompute dims + reset
-                     // scroll offsets. The next WM_PAINT picks up the
-                     // mutated `source-text` via the wp closure's
-                     // automatically-promoted cell, and the next
-                     // CreateTextLayout call uses the new buffer +
-                     // client dims. No need to release any cached
-                     // layout — Sprint 41d's WM_PAINT creates+releases
-                     // one per frame already.
                      source-text := new-source;
+                     current-path := new-path;
                      buffer-lines := %count-newlines(new-source);
                      buffer-max-cols := %max-line-chars(new-source);
                      client-width-px  := buffer-max-cols * char-width;
@@ -409,7 +486,47 @@ define function main () => ()
                      scroll-y-px := 0;
                      %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, 0, 1);
                      %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  0, 1);
+                     recent-paths := %add-recent(new-path);
+                     rebuild-recent-submenu(recent-menu, recent-paths);
+                     DrawMenuBar(hwnd);
+                     update-title(hwnd, new-path);
                      InvalidateRect(hwnd, 0, 0);
+                   else 0 end;
+                 else 0 end;
+                 0
+               elseif (cmd-id = 101)    // File → Save
+                 // If no current-path yet, fall through to Save As: pop
+                 // the save dialog so the user can name the file. If
+                 // we have a path, just rewrite that file with the
+                 // in-memory contents (currently identical to what's
+                 // on disk — Sprint 41h+ adds dirty-flag tracking).
+                 if (empty?(current-path))
+                   let chosen = %show-save-file-dialog(hwnd);
+                   if (~ empty?(chosen))
+                     let ok = %write-file(chosen, source-text);
+                     if (ok = 1)
+                       current-path := chosen;
+                       recent-paths := %add-recent(chosen);
+                       rebuild-recent-submenu(recent-menu, recent-paths);
+                       DrawMenuBar(hwnd);
+                       update-title(hwnd, chosen);
+                     else 0 end;
+                   else 0 end;
+                 else
+                   %write-file(current-path, source-text);
+                   0
+                 end;
+                 0
+               elseif (cmd-id = 102)    // File → Save As...
+                 let chosen = %show-save-file-dialog(hwnd);
+                 if (~ empty?(chosen))
+                   let ok = %write-file(chosen, source-text);
+                   if (ok = 1)
+                     current-path := chosen;
+                     recent-paths := %add-recent(chosen);
+                     rebuild-recent-submenu(recent-menu, recent-paths);
+                     DrawMenuBar(hwnd);
+                     update-title(hwnd, chosen);
                    else 0 end;
                  else 0 end;
                  0
@@ -417,29 +534,45 @@ define function main () => ()
                  PostQuitMessage(0);
                  0
                elseif (cmd-id = 200)    // Help → About
-                 // Sprint 41f investigated MessageBoxW-from-WNDPROC
-                 // thoroughly. Findings (see docs/duim-research/
-                 // 07-probe-findings.md):
-                 //   * Sprint 32 trampoline IS re-entry-safe — 5 baseline
-                 //     probes (Sleep, GetTickCount, IsWindow,
-                 //     DefWindowProcW, EnableWindow) all complete cleanly.
-                 //   * MessageBoxW with hwnd=0 + MB_TOPMOST +
-                 //     MB_SETFOREGROUND DOES return cleanly (IDOK = 1)
-                 //     but NO DIALOG IS VISIBLE — the OS auto-dismisses
-                 //     an invisible dialog with the default response.
-                 //   * The combination "DirectX-rendered window + custom
-                 //     WNDPROC + modern Windows" makes MessageBox
-                 //     unreliable in ways that are documented Microsoft
-                 //     guidance (use TaskDialogIndirect or custom popup
-                 //     instead). Foreground-lock-rule flags (TOPMOST +
-                 //     SETFOREGROUND) help in normal apps but don't
-                 //     rescue our DirectX-host configuration.
-                 // So Help → About uses SetWindowTextW. The Sprint 41-
-                 // known-issue is RESOLVED with a known-good workaround;
-                 // a real modal popup waits for either TaskDialogIndirect
-                 // wiring or a custom D2D-rendered popup window.
+                 // Sprint 41f workaround — see SetWindowTextW
+                 // declaration comment above.
                  SetWindowTextW(hwnd,
-                                "NewOpenDylan IDE - Sprint 41e (About)");
+                                "NewOpenDylan IDE - Sprint 41g (About)");
+                 0
+               elseif (cmd-id > 300 & cmd-id < 306)  // Recent items 301..305
+                 // Convert 1-based menu position to 0-based list index.
+                 let idx = cmd-id - 301;
+                 let cursor = recent-paths;
+                 let i = 0;
+                 // Walk to the requested index. If the list is shorter
+                 // than expected (stale menu vs. live list — shouldn't
+                 // happen but defensive), `cursor` lands on nil and we
+                 // bail out.
+                 until (i = idx | empty?(cursor))
+                   cursor := tail(cursor);
+                   i := i + 1;
+                 end;
+                 if (~ empty?(cursor))
+                   let path = head(cursor);
+                   let bytes = %read-file(path);
+                   if (~ empty?(bytes))
+                     source-text := bytes;
+                     current-path := path;
+                     buffer-lines := %count-newlines(bytes);
+                     buffer-max-cols := %max-line-chars(bytes);
+                     client-width-px  := buffer-max-cols * char-width;
+                     client-height-px := buffer-lines * line-height;
+                     scroll-x-px := 0;
+                     scroll-y-px := 0;
+                     %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, 0, 1);
+                     %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  0, 1);
+                     recent-paths := %add-recent(path);
+                     rebuild-recent-submenu(recent-menu, recent-paths);
+                     DrawMenuBar(hwnd);
+                     update-title(hwnd, path);
+                     InvalidateRect(hwnd, 0, 0);
+                   else 0 end;
+                 else 0 end;
                  0
                else
                  // Unknown command id — defer to the OS default.
@@ -454,31 +587,18 @@ define function main () => ()
            end;
   let cb = as-wndproc-callback(wp);
   let atom = %register-window-class(cb, "NodIDE");
-  // Sprint 41e — build the menu bar BEFORE CreateWindowExW so we can
-  // pass the HMENU as the window's `hMenu` arg. AppendMenuW flags used:
-  //   MF_STRING    = 0     (default — a plain text item)
-  //   MF_POPUP     = 16    (the uIDNewItem is a submenu HMENU)
-  //   MF_SEPARATOR = 2048  (horizontal divider; lpNewItem ignored)
-  let menu-bar = CreateMenu();
-  let file-menu = CreatePopupMenu();
-  AppendMenuW(file-menu, 0,    100, "&Open...\tCtrl+O");
-  AppendMenuW(file-menu, 2048, 0,   "");
-  AppendMenuW(file-menu, 0,    199, "E&xit\tAlt+F4");
-  AppendMenuW(menu-bar,  16,   file-menu, "&File");
-  let help-menu = CreatePopupMenu();
-  AppendMenuW(help-menu, 0,    200, "&About");
-  AppendMenuW(menu-bar,  16,   help-menu, "&Help");
   // dwStyle = WS_OVERLAPPEDWINDOW (0xCF0000)
   //         | WS_VSCROLL          (0x00200000)
   //         | WS_HSCROLL          (0x00100000)
   //         = 16711680.
-  // hMenu = `menu-bar` HMENU (10th arg, previously 0).
+  // hMenu = `menu-bar` HMENU (10th arg).
   let hwnd = CreateWindowExW(0, atom, "NewOpenDylan IDE",
                              16711680, -2147483648, -2147483648, 1024, 768,
                              0, menu-bar, 0, 0);
   swap := %dxgi-create-swap-chain-for-hwnd(dxgi-factory, d3d-device, hwnd, 1024, 768);
   %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, 0, 1);
   %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  0, 1);
+  update-title(hwnd, current-path);
   ShowWindow(hwnd, 5);
   UpdateWindow(hwnd);
   %run-message-loop();

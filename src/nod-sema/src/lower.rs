@@ -386,6 +386,22 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // Arity-1: takes the owner HWND as a fixnum. Return is a string-or-
     // nil union, so the type estimate has to be `Top`.
     ("%show-open-file-dialog", "nod_show_open_file_dialog", 1, TypeEstimate::Top),
+    // Sprint 41g — File → Save / Save As. `%write-file` takes
+    // (path, content) — both `<byte-string>` Words — and returns
+    // fixnum 1 on success / 0 on I/O error. `%show-save-file-dialog`
+    // mirrors `%show-open-file-dialog` exactly but calls
+    // `GetSaveFileNameW` with OFN_OVERWRITEPROMPT.
+    ("%write-file", "nod_write_file_from_string", 2, TypeEstimate::Integer),
+    ("%show-save-file-dialog", "nod_show_save_file_dialog", 1, TypeEstimate::Top),
+    // Sprint 41g — Recent-files persistence helpers + basename.
+    // `%load-recent` reads F:\scratch\nod-ide-recent.txt and returns a
+    // `<pair>`-spined Dylan list (or nil if empty). `%add-recent`
+    // prepends a path, dedups, caps at 5, writes back, returns the new
+    // list. `%basename` returns the last path component for the title
+    // bar.
+    ("%load-recent", "nod_load_recent", 0, TypeEstimate::Top),
+    ("%add-recent", "nod_add_recent", 1, TypeEstimate::Top),
+    ("%basename", "nod_basename", 1, TypeEstimate::Top),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

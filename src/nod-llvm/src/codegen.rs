@@ -339,6 +339,26 @@ pub const NOD_MAX_LINE_CHARS_SYMBOL: &str = "nod_max_line_chars";
 /// (owner HWND).
 pub const NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL: &str = "nod_show_open_file_dialog";
 
+// ─── Sprint 41g — File → Save / Save As + Recent submenu ─────────────────
+/// Write a Dylan `<byte-string>` payload to a file whose path is also
+/// a `<byte-string>`. Returns fixnum 1 on success / 0 on I/O error.
+/// Arity-2.
+pub const NOD_WRITE_FILE_FROM_STRING_SYMBOL: &str = "nod_write_file_from_string";
+/// Shim that wraps `GetSaveFileNameW` (same `OPENFILENAMEW` struct as
+/// the open-dialog shim) with `OFN_OVERWRITEPROMPT`. Returns the chosen
+/// path as a `<byte-string>` Word (or `nil` on cancel). Arity-1
+/// (owner HWND).
+pub const NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL: &str = "nod_show_save_file_dialog";
+/// Load the recent-files list from `F:\scratch\nod-ide-recent.txt` and
+/// return as a `<pair>`-spined Dylan list. Arity-0.
+pub const NOD_LOAD_RECENT_SYMBOL: &str = "nod_load_recent";
+/// Prepend a path to the recent-files list (dedup + cap at 5), persist
+/// back to disk, return the new list. Arity-1.
+pub const NOD_ADD_RECENT_SYMBOL: &str = "nod_add_recent";
+/// Last path component of a `<byte-string>`, splitting on `\` or `/`.
+/// Arity-1.
+pub const NOD_BASENAME_SYMBOL: &str = "nod_basename";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -510,6 +530,15 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_max_line_chars", NOD_MAX_LINE_CHARS_SYMBOL, 1),
     // Sprint 41e — File → Open dialog shim.
     ("nod_show_open_file_dialog", NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL, 1),
+    // Sprint 41g — File → Save / Save As shims. `nod_write_file_from_string`
+    // is the byte-string-to-file writer; `nod_show_save_file_dialog`
+    // mirrors the open-dialog shim but calls `GetSaveFileNameW`.
+    ("nod_write_file_from_string", NOD_WRITE_FILE_FROM_STRING_SYMBOL, 2),
+    ("nod_show_save_file_dialog", NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL, 1),
+    // Sprint 41g — Recent-files list helpers + basename.
+    ("nod_load_recent", NOD_LOAD_RECENT_SYMBOL, 0),
+    ("nod_add_recent", NOD_ADD_RECENT_SYMBOL, 1),
+    ("nod_basename", NOD_BASENAME_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

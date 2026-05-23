@@ -143,6 +143,13 @@ pub use com_shim::{
     // Sprint 41e — Win32 file-open common dialog shim (wraps
     // GetOpenFileNameW + the 88-byte OPENFILENAMEW struct).
     nod_show_open_file_dialog,
+    // Sprint 41g — Win32 file-save common dialog shim (wraps
+    // GetSaveFileNameW + the same OPENFILENAMEW struct) and the
+    // `<byte-string>`-to-file write shim that backs File → Save and
+    // File → Save As. Plus recent-files helpers (load/add/basename)
+    // that own the on-disk persistence + dedup/cap-at-5 logic.
+    nod_add_recent, nod_basename, nod_load_recent,
+    nod_show_save_file_dialog, nod_write_file_from_string,
     register as com_register, registry_len as com_registry_len,
 };
 pub use callbacks::{

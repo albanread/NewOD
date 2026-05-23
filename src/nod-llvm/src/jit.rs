@@ -96,6 +96,13 @@ use crate::codegen::{
     NOD_MAX_LINE_CHARS_SYMBOL,
     // Sprint 41e — File → Open dialog shim.
     NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL,
+    // Sprint 41g — File → Save / Save As shims.
+    NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL,
+    NOD_WRITE_FILE_FROM_STRING_SYMBOL,
+    // Sprint 41g — Recent-files list helpers + basename.
+    NOD_LOAD_RECENT_SYMBOL,
+    NOD_ADD_RECENT_SYMBOL,
+    NOD_BASENAME_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -633,6 +640,19 @@ impl<'ctx> Jit<'ctx> {
             // pulls the same symbol out of nod_runtime.lib's staticlib.
             (module.get_function(NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL),
              nod_runtime::nod_show_open_file_dialog as *const () as *mut std::ffi::c_void),
+            // Sprint 41g — File → Save / Save As shim bindings. Same
+            // cold-path-vs-AOT split as the open-dialog shim above.
+            (module.get_function(NOD_WRITE_FILE_FROM_STRING_SYMBOL),
+             nod_runtime::nod_write_file_from_string as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL),
+             nod_runtime::nod_show_save_file_dialog as *const () as *mut std::ffi::c_void),
+            // Sprint 41g — Recent-files persistence + basename.
+            (module.get_function(NOD_LOAD_RECENT_SYMBOL),
+             nod_runtime::nod_load_recent as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_ADD_RECENT_SYMBOL),
+             nod_runtime::nod_add_recent as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_BASENAME_SYMBOL),
+             nod_runtime::nod_basename as *const () as *mut std::ffi::c_void),
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
@@ -1341,6 +1361,16 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         // cache-replay symbol-mapping path so a cache hit keeps the
         // `%show-open-file-dialog` binding live.
         (NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL, nod_runtime::nod_show_open_file_dialog as *const () as *mut std::ffi::c_void),
+        // Sprint 41g — File → Save / Save As shims, surfaced through
+        // the cache-replay symbol-mapping path so a cache hit keeps
+        // both `%write-file` and `%show-save-file-dialog` bindings live.
+        (NOD_WRITE_FILE_FROM_STRING_SYMBOL, nod_runtime::nod_write_file_from_string as *const () as *mut std::ffi::c_void),
+        (NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL, nod_runtime::nod_show_save_file_dialog as *const () as *mut std::ffi::c_void),
+        // Sprint 41g — Recent-files helpers + basename, surfaced through
+        // the cache-replay symbol-mapping path.
+        (NOD_LOAD_RECENT_SYMBOL, nod_runtime::nod_load_recent as *const () as *mut std::ffi::c_void),
+        (NOD_ADD_RECENT_SYMBOL, nod_runtime::nod_add_recent as *const () as *mut std::ffi::c_void),
+        (NOD_BASENAME_SYMBOL, nod_runtime::nod_basename as *const () as *mut std::ffi::c_void),
     ]);
     v
 }

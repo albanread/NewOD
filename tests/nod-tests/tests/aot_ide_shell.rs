@@ -1098,3 +1098,119 @@ fn aot_nod_ide_menu_open() {
     let _ = remove_dir_all_best_effort(&dir);
     // Leave the F:\scratch fixtures so the user can rerun manually.
 }
+
+/// **The Sprint 41g headline.** Build an AOT-linked EXE — the
+/// File menu now offers Save / Save As / Recent files — and exercise
+/// the round-trip + recent-list persistence.
+///
+/// Differences vs. Sprint 41e (`aot_nod_ide_menu_open`):
+///
+///   * File menu now has Save (cmd-id 101), Save As (cmd-id 102), and
+///     a Recent submenu (cmd-ids 301..305).
+///   * Recent-files list persists across runs in
+///     `F:\scratch\nod-ide-recent.txt` — one absolute path per line,
+///     most-recent first, capped at 5. Dedup on add.
+///   * Window title shows the current file's basename (no longer the
+///     bare "NewOpenDylan IDE" — we now know which file is open).
+///   * Save / Save As don't change the file content (the editor is
+///     still read-only); they rewrite it with its own current bytes.
+///     That's intentional — the plumbing is ready for when editing
+///     arrives. Round-tripping read → write to a new path produces a
+///     byte-identical copy.
+///
+/// What this test exercises beyond Sprint 41e:
+///   * The new `nod_write_file_from_string` shim (byte-string-to-file
+///     binary write).
+///   * The new `nod_show_save_file_dialog` shim (wrap of
+///     `GetSaveFileNameW` with OFN_OVERWRITEPROMPT).
+///   * The new `nod_load_recent` / `nod_add_recent` / `nod_basename`
+///     shims — recent-list persistence with dedup + 5-entry cap, plus
+///     basename extraction for the title bar.
+///   * Dynamic menu rebuild: `RemoveMenu(MF_BYPOSITION)` + re-
+///     `AppendMenuW` + `DrawMenuBar` keep the Recent submenu in sync
+///     with the on-disk list across opens / saves.
+///
+/// `#[ignore]`-gated because it's interactive. After the user closes
+/// the window, the test asserts exit code 0.
+#[test]
+#[ignore = "interactive: pops a real Win32 window with Save/SaveAs/Recent. Run with `cargo test --test aot_ide_shell -- --ignored --nocapture aot_nod_ide_save_and_recent`."]
+#[serial]
+fn aot_nod_ide_save_and_recent() {
+    // Same `include_str!` trick as 41d/41e/41f: standalone fixture
+    // file is the canonical source; the test embeds it via include_str!
+    // so the standalone `nod-driver build`-able file and the test stay
+    // in lockstep automatically.
+    let source = include_str!("../fixtures/nod-ide.dylan");
+
+    let (dir, exe_path) = build_exe("nod-ide-save-recent", source);
+
+    let scratch_root = PathBuf::from(r"F:\scratch");
+    if !scratch_root.is_dir() {
+        eprintln!(
+            "[sprint-41g headline] F:\\scratch is missing on this machine — \
+             this test requires F:\\scratch to exist (hard project rule: \
+             test inputs live there, not inside the repo). Skipping."
+        );
+        return;
+    }
+
+    // Two fixtures so the user can pick something different via
+    // File → Save As. Both are small files in the test root.
+    let initial_fixture = scratch_root.join("nod-ide-41g-initial.dylan");
+    std::fs::write(
+        &initial_fixture,
+        "Module: initial-sample\n\n\
+         // initial-sample.dylan - Sprint 41g fixture for the Save/Recent IDE.\n\
+         //\n\
+         // The IDE opens with THIS file (passed via argv[1]).\n\
+         // Try File > Save As to pick a new filename, then File > Recent\n\
+         // to see the recent-list submenu populate.\n\n\
+         define function hello () => ()\n  \
+             format-out(\"hello from the initial buffer\\n\");\n\
+         end function;\n\n\
+         define function main () => ()\n  \
+             hello();\n\
+         end function main;\n",
+    )
+    .expect("write initial fixture");
+
+    eprintln!(
+        "[sprint-41g headline] AOT nod-ide (save+recent) EXE built at {}; \
+         spawning with argv[1] = {}.\n  \
+         A WINDOW WILL APPEAR; the title bar shows the file's basename \
+         (e.g. \"nod-ide-41g-initial.dylan\").\n  \
+         * Click File. The menu now shows Open / Save / Save As... / Recent / Exit.\n  \
+         * Click File > Save As. Choose F:\\scratch\\nod-ide-41g-saved.txt (or any other path).\n  \
+         * Title updates to the new basename. The file is created on disk\n  \
+           (it's a byte-identical copy of the current buffer).\n  \
+         * Click File > Recent. The submenu now shows the file you just\n  \
+           saved at position 1, plus any earlier entries from previous runs.\n  \
+         * Click a recent item. The buffer reloads from that path; title updates.\n  \
+         * Optional: close the window, then re-launch the EXE (it'll use\n  \
+           the same argv[1]). Open File > Recent — the previously-saved\n  \
+           file is STILL there (persisted across runs).\n  \
+         * Close the window. The test will then validate exit code 0.",
+        exe_path.display(),
+        initial_fixture.display(),
+    );
+
+    let mut child = Command::new(&exe_path)
+        .arg(&initial_fixture)
+        .spawn()
+        .expect("spawn AOT nod-ide (save+recent) EXE");
+    let status = child.wait().expect("wait for AOT nod-ide (save+recent) EXE");
+    let code = status.code().unwrap_or(-1);
+    eprintln!(
+        "[sprint-41g headline] AOT nod-ide (save+recent) EXE exited with code {code}"
+    );
+
+    assert_eq!(
+        code, 0,
+        "AOT nod-ide (save+recent) EXE must exit cleanly with code 0; exe={}",
+        exe_path.display()
+    );
+
+    let _ = remove_dir_all_best_effort(&dir);
+    // Leave F:\scratch fixtures + nod-ide-recent.txt in place so the
+    // user can rerun manually and observe persistence behaviour.
+}
