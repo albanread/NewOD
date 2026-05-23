@@ -1882,6 +1882,100 @@ pub unsafe extern "C-unwind" fn nod_run_message_loop() -> u64 {
     tag(exit_code as u32 as u64)
 }
 
+// ─── Sprint 41b — bit-extraction helpers for WM_SIZE lparam unpack ────────
+
+/// JIT-callable: return the low 16 bits of an integer. Used by the
+/// Dylan-side WM_SIZE handler to extract `LOWORD(lparam)` = new client
+/// width. Dylan currently lacks `logand` / `bit-and` / `ash`
+/// primitives, so a dedicated shim is the path of least resistance for
+/// Sprint 41b — alternatives (adding three full bitwise primitives, or
+/// exposing `GetClientRect` and a `<rect>` struct) are much larger
+/// commitments. Future sprints can promote this to a general
+/// `%logand(value, mask)` shim when more callers materialise.
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_lo_word(value: u64) -> u64 {
+    let v = untag(value);
+    tag(v & 0xFFFF)
+}
+
+/// JIT-callable: return bits 16-31 of an integer as a u16. Used by the
+/// Dylan-side WM_SIZE handler to extract `HIWORD(lparam)` = new client
+/// height. See `nod_lo_word` for the rationale.
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_hi_word(value: u64) -> u64 {
+    let v = untag(value);
+    tag((v >> 16) & 0xFFFF)
+}
+
+// ─── Sprint 41b — file I/O + argv helpers for the IDE ───────────────────────
+
+/// JIT-callable: read the entire contents of a file whose UTF-8 path is
+/// carried by the Dylan `<byte-string>` Word `path_word`, intern the
+/// result as a fresh Dylan `<byte-string>` Word, and return its raw
+/// bits. On any error (missing file, permission denied, OS quirk),
+/// return the `nil` immediate Word — the Dylan caller's `result = nil`
+/// check is the documented signal.
+///
+/// The file is decoded as UTF-8 with `String::from_utf8_lossy` so
+/// non-UTF-8 sequences are replaced with U+FFFD instead of propagating
+/// an error. For a source-viewer use case that's the right default:
+/// a Dylan source file with a stray non-UTF-8 byte should still render,
+/// just with a visible replacement glyph at the bad byte.
+///
+/// Allocation goes through `intern_string_literal`, which puts the
+/// content in the process-global static-area literal pool. That's
+/// long-lived (no GC) but the IDE reads each source file exactly
+/// once at open-time, so the pool grows O(file-size) per opened
+/// source, not per-paint. A future sprint can route the allocation
+/// through the moveable heap when an editor wants per-buffer
+/// lifetime.
+///
+/// # Safety
+/// `path_word` must be a valid Dylan Word. If sema's type-checking
+/// passed a non-`<byte-string>` Word, `read_dylan_byte_string` panics.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_read_file_to_string(path_word: u64) -> u64 {
+    let path_string = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(path_word));
+    match std::fs::read(&path_string) {
+        Ok(bytes) => {
+            // Lossy decode preserves the byte count for ASCII and
+            // mostly-ASCII files (every byte either round-trips or
+            // becomes U+FFFD, which is 3 UTF-8 bytes). Most Dylan
+            // source files are pure ASCII.
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            crate::intern_string_literal(&s).raw()
+        }
+        Err(_) => crate::literal_pool_immediates().nil.raw(),
+    }
+}
+
+/// JIT-callable: return the first user-supplied command-line argument
+/// (the second `std::env::args()` element, i.e. `argv[1]`) as a fresh
+/// Dylan `<byte-string>` Word. Returns `nil` if the process was
+/// launched with no extra args.
+///
+/// On Windows `std::env::args()` decodes the OS's UTF-16 command line
+/// to UTF-8 via the Rust std runtime — which is exactly what every
+/// well-behaved CLI tool wants. A future general `%argv()` shim can
+/// expose the full vector; Sprint 41b only needs the one filename arg
+/// the IDE EXE is invoked with.
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_get_argv1() -> u64 {
+    match std::env::args().nth(1) {
+        Some(s) => crate::intern_string_literal(&s).raw(),
+        None => crate::literal_pool_immediates().nil.raw(),
+    }
+}
+
 // ─── UTF-16 helpers ───────────────────────────────────────────────────────
 
 /// Decode a Dylan `<byte-string>` Word's UTF-8 payload to a

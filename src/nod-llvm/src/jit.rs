@@ -83,6 +83,11 @@ use crate::codegen::{
     NOD_PUMP_ONE_MESSAGE_SYMBOL,
     NOD_RUN_MESSAGE_LOOP_SYMBOL,
     NOD_DEF_WINDOW_PROC_SYMBOL,
+    // Sprint 41b — IDE source-viewer primitives.
+    NOD_READ_FILE_TO_STRING_SYMBOL,
+    NOD_GET_ARGV1_SYMBOL,
+    NOD_LO_WORD_SYMBOL,
+    NOD_HI_WORD_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -591,6 +596,19 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_run_message_loop as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_DEF_WINDOW_PROC_SYMBOL),
              nod_runtime::nod_def_window_proc as *const () as *mut std::ffi::c_void),
+            // Sprint 41b — IDE source-viewer primitives. `%read-file`
+            // and `%argv1` lower to these symbols; the JIT path binds
+            // them to the runtime's shims here so `nod-ide.dylan`
+            // works under both `cargo run --bin nod-driver eval` (JIT)
+            // and the AOT EXE path.
+            (module.get_function(NOD_READ_FILE_TO_STRING_SYMBOL),
+             nod_runtime::nod_read_file_to_string as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_GET_ARGV1_SYMBOL),
+             nod_runtime::nod_get_argv1 as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_LO_WORD_SYMBOL),
+             nod_runtime::nod_lo_word as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_HI_WORD_SYMBOL),
+             nod_runtime::nod_hi_word as *const () as *mut std::ffi::c_void),
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
@@ -1280,6 +1298,13 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_STRUCT_SET_POINTER_SYMBOL, nod_runtime::nod_struct_set_pointer as *const () as *mut std::ffi::c_void),
         (NOD_REGISTER_WNDPROC_SYMBOL, nod_runtime::nod_register_wndproc as *const () as *mut std::ffi::c_void),
         (NOD_REGISTER_WNDENUMPROC_SYMBOL, nod_runtime::nod_register_wndenumproc as *const () as *mut std::ffi::c_void),
+        // Sprint 41b — IDE source-viewer primitives, also surfaced
+        // through the cache-replay symbol-mapping path so a JIT cache
+        // hit doesn't lose the binding.
+        (NOD_READ_FILE_TO_STRING_SYMBOL, nod_runtime::nod_read_file_to_string as *const () as *mut std::ffi::c_void),
+        (NOD_GET_ARGV1_SYMBOL, nod_runtime::nod_get_argv1 as *const () as *mut std::ffi::c_void),
+        (NOD_LO_WORD_SYMBOL, nod_runtime::nod_lo_word as *const () as *mut std::ffi::c_void),
+        (NOD_HI_WORD_SYMBOL, nod_runtime::nod_hi_word as *const () as *mut std::ffi::c_void),
     ]);
     v
 }

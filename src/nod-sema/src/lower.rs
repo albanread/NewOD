@@ -355,6 +355,18 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // a WNDPROC's WM_DESTROY handler passed to `PostQuitMessage`).
     ("%run-message-loop", "nod_run_message_loop", 0, TypeEstimate::Integer),
     ("%def-window-proc", "nod_def_window_proc", 4, TypeEstimate::Integer),
+    // Sprint 41b — IDE source-viewer primitives. Both return either a
+    // fresh `<byte-string>` Word or the `nil` immediate, so the type
+    // estimate has to be `Top` (a union that includes neither
+    // `<integer>` nor a unique class). Dylan-side callers branch on
+    // `result = nil` to surface "no file" / "no arg" cases.
+    ("%read-file", "nod_read_file_to_string", 1, TypeEstimate::Top),
+    ("%argv1", "nod_get_argv1", 0, TypeEstimate::Top),
+    // Sprint 41b — LOWORD/HIWORD extraction for WM_SIZE `lparam` unpack.
+    // Both take a fixnum value and return a fixnum. Future sprints
+    // should replace with general bitwise primitives.
+    ("%lo-word", "nod_lo_word", 1, TypeEstimate::Integer),
+    ("%hi-word", "nod_hi_word", 1, TypeEstimate::Integer),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

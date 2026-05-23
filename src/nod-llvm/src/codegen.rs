@@ -311,6 +311,18 @@ pub const NOD_PUMP_ONE_MESSAGE_SYMBOL: &str = "nod_pump_one_message";
 pub const NOD_RUN_MESSAGE_LOOP_SYMBOL: &str = "nod_run_message_loop";
 pub const NOD_DEF_WINDOW_PROC_SYMBOL: &str = "nod_def_window_proc";
 
+// ─── Sprint 41b — IDE source-viewer primitives ────────────────────────────
+/// Read a file's contents into a fresh Dylan `<byte-string>` (or `nil`
+/// on error). Arity-1; takes a `<byte-string>` path Word.
+pub const NOD_READ_FILE_TO_STRING_SYMBOL: &str = "nod_read_file_to_string";
+/// Return `argv[1]` as a Dylan `<byte-string>` (or `nil` if absent).
+/// Arity-0.
+pub const NOD_GET_ARGV1_SYMBOL: &str = "nod_get_argv1";
+/// Low 16 bits of an integer (for `LOWORD(lparam)` in WM_SIZE).
+pub const NOD_LO_WORD_SYMBOL: &str = "nod_lo_word";
+/// Bits 16-31 of an integer (for `HIWORD(lparam)` in WM_SIZE).
+pub const NOD_HI_WORD_SYMBOL: &str = "nod_hi_word";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -466,6 +478,14 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     // C idiom that blocks on the whole thread's queue.
     ("nod_run_message_loop", NOD_RUN_MESSAGE_LOOP_SYMBOL, 0),
     ("nod_def_window_proc", NOD_DEF_WINDOW_PROC_SYMBOL, 4),
+    // Sprint 41b — IDE source-viewer primitives. Arity matches the
+    // C-ABI shim signatures: `nod_read_file_to_string(path_word)`
+    // takes the `<byte-string>` Word and returns a Word; `nod_get_argv1`
+    // takes no args and returns a Word.
+    ("nod_read_file_to_string", NOD_READ_FILE_TO_STRING_SYMBOL, 1),
+    ("nod_get_argv1", NOD_GET_ARGV1_SYMBOL, 0),
+    ("nod_lo_word", NOD_LO_WORD_SYMBOL, 1),
+    ("nod_hi_word", NOD_HI_WORD_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

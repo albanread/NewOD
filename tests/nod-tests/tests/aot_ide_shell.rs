@@ -284,3 +284,222 @@ fn aot_ide_shell_window_renders_hello_dylan() {
     // Success — clean up the temp dir.
     let _ = remove_dir_all_best_effort(&dir);
 }
+
+/// **The Sprint 41b headline.** Build an AOT-linked EXE — "nod-ide" —
+/// that opens a window, reads a `.dylan` source file path from `argv[1]`,
+/// and renders its contents as monospace text via DirectWrite. The
+/// window handles WM_SIZE correctly: dragging the window edge resizes
+/// the swap chain, recreates the bitmap, and re-renders without
+/// artifacts.
+///
+/// This is the first step from "Sprint 41a demo" to "I could use this
+/// to look at Dylan code." Read-only — no cursor, no scrollbar, no
+/// editing. Sprint 41c adds those.
+///
+/// What this test exercises beyond Sprint 41a:
+///   * `%read-file(path)` — new Sprint 41b runtime shim
+///     `nod_read_file_to_string` reads bytes off disk, allocates a fresh
+///     Dylan `<byte-string>` in the static-area literal pool, returns
+///     its Word. Errors return the `nil` immediate.
+///   * `%argv1()` — new Sprint 41b runtime shim `nod_get_argv1` reads
+///     `std::env::args().nth(1)` and surfaces it as a `<byte-string>`
+///     Word (or `nil` if absent).
+///   * `%lo-word(v)` / `%hi-word(v)` — minimal bitwise extraction
+///     shims for unpacking WM_SIZE's `lparam` (low 16 = width, high 16
+///     = height). Dylan currently lacks general `logand`/`ash`
+///     primitives; these are the path of least resistance for the
+///     Sprint 41b deliverable. A future sprint can promote them to
+///     `%logand` / `%ash`.
+///   * WM_SIZE handler in the Dylan WNDPROC. On resize we drop the
+///     cached D2D bitmap (bound to the old swap-chain dimensions),
+///     call `%dxgi-swap-chain-resize-buffers` with the unpacked width
+///     and height, and let the next WM_PAINT see `bitmap = 0` and
+///     recreate it for the new size.
+///
+/// `#[ignore]`-gated because it's interactive. The test runner spawns
+/// the EXE, the user resizes / closes the window, and the test asserts
+/// exit code 0 after `.wait()` returns.
+#[test]
+#[ignore = "interactive: pops a real Win32 window. Run with `cargo test --test aot_ide_shell -- --ignored --nocapture aot_nod_ide_source_viewer`."]
+#[serial]
+fn aot_nod_ide_source_viewer() {
+    // The Dylan source for `nod-ide.exe`. The first `define c-function`
+    // declarations match `aot_ide_shell_window_renders_hello_dylan`
+    // verbatim — see that test's docstring for why `lpClassName` must
+    // be `<c-pointer>` (an integer-shaped arg) instead of the default
+    // string-marshaling path.
+    //
+    // The structure differs from Sprint 41a in two ways:
+    //   1. main reads `%argv1()` then `%read-file(path)`, falling back
+    //      to a hardcoded test message if either is absent or fails.
+    //   2. The WNDPROC handles WM_SIZE (msg=5): release the cached
+    //      D2D bitmap, unpack `lparam` via `%lo-word`/`%hi-word`, call
+    //      `%dxgi-swap-chain-resize-buffers`. Next WM_PAINT then sees
+    //      `bitmap = 0` and re-creates it at the new size.
+    //
+    // The render path passes the entire file source as one DirectWrite
+    // layout — DWrite handles `\n` line breaks natively, so we don't
+    // need a Dylan-side line-splitter. The layout box is set to
+    // (width-padding, height-padding) so text wraps to the viewport
+    // and clips beyond it. Read-only display, no scrolling.
+    let source = "Module: nod-ide\n\n\
+        define c-function CreateWindowExW\n  \
+            (dwExStyle :: <c-int>, lpClassName :: <c-pointer>, lpWindowName :: <c-wide-string>,\n   \
+             dwStyle :: <c-int>, x :: <c-int>, y :: <c-int>, nWidth :: <c-int>, nHeight :: <c-int>,\n   \
+             hWndParent :: <c-pointer>, hMenu :: <c-pointer>, hInstance :: <c-pointer>,\n   \
+             lpParam :: <c-pointer>)\n   \
+         => (hwnd :: <c-pointer>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function ShowWindow\n  \
+            (hwnd :: <c-pointer>, nCmdShow :: <c-int>)\n   \
+         => (was-visible :: <c-bool>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function UpdateWindow\n  \
+            (hwnd :: <c-pointer>)\n   \
+         => (success :: <c-bool>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function DefWindowProcW\n  \
+            (hwnd :: <c-pointer>, msg :: <c-int>,\n   \
+             wparam :: <c-pointer>, lparam :: <c-pointer>)\n   \
+         => (lresult :: <c-pointer>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function PostQuitMessage\n  \
+            (exit-code :: <c-int>)\n   \
+         => ();\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define function main () => ()\n  \
+            let arg-path = %argv1();\n  \
+            let source-text = if (empty?(arg-path))\n                      \
+                                \"nod-ide: no argv[1] supplied; pass a Dylan source path as the first argument.\"\n                    \
+                              else\n                      \
+                                let bytes = %read-file(arg-path);\n                      \
+                                if (empty?(bytes))\n                        \
+                                  \"nod-ide: could not read the file passed via argv[1].\"\n                      \
+                                else\n                        \
+                                  bytes\n                      \
+                                end\n                    \
+                              end;\n  \
+            let d3d-device   = %d3d11-create-device();\n  \
+            let dxgi-factory = %dxgi-factory-from-d3d-device(d3d-device);\n  \
+            let dxgi-device  = %dxgi-device-from-d3d-device(d3d-device);\n  \
+            let d2d-factory  = %d2d-create-factory();\n  \
+            let d2d-device   = %d2d-create-device(d2d-factory, dxgi-device);\n  \
+            let dc           = %d2d-create-device-context(d2d-device);\n  \
+            let dwrite       = %dwrite-create-factory();\n  \
+            let format       = %dwrite-create-text-format(dwrite, \"Consolas\", 1400, \"en-us\");\n  \
+            let swap = 0;\n  \
+            let bitmap = 0;\n  \
+            let width = 1024;\n  \
+            let height = 768;\n  \
+            let wp = method (hwnd, msg, wparam, lparam)\n            \
+                       if (msg = 15)\n              \
+                         if (swap ~= 0)\n                \
+                           if (bitmap = 0)\n                  \
+                             bitmap := %d2d-create-bitmap-from-swap-chain(dc, swap);\n                \
+                           else 0 end;\n                \
+                           %d2d-set-target(dc, bitmap);\n                \
+                           %d2d-begin-draw(dc);\n                \
+                           %d2d-clear(dc, 255, 255, 255, 255);\n                \
+                           let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);\n                \
+                           let layout = %dwrite-create-text-layout(dwrite, source-text, format, width, height);\n                \
+                           %d2d-draw-text-layout(dc, 8, 8, layout, brush);\n                \
+                           %d2d-end-draw(dc);\n                \
+                           %com-release(brush);\n                \
+                           %com-release(layout);\n                \
+                           %dxgi-swap-chain-present(swap);\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 5)\n              \
+                         if (swap ~= 0 & wparam ~= 1)\n                \
+                           let new-w = %lo-word(lparam);\n                \
+                           let new-h = %hi-word(lparam);\n                \
+                           if (new-w > 0 & new-h > 0)\n                  \
+                             if (bitmap ~= 0)\n                    \
+                               %d2d-set-target(dc, 0);\n                    \
+                               %com-release(bitmap);\n                    \
+                               bitmap := 0;\n                  \
+                             else 0 end;\n                  \
+                             width := new-w;\n                  \
+                             height := new-h;\n                  \
+                             %dxgi-swap-chain-resize-buffers(swap, new-w, new-h);\n                \
+                           else 0 end;\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 2)\n              \
+                         PostQuitMessage(0);\n              \
+                         0\n            \
+                       else\n              \
+                         DefWindowProcW(hwnd, msg, wparam, lparam)\n            \
+                       end\n          \
+                     end;\n  \
+            let cb = as-wndproc-callback(wp);\n  \
+            let atom = %register-window-class(cb, \"NodIDE\");\n  \
+            let hwnd = CreateWindowExW(0, atom, \"NewOpenDylan IDE\",\n                                       \
+                13565952, -2147483648, -2147483648, 1024, 768,\n                                       \
+                0, 0, 0, 0);\n  \
+            swap := %dxgi-create-swap-chain-for-hwnd(dxgi-factory, d3d-device, hwnd, 1024, 768);\n  \
+            ShowWindow(hwnd, 5);\n  \
+            UpdateWindow(hwnd);\n  \
+            %run-message-loop();\n\
+        end function main;\n";
+
+    let (dir, exe_path) = build_exe("nod-ide", source);
+
+    // Write a small Dylan source fixture into the build dir so the
+    // test doesn't depend on any workspace-relative path being correct
+    // at runtime. The EXE reads this via `%argv1()` → `%read-file(path)`.
+    let fixture_path = dir.join("sample.dylan");
+    let fixture_content = "Module: sample\n\n\
+        // sample.dylan — Sprint 41b fixture for nod-ide.exe\n\
+        //\n\
+        // The IDE reads this file at startup and renders its contents\n\
+        // via DirectWrite. Resize the window — text should re-render\n\
+        // at the new viewport size without artifacts.\n\n\
+        define function greet () => ()\n  \
+            format-out(\"hello from a real Dylan source file!\\n\");\n\
+        end function;\n\n\
+        define function add (a, b) => (sum)\n  \
+            a + b\n\
+        end function;\n\n\
+        define function main () => ()\n  \
+            greet();\n  \
+            format-out(\"2 + 3 = %d\\n\", add(2, 3));\n\
+        end function main;\n";
+    std::fs::write(&fixture_path, fixture_content).expect("write sample fixture");
+
+    eprintln!(
+        "[sprint-41b headline] AOT nod-ide EXE built at {}; spawning with \
+         argv[1] = {}.\n  \
+         A WINDOW WILL APPEAR showing the file's source. \
+         RESIZE THE WINDOW (drag the corner / edge) — text should re-render \
+         at the new size without artifacts or crashes.\n  \
+         Click X to close. The test will then validate exit code 0.",
+        exe_path.display(),
+        fixture_path.display(),
+    );
+
+    // Spawn the EXE and block until it exits. The user resizes the
+    // window then closes it.
+    let mut child = Command::new(&exe_path)
+        .arg(&fixture_path)
+        .spawn()
+        .expect("spawn AOT nod-ide EXE");
+    let status = child.wait().expect("wait for AOT nod-ide EXE");
+    let code = status.code().unwrap_or(-1);
+    eprintln!("[sprint-41b headline] AOT nod-ide EXE exited with code {code}");
+
+    assert_eq!(
+        code, 0,
+        "AOT nod-ide EXE must exit cleanly with code 0 (WM_QUIT received \
+         via PostQuitMessage(0) in WM_DESTROY handler); exe={}",
+        exe_path.display()
+    );
+
+    // Success — clean up the temp dir.
+    let _ = remove_dir_all_best_effort(&dir);
+}

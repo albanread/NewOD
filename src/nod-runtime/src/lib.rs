@@ -137,7 +137,8 @@ pub use com_shim::{
     nod_dxgi_create_factory, nod_dxgi_create_surface_from_texture,
     nod_dxgi_create_swap_chain_for_hwnd, nod_dxgi_device_from_d3d_device,
     nod_dxgi_factory_from_d3d_device, nod_dxgi_swap_chain_present,
-    nod_dxgi_swap_chain_resize_buffers, nod_post_message, nod_pump_one_message,
+    nod_dxgi_swap_chain_resize_buffers, nod_get_argv1, nod_hi_word, nod_lo_word,
+    nod_post_message, nod_pump_one_message, nod_read_file_to_string,
     nod_register_window_class, nod_run_message_loop, register as com_register,
     registry_len as com_registry_len,
 };
