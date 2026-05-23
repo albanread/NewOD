@@ -2133,6 +2133,78 @@ pub unsafe extern "C-unwind" fn nod_get_scroll_pos(hwnd_word: u64, nbar: u64) ->
     tag(pos as u64)
 }
 
+// ─── Sprint 41e — Win32 file-open common dialog ──────────────────────────
+
+/// JIT-callable: show the Win32 common file-open dialog and return the
+/// chosen path as a fresh Dylan `<byte-string>` Word, or the `nil`
+/// immediate if the user cancelled (or any system error). The dialog is
+/// owned by `hwnd_word` (so it modals against the IDE window).
+///
+/// Why a shim: `GetOpenFileNameW` takes an `OPENFILENAMEW` struct with
+/// 18+ fields and a hard `cbSize = sizeof(OPENFILENAMEW)` invariant.
+/// Plumbing that as a Dylan-side `<c-struct>` would be far more code
+/// than the rest of the Sprint 41e brief combined. A single shim sets
+/// sane defaults (filter = Dylan/Text/All, OFN_FILEMUSTEXIST |
+/// OFN_PATHMUSTEXIST), allocates a 260-wchar buffer for the returned
+/// path, runs the dialog, and surfaces the chosen path back to Dylan as
+/// a freshly-interned `<byte-string>`.
+///
+/// # Safety
+/// `hwnd_word` must be a Dylan fixnum encoding a valid (or 0 = no
+/// owner) HWND. The dialog blocks the calling thread until the user
+/// confirms or cancels.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_show_open_file_dialog(hwnd_word: u64) -> u64 {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let hwnd_raw = untag_i64(hwnd_word);
+    let hwnd_h = HWND(hwnd_raw as *mut std::ffi::c_void);
+
+    // Filter pairs: "<display>\0<pattern>\0", terminated by a double
+    // null. The DirectWrite docs call this format a "double-null
+    // terminated wide-character string".
+    let filter_utf8 =
+        "Dylan (*.dylan)\0*.dylan\0Text (*.txt)\0*.txt\0All (*.*)\0*.*\0\0";
+    let filter: Vec<u16> = filter_utf8.encode_utf16().collect();
+
+    // 260 = MAX_PATH on classic Win32. Long-path support requires a
+    // larger buffer + OFN_EXPLORER + a manifest entry; deferred until
+    // someone files a real bug against an IDE-opened path > 260 chars.
+    let mut path_buf: [u16; 260] = [0u16; 260];
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd_h,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(path_buf.as_mut_ptr()),
+        nMaxFile: path_buf.len() as u32,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        ..unsafe { std::mem::zeroed() }
+    };
+
+    // SAFETY: ofn is fully populated; lpstrFile points to path_buf
+    // which lives for the duration of this call; lpstrFilter points to
+    // the filter Vec which also lives for the duration.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    drop(filter);
+
+    if !ok.as_bool() {
+        // Either the user cancelled or `CommDlgExtendedError()` would
+        // surface a real problem. Either way, Dylan-side semantics is
+        // "no file picked"; return nil for the caller to test.
+        return crate::literal_pool_immediates().nil.raw();
+    }
+
+    // Find the null terminator. GetOpenFileNameW guarantees one within
+    // [0, nMaxFile-1] on success.
+    let len = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+    let s = String::from_utf16_lossy(&path_buf[..len]);
+    crate::intern_string_literal(&s).raw()
+}
+
 // ─── UTF-16 helpers ───────────────────────────────────────────────────────
 
 /// Decode a Dylan `<byte-string>` Word's UTF-8 payload to a

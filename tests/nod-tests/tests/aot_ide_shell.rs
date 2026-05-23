@@ -963,3 +963,138 @@ fn aot_nod_ide_horizontal_scroll() {
     // Leave the F:\scratch fixture in place so the user can rerun the
     // EXE manually after the test. It's tiny (a few KB) and harmless.
 }
+
+/// **The Sprint 41e headline.** Build an AOT-linked EXE — the
+/// menu-bearing nod-ide — and exercise File → Open / Help → About /
+/// File → Exit interactively.
+///
+/// Differences vs. Sprint 41d (`aot_nod_ide_horizontal_scroll`):
+///
+///   * The window now has a real Win32 menu bar:
+///       File           Help
+///         Open... Ctrl+O   About
+///         ───────
+///         Exit    Alt+F4
+///   * `File → Open...` pops the standard Windows file-open dialog
+///     (via the new Sprint 41e `nod_show_open_file_dialog` shim around
+///     `GetOpenFileNameW`). Pick any file; the IDE re-reads it, resets
+///     both scrolls, and re-renders.
+///   * `File → Exit` posts WM_QUIT (same as clicking X).
+///   * `Help → About` pops a `MessageBoxW` with the version banner.
+///
+/// What this test exercises beyond Sprint 41d:
+///   * The new `nod_show_open_file_dialog` runtime shim (the only new
+///     runtime addition Sprint 41e makes — one helper wrapping the
+///     88-byte `OPENFILENAMEW` struct).
+///   * Bare-name materialization for `CreateMenu` / `CreatePopupMenu`
+///     (zero-arg HMENU returners), and explicit `define c-function`
+///     declarations for `AppendMenuW` / `MessageBoxW` (the menu APIs
+///     and message box).
+///   * `comdlg32.lib` joining the AOT driver's link line (so the
+///     staticlib's reference to `GetOpenFileNameW` resolves).
+///   * Cell-promotion of `source-text`, `buffer-lines`, `buffer-max-cols`
+///     etc. across the WNDPROC closure boundary (the WM_COMMAND handler
+///     mutates these when File → Open succeeds).
+///
+/// Test fixture lives under `F:\scratch` per the hard project rule.
+/// `#[ignore]`-gated because it's interactive. After the user closes
+/// the window, the test asserts exit code 0.
+#[test]
+#[ignore = "interactive: pops a real Win32 window with a menu bar. Run with `cargo test --test aot_ide_shell -- --ignored --nocapture aot_nod_ide_menu_open`."]
+#[serial]
+fn aot_nod_ide_menu_open() {
+    // The Sprint 41e Dylan body — same `include_str!` trick as 41d so
+    // the standalone fixture and the test stay in lockstep.
+    let source = include_str!("../fixtures/nod-ide.dylan");
+
+    let (dir, exe_path) = build_exe("nod-ide-menu", source);
+
+    // F:\scratch is the project's test-fixture root. The test is
+    // `#[ignore]`-gated; if F:\ doesn't exist on this machine, log and
+    // skip — the EXE is built (so we know the AOT pipeline works) but
+    // we don't attempt to run it with no fixture to point at.
+    let scratch_root = PathBuf::from(r"F:\scratch");
+    if !scratch_root.is_dir() {
+        eprintln!(
+            "[sprint-41e headline] F:\\scratch is missing on this machine — \
+             this test requires F:\\scratch to exist (hard project rule: \
+             test inputs live there, not inside the repo). Skipping."
+        );
+        return;
+    }
+
+    // The initial buffer the IDE opens with. The user then exercises
+    // File → Open... to pick a different file via the standard dialog.
+    let initial_fixture = scratch_root.join("nod-ide-41e-initial.dylan");
+    std::fs::write(
+        &initial_fixture,
+        "Module: initial-sample\n\n\
+         // initial-sample.dylan - Sprint 41e fixture for the menu-bearing nod-ide.\n\
+         //\n\
+         // The IDE opens with THIS file. Use the menu bar's File > Open...\n\
+         // to load a different .dylan / .txt file via the standard\n\
+         // Windows file picker.\n\n\
+         define function hello () => ()\n  \
+             format-out(\"hello from the initial buffer\\n\");\n\
+         end function;\n\n\
+         define function main () => ()\n  \
+             hello();\n\
+         end function main;\n",
+    )
+    .expect("write initial fixture");
+
+    // A second fixture so the user has something to pick in the
+    // File → Open dialog. Different content so they can visually
+    // confirm the buffer swapped.
+    let alt_fixture = scratch_root.join("nod-ide-41e-other.dylan");
+    std::fs::write(
+        &alt_fixture,
+        "Module: other-sample\n\n\
+         // other-sample.dylan - alternate fixture for File > Open.\n\
+         //\n\
+         // After picking THIS file via File > Open..., the IDE should\n\
+         // re-render with this content and both scrollbars reset.\n\n\
+         define function goodbye () => ()\n  \
+             format-out(\"this is the OTHER buffer; File > Open worked\\n\");\n\
+         end function;\n\n\
+         define function add (a, b) => (sum)\n  \
+             a + b\n\
+         end function;\n\n\
+         define function main () => ()\n  \
+             goodbye();\n  \
+             format-out(\"1 + 2 = %d\\n\", add(1, 2));\n\
+         end function main;\n",
+    )
+    .expect("write alt fixture");
+
+    eprintln!(
+        "[sprint-41e headline] AOT nod-ide (menu) EXE built at {}; spawning with \
+         argv[1] = {}.\n  \
+         A WINDOW WILL APPEAR with a menu bar showing File and Help.\n  \
+         * Click File > Open. A standard Windows file picker appears.\n  \
+         * Pick a .dylan or .txt file (e.g. {} for an easy round-trip).\n  \
+         * The window re-renders with that file's contents; both scrollbars reset.\n  \
+         * Click Help > About. A message box pops up showing the version banner.\n  \
+         * Click File > Exit (or the X button). The process exits cleanly with code 0.",
+        exe_path.display(),
+        initial_fixture.display(),
+        alt_fixture.display(),
+    );
+
+    let mut child = Command::new(&exe_path)
+        .arg(&initial_fixture)
+        .spawn()
+        .expect("spawn AOT nod-ide (menu) EXE");
+    let status = child.wait().expect("wait for AOT nod-ide (menu) EXE");
+    let code = status.code().unwrap_or(-1);
+    eprintln!("[sprint-41e headline] AOT nod-ide (menu) EXE exited with code {code}");
+
+    assert_eq!(
+        code, 0,
+        "AOT nod-ide (menu) EXE must exit cleanly with code 0; exe={}",
+        exe_path.display()
+    );
+
+    let _ = remove_dir_all_best_effort(&dir);
+    // Leave the F:\scratch fixtures so the user can rerun manually.
+}

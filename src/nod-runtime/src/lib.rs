@@ -140,6 +140,9 @@ pub use com_shim::{
     nod_dxgi_swap_chain_resize_buffers, nod_get_argv1, nod_get_scroll_pos, nod_hi_word, nod_lo_word,
     nod_post_message, nod_pump_one_message, nod_read_file_to_string,
     nod_count_newlines, nod_max_line_chars, nod_register_window_class, nod_run_message_loop, nod_set_scroll_info,
+    // Sprint 41e — Win32 file-open common dialog shim (wraps
+    // GetOpenFileNameW + the 88-byte OPENFILENAMEW struct).
+    nod_show_open_file_dialog,
     register as com_register, registry_len as com_registry_len,
 };
 pub use callbacks::{

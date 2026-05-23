@@ -2513,3 +2513,69 @@ and a few corner cases the seed-struct set didn't touch.
   manifest (cross-checked at load time) closes this. Low
   priority — the cache directory is process-owned, not a
   network endpoint.
+
+## Sprint 41 follow-ups (IDE polish)
+
+- **:open: Sprint 41d — window-larger-than-canvas background
+  artifact.** When the user opens a tiny file (say, 10 lines /
+  short lines) and then maximises the window, the area beyond
+  the buffer-sized canvas paints with the system background
+  colour (often black). The corrected editor model intentionally
+  caps the rendered canvas at `(buffer-max-cols × char-width)`
+  by `(buffer-lines × line-height)` — Sprint 41d's whole point
+  was that resizing the window does NOT change the canvas. But
+  when the window grows past the canvas, the back buffer's
+  white-fill (`%d2d-clear(dc, 255, 255, 255, 255)`) only
+  reaches the canvas; the OS fills the newly-exposed area with
+  the window's background brush.
+  Fix needs **canvas floor logic**: track the largest viewport
+  the user has ever shown, and stretch the rendered canvas's
+  white background fill to fill at least that area. Two
+  reasonable shapes:
+  (a) Cap the clear region at `max(canvas, max-viewport-ever)`
+  in WM_PAINT — small code change.
+  (b) Track a separate "white-fill rectangle" cell and grow it
+  monotonically on each WM_SIZE.
+  Either way the swap-chain back buffer is sized to the
+  viewport (Sprint 41c's `nod_dxgi_swap_chain_resize_buffers`)
+  so the OS just sees a fully-painted back buffer. User
+  deferred this on the 41e push — cosmetic, not a correctness
+  issue.
+- **:open: Sprint 41e — keyboard accelerators.** The File and
+  Help menu items show `Ctrl+O` and `Alt+F4` shortcut hints in
+  the menu text but the shortcuts don't actually dispatch the
+  WM_COMMAND. Win32 wires this via `LoadAcceleratorsW` +
+  `TranslateAcceleratorW` (called from inside the message
+  loop). The Sprint 41a `nod_run_message_loop` shim doesn't
+  thread an accelerator table; adding one requires either a
+  new shim that takes an HACCEL or moving the accelerator
+  translation into the existing loop with a default empty
+  table. Low priority — clicking the menu item works.
+- **:open: Sprint 41e — bare-name `AppendMenuW` with the
+  bare-name materialization path.** Sprint 41e's fixture uses
+  an explicit `define c-function` declaration for
+  `AppendMenuW` because the vendored DB types its 4th arg
+  (`lpNewItem`) as `WideString` and its 3rd arg
+  (`uIDNewItem`) as `U64`. The 3rd arg accepts either a
+  command id OR a submenu HMENU when MF_POPUP is set, and
+  re-typing it as `<c-pointer>` lets both call shapes share
+  one declaration. The bare-name path would also work if sema
+  routed integer-shaped Dylan values through to a `U64` arg
+  uniformly. Tightening the bare-name classification for
+  `U64`-typed args (allowing integer in addition to whatever
+  it currently accepts) closes this.
+- **:open: Sprint 41e — long-path support for File → Open.**
+  The `nod_show_open_file_dialog` shim allocates a `[u16; 260]`
+  path buffer (`MAX_PATH`). Long-path support (path > 260
+  chars) requires `OFN_EXPLORER` plus a larger buffer plus a
+  process manifest entry enabling long-paths. Deferred until
+  someone files a real bug against a long-path source file.
+- **:open: Cursor + editing.** The IDE is still read-only.
+  Adding a text cursor + edit operations is the next big
+  sprint family (Sprint 42+). Until then `File → Open` is the
+  only way to change what's on screen; once landed, the
+  cursor will integrate with the WM_KEYDOWN handler.
+- **:open: Multiple panes / tabs.** Sprint 41e shows one file
+  at a time. Multi-document support would be Sprint 41g or
+  Sprint 43 — requires a tab/pane container + a per-document
+  WNDPROC dispatch story.

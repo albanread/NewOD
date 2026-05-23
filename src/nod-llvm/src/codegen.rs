@@ -333,6 +333,12 @@ pub const NOD_COUNT_NEWLINES_SYMBOL: &str = "nod_count_newlines";
 /// Sprint 41d — longest non-newline run length in a `<byte-string>`. Arity-1.
 pub const NOD_MAX_LINE_CHARS_SYMBOL: &str = "nod_max_line_chars";
 
+// ─── Sprint 41e — File → Open common dialog ──────────────────────────────
+/// Shim that wraps `GetOpenFileNameW` + an `OPENFILENAMEW` struct, returning
+/// the chosen path as a `<byte-string>` Word (or `nil` on cancel). Arity-1
+/// (owner HWND).
+pub const NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL: &str = "nod_show_open_file_dialog";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -502,6 +508,8 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_get_scroll_pos", NOD_GET_SCROLL_POS_SYMBOL, 2),
     ("nod_count_newlines", NOD_COUNT_NEWLINES_SYMBOL, 1),
     ("nod_max_line_chars", NOD_MAX_LINE_CHARS_SYMBOL, 1),
+    // Sprint 41e — File → Open dialog shim.
+    ("nod_show_open_file_dialog", NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

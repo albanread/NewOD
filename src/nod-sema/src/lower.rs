@@ -380,6 +380,12 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // `<byte-string>`. The IDE uses this to size the horizontal
     // scrollbar's client-area width (`buffer-max-cols × char-width`).
     ("%max-line-chars", "nod_max_line_chars", 1, TypeEstimate::Integer),
+    // Sprint 41e — File → Open. Wraps Win32 `GetOpenFileNameW` plus the
+    // 88-byte `OPENFILENAMEW` struct in a single shim that returns the
+    // chosen path as a `<byte-string>` (or `nil` if the user cancelled).
+    // Arity-1: takes the owner HWND as a fixnum. Return is a string-or-
+    // nil union, so the type estimate has to be `Top`.
+    ("%show-open-file-dialog", "nod_show_open_file_dialog", 1, TypeEstimate::Top),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

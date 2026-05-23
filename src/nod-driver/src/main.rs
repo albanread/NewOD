@@ -414,6 +414,11 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
         // which symbols the staticlib's transitively-included COM
         // types will reference; the linker DCE drops unused entries.
         "propsys.lib",
+        // Sprint 41e — `GetOpenFileNameW` (called from the IDE's
+        // File → Open shim in nod-runtime's com_shim.rs) lives in
+        // comdlg32.dll. Without this import lib, link.exe surfaces an
+        // unresolved external when the staticlib pulls in the shim.
+        "comdlg32.lib",
     ] {
         link_cmd.arg(lib);
     }

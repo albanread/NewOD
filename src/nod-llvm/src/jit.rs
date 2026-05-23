@@ -94,6 +94,8 @@ use crate::codegen::{
     NOD_COUNT_NEWLINES_SYMBOL,
     // Sprint 41d — longest non-newline run helper.
     NOD_MAX_LINE_CHARS_SYMBOL,
+    // Sprint 41e — File → Open dialog shim.
+    NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -626,6 +628,11 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_MAX_LINE_CHARS_SYMBOL),
              nod_runtime::nod_max_line_chars as *const () as *mut std::ffi::c_void),
+            // Sprint 41e — File → Open shim binding for the cold path
+            // (`cargo run --bin nod-driver eval`). The AOT EXE path
+            // pulls the same symbol out of nod_runtime.lib's staticlib.
+            (module.get_function(NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL),
+             nod_runtime::nod_show_open_file_dialog as *const () as *mut std::ffi::c_void),
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
@@ -1330,6 +1337,10 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_COUNT_NEWLINES_SYMBOL, nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
         // Sprint 41d — longest non-newline run helper.
         (NOD_MAX_LINE_CHARS_SYMBOL, nod_runtime::nod_max_line_chars as *const () as *mut std::ffi::c_void),
+        // Sprint 41e — File → Open shim, surfaced through the
+        // cache-replay symbol-mapping path so a cache hit keeps the
+        // `%show-open-file-dialog` binding live.
+        (NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL, nod_runtime::nod_show_open_file_dialog as *const () as *mut std::ffi::c_void),
     ]);
     v
 }

@@ -71,6 +71,11 @@ windows = { version = "0.58", features = [
     # though it's linked from `user32.dll`. The companion `GetScrollPos`
     # is in `Win32_UI_WindowsAndMessaging`, already enabled above.
     "Win32_UI_Controls",
+    # Sprint 41e — `GetOpenFileNameW` + `OPENFILENAMEW` (the IDE's
+    # File → Open shim) live under `Win32_UI_Controls_Dialogs`. Linked
+    # from `comdlg32.dll`, which the AOT driver also adds to its link
+    # line so the IAT resolves correctly.
+    "Win32_UI_Controls_Dialogs",
     "Foundation_Numerics",
 ] }
 
