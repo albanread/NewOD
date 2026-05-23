@@ -1087,7 +1087,128 @@ unsafe fn trampoline_prelude(entry: *const ApiStubEntry) -> (*mut u8, ApiCallSig
             "winffi: c-function `{sym}@{dll}` called before initialize_stub_table populated its entry"
         );
     }
+    // Sprint 41f — `NOD_TRACE_FNPTR=1` opt-in trace: log the resolved
+    // (dll/symbol → fn_ptr → owning module path) tuple once per unique
+    // function pointer. Default OFF; the env-var check is cached so
+    // hot-path overhead is one atomic load + one branch when the trace
+    // is disabled. The point is to confirm that the stub-table
+    // resolution binds each `define c-function` to a plausible address
+    // inside the expected DLL (e.g. that `MessageBoxW` resolves to
+    // `C:\Windows\System32\user32.dll`, not somewhere bogus).
+    if trace_fnptr_enabled() {
+        // SAFETY: name pointers + lengths are static-area UTF-8 runs.
+        let dll = unsafe {
+            str_from_raw(entry_ref.dll_name_ptr, entry_ref.dll_name_len as usize)
+        };
+        let sym = unsafe {
+            str_from_raw(entry_ref.symbol_name_ptr, entry_ref.symbol_name_len as usize)
+        };
+        record_fnptr_trace(dll, sym, fn_ptr);
+    }
     (fn_ptr, entry_ref.signature)
+}
+
+// ─── Sprint 41f: NOD_TRACE_FNPTR diagnostic ──────────────────────────────
+//
+// One-shot env-var lookup (cached) + dedupe set keyed by fn_ptr address.
+// The trace logs one line per unique resolved fn_ptr, to stderr, with the
+// dll/symbol names from the stub entry, the raw address, and the module
+// path returned by `GetModuleHandleEx(FROM_ADDRESS) + GetModuleFileNameW`.
+//
+// A unique-address dedupe set is sufficient: even though many call sites
+// may share a single stub entry, every entry resolves to exactly one
+// fn_ptr, so logging per address gives one line per `(dll, symbol)` over
+// the lifetime of the process. The set is keyed by `usize` (the address)
+// rather than by string to avoid allocating on the hot path.
+
+/// Caches the `NOD_TRACE_FNPTR` env-var lookup. `0` = unknown, `1` =
+/// disabled, `2` = enabled.
+static TRACE_FNPTR_STATE: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn trace_fnptr_enabled() -> bool {
+    match TRACE_FNPTR_STATE.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let on = std::env::var_os("NOD_TRACE_FNPTR")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false);
+            TRACE_FNPTR_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+static FNPTR_SEEN: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+
+fn fnptr_seen() -> &'static Mutex<std::collections::HashSet<usize>> {
+    FNPTR_SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn record_fnptr_trace(dll: &str, symbol: &str, fn_ptr: *mut u8) {
+    let key = fn_ptr as usize;
+    {
+        let mut seen = match fnptr_seen().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !seen.insert(key) {
+            return;
+        }
+    }
+    // Sprint 41f — AOT-emitted stub entries leave dll_name_ptr /
+    // symbol_name_ptr NULL (see nod-llvm/aot.rs ~line 568, "Initialiser:
+    // zero strings, null fn_ptr"), because the Windows loader resolves
+    // imports through the IAT, not through our runtime resolver. In
+    // that case `str_from_raw` returns "" and the user sees the
+    // module-address mapping but no symbolic name. The module path
+    // (from GetModuleHandleEx) is the meaningful field in either mode.
+    let dll = if dll.is_empty() { "<aot>" } else { dll };
+    let symbol = if symbol.is_empty() { "<aot>" } else { symbol };
+    let module = module_path_for_address(fn_ptr as *const u8)
+        .unwrap_or_else(|| String::from("<unknown — GetModuleHandleEx failed>"));
+    eprintln!(
+        "[trampoline] symbol={dll}/{symbol} fn_ptr=0x{:016x} module={module}",
+        key
+    );
+}
+
+/// Resolve a code address back to the path of the DLL/EXE that contains
+/// it. Returns `None` if `GetModuleHandleEx` fails (which is a
+/// VERY interesting finding by itself — it means the address is not in
+/// any loaded module, i.e. the fn_ptr is bogus).
+///
+/// Only meaningful on Windows; non-Windows builds always return `None`.
+#[cfg(windows)]
+fn module_path_for_address(addr: *const u8) -> Option<String> {
+    use windows_sys::Win32::Foundation::HMODULE;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut hmod: HMODULE = std::ptr::null_mut();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    // SAFETY: GetModuleHandleExW with FROM_ADDRESS takes the address
+    // cast to PCWSTR (a documented overload — the flag tells the API
+    // to treat the pointer as a code address, not a string).
+    let ok = unsafe { GetModuleHandleExW(flags, addr as *const u16, &mut hmod) };
+    if ok == 0 || hmod.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 260];
+    // SAFETY: hmod is a valid module handle from the call above;
+    // buf is a writable 260-u16 array.
+    let len = unsafe { GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+#[cfg(not(windows))]
+fn module_path_for_address(_addr: *const u8) -> Option<String> {
+    None
 }
 
 // ─── Trampolines: arity 0..=8 ─────────────────────────────────────────────

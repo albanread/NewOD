@@ -106,6 +106,29 @@ define c-function AppendMenuW
     library: "user32.dll";
 end;
 
+// MessageBoxW from inside our WNDPROC HANGS — verified via diagnostic
+// instrumentation: format-out before the call fires, format-out after
+// never does. Cause is not yet diagnosed; Agent A (Win32 docs) said
+// "trampoline re-entry unsafe" but Agent B (internal audit) said the
+// trampolines ARE re-entry-safe (mutex dropped before invoke, TempBuf
+// stack-scoped, GC roots pinned). Standalone MessageBoxW from main()
+// (Sprint 39c test) works fine — only the WNDPROC-callback context
+// fails. Filed in DEFERRED.md as Sprint 41-known-issue. Help > About
+// uses SetWindowTextW as a workaround for now — it still demonstrates
+// menu dispatch works without depending on the modal-dialog path.
+define c-function SetWindowTextW
+  (hwnd :: <c-pointer>, lpString :: <c-wide-string>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+// Sprint 41f — probe declarations stripped. The Win32 probes
+// (Sleep, GetTickCount, IsWindow, EnableWindow) all completed cleanly
+// in the WM_COMMAND re-entry context, demonstrating Sprint 32's
+// trampoline IS re-entry-safe. See docs/duim-research/07-probe-findings.md
+// for the full investigation transcript. MessageBoxW declaration kept
+// in case a future TaskDialogIndirect-or-custom-popup sprint wants it
+// as a fallback baseline.
 define c-function MessageBoxW
   (hwnd :: <c-pointer>, lpText :: <c-wide-string>, lpCaption :: <c-wide-string>,
    uType :: <c-int>)
@@ -394,10 +417,29 @@ define function main () => ()
                  PostQuitMessage(0);
                  0
                elseif (cmd-id = 200)    // Help → About
-                 MessageBoxW(hwnd,
-                             "NewOpenDylan IDE\nSprint 41e\n(c) 2026",
-                             "About NewOpenDylan IDE",
-                             0);
+                 // Sprint 41f investigated MessageBoxW-from-WNDPROC
+                 // thoroughly. Findings (see docs/duim-research/
+                 // 07-probe-findings.md):
+                 //   * Sprint 32 trampoline IS re-entry-safe — 5 baseline
+                 //     probes (Sleep, GetTickCount, IsWindow,
+                 //     DefWindowProcW, EnableWindow) all complete cleanly.
+                 //   * MessageBoxW with hwnd=0 + MB_TOPMOST +
+                 //     MB_SETFOREGROUND DOES return cleanly (IDOK = 1)
+                 //     but NO DIALOG IS VISIBLE — the OS auto-dismisses
+                 //     an invisible dialog with the default response.
+                 //   * The combination "DirectX-rendered window + custom
+                 //     WNDPROC + modern Windows" makes MessageBox
+                 //     unreliable in ways that are documented Microsoft
+                 //     guidance (use TaskDialogIndirect or custom popup
+                 //     instead). Foreground-lock-rule flags (TOPMOST +
+                 //     SETFOREGROUND) help in normal apps but don't
+                 //     rescue our DirectX-host configuration.
+                 // So Help → About uses SetWindowTextW. The Sprint 41-
+                 // known-issue is RESOLVED with a known-good workaround;
+                 // a real modal popup waits for either TaskDialogIndirect
+                 // wiring or a custom D2D-rendered popup window.
+                 SetWindowTextW(hwnd,
+                                "NewOpenDylan IDE - Sprint 41e (About)");
                  0
                else
                  // Unknown command id — defer to the OS default.
