@@ -251,11 +251,14 @@ fn user_define_c_function_overrides_materialization() {
 /// use a clearly-non-existent name that drives the UnknownCallee
 /// fallback path.
 ///
-/// (The embedded blob's build.rs filter drops 5,191 functions for
-/// `bad_type` — struct-by-value, function-pointer, etc. — so any
+/// (The embedded blob's build.rs filter drops ~3,200 functions for
+/// `bad_type` — struct-by-value, COM interfaces, etc. — so any
 /// genuine "unsupported type" Win32 entry is already absent from the
-/// index. Sprint 37+ may add a path that surfaces those with a richer
-/// diagnostic rather than UnknownCallee.)
+/// index. Sprint 40d folded `function_pointer` / `delegate` params
+/// into the accepted set so the ~1,987 callback-taking APIs are no
+/// longer rejected; the residual ~3,200 are mostly struct-by-value
+/// signatures. Sprint 37+ may add a path that surfaces those with a
+/// richer diagnostic rather than UnknownCallee.)
 #[test]
 #[serial]
 fn unsupported_name_declines_materialization() {
@@ -275,8 +278,9 @@ fn unsupported_name_declines_materialization() {
 // ─── 9. Cross-DLL ambiguity priority ──────────────────────────────────────
 
 /// Cross-DLL name collisions break by priority order. The embedded
-/// 13,080-function subset has no Win32 names appearing in multiple
-/// DLLs the materializer would consider equally good — the
+/// ~15,067-function subset (post-Sprint 40d) has no Win32 names
+/// appearing in multiple DLLs the materializer would consider
+/// equally good — the
 /// `WINAPI_DLL_PRIORITY` table is more interesting as a unit-tested
 /// pure function. We exercise it via a sema-side direct check on the
 /// already-resolved bindings below.
@@ -335,5 +339,101 @@ fn duplicate_bare_calls_share_one_materialization() {
         stats.materialized_lifetime, 1,
         "two calls to the same materialized function must share one slot; got {}",
         stats.materialized_lifetime
+    );
+}
+
+// ─── 12. Sprint 40d — bare-name callback-taking APIs materialize ──────────
+
+/// Sprint 40d headline (JIT side). Before Sprint 40d the
+/// `nod_winapi` projection skipped any function whose signature
+/// mentioned a `function_pointer` / `delegate` param (the SQL `kind`
+/// `classify_type` rejected outright) — including the entire family
+/// of callback-taking Win32 APIs (`EnumWindows`, `EnumChildWindows`,
+/// `EnumThreadWindows`, `SetWindowsHookExW`, `CallWindowProcW`, …)
+/// and every function with an `LPARAM` / `WPARAM` / `HINSTANCE`
+/// parameter (stored as `kind = "struct"` in the DB but really a
+/// typedef'd integer/handle). Sprint 40d extends `classify_type` to
+/// (a) collapse `function_pointer` / `delegate` to an opaque
+/// `<c-pointer>`, and (b) fall through `struct`-kind rows to the
+/// named-typedef table so `LPARAM` resolves as `i64`, `HINSTANCE`
+/// as a handle, etc. The result is that bare-name `EnumWindows`
+/// (which exercises BOTH arms in its 2-param signature) now
+/// materializes successfully from `user32.dll`.
+///
+/// This test exercises the materialization path only — we DO NOT
+/// invoke the callback through the OS (that's `winffi_callbacks.rs`
+/// which uses the explicit `define c-function` form). We pass a
+/// `$NULL` callback (the OS would crash trying to invoke it, so
+/// we don't actually call EnumWindows here either). Instead we
+/// introspect the bindings after a parse + sema pass and confirm
+/// `EnumWindows` materialized from `user32.dll` as a
+/// `BindingSource::JitMaterialized` entry. That proves the
+/// `classify_type` extension flowed all the way through.
+#[test]
+#[serial]
+fn bare_EnumWindows_materializes_from_user32() {
+    setup();
+    let bindings = introspect_bindings(
+        "",
+        "let cb-ptr = $NULL; EnumWindows(cb-ptr, $NULL)",
+    )
+    .unwrap_or_else(|e| panic!("EnumWindows introspection failed: {e:?}"));
+    let ew = bindings
+        .iter()
+        .find(|b| b.dylan_name == "EnumWindows")
+        .unwrap_or_else(|| panic!("no EnumWindows binding materialized; saw {bindings:#?}"));
+    eprintln!(
+        "[sprint40d JIT] EnumWindows introspection: c_name={} library={} source={:?}",
+        ew.c_name, ew.library, ew.source
+    );
+    assert_eq!(
+        ew.c_name, "EnumWindows",
+        "EnumWindows must resolve to its own name (no A/W suffix)"
+    );
+    assert_eq!(
+        ew.library, "user32.dll",
+        "EnumWindows lives in user32.dll, not {}",
+        ew.library
+    );
+    assert!(
+        ew.source == BindingSource::JitMaterialized,
+        "EnumWindows came from the projected index, not a user declaration; \
+         source = {:?}",
+        ew.source
+    );
+}
+
+/// Sprint 40d companion — `SetWindowsHookExW` is another canonical
+/// callback-taking API. Its first param is a `HOOKPROC` (different
+/// `delegate` row than `WNDENUMPROC`), proving the fix isn't
+/// specific to one callback type. Same introspection-only approach
+/// — we don't actually install a hook in `cargo test`. The `$NULL`
+/// callback is rejected at the OS level if invoked, but we never
+/// invoke it; the goal is to prove materialization succeeded.
+#[test]
+#[serial]
+fn bare_SetWindowsHookExW_materializes_from_user32() {
+    setup();
+    let bindings = introspect_bindings(
+        "",
+        "SetWindowsHookExW(0, $NULL, $NULL, 0)",
+    )
+    .unwrap_or_else(|e| panic!("SetWindowsHookExW introspection failed: {e:?}"));
+    let sh = bindings
+        .iter()
+        .find(|b| b.dylan_name == "SetWindowsHookExW")
+        .unwrap_or_else(|| panic!(
+            "no SetWindowsHookExW binding materialized; saw {bindings:#?}"
+        ));
+    eprintln!(
+        "[sprint40d JIT] SetWindowsHookExW introspection: c_name={} library={} source={:?}",
+        sh.c_name, sh.library, sh.source
+    );
+    assert_eq!(sh.library, "user32.dll");
+    assert_eq!(
+        sh.source,
+        BindingSource::JitMaterialized,
+        "expected JitMaterialized; got {:?}",
+        sh.source
     );
 }

@@ -155,9 +155,43 @@ fn classify_type(conn: &Connection, type_id: i64, depth: u32) -> Option<TypeRef>
                 .unwrap_or(TypeRef::U32);
             Some(TypeRef::Enum { base: Box::new(base) })
         }
-        // Anything else — struct, union, function_pointer, delegate,
-        // interface, apis-container, type (= Native*Attribute) — is
-        // explicitly out of scope.
+        // Sprint 40d — callable types (WNDPROC, WNDENUMPROC,
+        // HOOKPROC, DLGPROC, TIMERPROC, ENUMRESLANGPROCW, …) and the
+        // sibling `delegate` family project as an opaque
+        // `<c-pointer>`. The Dylan side passes a value it got from
+        // `as-wndproc-callback` / `as-wndenumproc-callback` / etc.,
+        // or a `$NULL` literal. The Sprint 28/30 marshaling treats
+        // these identically to any other opaque pointer, so the
+        // enclosing function (EnumChildWindows, EnumThreadWindows,
+        // SetWindowsHookExW, …) is now ACCEPTED into the projected
+        // subset.
+        "function_pointer" | "delegate" => {
+            Some(TypeRef::Pointer { pointee_type_ref: None })
+        }
+        // Sprint 40d — the vendored DB inconsistently stores a few
+        // pointer-sized integer typedefs (`LPARAM`, `WPARAM`,
+        // `LRESULT`, `INT_PTR`, `UINT_PTR`, …) and handle typedefs
+        // (`HINSTANCE`, `HMODULE`, …) as `kind = "struct"` rather
+        // than `kind = "reference"`. They are NOT real structs — at
+        // the C level they're typedef'd integers / handles. When the
+        // name matches a known typedef table entry, accept it; this
+        // unblocks `EnumWindows` (LPARAM param), `CreateWindowExW`
+        // (HINSTANCE param), and friends, none of which were
+        // reachable in Sprint 27. The `H`-prefixed opaque-handle
+        // fallback (mirroring the `reference` arm) catches the rest.
+        "struct" | "union" => {
+            if let Some(t) = resolve_named_reference(&name) {
+                return Some(t);
+            }
+            if name.starts_with('H')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Some(TypeRef::Handle);
+            }
+            None
+        }
+        // Anything else — interface, apis-container,
+        // type (= Native*Attribute) — is explicitly out of scope.
         _ => None,
     }
 }

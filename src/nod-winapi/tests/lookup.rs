@@ -100,3 +100,59 @@ fn find_function_returns_none_for_unknown_name() {
     assert!(nod_winapi::find_function("kernel32.dll", "DefinitelyNotAFunction").is_none());
     assert!(nod_winapi::find_function("nonexistent.dll", "Beep").is_none());
 }
+
+/// Sprint 40d — `classify_type` now accepts `function_pointer` (and
+/// `delegate`) param types by collapsing them to an opaque
+/// `<c-pointer>` (`TypeRef::Pointer { pointee_type_ref: None }`).
+/// Before Sprint 40d, any function whose signature mentioned a
+/// callback type (WNDPROC, WNDENUMPROC, HOOKPROC, DLGPROC,
+/// TIMERPROC, ENUMRESLANGPROCW, …) was dropped from the projected
+/// subset because `classify_type` returned `None` for it, marking
+/// the enclosing function as `bad_type`. After Sprint 40d, the
+/// canonical headline `EnumWindows` (user32.dll) is in the
+/// projection — which unblocks bare-name calls in both the JIT
+/// (Sprint 31 materialization) and the AOT pipeline (Sprint 40b
+/// callbacks).
+#[test]
+fn find_enum_windows_after_callback_projection() {
+    let f = nod_winapi::find_function("user32.dll", "EnumWindows")
+        .expect("EnumWindows must be in the projected subset after Sprint 40d");
+    assert_eq!(f.name, "EnumWindows");
+    assert_eq!(f.dll, "user32.dll");
+    // EnumWindows(WNDENUMPROC lpEnumFunc, LPARAM lParam) -> BOOL.
+    // The first param's WNDENUMPROC type now collapses to an opaque
+    // `Pointer { None }`. The second is LPARAM (alias of i64) which
+    // marshals fine. Return is BOOL → Bool32.
+    assert_eq!(f.params.len(), 2, "EnumWindows takes two parameters");
+    match &f.params[0].type_ref {
+        TypeRef::Pointer { pointee_type_ref: None } => {}
+        other => panic!(
+            "EnumWindows param 0 expected opaque Pointer (from WNDENUMPROC \
+             function_pointer collapse), got {other:?}"
+        ),
+    }
+    match unwrap_alias(&f.return_type) {
+        TypeRef::Bool32 => {}
+        other => panic!("EnumWindows return expected Bool32, got {other:?}"),
+    }
+}
+
+/// Sprint 40d companion — a sample of other callback-taking APIs
+/// must now be reachable: `SetWindowsHookExW` (HOOKPROC),
+/// `EnumChildWindows` (WNDENUMPROC), `EnumThreadWindows`
+/// (WNDENUMPROC). All three are in user32.dll. This proves the
+/// fix is not specific to one DLL or one callback kind.
+#[test]
+fn callback_taking_apis_projected_after_sprint_40d() {
+    for name in [
+        "SetWindowsHookExW",
+        "EnumChildWindows",
+        "EnumThreadWindows",
+    ] {
+        assert!(
+            nod_winapi::find_function("user32.dll", name).is_some(),
+            "{name} must be in the projected subset after Sprint 40d \
+             (function_pointer params no longer rejected)"
+        );
+    }
+}

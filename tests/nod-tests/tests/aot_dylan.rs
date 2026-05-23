@@ -419,6 +419,62 @@ fn aot_enum_windows_callback() {
     eprintln!("[sprint-40b headline] AOT EnumWindows enumerated {n} top-level windows");
 }
 
+/// Sprint 40d — bare-name `EnumWindows` (no explicit
+/// `define c-function`) in an AOT EXE. This is the Sprint 40b
+/// headline minus the user-written declaration: the sema-side
+/// materializer (Sprint 31) must pick `EnumWindows` out of
+/// `user32.dll`, build its `ApiCallSignature` from the projected
+/// `FunctionInfo`, and feed the stub-table call path so the AOT
+/// pipeline emits the same `nod_aot_register_api_stub` + `dllimport`
+/// + Win64 trampoline call as if the user had written the
+/// declaration by hand.
+///
+/// Before Sprint 40d this reported "unknown callee `EnumWindows`"
+/// because `nod_winapi`'s `build.rs` skipped every function whose
+/// signature mentioned a `function_pointer` / `delegate` param —
+/// `EnumWindows`'s first param is `WNDENUMPROC` (a `delegate`-kind
+/// row in the SQL DB) and its second is `LPARAM` (a `struct`-kind
+/// row that's really a `i64` typedef). Sprint 40d's two-arm
+/// extension to `classify_type` accepts both kinds (the former as
+/// an opaque `<c-pointer>` collapse, the latter via the known
+/// typedef table) so the function lands in the projected subset
+/// and bare-name materialization works.
+///
+/// Asserts the same `count: N` shape as
+/// `aot_enum_windows_callback`; the absence of `define c-function
+/// EnumWindows` in the source is the whole point.
+#[test]
+#[ignore]
+#[serial]
+fn aot_bare_enum_windows() {
+    let source = "Module: bare-enum\n\n\
+        define function main () => ()\n  \
+            let count = 0;\n  \
+            let cb = method (hwnd, lp) count := count + 1; #t end;\n  \
+            let cb-ptr = as-wndenumproc-callback(cb);\n  \
+            EnumWindows(cb-ptr, $NULL);\n  \
+            format-out(\"count: %d\\n\", count);\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("bare-enum", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    let trimmed = stdout.trim_end();
+    let n_str = trimmed
+        .strip_prefix("count: ")
+        .unwrap_or_else(|| panic!("unexpected stdout shape: {stdout:?}; stderr=\n{stderr}"));
+    let n: i64 = n_str
+        .parse()
+        .unwrap_or_else(|e| panic!("count parse failed for {n_str:?}: {e}; stderr=\n{stderr}"));
+    assert!(
+        n > 0,
+        "EnumWindows must invoke the callback at least once, got count={n}; stderr=\n{stderr}"
+    );
+    assert!(
+        n < 100_000,
+        "callback count is suspiciously large ({n}); suggests runaway loop or marshaling bug; stderr=\n{stderr}"
+    );
+    eprintln!("[sprint-40d headline] AOT bare-name EnumWindows enumerated {n} top-level windows");
+}
+
 /// Smoke test that `as-wndproc-callback` registers a closure without
 /// actually creating a window. Returns a non-null `<c-pointer>` (the
 /// trampoline slot's address); we just print "ok" / "null". Doesn't
