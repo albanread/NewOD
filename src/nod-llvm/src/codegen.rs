@@ -46,7 +46,7 @@
 //!     `LLVMAddGlobalMapping` at JIT-engine creation time.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -66,8 +66,9 @@ use nod_runtime::ClassId;
 
 use crate::cache::CacheKey;
 use crate::symbols::{
-    ModuleManifest, RelocKind, class_md_symbol, imm_false_symbol, imm_false_wrapper_symbol,
-    imm_nil_symbol, imm_true_symbol, strlit_symbol, stub_symbol, symlit_symbol,
+    ModuleManifest, RelocKind, cache_slot_symbol, class_md_symbol, generic_symbol,
+    imm_false_symbol, imm_false_wrapper_symbol, imm_nil_symbol, imm_true_symbol, strlit_symbol,
+    stub_symbol, symlit_symbol,
 };
 
 /// Name of the JIT-side `nod_make` external declaration.
@@ -498,6 +499,48 @@ pub(crate) struct ModuleCodegenCtx {
     /// and matched verbatim. The value is the per-module index used to
     /// namespace the external global `@nod_stub__<key>__<idx>`.
     pub stub_entry_idx: RefCell<HashMap<(String, String), u32>>,
+    /// Sprint 38e — per-module dedup record for inline-cache dispatch
+    /// slots. Keyed by `site_id` (the codegen's stable per-MODULE
+    /// counter in `next_dispatch_site_id` below); the value is unit
+    /// because the external global's name already encodes the site_id
+    /// directly (`@nod_cache_slot__<key>__<site_id>`). The set tracks
+    /// which site_ids have already had their external global declared
+    /// in this module so a second dispatch site reusing the same
+    /// site_id (which can't happen today but could under future
+    /// refactors) doesn't double-emit the manifest row.
+    pub cache_slot_seen: RefCell<HashSet<u64>>,
+    /// Sprint 38e — per-module dedup table for generic-function
+    /// pointers, keyed by generic name. Multiple dispatch sites in the
+    /// same module that target the same generic share one external
+    /// global and one manifest row. The name itself encodes the
+    /// identity (`@nod_generic__<key>__<sanitised-name>`); the set
+    /// tracks first-seen.
+    pub generic_function_seen: RefCell<HashSet<String>>,
+    /// Sprint 38e — module-wide monotonic counter for inline-cache
+    /// dispatch site IDs.
+    ///
+    /// **Pre-Sprint-38e this counter lived per-function** (an `Emit`
+    /// field), which was fine because the cache slot's address was
+    /// baked into IR as an i64 constant minted by
+    /// `allocate_cache_slot(site_id)` — distinct functions calling
+    /// `allocate_cache_slot(0)` got distinct static-area addresses
+    /// (the allocator doesn't dedupe by site_id), so collisions on
+    /// `site_id == 0` between functions were harmless.
+    ///
+    /// **Sprint 38e** routes the cache slot lookup through a
+    /// per-module symbol `@nod_cache_slot__<key>__<site_id>` whose
+    /// JIT-link address is `cache_slot_slot_addr(site_id)`. That slot
+    /// allocator DOES dedupe by site_id (process-globally), so two
+    /// functions in the same module each using `site_id == 0` would
+    /// share the same `CacheSlot` — semantically wrong (cross-talk
+    /// between unrelated call sites would scramble the inline cache).
+    ///
+    /// Promoting the counter to module scope makes every dispatch site
+    /// in a module distinct, restoring the pre-Sprint-38e invariant
+    /// that no two sites share a `CacheSlot`. Cross-module collisions
+    /// are already prevented by the per-module `<key>` prefix in the
+    /// symbol name.
+    pub next_dispatch_site_id: RefCell<u64>,
 }
 
 impl ModuleCodegenCtx {
@@ -508,7 +551,20 @@ impl ModuleCodegenCtx {
             string_lit_idx: RefCell::new(HashMap::new()),
             symbol_lit_idx: RefCell::new(HashMap::new()),
             stub_entry_idx: RefCell::new(HashMap::new()),
+            cache_slot_seen: RefCell::new(HashSet::new()),
+            generic_function_seen: RefCell::new(HashSet::new()),
+            next_dispatch_site_id: RefCell::new(0),
         }
+    }
+
+    /// Sprint 38e — mint the next module-wide unique dispatch site id.
+    /// Replaces the per-function counter so cross-function site_ids
+    /// can't collide and accidentally share one `CacheSlot`.
+    pub fn next_dispatch_site_id(&self) -> u64 {
+        let mut id = self.next_dispatch_site_id.borrow_mut();
+        let v = *id;
+        *id += 1;
+        v
     }
 
     /// Sprint 38c — look up or assign the per-module index for a
@@ -720,6 +776,80 @@ fn get_or_add_stub_entry_global<'ctx>(
     g
 }
 
+/// Sprint 38e — per-module external global for an inline-cache dispatch
+/// slot. The slot's contents at JIT-link time are the `u64`-cast
+/// address of a freshly-allocated (empty) [`nod_runtime::CacheSlot`] in
+/// the current process's static area (via
+/// [`nod_runtime::cache_slot_slot_addr`]); the loaded value is the
+/// pointer codegen needs to derive the field-offset addresses (class /
+/// method / generation / hits) for atomic loads + the slow-path
+/// dispatch arg.
+///
+/// Idempotent: the second call for the same `site_id` reuses the
+/// existing global and records no extra manifest row.
+fn get_or_add_cache_slot_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    site_id: u64,
+) -> GlobalValue<'ctx> {
+    let sym = cache_slot_symbol(mctx.key, site_id);
+    if let Some(g) = module.get_global(&sym) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &sym);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    // Only emit the manifest row on first sight of this site_id.
+    if mctx.cache_slot_seen.borrow_mut().insert(site_id) {
+        mctx.manifest
+            .borrow_mut()
+            .push(sym, RelocKind::CacheSlot { site_id });
+    }
+    g
+}
+
+/// Sprint 38e — per-module external global for a `GenericFunction`
+/// pointer keyed by generic name. The slot's contents at JIT-link time
+/// are the `u64`-cast address of the `&'static GenericFunction`
+/// returned by [`nod_runtime::get_or_create_generic`]; the loaded
+/// value is the generic pointer codegen needs to derive the
+/// `generation` field address (via `add i64`).
+///
+/// Multiple dispatch sites in the same module that target the same
+/// generic share one external global and one manifest row — dedup is
+/// per-name (case-sensitive, matching Dylan's binding rules).
+fn get_or_add_generic_function_global<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    mctx: &ModuleCodegenCtx,
+    name: &str,
+) -> GlobalValue<'ctx> {
+    let sym = generic_symbol(mctx.key, name);
+    if let Some(g) = module.get_global(&sym) {
+        return g;
+    }
+    let i64_ty = ctx.i64_type();
+    let g = module.add_global(i64_ty, Some(inkwell::AddressSpace::default()), &sym);
+    g.set_linkage(Linkage::External);
+    g.set_externally_initialized(true);
+    // Only emit the manifest row on first sight of this name.
+    if mctx
+        .generic_function_seen
+        .borrow_mut()
+        .insert(name.to_string())
+    {
+        mctx.manifest.borrow_mut().push(
+            sym,
+            RelocKind::Generic {
+                name: name.to_string(),
+            },
+        );
+    }
+    g
+}
+
 pub struct CodegenOutput<'ctx> {
     pub module: Module<'ctx>,
     pub function_map: FunctionMap<'ctx>,
@@ -913,11 +1043,10 @@ struct Emit<'ctx, 'a> {
     /// finishes. Slots persist across calls; the pool grows as new
     /// peaks are reached.
     safepoint_slot_pool: Vec<inkwell::values::PointerValue<'ctx>>,
-    /// Sprint 13: per-function counter for `Dispatch` call sites.
-    /// Each `Computation::Dispatch` mints a fresh site id via this
-    /// counter; the site id is baked into the cache slot at allocation
-    /// time so `dump_dispatch` can identify which site fired.
-    next_dispatch_site_id: u64,
+    // Sprint 38e — `next_dispatch_site_id` was previously a per-function
+    // counter here. It now lives in `ModuleCodegenCtx::next_dispatch_site_id`
+    // so site_ids are module-wide unique; see the doc comment there for
+    // the cross-function-collision rationale.
 }
 
 fn emit_function<'ctx, 'a>(
@@ -942,7 +1071,6 @@ fn emit_function<'ctx, 'a>(
         temps: HashMap::new(),
         pending_incoming: Vec::new(),
         safepoint_slot_pool: Vec::new(),
-        next_dispatch_site_id: 0,
     };
 
     // Pre-create every LLVM basic block so terminators can branch
@@ -1161,6 +1289,53 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         let v = self
             .builder
             .build_load(self.ctx.i64_type(), g.as_pointer_value(), "stub_entry.load")
+            .map_err(map_err)?
+            .into_int_value();
+        Ok(v)
+    }
+
+    /// Sprint 38e — load the address of a `CacheSlot` for `site_id`
+    /// from the per-module external global. The loaded `i64` is the
+    /// pointer the dispatch site uses to derive field-offset addresses
+    /// (class / method / generation / hits) via `add i64`.
+    ///
+    /// LLVM at `-O2` will CSE the load + adds within the dispatch
+    /// diamond, so the natural IR shape — load once, add for each
+    /// field — costs no more than the pre-Sprint-38e baked-constant
+    /// shape after optimisation. See user memory note "LLVM does most
+    /// optimization".
+    fn load_cache_slot_ptr(
+        &self,
+        site_id: u64,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_cache_slot_global(self.ctx, self.module, self.mctx, site_id);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(
+                self.ctx.i64_type(),
+                g.as_pointer_value(),
+                &format!("disp.s{site_id}.cache_slot.load"),
+            )
+            .map_err(map_err)?
+            .into_int_value();
+        Ok(v)
+    }
+
+    /// Sprint 38e — load the address of a `GenericFunction` keyed by
+    /// `name` from the per-module external global. Multiple dispatch
+    /// sites targeting the same generic share one external global +
+    /// one manifest row + one IR-level `load i64` per use (LLVM CSE
+    /// folds within the function at `-O2`).
+    fn load_generic_function_ptr(
+        &self,
+        name: &str,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let g = get_or_add_generic_function_global(self.ctx, self.module, self.mctx, name);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let v = self
+            .builder
+            .build_load(self.ctx.i64_type(), g.as_pointer_value(), "generic.load")
             .map_err(map_err)?
             .into_int_value();
         Ok(v)
@@ -2417,38 +2592,95 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             )));
         }
 
-        // Reserve a unique site id for this call site.
-        let site_id = self.next_dispatch_site_id;
-        self.next_dispatch_site_id += 1;
+        // Sprint 38e — reserve a module-wide unique site id for this
+        // call site (previously per-function; see
+        // `ModuleCodegenCtx::next_dispatch_site_id` doc).
+        let site_id = self.mctx.next_dispatch_site_id();
 
-        // Bake addresses of the GenericFunction and the CacheSlot into
-        // the IR as i64 constants. Both are pinned for the process
-        // lifetime (generic: leaked Box; cache slot: StaticArea).
-        let generic = nod_runtime::get_or_create_generic(generic_name);
-        let generic_ptr_raw: u64 = (generic as *const _) as u64;
-        let cache_slot_ptr = nod_runtime::allocate_cache_slot(site_id);
-        let cache_slot_raw: u64 = cache_slot_ptr as u64;
+        // Sprint 38e — load the GenericFunction + CacheSlot pointers
+        // through per-module external globals instead of baking them
+        // as per-process `i64` constants. Pre-Sprint-38e this was:
+        //
+        //   let generic_ptr_const = i64ty.const_int(<runtime-address>, false);
+        //   let cache_slot_const = i64ty.const_int(<runtime-address>, false);
+        //
+        // which pinned the bitcode to the process that produced it.
+        // Now codegen emits one `load i64, ptr @nod_generic__<key>__<sanitised-name>`
+        // and one `load i64, ptr @nod_cache_slot__<key>__<site_id>`;
+        // the JIT-link path binds each global to a stable
+        // `&'static u64` slot whose contents are the current process's
+        // pointer bits (see `nod_runtime::cache_slot_slot_addr` and
+        // `generic_function_slot_addr`).
+        //
+        // The five field-offset addresses (cache class/method/gen/hits,
+        // generic generation) become `add i64 <loaded-ptr>, <offset>`.
+        // LLVM at `-O2` CSEs the load + adds and folds the per-field
+        // GEP-equivalents — see user memory note "LLVM does most
+        // optimization". No manual caching needed on the Rust side.
+        let cache_slot_loaded = self.load_cache_slot_ptr(site_id)?;
+        let generic_ptr_loaded = self.load_generic_function_ptr(generic_name)?;
 
         // Field offsets within `CacheSlot` — must match the
         // `#[repr(C)]` layout in `nod_runtime::dispatch`.
-        let cache_class_addr =
-            i64ty.const_int(cache_slot_raw + offset_of_cache_slot_class() as u64, false);
-        let cache_method_addr =
-            i64ty.const_int(cache_slot_raw + offset_of_cache_slot_method() as u64, false);
-        let cache_gen_addr =
-            i64ty.const_int(cache_slot_raw + offset_of_cache_slot_generation() as u64, false);
-        let cache_hits_addr =
-            i64ty.const_int(cache_slot_raw + offset_of_cache_slot_hits() as u64, false);
+        let cache_class_off = i64ty.const_int(offset_of_cache_slot_class() as u64, false);
+        let cache_method_off = i64ty.const_int(offset_of_cache_slot_method() as u64, false);
+        let cache_gen_off = i64ty.const_int(offset_of_cache_slot_generation() as u64, false);
+        let cache_hits_off = i64ty.const_int(offset_of_cache_slot_hits() as u64, false);
+        let generic_gen_off = i64ty.const_int(offset_of_generic_generation() as u64, false);
+
+        let cache_class_addr = self
+            .builder
+            .build_int_add(
+                cache_slot_loaded,
+                cache_class_off,
+                &format!("disp.s{site_id}.cache_class.addr"),
+            )
+            .map_err(map_err)?;
+        let cache_method_addr = self
+            .builder
+            .build_int_add(
+                cache_slot_loaded,
+                cache_method_off,
+                &format!("disp.s{site_id}.cache_method.addr"),
+            )
+            .map_err(map_err)?;
+        let cache_gen_addr = self
+            .builder
+            .build_int_add(
+                cache_slot_loaded,
+                cache_gen_off,
+                &format!("disp.s{site_id}.cache_gen.addr"),
+            )
+            .map_err(map_err)?;
+        let cache_hits_addr = self
+            .builder
+            .build_int_add(
+                cache_slot_loaded,
+                cache_hits_off,
+                &format!("disp.s{site_id}.cache_hits.addr"),
+            )
+            .map_err(map_err)?;
         // misses bumped by nod_dispatch itself.
 
         // GenericFunction.generation is the second field; compute its
-        // address relative to the generic pointer.
-        let generic_gen_addr =
-            i64ty.const_int(generic_ptr_raw + offset_of_generic_generation() as u64, false);
+        // address relative to the loaded generic pointer.
+        let generic_gen_addr = self
+            .builder
+            .build_int_add(
+                generic_ptr_loaded,
+                generic_gen_off,
+                &format!("disp.s{site_id}.gen.addr"),
+            )
+            .map_err(map_err)?;
 
         let arity_const = i64ty.const_int(args.len() as u64, false);
-        let generic_ptr_const = i64ty.const_int(generic_ptr_raw, false);
-        let cache_slot_const = i64ty.const_int(cache_slot_raw, false);
+        // The slow-path arg shape passes the same `cache_slot` and
+        // `generic` pointers `nod_dispatch` already takes; these are
+        // the same loaded values we used above (no second load needed —
+        // they're SSA values that LLVM will keep around as long as
+        // they're used).
+        let generic_ptr_const = generic_ptr_loaded;
+        let cache_slot_const = cache_slot_loaded;
 
         // Snapshot arg SSA values BEFORE the safepoint (still valid
         // because spill doesn't invalidate the original temp mapping —

@@ -147,7 +147,6 @@ pub use conditions::{
 };
 pub use dispatch::{
     CacheSlot, GenericFunction, Method, MethodPtr, MethodTableError, ResolvedDispatchEntry,
-    _reset_for_tests as _reset_dispatch_for_tests,
     _reset_method_chain_stack_for_tests, add_method, add_method_full, add_method_named,
     dump_dispatch, find_generic, find_initialize_method, find_method_body_ptr,
     for_each_generic, generic_generation_offset, get_or_create_generic, has_next_method,
@@ -528,6 +527,160 @@ pub fn allocate_cache_slot(site_id: u64) -> *const CacheSlot {
         let slot: &'static CacheSlot = pool.static_area.alloc(CacheSlot::cold(site_id));
         slot as *const CacheSlot
     })
+}
+
+/// Sprint 38e — per-(module-key-prefix, site_id) slot table for
+/// inline-cache dispatch slots. Each distinct
+/// `(key_prefix, site_id)` pair maps to one stable `&'static u64`
+/// whose contents are the address of a freshly-allocated [`CacheSlot`]
+/// in the current process's static area.
+///
+/// **Why the key prefix is part of the map key**: two distinct modules
+/// (e.g. two different Dylan source files compiled into the same
+/// process) may each have dispatch sites with `site_id = 0`. Without
+/// the key_prefix in the map key, they'd share one underlying
+/// `CacheSlot`, which would scramble both modules' inline caches.
+/// Within one module, `site_id`s are unique
+/// (`ModuleCodegenCtx::next_dispatch_site_id` is module-wide
+/// monotonic), so the pair `(key_prefix, site_id)` is process-globally
+/// unique.
+///
+/// **Cross-process state**: the cache slot itself has no persistent
+/// state across processes — it's a Sprint 13 polyinline-cache, mutated
+/// atomically at runtime by the fast-path/slow-path. When a cached
+/// `.bc` is loaded in a fresh process, this slot allocator runs once
+/// per `(key_prefix, site_id)` pair and minted slots start out empty
+/// (which is exactly what we want: cold and warm both see a fresh
+/// cache, no state needs to round-trip).
+static CACHE_SLOT_SLOTS: LazyLock<Mutex<HashMap<(String, u64), &'static u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Sprint 38e — per-generic-name slot table for `GenericFunction`
+/// pointers. Each distinct name maps to one stable `&'static u64` whose
+/// contents are the address of the `&'static GenericFunction` returned
+/// by [`get_or_create_generic`].
+///
+/// `get_or_create_generic` already leaks a `&'static GenericFunction`
+/// per name (process lifetime), so this slot is just an indirection
+/// that lets codegen emit `load i64, ptr @nod_generic__*` instead of
+/// baking the per-process address.
+static GENERIC_FUNCTION_SLOTS: LazyLock<Mutex<HashMap<String, &'static u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Sprint 38e — wraps Sprint 13's `dispatch::_reset_for_tests` to ALSO
+/// clear the Sprint 38e slot tables.
+///
+/// Pre-Sprint-38e, `_reset_dispatch_for_tests` (re-exported from
+/// `dispatch.rs`) wiped the `GenericFunction` registry and the
+/// resolved-dispatch index. That was sufficient because the cache slot
+/// addresses + generic pointers were baked into IR as i64 constants —
+/// each test's freshly-JIT-compiled module saw fresh constants, no
+/// stale state could leak.
+///
+/// Sprint 38e routes both through Sprint 38e slot allocators that
+/// memoise leaked `&'static u64`s indefinitely. A test that wipes the
+/// generic registry without also clearing the slot tables would have
+/// the next test's `@nod_generic__*` loads return stale generic
+/// pointer bits (pointing at the freed-then-recreated generic, which
+/// has zero methods after the registry clear). Wrapping the existing
+/// helper here keeps the test-side API identical
+/// (`_reset_dispatch_for_tests()`) while threading the additional
+/// slot-table clear underneath.
+pub fn _reset_dispatch_for_tests() {
+    dispatch::_reset_for_tests();
+    _reset_sprint38e_slots_for_tests();
+}
+
+/// Sprint 38e — test helper: clear both Sprint 38e slot tables.
+///
+/// The slot allocators memoise leaked `&'static u64`s per-process. In a
+/// single-process production run that's the right behaviour (multiple
+/// JIT-loaded modules referencing the same generic / cache site share
+/// one underlying pointer cell). Tests that call
+/// `_reset_dispatch_for_tests` to wipe the `GenericFunction` registry
+/// also need to clear these slot tables — otherwise a previous test's
+/// stale `&'static GenericFunction` pointer bits remain in the slot,
+/// the next test's `@nod_generic__*` load reads those stale bits, and
+/// dispatch through the warm IR hits a generic with no methods.
+///
+/// The leaked `u64` slots themselves are not freed (they're
+/// `'static`); this just wipes the map so the next lookup allocates a
+/// fresh slot keyed on the new run's generic / cache slot pointers.
+pub fn _reset_sprint38e_slots_for_tests() {
+    {
+        let mut guard = CACHE_SLOT_SLOTS
+            .lock()
+            .expect("cache slot slot table poisoned");
+        guard.clear();
+    }
+    let mut guard = GENERIC_FUNCTION_SLOTS
+        .lock()
+        .expect("generic function slot table poisoned");
+    guard.clear();
+}
+
+/// Sprint 38e — stable address of a `u64` holding the address of a
+/// `CacheSlot` for `(key_prefix, site_id)`. Repeated calls with the
+/// same `(key_prefix, site_id)` return the SAME `*const u64`.
+///
+/// `key_prefix` is the per-module symbol-name prefix (the first 16 hex
+/// characters of the module's cache key); see `nod-llvm::symbols`. It
+/// disambiguates `site_id == 0` between distinct modules sharing the
+/// same process.
+///
+/// First lookup calls [`allocate_cache_slot`], which mints a fresh
+/// (empty) `CacheSlot` in the static area; we leak a `Box<u64>` holding
+/// the slot's pointer bits and memoise it. Subsequent lookups return
+/// the cached `&'static u64`.
+///
+/// Used by `Jit::add_module`/`add_module_from_bitcode` to map
+/// `@nod_cache_slot__<key>__<site_id>` to a stable address whose
+/// contents load as the cache slot pointer in the current process.
+/// Codegen emits `load i64, ptr @nod_cache_slot__*` once per dispatch
+/// site and derives the field-offset addresses (class / method /
+/// generation / hits) by `add i64`-ing the loaded value with the
+/// `#[repr(C)]` field offsets.
+pub fn cache_slot_slot_addr(key_prefix: &str, site_id: u64) -> &'static u64 {
+    let key = (key_prefix.to_string(), site_id);
+    let mut guard = CACHE_SLOT_SLOTS
+        .lock()
+        .expect("cache slot slot table poisoned");
+    if let Some(&slot) = guard.get(&key) {
+        return slot;
+    }
+    let cache_slot_ptr = allocate_cache_slot(site_id);
+    let slot: &'static u64 = Box::leak(Box::new(cache_slot_ptr as u64));
+    guard.insert(key, slot);
+    slot
+}
+
+/// Sprint 38e — stable address of a `u64` holding the address of the
+/// `&'static GenericFunction` for `name`. Repeated calls with the same
+/// name return the SAME `*const u64`.
+///
+/// First lookup calls [`get_or_create_generic`] (which itself leaks a
+/// `&'static GenericFunction` keyed on name); we leak a `Box<u64>`
+/// holding the generic's pointer bits and memoise it. Subsequent
+/// lookups return the cached `&'static u64`.
+///
+/// Used by `Jit::add_module`/`add_module_from_bitcode` to map
+/// `@nod_generic__<key>__<sanitised-name>` to a stable address whose
+/// contents load as the generic pointer in the current process.
+/// Codegen emits `load i64, ptr @nod_generic__*` once per dispatch site
+/// and derives the `generation` field address by `add i64`-ing with
+/// [`generic_generation_offset`].
+pub fn generic_function_slot_addr(name: &str) -> &'static u64 {
+    let mut guard = GENERIC_FUNCTION_SLOTS
+        .lock()
+        .expect("generic function slot table poisoned");
+    if let Some(&slot) = guard.get(name) {
+        return slot;
+    }
+    let generic = get_or_create_generic(name);
+    let generic_ptr_bits = generic as *const GenericFunction as u64;
+    let slot: &'static u64 = Box::leak(Box::new(generic_ptr_bits));
+    guard.insert(name.to_string(), slot);
+    slot
 }
 
 /// Description of a user class to be registered. Sprint 12 expects

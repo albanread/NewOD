@@ -148,7 +148,7 @@ impl<'ctx> Jit<'ctx> {
             let Some(global) = module.get_global(&entry.symbol) else {
                 continue;
             };
-            let addr = match resolve_reloc_kind(&entry.kind) {
+            let addr = match resolve_reloc_kind(&manifest.key_prefix, &entry.kind) {
                 Ok(a) => a,
                 Err(e) => {
                     return Err(JitError::Create(format!(
@@ -911,7 +911,7 @@ impl<'ctx> Jit<'ctx> {
                 // isn't referenced.
                 continue;
             };
-            let addr = match resolve_reloc_kind(&entry.kind) {
+            let addr = match resolve_reloc_kind(&manifest.key_prefix, &entry.kind) {
                 Ok(a) => a,
                 Err(e) => return Err(JitError::Create(format!("reloc {}: {e}", entry.symbol))),
             };
@@ -1044,7 +1044,17 @@ pub fn bitcode_to_ir_text(bitcode: &[u8]) -> Result<String, JitError> {
 /// [`RelocKind`]. The cold-compile path baked the resolved address
 /// into IR as an `i64` constant; the cache-hit path calls this to
 /// recompute it against the new process's runtime state.
-fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String> {
+/// `key_prefix` is the manifest-level per-module key prefix (16 hex
+/// chars). It's used to disambiguate `CacheSlot` site_ids across
+/// modules sharing the same process — see
+/// `nod_runtime::cache_slot_slot_addr` for the rationale. Reloc kinds
+/// that are already process-globally unique (immediates, class
+/// metadata, literals, stub entries, generic functions) ignore this
+/// argument.
+fn resolve_reloc_kind(
+    key_prefix: &str,
+    kind: &RelocKind,
+) -> Result<*mut std::ffi::c_void, String> {
     let addr: u64 = match kind {
         // Sprint 38b — `Imm*` reloc kinds resolve to the *address* of a
         // process-global slot holding the Word bits, NOT the bits
@@ -1083,12 +1093,30 @@ fn resolve_reloc_kind(kind: &RelocKind) -> Result<*mut std::ffi::c_void, String>
         RelocKind::SymbolLiteral { name } => {
             nod_runtime::intern_symbol_literal_slot_addr(name) as u64
         }
+        // Sprint 38e — same correction as Sprint 38b/c/d: return the
+        // *address* of a stable slot whose contents are the
+        // cache-slot/generic pointer bits in the current process, NOT
+        // the pointer itself. The JIT-link path registers the slot's
+        // address via `LLVMAddGlobalMapping(@nod_cache_slot__*, slot)` /
+        // `(@nod_generic__*, slot)`; the IR emits `load i64, ptr @...`
+        // to recover the pointer bits.
+        //
+        // Memoisation lives in the slot allocators
+        // (`nod_runtime::cache_slot_slot_addr`,
+        // `generic_function_slot_addr`): multiple JIT-loaded modules
+        // referencing the same site_id / generic name share one
+        // underlying CacheSlot / GenericFunction (and therefore one
+        // resolved pointer cell across replays).
         RelocKind::CacheSlot { site_id } => {
-            nod_runtime::allocate_cache_slot(*site_id) as u64
+            // Sprint 38e — the slot allocator keys on
+            // `(key_prefix, site_id)` so two modules in the same
+            // process with overlapping site_ids don't share one
+            // `CacheSlot`. See `nod_runtime::cache_slot_slot_addr`'s
+            // doc comment.
+            nod_runtime::cache_slot_slot_addr(key_prefix, *site_id) as *const u64 as u64
         }
         RelocKind::Generic { name } => {
-            let g = nod_runtime::get_or_create_generic(name);
-            g as *const _ as u64
+            nod_runtime::generic_function_slot_addr(name) as *const u64 as u64
         }
         // Sprint 38d — same correction as Sprint 38b/c: return the
         // *address* of a stable slot whose contents are the entry-pointer
