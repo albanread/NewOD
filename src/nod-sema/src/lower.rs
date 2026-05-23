@@ -5467,27 +5467,92 @@ impl FunctionBuilder {
             else_block: else_b,
         });
 
+        // Sprint 42-pre: env-merge at the join. Walk both arms upfront
+        // to find every name that gets rebound in either; snapshot the
+        // pre-if env so each arm can be lowered against the same state;
+        // emit join-block params for the rebound names and route each
+        // arm's jump with the correct args. Without this, a then-only
+        // (or else-only) `name := value` mutates env in place but no
+        // join phi gets created — and when `name` is also a loop-header
+        // phi target, the back-edge picks up an arm-local temp that
+        // doesn't dominate the back-edge block. LLVM verification then
+        // (correctly) rejects the IR with "Instruction does not dominate
+        // all uses".
+        //
+        // Cell-promoted locals are fine without a phi (the cell pointer
+        // stays the same in env across arms); we still include them in
+        // the args, producing `phi(cell_t, cell_t) = cell_t`. Harmless.
+        let mut assigned_in_arms: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        collect_assigned_in_expr(then_, env, &mut assigned_in_arms);
+        collect_assigned_in_expr(else_, env, &mut assigned_in_arms);
+        let mut merge_names: Vec<String> = assigned_in_arms.into_iter().collect();
+        merge_names.sort(); // deterministic param order
+        // Filter to names actually bound in env (collect_assigned_in_expr
+        // already gates on env.contains_key, but be defensive).
+        merge_names.retain(|n| env.contains_key(n));
+        let pre_env = env.clone();
+
+        // Lower the then arm against the pre-if env. `self.current`
+        // after `lower_expr` is wherever the arm finished (possibly a
+        // nested join block, not `then_b`); `terminate_current` uses
+        // that, which is what we want — we terminate the *last* block
+        // of the arm with the jump to the outer join.
         self.switch_to(then_b);
         let then_v = self.lower_expr(then_, env, ctx)?;
         let then_ty = self.func.temp_type(then_v);
+        let then_merge_temps: Vec<TempId> = merge_names
+            .iter()
+            .map(|n| *env.get(n).expect("merge name bound after then arm"))
+            .collect();
+        let mut then_args: Vec<TempId> = Vec::with_capacity(1 + then_merge_temps.len());
+        then_args.push(then_v);
+        then_args.extend(then_merge_temps.iter().copied());
         self.terminate_current(Terminator::Jump {
             target: join_b,
-            args: vec![then_v],
+            args: then_args,
         });
 
+        // Reset env to pre-if state, then lower the else arm.
+        *env = pre_env.clone();
         self.switch_to(else_b);
         let else_v = self.lower_expr(else_, env, ctx)?;
         let else_ty = self.func.temp_type(else_v);
+        let else_merge_temps: Vec<TempId> = merge_names
+            .iter()
+            .map(|n| *env.get(n).expect("merge name bound after else arm"))
+            .collect();
+        let mut else_args: Vec<TempId> = Vec::with_capacity(1 + else_merge_temps.len());
+        else_args.push(else_v);
+        else_args.extend(else_merge_temps.iter().copied());
         self.terminate_current(Terminator::Jump {
             target: join_b,
-            args: vec![else_v],
+            args: else_args,
         });
 
+        // Add join params: if-value first, then one per merged name.
+        // Param order MUST match the jump-args order above.
         let joined_ty = then_ty.join(else_ty);
-        let join_param = self.add_block_param(join_b, joined_ty);
+        let join_value_param = self.add_block_param(join_b, joined_ty);
+        let mut join_var_params: Vec<TempId> = Vec::with_capacity(merge_names.len());
+        for (i, _n) in merge_names.iter().enumerate() {
+            let then_t_ty = self.func.temp_type(then_merge_temps[i]);
+            let else_t_ty = self.func.temp_type(else_merge_temps[i]);
+            let ty = then_t_ty.join(else_t_ty);
+            let p = self.add_block_param(join_b, ty);
+            join_var_params.push(p);
+        }
+
+        // Switch to join and rebind env so post-if code sees the phi'd
+        // values. The caller (let-binding, sequence, etc.) just reads
+        // env normally.
         self.switch_to(join_b);
-        Ok(join_param)
+        for (n, p) in merge_names.iter().zip(join_var_params.iter()) {
+            env.insert(n.clone(), *p);
+        }
+        Ok(join_value_param)
     }
+
 
     /// Sprint 18: lower `while (cond) body end` / `until (cond) body end`
     /// into a three-block CFG with a back-edge.
