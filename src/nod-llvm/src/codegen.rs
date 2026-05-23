@@ -305,6 +305,10 @@ pub const NOD_CREATE_HIDDEN_WINDOW_SYMBOL: &str = "nod_create_hidden_window";
 pub const NOD_DESTROY_WINDOW_SYMBOL: &str = "nod_destroy_window";
 pub const NOD_POST_MESSAGE_SYMBOL: &str = "nod_post_message";
 pub const NOD_PUMP_ONE_MESSAGE_SYMBOL: &str = "nod_pump_one_message";
+/// Sprint 41a — canonical blocking `GetMessage` / `Translate` /
+/// `Dispatch` loop. Arity 0; returns the fixnum-tagged WM_QUIT exit
+/// code.
+pub const NOD_RUN_MESSAGE_LOOP_SYMBOL: &str = "nod_run_message_loop";
 pub const NOD_DEF_WINDOW_PROC_SYMBOL: &str = "nod_def_window_proc";
 
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
@@ -457,6 +461,10 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_destroy_window", NOD_DESTROY_WINDOW_SYMBOL, 1),
     ("nod_post_message", NOD_POST_MESSAGE_SYMBOL, 4),
     ("nod_pump_one_message", NOD_PUMP_ONE_MESSAGE_SYMBOL, 1),
+    // Sprint 41a — blocking message loop. Arity-0 in the C-ABI sense
+    // (no Dylan-side args, no HWND filter) matches the canonical Win32
+    // C idiom that blocks on the whole thread's queue.
+    ("nod_run_message_loop", NOD_RUN_MESSAGE_LOOP_SYMBOL, 0),
     ("nod_def_window_proc", NOD_DEF_WINDOW_PROC_SYMBOL, 4),
 ];
 

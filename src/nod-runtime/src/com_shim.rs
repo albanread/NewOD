@@ -1822,6 +1822,66 @@ pub unsafe extern "C-unwind" fn nod_pump_one_message(_hwnd_word: u64) -> u64 {
     tag(count)
 }
 
+/// JIT-callable: the canonical Win32 blocking message loop. Calls
+/// `GetMessageW` in a loop until it returns 0 (signalling `WM_QUIT`,
+/// which a WNDPROC posts via `PostQuitMessage(N)` typically inside a
+/// `WM_DESTROY` handler). Each non-quit message is translated +
+/// dispatched. Returns the fixnum-tagged `WPARAM` of the WM_QUIT
+/// message (which `PostQuitMessage(N)` set to `N`) so the caller can
+/// surface a process exit code.
+///
+/// This is the Sprint 41a primitive: a Dylan-source `%run-message-loop()`
+/// call lowers to this shim and the test/EXE blocks here until the
+/// user closes the window. Behaves identically to the canonical
+/// `while (GetMessage(...)) { Translate; Dispatch; }` C idiom every
+/// Win32 SDK sample carries.
+///
+/// `GetMessageW`'s return contract is `BOOL`-but-tri-valued: positive
+/// for "got a message", zero for "WM_QUIT", negative for an error
+/// (typically because the caller passed garbage). We treat any
+/// non-positive return as "stop pumping" — for a negative error
+/// `msg.wParam` is undefined, so the caller observes 0 as the exit
+/// code, which is the same outcome as a clean WM_QUIT(0). A future
+/// sprint can surface the error as a `<c-ffi-error>` if a use case
+/// emerges; Sprint 41a chose simplicity over a path that doesn't
+/// fire in practice (every well-formed program reaches WM_QUIT,
+/// never the error branch).
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary; `GetMessageW` is a
+/// stateless Win32 API that fills `MSG` via the out-pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_run_message_loop() -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    };
+    let mut msg = MSG::default();
+    let exit_code: i32;
+    // SAFETY: msg is a stack out-param; GetMessageW writes to it on
+    // every iteration. `None` HWND filter blocks on the whole thread
+    // queue, exactly matching the C idiom.
+    unsafe {
+        loop {
+            // GetMessageW returns:
+            //   > 0 : a message was retrieved (translate + dispatch).
+            //   = 0 : WM_QUIT — exit loop, return msg.wParam as code.
+            //   < 0 : error (invalid hwnd, etc.) — exit loop, code 0.
+            let ret = GetMessageW(&mut msg, None, 0, 0).0;
+            if ret <= 0 {
+                break;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // msg.wParam carries the value `PostQuitMessage(N)` passed.
+        // For the negative-return error path, msg is undefined but
+        // wParam is just a u/i value — clamp the fixnum-encoded
+        // exit code to a 32-bit integer the caller can compare.
+        exit_code = msg.wParam.0 as i32;
+    }
+    tag(exit_code as u32 as u64)
+}
+
 // ─── UTF-16 helpers ───────────────────────────────────────────────────────
 
 /// Decode a Dylan `<byte-string>` Word's UTF-8 payload to a

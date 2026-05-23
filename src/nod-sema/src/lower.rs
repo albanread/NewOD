@@ -350,6 +350,10 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%destroy-window", "nod_destroy_window", 1, TypeEstimate::Integer),
     ("%post-message", "nod_post_message", 4, TypeEstimate::Integer),
     ("%pump-one-message", "nod_pump_one_message", 1, TypeEstimate::Integer),
+    // Sprint 41a — blocking Win32 message loop. Arity-0, returns the
+    // fixnum-tagged WPARAM of the WM_QUIT message (typically the value
+    // a WNDPROC's WM_DESTROY handler passed to `PostQuitMessage`).
+    ("%run-message-loop", "nod_run_message_loop", 0, TypeEstimate::Integer),
     ("%def-window-proc", "nod_def_window_proc", 4, TypeEstimate::Integer),
 ];
 

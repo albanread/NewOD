@@ -81,6 +81,7 @@ use crate::codegen::{
     NOD_DESTROY_WINDOW_SYMBOL,
     NOD_POST_MESSAGE_SYMBOL,
     NOD_PUMP_ONE_MESSAGE_SYMBOL,
+    NOD_RUN_MESSAGE_LOOP_SYMBOL,
     NOD_DEF_WINDOW_PROC_SYMBOL,
 };
 use crate::jit_mm;
@@ -582,6 +583,12 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_post_message as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_PUMP_ONE_MESSAGE_SYMBOL),
              nod_runtime::nod_pump_one_message as *const () as *mut std::ffi::c_void),
+            // Sprint 41a — blocking message loop. The JIT path binds the
+            // declared `nod_run_message_loop` symbol to the runtime's
+            // shim so a `%run-message-loop()` Dylan call lands in the
+            // GetMessage/Translate/Dispatch loop.
+            (module.get_function(NOD_RUN_MESSAGE_LOOP_SYMBOL),
+             nod_runtime::nod_run_message_loop as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_DEF_WINDOW_PROC_SYMBOL),
              nod_runtime::nod_def_window_proc as *const () as *mut std::ffi::c_void),
         ];

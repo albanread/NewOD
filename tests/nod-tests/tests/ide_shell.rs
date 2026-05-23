@@ -1,4 +1,5 @@
-//! Sprint 36 — IDE shell *interactive* demo.
+//! Sprint 36 — IDE shell *interactive* demo, completed in Sprint 41a
+//! with a real blocking message loop.
 //!
 //! THIS TEST POPS A REAL WIN32 WINDOW. It is `#[ignore]`-gated so
 //! routine `cargo test` doesn't disturb the user's screen. Run
@@ -8,20 +9,33 @@
 //! cargo test --test ide_shell -- --ignored
 //! ```
 //!
-//! The headline: a Dylan-source expression assembles every Sprint 27→35
+//! The headline: a Dylan-source expression assembles every Sprint 27→36
 //! deliverable into a working IDE shell — `CreateWindowExW` opens a
 //! titled window, the Sprint 36 HWND-bound swap chain feeds a D2D
 //! device context, DirectWrite renders "hello, dylan" through D2D into
 //! the window's client area on each `WM_PAINT`, the Sprint 32 WNDPROC
-//! routes messages back to a Dylan closure, and `GetMessageW` /
-//! `DispatchMessageW` drive the message pump until the user clicks
-//! the close box (WM_DESTROY → PostQuitMessage(0) → WM_QUIT exit).
+//! routes messages back to a Dylan closure, and the Sprint 41a
+//! `%run-message-loop()` primitive blocks on `GetMessageW` until the
+//! user clicks the close box (WM_DESTROY → PostQuitMessage(0) →
+//! WM_QUIT exit code 0).
 //!
 //! Acceptance: the test returns `exit-code = 0`, meaning the window
 //! came up, rendered, accepted the close gesture, and unwound the
 //! pump cleanly. The infrastructure tests in `ide_shell_infra.rs`
 //! cover each piece in isolation; this test is the end-to-end demo
 //! that proves they compose.
+//!
+//! ## Sprint 41a change
+//!
+//! Sprint 36c's first shipping form used `Sleep(5000)` as a placeholder
+//! after `ShowWindow` / `UpdateWindow` — the window appeared but didn't
+//! respond to input and unconditionally vanished after five seconds.
+//! Sprint 41a replaces that placeholder with `%run-message-loop()`, a
+//! `GetMessageW` / `TranslateMessage` / `DispatchMessageW` blocking
+//! loop that returns the `WM_QUIT` exit code (0 when the WNDPROC's
+//! `WM_DESTROY` handler calls `PostQuitMessage(0)`). The window now
+//! stays up until the user closes it, which is the actual Win32
+//! "real window" criterion.
 
 #![cfg(windows)]
 #![allow(non_snake_case)]
@@ -186,10 +200,7 @@ fn ide_shell_window_renders_hello_dylan() {
         ShowWindow(hwnd, 5); \
         UpdateWindow(hwnd); \
         \
-        \
-        Sleep(5000); \
-        \
-        0";
+        %run-message-loop()";
     let s = eval_expr_with_items_to_string(IDE_SHELL_DECL, body)
         .unwrap_or_else(|e| panic!("IDE shell test failed: {e:?}"));
     assert_eq!(
