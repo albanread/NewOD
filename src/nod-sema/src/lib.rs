@@ -723,11 +723,14 @@ fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
 /// generics are present in the parser + lowering tables before the
 /// user file is processed.
 ///
-/// **Sprint 39a scope**: the lowered module is suitable for AOT only
-/// when it doesn't reference Win32 APIs (Sprint 39b) and doesn't rely
-/// on stdlib bodies being separately compiled (Sprint 39c — for now,
-/// every AOT build inlines the entire stdlib into the user module's
-/// IR, which is wasteful but correct).
+/// **Sprint 39c** — the lowered stdlib is merged into the user's
+/// [`LoweredModule`] before return so the resulting `.obj` carries
+/// every Dylan-side body the dispatch / function-ref / block tables
+/// need at AOT runtime. Stdlib items lose to user-defined items on
+/// name conflicts (user wins). Embedding the full stdlib per-EXE is
+/// wasteful; a future sprint can carve it out into a pre-compiled
+/// `stdlib.obj` linked into every EXE. The minimum-viable-correctness
+/// approach here keeps the AOT pipeline honest.
 pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
     stdlib::ensure_loaded();
     let src = std::fs::read_to_string(path).map_err(EvalError::Io)?;
@@ -740,8 +743,168 @@ pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
     let mut module =
         parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
-    let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    let mut lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    merge_stdlib_into_user_module(&mut lm);
     Ok(lm)
+}
+
+/// Sprint 39c — build the AOT registration payload from a (post-
+/// merge) [`LoweredModule`]. The driver passes the resulting
+/// [`nod_llvm::AotRegistrations`] to
+/// `emit_aot_object_with_registrations` so the AOT resolver in the
+/// emitted EXE registers every Dylan-side method / block / top-level
+/// function body with the runtime dispatch / function-ref / block
+/// registries BEFORE `nod_user_main` runs.
+///
+/// Mirrors `register_methods` / `register_blocks` /
+/// `register_top_level_functions` but emits descriptors instead of
+/// calling the runtime helpers directly — the AOT path can't take
+/// the JIT-style "look up the symbol, then call the helper" route
+/// because there's no JIT engine; the LLVM symbol-to-address binding
+/// happens at link/load time.
+pub fn build_aot_registrations(lm: &LoweredModule) -> nod_llvm::AotRegistrations {
+    use nod_llvm::{
+        AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
+        AotMethodRegistration, AotRegistrations,
+    };
+    let mut out = AotRegistrations::default();
+    // Methods.
+    for m in &lm.methods {
+        out.methods.push(AotMethodRegistration {
+            generic_name: m.generic_name.clone(),
+            specialisers: m.specialisers.iter().map(|c| c.0).collect(),
+            body_fn_name: m.body_fn_name.clone(),
+            param_count: m.param_count,
+        });
+    }
+    // Blocks.
+    for b in &lm.blocks {
+        let handlers = b
+            .handlers
+            .iter()
+            .map(|h| AotBlockHandlerRegistration {
+                class_id: h.class_id.0,
+                class_name: h.class_name.clone(),
+                body_fn_name: h.body_fn_name.clone(),
+            })
+            .collect();
+        out.blocks.push(AotBlockRegistration {
+            block_id: b.block_id,
+            body_fn_name: b.body_fn_name.clone(),
+            cleanup_fn_name: b.cleanup_fn_name.clone(),
+            afterwards_fn_name: b.afterwards_fn_name.clone(),
+            handlers,
+        });
+    }
+    // Top-level functions. Mirrors `register_top_level_functions`:
+    // skip block-form lifted thunks (they have a non-standard ABI)
+    // and skip the synthetic `<eval-entry>` (not reachable as a
+    // top-level Dylan function).
+    let mut block_thunk_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for b in &lm.blocks {
+        block_thunk_names.insert(b.body_fn_name.clone());
+        if let Some(n) = &b.cleanup_fn_name {
+            block_thunk_names.insert(n.clone());
+        }
+        if let Some(n) = &b.afterwards_fn_name {
+            block_thunk_names.insert(n.clone());
+        }
+        for h in &b.handlers {
+            block_thunk_names.insert(h.body_fn_name.clone());
+        }
+    }
+    for f in &lm.functions {
+        if block_thunk_names.contains(&f.name) {
+            continue;
+        }
+        if f.name == "<eval-entry>" {
+            continue;
+        }
+        let arity = if let Some(info) = lm.closures.closure_for(&f.name) {
+            info.arity
+        } else {
+            f.params.len()
+        };
+        out.functions.push(AotFunctionRegistration {
+            name: f.name.clone(),
+            arity,
+            body_fn_name: f.name.clone(),
+        });
+    }
+    out
+}
+
+/// Sprint 39c — append the stdlib's lowered DFM artefacts onto the
+/// user's [`LoweredModule`] so the resulting `.obj` carries every
+/// Dylan-side function body the AOT-runtime needs. The merge keeps
+/// user definitions (functions / methods / blocks) intact; conflicts
+/// on identical `body_fn_name` resolve in the user's favour by
+/// skipping the stdlib copy. Block IDs are runtime-allocated and
+/// already process-unique, so they never collide.
+///
+/// The merge runs AFTER `lower_module_full` so the user's IR has
+/// finished resolving Dispatch nodes (which may target stdlib
+/// generics by name); the user's `methods` / `functions` / `blocks`
+/// vectors are then extended with the stdlib's. Codegen sees the
+/// concatenated function list and emits one LLVM function per entry;
+/// the AOT post-processing pass then walks the merged
+/// `methods` / `blocks` / function lists to emit startup registration
+/// calls so dispatch, the block registry, and the function-ref
+/// registry are populated before `nod_user_main` runs.
+fn merge_stdlib_into_user_module(lm: &mut LoweredModule) {
+    let Some(stdlib_lm) = stdlib::stdlib_lowered() else {
+        // ensure_loaded ran first; this branch should be unreachable.
+        // If it ever fires the user gets a useful diagnostic out of
+        // codegen ("undefined symbol size$<object>") rather than a
+        // crash, so we don't panic here.
+        return;
+    };
+    use std::collections::HashSet;
+    let user_fn_names: HashSet<String> =
+        lm.functions.iter().map(|f| f.name.clone()).collect();
+    for f in &stdlib_lm.functions {
+        if user_fn_names.contains(&f.name) {
+            // User overrides stdlib — skip the stdlib copy so codegen
+            // doesn't emit a duplicate LLVM function definition.
+            continue;
+        }
+        lm.functions.push(f.clone());
+    }
+    // Methods: dedup on `body_fn_name`. The stdlib's `define method`
+    // bodies have predictable names (`{generic}${specialisers}`); if
+    // the user happens to redefine the exact same method body the
+    // user's copy wins.
+    let user_method_bodies: HashSet<String> =
+        lm.methods.iter().map(|m| m.body_fn_name.clone()).collect();
+    for m in &stdlib_lm.methods {
+        if user_method_bodies.contains(&m.body_fn_name) {
+            continue;
+        }
+        lm.methods.push(m.clone());
+    }
+    // Blocks: ids are runtime-allocated so always unique. Just
+    // concatenate.
+    for b in &stdlib_lm.blocks {
+        lm.blocks.push(b.clone());
+    }
+    // Closures: extend the closure registry with stdlib's entries.
+    // The lifter names lifted thunks with monotonically-allocated
+    // numeric suffixes (`__anon-method-NNNN`); the stdlib's load
+    // pass runs before the user's, so stdlib closures occupy a lower
+    // numeric range. Cross-contamination is structurally impossible.
+    for (k, v) in &stdlib_lm.closures.by_lifted_name {
+        lm.closures
+            .by_lifted_name
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+    for (k, v) in &stdlib_lm.closures.cell_locals_per_function {
+        lm.closures
+            .cell_locals_per_function
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
 }
 
 /// Sprint 31: parse the same `items + expr` shape as

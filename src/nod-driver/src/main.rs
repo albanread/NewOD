@@ -287,9 +287,23 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
     // immutable across emission, so reading them here is order-independent.
     let user_dlls = collect_user_dlls(&manifest);
 
-    if let Err(e) =
-        nod_llvm::aot::emit_aot_object(&module, &manifest, &obj_path, OptimizationLevel::Default)
-    {
+    // Sprint 39c — build the registration payload from the merged
+    // (user + stdlib) lowered module. The AOT entry-stub injection
+    // pass embeds one `nod_aot_register_method` / `nod_aot_register_block`
+    // / `nod_aot_register_jit_function` call per entry inside the
+    // codegen-emitted `nod_aot_resolve_relocs` function, which the
+    // EXE's `main` calls before invoking the user's Dylan code. This
+    // is what makes `size(<range>)` (and every other stdlib-defined
+    // generic method) resolve at AOT runtime.
+    let registrations = nod_sema::build_aot_registrations(&lm);
+
+    if let Err(e) = nod_llvm::aot::emit_aot_object_with_registrations(
+        &module,
+        &manifest,
+        &registrations,
+        &obj_path,
+        OptimizationLevel::Default,
+    ) {
         eprintln!("nod build: {e}");
         return ExitCode::from(1);
     }

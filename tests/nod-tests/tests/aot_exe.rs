@@ -180,54 +180,27 @@ fn aot_arithmetic() {
     assert_eq!(stdout, "42\n", "stdout mismatch; stderr=\n{stderr}");
 }
 
-/// Sprint 39a: end-to-end exercise of Sprint 38c (class metadata
-/// relocation) + Sprint 38e (cache slot + generic relocation).
-/// `size(make(<range>, from: 0, to: 5))` is the same workload Sprint
-/// 38g's headline subprocess speedup test uses, ensuring the AOT
-/// pipeline covers the same per-bake-site categories as the JIT.
+/// Sprint 39c: end-to-end exercise of stdlib pre-compilation. The
+/// program `size(make(<range>, from: 0, to: 5))` exercises:
+///   * Sprint 38c class-metadata relocations (`<range>`).
+///   * Sprint 38e cache-slot + generic-function relocations
+///     (`size`'s inline cache, `\size`).
+///   * Sprint 39c stdlib merging: the user's `.obj` contains the
+///     stdlib's `size$<range>` method body and the resolver function
+///     registers it with the dispatch table at startup.
 ///
-/// ## Sprint 39a scope note: this test is `#[ignore]`-with-expected-
-/// failure — passing it requires the stdlib to be inlined into the
-/// user's `.obj`, which is **Sprint 39c**'s job per the Sprint 39 plan.
-/// At Sprint 39a's slice (this commit), the AOT pipeline can resolve
-/// seed class IDs (e.g. `<integer>`, `<byte-string>`) but not user-
-/// classes registered by the stdlib's `define class` items because the
-/// AOT runtime's `nod_runtime_init` doesn't replay stdlib lowering.
-///
-/// The test stays in the file so 39c can flip it from "documented
-/// expected failure" to "green" by adding stdlib inlining + matching
-/// class-registration replay. Until then, it crashes with a `<range>`
-/// → wrong-class-metadata mismatch (the seed class IDs themselves are
-/// fine, but `make` machinery routes through stdlib methods Sprint 39a
-/// doesn't include).
-///
-/// Run-and-assert-failure is intentional: if a future change
-/// accidentally makes this pass without Sprint 39c, the test should
-/// be updated to assert success — that change is welcome.
+/// Sprint 39a / 39b documented this as `aot_dispatch_deferred_to_39c`
+/// with an expected-failure pattern; Sprint 39c flips it to a real
+/// positive assertion (renamed back to `aot_dispatch`).
 #[test]
 #[ignore]
 #[serial]
-fn aot_dispatch_deferred_to_39c() {
+fn aot_dispatch() {
     let source = "Module: dispatch\n\n\
         define function main () => ()\n  \
             format-out(\"%d\\n\", size(make(<range>, from: 0, to: 5)));\n\
         end function main;\n";
-    // We expect this to fail at runtime until Sprint 39c. The test
-    // documents the expected mode of failure so a passing run on a
-    // future Sprint 39c-aware codebase forces an assertion update
-    // (rather than silently flipping behaviour).
     let (stdout, stderr, code) = build_and_run("dispatch", source);
-    if code == 0 && stdout == "6\n" {
-        // Sprint 39c has landed and this test would now succeed —
-        // promote it to a real positive assertion. Until then this
-        // path indicates an intentional Sprint 39c upgrade.
-        return;
-    }
-    eprintln!(
-        "aot_dispatch_deferred_to_39c: expected failure until Sprint 39c. \
-         got stdout={stdout:?}, stderr={stderr:?}, code={code}"
-    );
-    // Non-zero exit code matches the current Sprint 39a state where
-    // dispatch fails because the stdlib isn't in the EXE yet.
-    assert_ne!(code, 0, "Sprint 39c may have landed; promote this test");
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "6\n", "stdout mismatch; stderr=\n{stderr}");
 }

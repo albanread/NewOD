@@ -48,7 +48,7 @@ use nod_llvm::{Jit, codegen_module};
 use nod_macro::MacroTable;
 use nod_reader::{Expr, Item, Module, Param, ReturnSig, Span};
 
-use crate::lower::{MethodRegistration, lower_module_full};
+use crate::lower::{LoweredModule, MethodRegistration, lower_module_full};
 use crate::{register_blocks, register_methods, register_top_level_functions};
 
 /// Static-area for the stdlib LLVM context + JIT. Leaking the
@@ -56,6 +56,19 @@ use crate::{register_blocks, register_methods, register_top_level_functions};
 /// addresses registered with `nod_runtime` must outlive every user
 /// JIT.
 static STDLIB_ARTEFACTS: OnceLock<&'static StdlibArtefacts> = OnceLock::new();
+
+/// Sprint 39c — the stdlib's lowered DFM module, stashed so the AOT
+/// pipeline (`compile_file_for_aot`) can merge stdlib functions /
+/// methods / blocks / closures into the user's `LoweredModule` before
+/// codegen. The JIT path doesn't consult this — it already JITs the
+/// stdlib into its own engine and registers the resulting pointers in
+/// the process-global dispatch / function tables.
+///
+/// Held as a `&'static LoweredModule` so per-EXE clones are cheap-ish
+/// (the methods / blocks vectors are `Clone`); the AOT pipeline
+/// deep-clones into the user's `LoweredModule` to keep the JIT path's
+/// view untouched.
+static STDLIB_LOWERED: OnceLock<&'static LoweredModule> = OnceLock::new();
 
 /// What the loader hands back. Mostly informational — the
 /// dispatch-table / macro-registry side effects are the real
@@ -136,6 +149,19 @@ pub fn lookup_constant(name: &str) -> Option<i128> {
 /// guaranteed to find an initialised table.
 pub fn constants_table() -> Option<&'static HashMap<String, i128>> {
     STDLIB_CONSTANTS.get()
+}
+
+/// Sprint 39c — the stdlib's fully-lowered DFM module. Returns `None`
+/// before [`ensure_loaded`] has populated it; the AOT driver calls
+/// `ensure_loaded` ahead of `compile_file_for_aot`, so by the time
+/// this getter fires the value is guaranteed to be present.
+///
+/// Used by [`crate::compile_file_for_aot`] to merge stdlib functions
+/// / methods / blocks / closures into the user's `LoweredModule`
+/// before codegen, so the resulting EXE's `.obj` carries every body
+/// the dispatch / function-ref / block tables need at runtime.
+pub fn stdlib_lowered() -> Option<&'static LoweredModule> {
+    STDLIB_LOWERED.get().copied()
 }
 
 /// Top-level entry: parse + expand + lower + JIT `stdlib.dylan`
@@ -313,10 +339,21 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
     let _: &'static mut Jit<'static> = Box::leak(Box::new(jit));
 
     let function_names = lm.functions.iter().map(|f| f.name.clone()).collect();
+    let method_registrations = lm.methods.clone();
+
+    // Sprint 39c — stash the lowered stdlib so the AOT pipeline can
+    // merge its functions / methods / blocks / closures into the
+    // user's `LoweredModule` before codegen. Doing this once here
+    // (rather than re-parsing + re-lowering on every AOT build)
+    // matches the JIT path's amortisation. Box::leak gives a
+    // `&'static LoweredModule`; the value is small (~kBs of vectors)
+    // so the leak is negligible.
+    let leaked_lm: &'static LoweredModule = Box::leak(Box::new(lm));
+    let _ = STDLIB_LOWERED.set(leaked_lm);
 
     Ok(StdlibArtefacts {
         function_names,
-        method_registrations: lm.methods,
+        method_registrations,
         macro_names,
     })
 }

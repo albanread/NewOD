@@ -1,0 +1,293 @@
+//! Sprint 39c — broader AOT correctness tests.
+//!
+//! Exercises stdlib-defined Dylan features (stdlib generics dispatching
+//! to seed-class instances, `for-each` macro expansion over the FIP
+//! primitives, NLX `block` no-exit value flow, and an opt-in
+//! MessageBoxW) through the full Dylan-source → `.obj` → linker →
+//! EXE pipeline. Every test is `#[ignore]` because the pipeline
+//! shells out to `cargo run --bin nod-driver` plus MSVC's
+//! `link.exe`, and `serial_test::serial` keeps concurrent
+//! invocations from stalling on Cargo's build-system lock.
+//!
+//! Run with:
+//!
+//! ```text
+//! cargo test --test aot_dylan -- --ignored --nocapture
+//! ```
+//!
+//! ## Why a separate file from `aot_exe.rs`?
+//!
+//! `aot_exe.rs` is the canonical Sprint 39a-bringup file (hello-world,
+//! arithmetic, dispatch); it stays small and focused on "the AOT
+//! pipeline works at all". `aot_dylan.rs` is the broader correctness
+//! suite that grows as new stdlib features get AOT'd. The dispatch
+//! test in `aot_exe.rs` already covers the Sprint 38c/38e relocation
+//! categories; tests here add the **Dylan-side behaviour** dimension.
+//!
+//! ## What's covered (Sprint 39c)
+//!
+//! - `concatenate` on lists (stdlib `<list>` concatenation).
+//! - `for-each (x in c) body end` over a `<pair>` list (the macro's
+//!   `until + %fip-*` expansion).
+//! - `block () body end` no-exit value flow (block-registry exercise
+//!   without NLX).
+//! - `MessageBoxW` interactive opt-in.
+//!
+//! ## User-defined classes
+//!
+//! `define class` in user source is **deferred to a future sprint**.
+//! Sprint 39c only ensures the stdlib's methods reach the dispatch
+//! table at AOT-runtime; user-class registration requires baking the
+//! slot / CPL / parent metadata into the EXE (the
+//! `register_user_class_metadata` machinery is non-trivial to
+//! serialize), which is its own sprint slice. The stdlib doesn't
+//! currently declare any user classes (every built-in class is
+//! seeded in Rust via `ensure_*_registered`), so Sprint 39c can land
+//! the headline `aot_dispatch` (stdlib-defined methods on seed
+//! classes) without it.
+//!
+//! ## User-defined `for (i from N to M)`
+//!
+//! Sprint 18's parser only lowers `while` and `until`. `for-each
+//! (x in c) body end` exists as a stdlib macro; full `for` is a
+//! future sprint. Tests here use only stdlib-supported surface
+//! syntax.
+
+#![cfg(windows)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serial_test::serial;
+
+/// Workspace root inferred from `CARGO_MANIFEST_DIR`. Mirrors
+/// `aot_exe.rs`'s helper of the same name.
+fn workspace_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.parent().unwrap().parent().unwrap().to_path_buf()
+}
+
+fn make_temp_dir(test_name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("nod-aot-dylan-test-{test_name}-{nanos}"));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+/// Build a Dylan source string to an EXE in a fresh temp dir, run
+/// the EXE, return (stdout, stderr, exit_code). On exit_code == 0 the
+/// temp dir is removed; on failure it's kept for forensic inspection.
+fn build_and_run(test_name: &str, source: &str) -> (String, String, i32) {
+    let dir = make_temp_dir(test_name);
+    let src_path = dir.join("input.dylan");
+    let exe_path = dir.join("output.exe");
+    std::fs::write(&src_path, source).expect("write source");
+
+    let workspace = workspace_root();
+    let build = Command::new("cargo")
+        .current_dir(&workspace)
+        .args(["build", "-p", "nod-driver", "-p", "nod-runtime"])
+        .output()
+        .expect("spawn cargo build");
+    if !build.status.success() {
+        panic!(
+            "cargo build failed: {}\nstderr:\n{}",
+            build.status,
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    let driver = Command::new("cargo")
+        .current_dir(&workspace)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "nod-driver",
+            "--",
+            "build",
+            src_path.to_str().unwrap(),
+            "-o",
+            exe_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn nod-driver");
+    if !driver.status.success() {
+        panic!(
+            "nod-driver build failed: {}\nstdout:\n{}\nstderr:\n{}",
+            driver.status,
+            String::from_utf8_lossy(&driver.stdout),
+            String::from_utf8_lossy(&driver.stderr)
+        );
+    }
+    assert!(exe_path.is_file(), "EXE not produced at {}", exe_path.display());
+
+    let exe = Command::new(&exe_path).output().expect("spawn user EXE");
+    let stdout = String::from_utf8_lossy(&exe.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&exe.stderr).into_owned();
+    let code = exe.status.code().unwrap_or(-1);
+
+    if code == 0 {
+        let _ = remove_dir_all_best_effort(&dir);
+    }
+
+    (stdout, stderr, code)
+}
+
+fn remove_dir_all_best_effort(p: &Path) -> std::io::Result<()> {
+    if let Err(_e) = std::fs::remove_dir_all(p) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::remove_dir_all(p)?;
+    }
+    Ok(())
+}
+
+// ─── Sprint 39c — broader stdlib correctness tests ───────────────────────────
+
+/// Stdlib `concatenate` on `<list>` arguments. The collection runtime
+/// emits a fresh `<pair>` chain when both inputs are lists (other
+/// shapes widen to `<simple-object-vector>`); we then take `size` of
+/// the result to assert the merged-stdlib dispatch reaches the
+/// methods needed for both `concatenate` and `size`.
+#[test]
+#[ignore]
+#[serial]
+fn aot_list_concat_size() {
+    let source = "Module: concat\n\n\
+        define function main () => ()\n  \
+            format-out(\"%d\\n\", size(concatenate(#(1, 2), #(3, 4, 5))));\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("concat", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "5\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// `for-each (x in lst) body end` over a `<pair>` list. Exercises:
+///   * The stdlib's `for-each` macro expansion (registered in the
+///     process-global macro table by `ensure_loaded`).
+///   * The `%fip-init` / `%fip-finished?` / `%fip-current-element` /
+///     `%fip-advance!` primitive dispatch against `<pair>`.
+///   * Read-modify-write of the captured local `total` across the
+///     loop body (Sprint 24 cell-promotion in lifted closures, even
+///     for non-escaping captures).
+///
+/// Asserts 1+2+3+4+5+6+7+8+9+10 = 55.
+#[test]
+#[ignore]
+#[serial]
+fn aot_for_each_sum_list() {
+    let source = "Module: foreach\n\n\
+        define function main () => ()\n  \
+            let total = 0;\n  \
+            for-each (x in #(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)) total := total + x end;\n  \
+            format-out(\"%d\\n\", total);\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("foreach", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "55\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// Sprint 19 `block` with no exit (`block () body end`) — exercises
+/// the AOT block-registration path even when no NLX actually occurs.
+/// Asserts the block's last-expression-value semantics survive the
+/// AOT lower → codegen → register-thunks path.
+///
+/// Note: `let r = block () … end` (block at expression position
+/// flowing into a `let`) is a known lowering deferral — the JIT
+/// surfaces the same diagnostic. We use a helper function so the
+/// block lives at the function body's return position, which IS
+/// lowerable.
+#[test]
+#[ignore]
+#[serial]
+fn aot_block_no_early_exit() {
+    let source = "Module: blk\n\n\
+        define function compute () => (n :: <integer>)\n  \
+            block ()\n    \
+                let a = 10;\n    \
+                let b = 20;\n    \
+                a + b\n  \
+            end block\n\
+        end function;\n\n\
+        define function main () => ()\n  \
+            format-out(\"%d\\n\", compute());\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("block-no-exit", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "30\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// Stdlib `reduce` over a `<pair>` list — exercises first-class
+/// function dispatch (the `\+` reference goes through the
+/// function-ref registry, which the AOT resolver populates at
+/// startup via `nod_aot_register_jit_function` for every top-level
+/// stdlib function). Asserts 1+2+3+4+5 = 15.
+#[test]
+#[ignore]
+#[serial]
+fn aot_reduce_plus() {
+    let source = "Module: red\n\n\
+        define function main () => ()\n  \
+            format-out(\"%d\\n\", reduce(\\+, 0, #(1, 2, 3, 4, 5)));\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("reduce", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "15\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// `size(<range>)` exercised through a Dylan-defined helper function
+/// that wraps the call. This proves the merged-stdlib resolves the
+/// `size` method body when called from a user function (i.e., across
+/// the lift sink the merge produces, not just from `main`).
+#[test]
+#[ignore]
+#[serial]
+fn aot_range_size_through_helper() {
+    let source = "Module: rng\n\n\
+        define function range-size (lo, hi) => (n :: <integer>)\n  \
+            size(make(<range>, from: lo, to: hi))\n\
+        end function;\n\n\
+        define function main () => ()\n  \
+            format-out(\"%d\\n\", range-size(0, 10));\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("range-helper", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "11\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// Sprint 30's MessageBoxW headline reborn for AOT. Shows a real
+/// Win32 dialog and waits for the user to click OK; the EXE then
+/// exits with the dialog's return code (IDOK = 1) printed to stdout.
+///
+/// `#[ignore]` AND opt-in. Run with:
+///
+/// ```text
+/// cargo test --test aot_dylan aot_messagebox_w_ignored -- --ignored --nocapture
+/// ```
+///
+/// The test is INTENTIONALLY interactive — it proves the full Win32
+/// path (user32.dll dllimport + Sprint 30 string marshaling + Win64
+/// trampoline) works in an AOT EXE that ALSO carries the merged
+/// stdlib (the `format-out` call after MessageBoxW returns exercises
+/// the same registered-method path the non-interactive tests do).
+/// The non-interactive AOT-Win32 tests in `aot_win32.rs` already
+/// cover symbol resolution and IAT imports without pulling up UI;
+/// this one verifies the marshaling edge cases that need a real
+/// Win32 call.
+#[test]
+#[ignore]
+#[serial]
+fn aot_messagebox_w_ignored() {
+    let source = "Module: msgbox\n\n\
+        define function main () => ()\n  \
+            format-out(\"%d\\n\", MessageBoxW($NULL, \"Sprint 39c AOT MessageBoxW test\", \"NewOpenDylan\", $MB-OK));\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("msgbox", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    // MB_OK → IDOK = 1.
+    assert_eq!(stdout, "1\n", "stdout mismatch; stderr=\n{stderr}");
+}

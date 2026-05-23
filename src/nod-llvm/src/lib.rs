@@ -43,3 +43,10 @@ pub use symbols::{
     generic_symbol, imm_false_symbol, imm_false_wrapper_symbol, imm_nil_symbol, imm_true_symbol,
     key_prefix, strlit_symbol, stub_symbol, symlit_symbol,
 };
+
+// Sprint 39c — registration payload types so `nod-sema` can build
+// the merged-stdlib registrations and hand them to the AOT pipeline.
+pub use aot::{
+    AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
+    AotMethodRegistration, AotRegistrations,
+};

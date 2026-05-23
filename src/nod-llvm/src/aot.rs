@@ -39,6 +39,67 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, GlobalValue};
 use crate::jit::JitError;
 use crate::symbols::{ModuleManifest, RelocKind};
 
+/// Sprint 39c — registration payload the AOT path emits into the
+/// codegen-injected `nod_aot_resolve_relocs` function so the EXE's
+/// startup populates the dispatch / function-ref / block registries
+/// with the merged-stdlib + user-defined bodies BEFORE `nod_user_main`
+/// runs.
+///
+/// The shape mirrors the JIT-time `register_methods` /
+/// `register_top_level_functions` / `register_blocks` helpers in
+/// `nod-sema` but carries only the data that's still meaningful at
+/// EXE-link time: names + class IDs + arities + the LLVM symbol the
+/// linker will resolve to a function pointer. The driver (nod-sema)
+/// fills this out from the merged `LoweredModule` and hands it to
+/// [`emit_aot_object_with_registrations`].
+#[derive(Default, Clone, Debug)]
+pub struct AotRegistrations {
+    pub methods: Vec<AotMethodRegistration>,
+    pub blocks: Vec<AotBlockRegistration>,
+    pub functions: Vec<AotFunctionRegistration>,
+}
+
+/// One method registration. Codegen emits one `nod_aot_register_method`
+/// call per entry inside `nod_aot_resolve_relocs`.
+#[derive(Clone, Debug)]
+pub struct AotMethodRegistration {
+    pub generic_name: String,
+    pub specialisers: Vec<u32>,
+    pub body_fn_name: String,
+    pub param_count: usize,
+}
+
+/// One block registration. `cleanup_fn_name`, `afterwards_fn_name`,
+/// and each handler's `body_fn_name` are LLVM symbol names already
+/// present as functions in the merged module.
+#[derive(Clone, Debug)]
+pub struct AotBlockRegistration {
+    pub block_id: u64,
+    pub body_fn_name: String,
+    pub cleanup_fn_name: Option<String>,
+    pub afterwards_fn_name: Option<String>,
+    pub handlers: Vec<AotBlockHandlerRegistration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AotBlockHandlerRegistration {
+    pub class_id: u32,
+    pub class_name: String,
+    pub body_fn_name: String,
+}
+
+/// One top-level function. The dispatcher's function-ref registry is
+/// keyed on `(name, arity)`, so a single entry suffices regardless of
+/// whether the function is a plain `define function`, a closure body
+/// (arity is the *source* arity here), or a method-table entry's
+/// callable side.
+#[derive(Clone, Debug)]
+pub struct AotFunctionRegistration {
+    pub name: String,
+    pub arity: usize,
+    pub body_fn_name: String,
+}
+
 /// The renamed user `main` symbol the staticlib's
 /// `nod_aot_main_wrapper` (in `nod-runtime/src/aot.rs`) calls. Must
 /// agree with the `extern "C-unwind"` declaration there.
@@ -140,6 +201,23 @@ pub fn emit_aot_entry_stubs<'ctx>(
     module: &Module<'ctx>,
     manifest: &ModuleManifest,
 ) -> Result<(), AotError> {
+    emit_aot_entry_stubs_with_registrations(
+        module,
+        manifest,
+        &AotRegistrations::default(),
+    )
+}
+
+/// Sprint 39c — variant of [`emit_aot_entry_stubs`] that also emits
+/// startup registration calls for the merged Dylan-side methods /
+/// blocks / functions. The driver hands a non-empty
+/// [`AotRegistrations`] here when building any AOT EXE that uses
+/// stdlib generics (which is essentially every non-trivial program).
+pub fn emit_aot_entry_stubs_with_registrations<'ctx>(
+    module: &Module<'ctx>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+) -> Result<(), AotError> {
     // Resist the temptation to rename `<eval-entry>` here — that name
     // is reserved for the JIT path. AOT users write `define function
     // main`.
@@ -184,7 +262,13 @@ pub fn emit_aot_entry_stubs<'ctx>(
     // C-ABI helper for each manifest entry, passing the global's
     // address and any per-kind parameters. For StubEntry the resolver
     // stores `&<dllimport_symbol>` into each entry's `fn_ptr` field.
-    let resolver_fn = emit_resolve_relocs_function(module, manifest, &stub_entries)?;
+    //
+    // Sprint 39c — the resolver also emits per-method / per-block /
+    // per-top-level-function registration calls so the dispatch /
+    // function-ref / block registries are populated with the merged
+    // stdlib (and user-defined) bodies BEFORE `nod_user_main` runs.
+    let resolver_fn =
+        emit_resolve_relocs_function(module, manifest, &stub_entries, registrations)?;
 
     // Step 5: emit `i32 @main()` that calls the resolver, then the
     // wrapper, then returns the wrapper's rc.
@@ -467,6 +551,7 @@ fn emit_resolve_relocs_function<'ctx>(
     module: &Module<'ctx>,
     manifest: &ModuleManifest,
     stub_entries: &StubEntryInfoMap<'ctx>,
+    registrations: &AotRegistrations,
 ) -> Result<inkwell::values::FunctionValue<'ctx>, AotError> {
     let ctx = module.get_context();
     let void_ty = ctx.void_type();
@@ -658,10 +743,352 @@ fn emit_resolve_relocs_function<'ctx>(
             }
         }
     }
+
+    // Sprint 39c — emit the merged-stdlib registration calls. Order
+    // matters in two ways:
+    //
+    // 1. Top-level functions register first so a method body that
+    //    references `\name` (via a function-ref construction site)
+    //    can resolve at runtime. The function-ref registry is
+    //    consulted lazily by the call-site, so technically registering
+    //    after methods would still work — but the visit-order here
+    //    matches the JIT path's `register_top_level_functions →
+    //    register_methods → register_blocks` sequence to keep the
+    //    eager-load discipline predictable.
+    //
+    // 2. Methods register before blocks because a block's `exception`
+    //    handler body MAY want to call generics on the captured-
+    //    condition value. The handler thunks themselves don't go
+    //    through the dispatch table (their addresses are stored
+    //    inside `BlockFns.handlers`), but methods they invoke do.
+    emit_top_level_function_registrations(module, &builder, &ctx, registrations, isize_ty)?;
+    emit_method_registrations(module, &builder, &ctx, registrations, isize_ty, i32_ty)?;
+    emit_block_registrations(module, &builder, &ctx, registrations, isize_ty)?;
+
     builder
         .build_return(None)
         .map_err(|e| AotError::Llvm(format!("resolver build_return: {e}")))?;
     Ok(resolver_fn)
+}
+
+/// Sprint 39c — for each [`AotFunctionRegistration`] emit a call to
+/// `nod_aot_register_jit_function(name_ptr, name_len, arity, code_ptr)`
+/// inside the resolver. The runtime helper appends `(name, arity,
+/// code_ptr)` to the process-global JIT function registry the
+/// dispatcher consults for `\name` references.
+fn emit_top_level_function_registrations<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::builder::Builder<'ctx>,
+    ctx: &inkwell::context::ContextRef<'ctx>,
+    registrations: &AotRegistrations,
+    isize_ty: inkwell::types::IntType<'ctx>,
+) -> Result<(), AotError> {
+    if registrations.functions.is_empty() {
+        return Ok(());
+    }
+    let void_ty = ctx.void_type();
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    // `void nod_aot_register_jit_function(ptr name, isize name_len,
+    //                                     isize arity, ptr code)`.
+    let helper_ty =
+        void_ty.fn_type(&[ptr_ty.into(), isize_ty.into(), isize_ty.into(), ptr_ty.into()], false);
+    let helper = module
+        .get_function("nod_aot_register_jit_function")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "nod_aot_register_jit_function",
+                helper_ty,
+                Some(Linkage::External),
+            )
+        });
+    for reg in &registrations.functions {
+        // Skip if the body function isn't in the module (codegen-DCE
+        // may have stripped an unused stdlib helper).
+        let Some(fv) = module.get_function(&reg.body_fn_name) else {
+            continue;
+        };
+        let (name_ptr, name_len) =
+            emit_byte_constant(module, builder, ctx, reg.name.as_bytes())?;
+        let arity_v = isize_ty.const_int(reg.arity as u64, false);
+        let code_ptr: BasicValueEnum<'ctx> = fv.as_global_value().as_pointer_value().into();
+        let len_v = isize_ty.const_int(name_len as u64, false);
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
+            name_ptr.into(),
+            len_v.into(),
+            arity_v.into(),
+            code_ptr.into(),
+        ];
+        builder
+            .build_call(helper, &args, "")
+            .map_err(|e| AotError::Llvm(format!("call register_jit_function: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Sprint 39c — for each [`AotMethodRegistration`] emit a call to
+/// `nod_aot_register_method(...)` inside the resolver. The runtime
+/// helper looks up / creates the generic, then appends the method to
+/// the dispatch table.
+///
+/// Specialisers (`Vec<u32>` class IDs) are baked as a private LLVM
+/// `[u32; N]` constant per method.
+fn emit_method_registrations<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::builder::Builder<'ctx>,
+    ctx: &inkwell::context::ContextRef<'ctx>,
+    registrations: &AotRegistrations,
+    isize_ty: inkwell::types::IntType<'ctx>,
+    i32_ty: inkwell::types::IntType<'ctx>,
+) -> Result<(), AotError> {
+    if registrations.methods.is_empty() {
+        return Ok(());
+    }
+    let void_ty = ctx.void_type();
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    // `void nod_aot_register_method(ptr gname, isize glen, ptr specs,
+    //                               isize n_specs, ptr body, isize pcount,
+    //                               ptr bname, isize blen)`.
+    let helper_ty = void_ty.fn_type(
+        &[
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+        ],
+        false,
+    );
+    let helper = module
+        .get_function("nod_aot_register_method")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "nod_aot_register_method",
+                helper_ty,
+                Some(Linkage::External),
+            )
+        });
+    for (idx, reg) in registrations.methods.iter().enumerate() {
+        let Some(fv) = module.get_function(&reg.body_fn_name) else {
+            // Codegen didn't emit this body — `emit_aot_entry_stubs`
+            // verify would have caught a hard miss, so this branch only
+            // fires when DCE strips a dead method. Skip silently.
+            continue;
+        };
+        // Bake specialisers as a private `[N x i32]` global.
+        let spec_arr_ty = i32_ty.array_type(reg.specialisers.len() as u32);
+        let spec_vals: Vec<_> = reg
+            .specialisers
+            .iter()
+            .map(|id| i32_ty.const_int(*id as u64, false))
+            .collect();
+        let spec_init = i32_ty.const_array(&spec_vals);
+        let spec_global = module.add_global(
+            spec_arr_ty,
+            Some(AddressSpace::default()),
+            &format!("__nod_aot_specs_{idx}"),
+        );
+        spec_global.set_linkage(Linkage::Private);
+        spec_global.set_constant(true);
+        spec_global.set_initializer(&spec_init);
+        let zero = i32_ty.const_zero();
+        let spec_ptr = unsafe {
+            builder
+                .build_gep(
+                    spec_arr_ty,
+                    spec_global.as_pointer_value(),
+                    &[zero, zero],
+                    "",
+                )
+                .map_err(|e| AotError::Llvm(format!("gep specialisers: {e}")))?
+        };
+
+        let (gname_ptr, gname_len) =
+            emit_byte_constant(module, builder, ctx, reg.generic_name.as_bytes())?;
+        let (bname_ptr, bname_len) =
+            emit_byte_constant(module, builder, ctx, reg.body_fn_name.as_bytes())?;
+
+        let body_ptr: BasicValueEnum<'ctx> = fv.as_global_value().as_pointer_value().into();
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
+            gname_ptr.into(),
+            isize_ty.const_int(gname_len as u64, false).into(),
+            spec_ptr.into(),
+            isize_ty.const_int(reg.specialisers.len() as u64, false).into(),
+            body_ptr.into(),
+            isize_ty.const_int(reg.param_count as u64, false).into(),
+            bname_ptr.into(),
+            isize_ty.const_int(bname_len as u64, false).into(),
+        ];
+        builder
+            .build_call(helper, &args, "")
+            .map_err(|e| AotError::Llvm(format!("call register_method: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Sprint 39c — for each [`AotBlockRegistration`] emit a call to
+/// `nod_aot_register_block(...)` inside the resolver. Cleanup and
+/// afterwards thunks are passed as nullable function pointers;
+/// handlers are baked into a static `[AotHandlerEntry; N]` per block.
+fn emit_block_registrations<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::builder::Builder<'ctx>,
+    ctx: &inkwell::context::ContextRef<'ctx>,
+    registrations: &AotRegistrations,
+    isize_ty: inkwell::types::IntType<'ctx>,
+) -> Result<(), AotError> {
+    if registrations.blocks.is_empty() {
+        return Ok(());
+    }
+    let void_ty = ctx.void_type();
+    let i32_ty = ctx.i32_type();
+    let i64_ty = ctx.i64_type();
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+
+    // `void nod_aot_register_block(i64 id, ptr body, ptr cleanup,
+    //                              ptr afterwards, ptr handlers,
+    //                              isize n_handlers)`.
+    let helper_ty = void_ty.fn_type(
+        &[
+            i64_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+        ],
+        false,
+    );
+    let helper = module
+        .get_function("nod_aot_register_block")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "nod_aot_register_block",
+                helper_ty,
+                Some(Linkage::External),
+            )
+        });
+
+    // `%AotHandlerEntry` layout (matches `nod_runtime::aot::AotHandlerEntry`
+    // exactly):
+    //   off 0  i32  class_id
+    //   off 4  i32  padding
+    //   off 8  ptr  class_name_ptr
+    //   off 16 isize class_name_len
+    //   off 24 ptr  body
+    let handler_struct_ty = ctx.struct_type(
+        &[
+            i32_ty.into(),
+            i32_ty.into(),
+            ptr_ty.into(),
+            isize_ty.into(),
+            ptr_ty.into(),
+        ],
+        false,
+    );
+
+    for (idx, reg) in registrations.blocks.iter().enumerate() {
+        let Some(body_fv) = module.get_function(&reg.body_fn_name) else {
+            continue;
+        };
+        let cleanup_ptr: BasicValueEnum<'ctx> = match &reg.cleanup_fn_name {
+            Some(n) => match module.get_function(n) {
+                Some(fv) => fv.as_global_value().as_pointer_value().into(),
+                None => ptr_ty.const_null().into(),
+            },
+            None => ptr_ty.const_null().into(),
+        };
+        let afterwards_ptr: BasicValueEnum<'ctx> = match &reg.afterwards_fn_name {
+            Some(n) => match module.get_function(n) {
+                Some(fv) => fv.as_global_value().as_pointer_value().into(),
+                None => ptr_ty.const_null().into(),
+            },
+            None => ptr_ty.const_null().into(),
+        };
+
+        // Bake handlers as a static array.
+        let (handlers_ptr_val, n_handlers) = if reg.handlers.is_empty() {
+            (ptr_ty.const_null(), 0usize)
+        } else {
+            let mut handler_initializers: Vec<inkwell::values::StructValue<'ctx>> =
+                Vec::with_capacity(reg.handlers.len());
+            for h in &reg.handlers {
+                let body_fv = match module.get_function(&h.body_fn_name) {
+                    Some(fv) => fv,
+                    None => {
+                        // Unreachable in normal flows; skip via null
+                        // body so the block still registers other
+                        // handlers cleanly.
+                        let name_ptr = ptr_ty.const_null();
+                        let init = handler_struct_ty.const_named_struct(&[
+                            i32_ty.const_int(h.class_id as u64, false).into(),
+                            i32_ty.const_zero().into(),
+                            name_ptr.into(),
+                            isize_ty.const_zero().into(),
+                            ptr_ty.const_null().into(),
+                        ]);
+                        handler_initializers.push(init);
+                        continue;
+                    }
+                };
+                // Bake the class-name string as a private global.
+                let name_arr_ty = ctx.i8_type().array_type(h.class_name.len() as u32);
+                let name_global = module.add_global(
+                    name_arr_ty,
+                    Some(AddressSpace::default()),
+                    &format!("__nod_aot_handler_cname_{idx}_{}", h.class_id),
+                );
+                name_global.set_linkage(Linkage::Private);
+                name_global.set_constant(true);
+                let bytes: Vec<_> = h
+                    .class_name
+                    .as_bytes()
+                    .iter()
+                    .map(|b| ctx.i8_type().const_int(*b as u64, false))
+                    .collect();
+                name_global.set_initializer(&ctx.i8_type().const_array(&bytes));
+
+                let init = handler_struct_ty.const_named_struct(&[
+                    i32_ty.const_int(h.class_id as u64, false).into(),
+                    i32_ty.const_zero().into(),
+                    name_global.as_pointer_value().into(),
+                    isize_ty
+                        .const_int(h.class_name.len() as u64, false)
+                        .into(),
+                    body_fv.as_global_value().as_pointer_value().into(),
+                ]);
+                handler_initializers.push(init);
+            }
+            let arr_ty = handler_struct_ty.array_type(reg.handlers.len() as u32);
+            let arr_init = handler_struct_ty.const_array(&handler_initializers);
+            let handlers_global = module.add_global(
+                arr_ty,
+                Some(AddressSpace::default()),
+                &format!("__nod_aot_handlers_{idx}"),
+            );
+            handlers_global.set_linkage(Linkage::Private);
+            handlers_global.set_constant(false); // contains live pointers
+            handlers_global.set_initializer(&arr_init);
+            (handlers_global.as_pointer_value(), reg.handlers.len())
+        };
+
+        let block_id_v = i64_ty.const_int(reg.block_id, false);
+        let body_ptr: BasicValueEnum<'ctx> = body_fv.as_global_value().as_pointer_value().into();
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
+            block_id_v.into(),
+            body_ptr.into(),
+            cleanup_ptr.into(),
+            afterwards_ptr.into(),
+            handlers_ptr_val.into(),
+            isize_ty.const_int(n_handlers as u64, false).into(),
+        ];
+        builder
+            .build_call(helper, &args, "")
+            .map_err(|e| AotError::Llvm(format!("call register_block: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Emit a private `[N x i8]` constant containing `bytes` and return a
@@ -773,6 +1200,23 @@ pub fn emit_aot_object(
     opt_level: OptimizationLevel,
 ) -> Result<(), AotError> {
     emit_aot_entry_stubs(module, manifest)?;
+    emit_object_file(module, path, opt_level)?;
+    Ok(())
+}
+
+/// Sprint 39c — variant of [`emit_aot_object`] that threads the
+/// merged-stdlib registrations into the entry-stub-injection pass.
+/// The driver (`nod-driver build`) uses this; the older
+/// [`emit_aot_object`] entry stays for callers that don't have a
+/// registrations payload (currently just tests).
+pub fn emit_aot_object_with_registrations(
+    module: &Module<'_>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    path: &Path,
+    opt_level: OptimizationLevel,
+) -> Result<(), AotError> {
+    emit_aot_entry_stubs_with_registrations(module, manifest, registrations)?;
     emit_object_file(module, path, opt_level)?;
     Ok(())
 }

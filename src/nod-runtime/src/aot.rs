@@ -192,6 +192,203 @@ pub unsafe extern "C" fn nod_aot_set_generic(
     unsafe { *slot = *v };
 }
 
+// ─── Sprint 39c — startup registration helpers ───────────────────────────────
+//
+// In the JIT path, the post-codegen glue in `nod-sema` resolves
+// every method body / block thunk / top-level function to its JIT'd
+// address and calls `add_method_named` / `register_block_fns` /
+// `register_jit_function` immediately. The AOT path can't do that
+// at compile time — the LLVM functions don't have addresses until
+// the linker emits them into the EXE. Instead the codegen-emitted
+// `nod_aot_resolve_relocs` calls these helpers from inside the EXE
+// once per merged-stdlib (and user-defined) method / block / function;
+// the helpers run inside the new process so they see the same
+// process-global dispatch tables `nod_runtime_init` just populated.
+
+/// Sprint 39c — register a Dylan method body with the global dispatch
+/// table. Called from the codegen-emitted resolver per method in the
+/// merged `LoweredModule`.
+///
+/// Arguments (all `(ptr, len)` for strings, raw fn ptr for the body,
+/// raw `ClassId` array for the specialisers — kept as flat C-ABI
+/// inputs because LLVM IR can pass each one as a `BasicMetadataValueEnum`
+/// without needing to materialise a Rust struct):
+///
+/// - `generic_name_ptr`, `generic_name_len` — UTF-8 generic name.
+/// - `specialisers_ptr`, `n_specialisers` — array of `u32` class IDs
+///   (matching `ClassId(u32)`'s repr).
+/// - `body_fn_ptr` — address of the method body's LLVM function
+///   (linker-resolved at EXE-load time).
+/// - `param_count` — Dylan-source arity (not the JIT body arity; the
+///   dispatcher cares about the user-facing argument count).
+/// - `body_fn_name_ptr`, `body_fn_name_len` — UTF-8 symbol name; the
+///   dispatcher uses this for the Sprint 16 `DirectCall` path that
+///   doesn't go through `{generic}${specialisers}` mangling.
+///
+/// # Safety
+///
+/// All `(ptr, len)` pairs must describe valid UTF-8 byte slices.
+/// `specialisers_ptr` + `n_specialisers` must describe a contiguous
+/// `[u32]` array. `body_fn_ptr` must be a valid function pointer of
+/// signature `extern "C-unwind" fn(u64, …, u64) -> u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_register_method(
+    generic_name_ptr: *const u8,
+    generic_name_len: usize,
+    specialisers_ptr: *const u32,
+    n_specialisers: usize,
+    body_fn_ptr: *const u8,
+    param_count: usize,
+    body_fn_name_ptr: *const u8,
+    body_fn_name_len: usize,
+) {
+    // SAFETY: caller asserts the byte slices are valid UTF-8.
+    let generic_name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            generic_name_ptr,
+            generic_name_len,
+        ))
+    };
+    let body_fn_name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            body_fn_name_ptr,
+            body_fn_name_len,
+        ))
+    };
+    // SAFETY: caller asserts the array is `[u32; n_specialisers]`.
+    let raw_ids: &[u32] =
+        unsafe { std::slice::from_raw_parts(specialisers_ptr, n_specialisers) };
+    let specialisers: Vec<crate::ClassId> = raw_ids.iter().copied().map(crate::ClassId).collect();
+    // SAFETY: body_fn_ptr is link-time-resolved; the JIT-style dispatcher
+    // treats it as `*const u8` regardless of the underlying signature.
+    unsafe {
+        crate::add_method_named(
+            generic_name,
+            specialisers,
+            body_fn_ptr,
+            param_count,
+            body_fn_name,
+        );
+    }
+}
+
+/// Sprint 39c — register a top-level Dylan function in the function-ref
+/// registry so `\name` resolves to its body address.
+///
+/// # Safety
+///
+/// `name_ptr` + `name_len` must describe a valid UTF-8 byte slice.
+/// `code_ptr` must be a valid function pointer of the signature
+/// codegen emitted for `name` (the dispatcher's `nod_funcall_N`
+/// trampolines interpret it via the registered arity).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_register_jit_function(
+    name_ptr: *const u8,
+    name_len: usize,
+    arity: usize,
+    code_ptr: *const u8,
+) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len))
+    };
+    // SAFETY: code_ptr is link-time-resolved.
+    unsafe {
+        crate::register_jit_function(name, arity, code_ptr);
+    }
+}
+
+/// Sprint 39c — a single `exception` clause's runtime metadata.
+/// Mirrors [`crate::HandlerFn`]'s `#[repr(C)]` layout exactly so the
+/// codegen-emitted handler array (a static `[HandlerFn; N]` in the
+/// EXE's data section) can be passed by `(ptr, len)` and walked
+/// directly without intermediate copies.
+///
+/// `class_name_ptr` / `class_name_len` reference a static UTF-8
+/// byte slice the codegen emitted for the handler's specialiser
+/// class name (used by the runtime for diagnostic dumps).
+#[repr(C)]
+pub struct AotHandlerEntry {
+    pub class_id: u32,
+    /// Padding to align the 8-byte fields below; the struct must
+    /// match `HandlerFn`'s natural alignment.
+    pub _pad: u32,
+    pub class_name_ptr: *const u8,
+    pub class_name_len: usize,
+    pub body: *const u8,
+}
+
+/// Sprint 39c — register a `block` form's lifted thunks with the
+/// global block registry. Mirrors `register_block_fns` but accepts
+/// raw inputs the codegen-emitted resolver can pass without
+/// constructing a `BlockFns` struct.
+///
+/// `cleanup_ptr` and `afterwards_ptr` are `null` when the source
+/// block omitted the corresponding clause. `handlers_ptr` +
+/// `n_handlers` describe a static array of [`AotHandlerEntry`] —
+/// codegen emits the array in the EXE's data section and the
+/// runtime keeps the references alive for the process lifetime.
+///
+/// # Safety
+///
+/// `body_ptr` must be a valid function pointer; `cleanup_ptr` /
+/// `afterwards_ptr` are either null or valid function pointers;
+/// `handlers_ptr` + `n_handlers` must describe a valid array;
+/// each handler's `class_name_ptr` / `class_name_len` must be a
+/// valid UTF-8 byte slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_register_block(
+    block_id: u64,
+    body_ptr: *const u8,
+    cleanup_ptr: *const u8,
+    afterwards_ptr: *const u8,
+    handlers_ptr: *const AotHandlerEntry,
+    n_handlers: usize,
+) {
+    let cleanup = if cleanup_ptr.is_null() {
+        None
+    } else {
+        Some(cleanup_ptr)
+    };
+    let afterwards = if afterwards_ptr.is_null() {
+        None
+    } else {
+        Some(afterwards_ptr)
+    };
+    // Build a static `[HandlerFn]` from the codegen-emitted
+    // `[AotHandlerEntry]` array. The handler entries themselves
+    // live in the EXE's read-only data section so taking references
+    // is sound; we materialise a fresh `Vec<HandlerFn>` and leak it
+    // so the slice's lifetime is `'static` (matching what
+    // `register_block_fns` expects from the JIT path).
+    let handlers: Vec<crate::HandlerFn> = if n_handlers == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: caller asserts the array is `[AotHandlerEntry; n_handlers]`.
+        let slice = unsafe { std::slice::from_raw_parts(handlers_ptr, n_handlers) };
+        slice
+            .iter()
+            .map(|h| crate::HandlerFn {
+                class_id: crate::ClassId(h.class_id),
+                class_name_ptr: h.class_name_ptr,
+                class_name_len: h.class_name_len,
+                body: h.body,
+            })
+            .collect()
+    };
+    let handlers_static: &'static [crate::HandlerFn] =
+        Box::leak(handlers.into_boxed_slice());
+    crate::register_block_fns(
+        block_id,
+        crate::BlockFns {
+            body: body_ptr,
+            cleanup,
+            afterwards,
+            handlers: handlers_static,
+        },
+    );
+}
+
 /// Sprint 39a — eagerly perform every initialisation the JIT path defers
 /// until first use. Called from the codegen-emitted `i32 @main()` stub
 /// (via [`nod_aot_main_wrapper`]) before the user's Dylan body runs.
