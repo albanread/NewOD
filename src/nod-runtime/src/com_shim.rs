@@ -102,7 +102,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
     DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
@@ -602,7 +602,15 @@ pub unsafe extern "C-unwind" fn nod_dxgi_create_swap_chain_for_hwnd(
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: 2,
-        Scaling: DXGI_SCALING_STRETCH,
+        // Sprint 41c — Scaling: NONE (not STRETCH). With STRETCH, when the
+        // user drags the window edge, the OS scales the back buffer to
+        // fill the new client area until ResizeBuffers updates the
+        // dimensions — text gets visually stretched mid-drag. With NONE,
+        // the back buffer stays at its native size, top-left anchored;
+        // the OS fills the newly-exposed region with the window's
+        // background brush. NONE requires a flip-model swap chain
+        // (FLIP_SEQUENTIAL or FLIP_DISCARD), which we're already using.
+        Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
         Flags: 0,
@@ -1974,6 +1982,113 @@ pub unsafe extern "C-unwind" fn nod_get_argv1() -> u64 {
         Some(s) => crate::intern_string_literal(&s).raw(),
         None => crate::literal_pool_immediates().nil.raw(),
     }
+}
+
+// ─── Sprint 41c — line-count helper ────────────────────────────────────────
+
+/// JIT-callable: count newline-terminated lines in a Dylan `<byte-string>`.
+/// Returns `count('\n' bytes in s) + 1` — i.e. a file ending in `\n` is
+/// counted as having one fewer "real" line than the byte count would
+/// suggest, but trailing-newline files are universal and the IDE wants
+/// "scroll over this much vertical space", which is exactly what
+/// `newlines + 1` measures (the last "line" past a trailing newline is
+/// the empty cursor position).
+///
+/// This is the path-of-least-resistance shim: a byte-string iterator
+/// would require adding a `FipKind::ByteString` arm to
+/// `collections.rs`, which is a deeper change than Sprint 41c needs.
+///
+/// # Safety
+/// `s_word` must be a Dylan `<byte-string>` Word; `read_dylan_byte_string`
+/// panics on the wrong class.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_count_newlines(s_word: u64) -> u64 {
+    let s = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(s_word));
+    let n = s.bytes().filter(|&b| b == b'\n').count() as u64;
+    tag(n + 1)
+}
+
+// ─── Sprint 41c — scrollbar primitives ─────────────────────────────────────
+
+/// JIT-callable: configure the vertical or horizontal scrollbar on the
+/// given window. Flat-args shim around `SetScrollInfo` — passing the
+/// SCROLLINFO struct from Dylan would require plumbing a 7-field
+/// `<c-struct>` shape, which is a much bigger lift than a 7-u64-args
+/// shim that builds the struct on the Rust side.
+///
+/// * `hwnd_word` — fixnum-tagged HWND (from `CreateWindowExW`).
+/// * `nbar` — 0 = `SB_HORZ`, 1 = `SB_VERT`. Matches the Win32
+///   `SCROLLBAR_CONSTANTS` integer encoding so Dylan callers can use
+///   the win32-constants names directly if those land in stdlib in a
+///   later sprint.
+/// * `n_min` — scroll range minimum (typically 0).
+/// * `n_max` — scroll range maximum (e.g. line-count).
+/// * `n_page` — visible-window size in the same units as the range;
+///   drives proportional thumb sizing.
+/// * `n_pos` — desired current scroll position.
+/// * `redraw` — 1 to repaint the scrollbar immediately, 0 to defer.
+///
+/// Returns the new scroll position as a fixnum-tagged Word (Win32's
+/// `SetScrollInfo` returns the actual position, which may differ from
+/// the requested `n_pos` if it was out of range). On a null/invalid
+/// HWND returns 0.
+///
+/// # Safety
+/// `hwnd_word` must encode a real HWND. Win32 validates and returns 0
+/// for garbage handles, so a stale handle is safe but useless.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_set_scroll_info(
+    hwnd_word: u64,
+    nbar: u64,
+    n_min: u64,
+    n_max: u64,
+    n_page: u64,
+    n_pos: u64,
+    redraw: u64,
+) -> u64 {
+    use windows::Win32::UI::Controls::SetScrollInfo;
+    use windows::Win32::UI::WindowsAndMessaging::{SCROLLBAR_CONSTANTS, SCROLLINFO, SIF_ALL};
+    let hwnd_raw = untag_i64(hwnd_word);
+    if hwnd_raw == 0 {
+        return 0;
+    }
+    let hwnd_h = HWND(hwnd_raw as *mut std::ffi::c_void);
+    let bar = SCROLLBAR_CONSTANTS(untag(nbar) as i32);
+    let info = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_ALL,
+        nMin: untag_i64(n_min) as i32,
+        nMax: untag_i64(n_max) as i32,
+        nPage: untag(n_page) as u32,
+        nPos: untag_i64(n_pos) as i32,
+        nTrackPos: 0,
+    };
+    let redraw_b = untag(redraw) != 0;
+    // SAFETY: hwnd valid (checked above), &info valid on stack.
+    let new_pos = unsafe { SetScrollInfo(hwnd_h, bar, &info, redraw_b) };
+    tag(new_pos as u64)
+}
+
+/// JIT-callable: read the current scroll position of the given
+/// scrollbar (`nbar` = 0 = SB_HORZ, 1 = SB_VERT). Returns the position
+/// as a fixnum-tagged Word. On invalid HWND returns 0.
+///
+/// # Safety
+/// `hwnd_word` must encode a real HWND.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_get_scroll_pos(hwnd_word: u64, nbar: u64) -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetScrollPos, SCROLLBAR_CONSTANTS};
+    let hwnd_raw = untag_i64(hwnd_word);
+    if hwnd_raw == 0 {
+        return 0;
+    }
+    let hwnd_h = HWND(hwnd_raw as *mut std::ffi::c_void);
+    let bar = SCROLLBAR_CONSTANTS(untag(nbar) as i32);
+    // SAFETY: hwnd valid (checked above). GetScrollPos returns 0 on
+    // failure as well; that's indistinguishable from a real 0
+    // position, which is acceptable for IDE viewport tracking.
+    let pos = unsafe { GetScrollPos(hwnd_h, bar) };
+    tag(pos as u64)
 }
 
 // ─── UTF-16 helpers ───────────────────────────────────────────────────────

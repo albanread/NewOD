@@ -367,6 +367,15 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // should replace with general bitwise primitives.
     ("%lo-word", "nod_lo_word", 1, TypeEstimate::Integer),
     ("%hi-word", "nod_hi_word", 1, TypeEstimate::Integer),
+    // Sprint 41c — scrollbar primitives. `%set-scroll-info` takes
+    // (hwnd, nbar, n-min, n-max, n-page, n-pos, redraw); `%get-scroll-pos`
+    // takes (hwnd, nbar). Both return fixnum-tagged integers.
+    ("%set-scroll-info", "nod_set_scroll_info", 7, TypeEstimate::Integer),
+    ("%get-scroll-pos", "nod_get_scroll_pos", 2, TypeEstimate::Integer),
+    // Sprint 41c — count '\n' bytes in a `<byte-string>` and return that
+    // count + 1 (one line beyond the trailing newline). The IDE uses
+    // this to size the vertical scrollbar.
+    ("%count-newlines", "nod_count_newlines", 1, TypeEstimate::Integer),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

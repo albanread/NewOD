@@ -503,3 +503,316 @@ fn aot_nod_ide_source_viewer() {
     // Success — clean up the temp dir.
     let _ = remove_dir_all_best_effort(&dir);
 }
+
+/// **The Sprint 41c headline.** Build an AOT-linked EXE — the scrollable
+/// nod-ide — and exercise the native resize + scroll feel.
+///
+/// Differences vs. Sprint 41b (`aot_nod_ide_source_viewer`):
+///
+///   * Swap-chain `Scaling: DXGI_SCALING_NONE` (set inside
+///     `com_shim.rs`). With STRETCH (the Sprint 41b default), dragging
+///     the window edge visually stretches the rendered text until
+///     ResizeBuffers refreshes the back buffer. With NONE, the back
+///     buffer stays at native size; the OS fills the newly-exposed
+///     region with the window's background brush — exactly the
+///     Notepad++ feel.
+///   * `WS_VSCROLL` in the window's dwStyle. The scrollbar appears on
+///     the right edge of the window; its range and proportional thumb
+///     come from the new `%set-scroll-info` Dylan primitive.
+///   * New WNDPROC handlers for WM_VSCROLL, WM_MOUSEWHEEL, WM_KEYDOWN
+///     (PgUp/PgDn/Home/End — arrow keys are deferred to Sprint 41d
+///     when there's a cursor to move).
+///   * WM_PAINT renders the text translated by the current scroll
+///     position; lines off-viewport fall off the top/bottom and
+///     Direct2D clips them.
+///   * On WM_SIZE we now also recompute `viewport-lines` and call
+///     `%set-scroll-info` to keep the thumb proportional to the new
+///     window height.
+///
+/// What this test exercises end-to-end:
+///   * The Sprint 41c runtime shims `nod_set_scroll_info`,
+///     `nod_get_scroll_pos`, `nod_count_newlines` — all reachable from
+///     `nod_runtime.lib` linked into the EXE.
+///   * The Sprint 41c codegen wiring (lowering + JIT-symbol bindings)
+///     surfaces correctly through the AOT pipeline.
+///   * The Sprint 41c Dylan source compiles, links, and runs as an EXE
+///     that opens a scrollable read-only Dylan viewer.
+///
+/// `#[ignore]`-gated because it's interactive. The test runner spawns
+/// the EXE, the user scrolls / resizes / closes, and the test asserts
+/// exit code 0 after `.wait()` returns.
+#[test]
+#[ignore = "interactive: pops a real Win32 window. Run with `cargo test --test aot_ide_shell -- --ignored --nocapture aot_nod_ide_scrollable_source_viewer`."]
+#[serial]
+fn aot_nod_ide_scrollable_source_viewer() {
+    // The Sprint 41c Dylan source body. Mirrors
+    // `tests/nod-tests/fixtures/nod-ide.dylan` — that fixture is the
+    // standalone source you could `nod-driver build` directly; the
+    // body below embeds the same Dylan code via a string literal so
+    // the test is self-contained.
+    let source = "Module: nod-ide\n\n\
+        define c-function CreateWindowExW\n  \
+            (dwExStyle :: <c-int>, lpClassName :: <c-pointer>, lpWindowName :: <c-wide-string>,\n   \
+             dwStyle :: <c-int>, x :: <c-int>, y :: <c-int>, nWidth :: <c-int>, nHeight :: <c-int>,\n   \
+             hWndParent :: <c-pointer>, hMenu :: <c-pointer>, hInstance :: <c-pointer>,\n   \
+             lpParam :: <c-pointer>)\n   \
+         => (hwnd :: <c-pointer>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function ShowWindow\n  \
+            (hwnd :: <c-pointer>, nCmdShow :: <c-int>)\n   \
+         => (was-visible :: <c-bool>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function UpdateWindow\n  \
+            (hwnd :: <c-pointer>)\n   \
+         => (success :: <c-bool>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function InvalidateRect\n  \
+            (hwnd :: <c-pointer>, lpRect :: <c-pointer>, bErase :: <c-bool>)\n   \
+         => (success :: <c-bool>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function DefWindowProcW\n  \
+            (hwnd :: <c-pointer>, msg :: <c-int>,\n   \
+             wparam :: <c-pointer>, lparam :: <c-pointer>)\n   \
+         => (lresult :: <c-pointer>);\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define c-function PostQuitMessage\n  \
+            (exit-code :: <c-int>)\n   \
+         => ();\n    \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define function main () => ()\n  \
+            let arg-path = %argv1();\n  \
+            let source-text = if (empty?(arg-path))\n                      \
+                                \"nod-ide: no argv[1] supplied; pass a Dylan source path as the first argument.\"\n                    \
+                              else\n                      \
+                                let bytes = %read-file(arg-path);\n                      \
+                                if (empty?(bytes))\n                        \
+                                  \"nod-ide: could not read the file passed via argv[1].\"\n                      \
+                                else\n                        \
+                                  bytes\n                      \
+                                end\n                    \
+                              end;\n  \
+            let d3d-device   = %d3d11-create-device();\n  \
+            let dxgi-factory = %dxgi-factory-from-d3d-device(d3d-device);\n  \
+            let dxgi-device  = %dxgi-device-from-d3d-device(d3d-device);\n  \
+            let d2d-factory  = %d2d-create-factory();\n  \
+            let d2d-device   = %d2d-create-device(d2d-factory, dxgi-device);\n  \
+            let dc           = %d2d-create-device-context(d2d-device);\n  \
+            let dwrite       = %dwrite-create-factory();\n  \
+            let format       = %dwrite-create-text-format(dwrite, \"Consolas\", 1400, \"en-us\");\n  \
+            let swap = 0;\n  \
+            let bitmap = 0;\n  \
+            let width = 1024;\n  \
+            let height = 768;\n  \
+            let line-height = 18;\n  \
+            let line-count = %count-newlines(source-text);\n  \
+            let scroll-y-line = 0;\n  \
+            let viewport-lines = 768 / 18;\n  \
+            let wp = method (hwnd, msg, wparam, lparam)\n            \
+                       if (msg = 15)\n              \
+                         if (swap ~= 0)\n                \
+                           if (bitmap = 0)\n                  \
+                             bitmap := %d2d-create-bitmap-from-swap-chain(dc, swap);\n                \
+                           else 0 end;\n                \
+                           %d2d-set-target(dc, bitmap);\n                \
+                           %d2d-begin-draw(dc);\n                \
+                           %d2d-clear(dc, 255, 255, 255, 255);\n                \
+                           let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);\n                \
+                           let layout = %dwrite-create-text-layout(dwrite, source-text, format, width, height + scroll-y-line * line-height);\n                \
+                           %d2d-draw-text-layout(dc, 8, 8 - scroll-y-line * line-height, layout, brush);\n                \
+                           %d2d-end-draw(dc);\n                \
+                           %com-release(brush);\n                \
+                           %com-release(layout);\n                \
+                           %dxgi-swap-chain-present(swap);\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 5)\n              \
+                         if (swap ~= 0 & wparam ~= 1)\n                \
+                           let new-w = %lo-word(lparam);\n                \
+                           let new-h = %hi-word(lparam);\n                \
+                           if (new-w > 0 & new-h > 0)\n                  \
+                             if (bitmap ~= 0)\n                    \
+                               %d2d-set-target(dc, 0);\n                    \
+                               %com-release(bitmap);\n                    \
+                               bitmap := 0;\n                  \
+                             else 0 end;\n                  \
+                             width := new-w;\n                  \
+                             height := new-h;\n                  \
+                             %dxgi-swap-chain-resize-buffers(swap, new-w, new-h);\n                  \
+                             viewport-lines := new-h / line-height;\n                  \
+                             %set-scroll-info(hwnd, 1, 0, line-count, viewport-lines, scroll-y-line, 1);\n                \
+                           else 0 end;\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 277)\n              \
+                         let action = %lo-word(wparam);\n              \
+                         let new-pos = if (action = 0)\n                                         \
+                                         scroll-y-line - 1\n                                       \
+                                       elseif (action = 1)\n                                         \
+                                         scroll-y-line + 1\n                                       \
+                                       elseif (action = 2)\n                                         \
+                                         scroll-y-line - (viewport-lines - 1)\n                                       \
+                                       elseif (action = 3)\n                                         \
+                                         scroll-y-line + (viewport-lines - 1)\n                                       \
+                                       elseif (action = 4)\n                                         \
+                                         %hi-word(wparam)\n                                       \
+                                       elseif (action = 5)\n                                         \
+                                         %hi-word(wparam)\n                                       \
+                                       elseif (action = 6)\n                                         \
+                                         0\n                                       \
+                                       elseif (action = 7)\n                                         \
+                                         line-count - viewport-lines\n                                       \
+                                       else\n                                         \
+                                         scroll-y-line\n                                       \
+                                       end;\n              \
+                         let max-scroll = if (line-count > viewport-lines)\n                                            \
+                                            line-count - viewport-lines\n                                          \
+                                          else 0 end;\n              \
+                         let clamped = if (new-pos < 0) 0\n                                       \
+                                       elseif (new-pos > max-scroll) max-scroll\n                                       \
+                                       else new-pos end;\n              \
+                         if (clamped ~= scroll-y-line)\n                \
+                           scroll-y-line := clamped;\n                \
+                           %set-scroll-info(hwnd, 1, 0, line-count, viewport-lines, clamped, 1);\n                \
+                           InvalidateRect(hwnd, 0, 0);\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 522)\n              \
+                         let raw-delta = %hi-word(wparam);\n              \
+                         let signed-delta = if (raw-delta > 32767)\n                                              \
+                                              raw-delta - 65536\n                                            \
+                                            else\n                                              \
+                                              raw-delta\n                                            \
+                                            end;\n              \
+                         let lines-to-scroll = -1 * signed-delta * 3 / 120;\n              \
+                         let new-pos = scroll-y-line + lines-to-scroll;\n              \
+                         let max-scroll = if (line-count > viewport-lines)\n                                            \
+                                            line-count - viewport-lines\n                                          \
+                                          else 0 end;\n              \
+                         let clamped = if (new-pos < 0) 0\n                                       \
+                                       elseif (new-pos > max-scroll) max-scroll\n                                       \
+                                       else new-pos end;\n              \
+                         if (clamped ~= scroll-y-line)\n                \
+                           scroll-y-line := clamped;\n                \
+                           %set-scroll-info(hwnd, 1, 0, line-count, viewport-lines, clamped, 1);\n                \
+                           InvalidateRect(hwnd, 0, 0);\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 256)\n              \
+                         let vk = %lo-word(wparam);\n              \
+                         let max-scroll = if (line-count > viewport-lines)\n                                            \
+                                            line-count - viewport-lines\n                                          \
+                                          else 0 end;\n              \
+                         let new-pos = if (vk = 33)\n                                         \
+                                         scroll-y-line - (viewport-lines - 1)\n                                       \
+                                       elseif (vk = 34)\n                                         \
+                                         scroll-y-line + (viewport-lines - 1)\n                                       \
+                                       elseif (vk = 36)\n                                         \
+                                         0\n                                       \
+                                       elseif (vk = 35)\n                                         \
+                                         max-scroll\n                                       \
+                                       else\n                                         \
+                                         scroll-y-line\n                                       \
+                                       end;\n              \
+                         let clamped = if (new-pos < 0) 0\n                                       \
+                                       elseif (new-pos > max-scroll) max-scroll\n                                       \
+                                       else new-pos end;\n              \
+                         if (clamped ~= scroll-y-line)\n                \
+                           scroll-y-line := clamped;\n                \
+                           %set-scroll-info(hwnd, 1, 0, line-count, viewport-lines, clamped, 1);\n                \
+                           InvalidateRect(hwnd, 0, 0);\n              \
+                         else 0 end;\n              \
+                         0\n            \
+                       elseif (msg = 2)\n              \
+                         PostQuitMessage(0);\n              \
+                         0\n            \
+                       else\n              \
+                         DefWindowProcW(hwnd, msg, wparam, lparam)\n            \
+                       end\n          \
+                     end;\n  \
+            let cb = as-wndproc-callback(wp);\n  \
+            let atom = %register-window-class(cb, \"NodIDE\");\n  \
+            let hwnd = CreateWindowExW(0, atom, \"NewOpenDylan IDE\",\n                                       \
+                15663104, -2147483648, -2147483648, 1024, 768,\n                                       \
+                0, 0, 0, 0);\n  \
+            swap := %dxgi-create-swap-chain-for-hwnd(dxgi-factory, d3d-device, hwnd, 1024, 768);\n  \
+            %set-scroll-info(hwnd, 1, 0, line-count, viewport-lines, 0, 1);\n  \
+            ShowWindow(hwnd, 5);\n  \
+            UpdateWindow(hwnd);\n  \
+            %run-message-loop();\n\
+        end function main;\n";
+
+    let (dir, exe_path) = build_exe("nod-ide-scrollable", source);
+
+    // Write a tall Dylan source fixture (bigger than the default
+    // viewport) so the scrollbar has something to scroll. The
+    // repeated-block pad makes the file ~80 lines, well past the
+    // ~42 lines that fit in a 1024x768 default window.
+    let fixture_path = dir.join("tall-sample.dylan");
+    let mut fixture_content = String::from(
+        "Module: tall-sample\n\n\
+         // tall-sample.dylan - Sprint 41c fixture for the scrollable nod-ide.\n\
+         //\n\
+         // This file is deliberately taller than the default 1024x768\n\
+         // window so the scrollbar engages immediately on open. Resize\n\
+         // the window - the text should stay at its native size (no\n\
+         // stretching) and the scrollbar thumb should grow / shrink\n\
+         // proportionally. Spin the mouse wheel, drag the scrollbar\n\
+         // thumb, press PgUp / PgDn / Home / End - all should scroll.\n\n\
+         define function repeated-block-1 () => ()\n  \
+             format-out(\"block 1: this line is part of the long sample.\\n\");\n\
+         end function;\n\n",
+    );
+    for i in 2..=18 {
+        fixture_content.push_str(&format!(
+            "define function repeated-block-{i} () => ()\n  \
+                 format-out(\"block {i}: this line is part of the long sample.\\n\");\n\
+             end function;\n\n",
+        ));
+    }
+    fixture_content.push_str(
+        "define function main () => ()\n  \
+             repeated-block-1();\n  \
+             // ... and so on.\n\
+         end function main;\n",
+    );
+    std::fs::write(&fixture_path, fixture_content).expect("write tall sample fixture");
+
+    eprintln!(
+        "[sprint-41c headline] AOT scrollable nod-ide EXE built at {}; spawning with \
+         argv[1] = {}.\n  \
+         A WINDOW WILL APPEAR showing the file's source with a vertical \
+         scrollbar on the right.\n  \
+         * RESIZE the window - text should NOT stretch; you should just \
+           see more or less of the file.\n  \
+         * Spin the MOUSE WHEEL - text should scroll up/down by 3 lines per notch.\n  \
+         * Press PgUp / PgDn / Home / End - should page-scroll / jump to top/bottom.\n  \
+         * Click / drag the SCROLLBAR - should scroll the viewport.\n  \
+         Click X to close. The test will then validate exit code 0.",
+        exe_path.display(),
+        fixture_path.display(),
+    );
+
+    let mut child = Command::new(&exe_path)
+        .arg(&fixture_path)
+        .spawn()
+        .expect("spawn AOT nod-ide (scrollable) EXE");
+    let status = child.wait().expect("wait for AOT nod-ide (scrollable) EXE");
+    let code = status.code().unwrap_or(-1);
+    eprintln!(
+        "[sprint-41c headline] AOT nod-ide (scrollable) EXE exited with code {code}"
+    );
+
+    assert_eq!(
+        code, 0,
+        "AOT nod-ide (scrollable) EXE must exit cleanly with code 0; exe={}",
+        exe_path.display()
+    );
+
+    let _ = remove_dir_all_best_effort(&dir);
+}

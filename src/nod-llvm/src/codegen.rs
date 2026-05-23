@@ -323,6 +323,14 @@ pub const NOD_LO_WORD_SYMBOL: &str = "nod_lo_word";
 /// Bits 16-31 of an integer (for `HIWORD(lparam)` in WM_SIZE).
 pub const NOD_HI_WORD_SYMBOL: &str = "nod_hi_word";
 
+// ─── Sprint 41c — scrollbar primitives ────────────────────────────────────
+/// Configure a scrollbar (vertical or horizontal) on a window. Arity-7.
+pub const NOD_SET_SCROLL_INFO_SYMBOL: &str = "nod_set_scroll_info";
+/// Read a scrollbar's current position. Arity-2.
+pub const NOD_GET_SCROLL_POS_SYMBOL: &str = "nod_get_scroll_pos";
+/// Count newlines in a `<byte-string>` and return count+1. Arity-1.
+pub const NOD_COUNT_NEWLINES_SYMBOL: &str = "nod_count_newlines";
+
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
 pub const NOD_TABLE_SIZE_SYMBOL: &str = "nod_table_size";
@@ -486,6 +494,11 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_get_argv1", NOD_GET_ARGV1_SYMBOL, 0),
     ("nod_lo_word", NOD_LO_WORD_SYMBOL, 1),
     ("nod_hi_word", NOD_HI_WORD_SYMBOL, 1),
+    // Sprint 41c — scrollbar primitives. Arity matches the Rust shim:
+    // SetScrollInfo flattened to 7 u64 args; GetScrollPos takes (hwnd, nbar).
+    ("nod_set_scroll_info", NOD_SET_SCROLL_INFO_SYMBOL, 7),
+    ("nod_get_scroll_pos", NOD_GET_SCROLL_POS_SYMBOL, 2),
+    ("nod_count_newlines", NOD_COUNT_NEWLINES_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

@@ -66,6 +66,11 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # Sprint 41c — `SetScrollInfo` (used by the IDE's scrollbar primitive)
+    # lives under the `Win32_UI_Controls` feature in `windows 0.58`, even
+    # though it's linked from `user32.dll`. The companion `GetScrollPos`
+    # is in `Win32_UI_WindowsAndMessaging`, already enabled above.
+    "Win32_UI_Controls",
     "Foundation_Numerics",
 ] }
 

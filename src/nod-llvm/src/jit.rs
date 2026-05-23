@@ -88,6 +88,10 @@ use crate::codegen::{
     NOD_GET_ARGV1_SYMBOL,
     NOD_LO_WORD_SYMBOL,
     NOD_HI_WORD_SYMBOL,
+    // Sprint 41c — scrollbar primitives.
+    NOD_SET_SCROLL_INFO_SYMBOL,
+    NOD_GET_SCROLL_POS_SYMBOL,
+    NOD_COUNT_NEWLINES_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -609,6 +613,15 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_lo_word as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_HI_WORD_SYMBOL),
              nod_runtime::nod_hi_word as *const () as *mut std::ffi::c_void),
+            // Sprint 41c — scrollbar primitives. Bound here so the JIT
+            // sees `%set-scroll-info` / `%get-scroll-pos` resolve to the
+            // runtime shims in `nod-runtime/src/com_shim.rs`.
+            (module.get_function(NOD_SET_SCROLL_INFO_SYMBOL),
+             nod_runtime::nod_set_scroll_info as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_GET_SCROLL_POS_SYMBOL),
+             nod_runtime::nod_get_scroll_pos as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_COUNT_NEWLINES_SYMBOL),
+             nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
@@ -1305,6 +1318,12 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_GET_ARGV1_SYMBOL, nod_runtime::nod_get_argv1 as *const () as *mut std::ffi::c_void),
         (NOD_LO_WORD_SYMBOL, nod_runtime::nod_lo_word as *const () as *mut std::ffi::c_void),
         (NOD_HI_WORD_SYMBOL, nod_runtime::nod_hi_word as *const () as *mut std::ffi::c_void),
+        // Sprint 41c — scrollbar primitives, also surfaced through the
+        // cache-replay symbol-mapping path so a cache hit keeps the
+        // binding live.
+        (NOD_SET_SCROLL_INFO_SYMBOL, nod_runtime::nod_set_scroll_info as *const () as *mut std::ffi::c_void),
+        (NOD_GET_SCROLL_POS_SYMBOL, nod_runtime::nod_get_scroll_pos as *const () as *mut std::ffi::c_void),
+        (NOD_COUNT_NEWLINES_SYMBOL, nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
     ]);
     v
 }
