@@ -816,3 +816,150 @@ fn aot_nod_ide_scrollable_source_viewer() {
 
     let _ = remove_dir_all_best_effort(&dir);
 }
+
+/// **The Sprint 41d headline.** Build an AOT-linked EXE — the
+/// horizontally-scrollable nod-ide — and exercise the corrected editor
+/// model.
+///
+/// Differences vs. Sprint 41c (`aot_nod_ide_scrollable_source_viewer`):
+///
+///   * **Client area is BUFFER-sized, not window-sized.** The rendered
+///     canvas is `(buffer-max-cols × char-width)` wide by
+///     `(buffer-lines × line-height)` tall. Resizing the OS window
+///     never changes it.
+///   * **Horizontal scrollbar.** `WS_HSCROLL` (0x00100000) added to
+///     dwStyle (now 16711680). New SB_HORZ (nbar=0) configuration via
+///     the existing `%set-scroll-info`.
+///   * **Pixel-based scroll offsets.** `scroll-x-px` / `scroll-y-px`
+///     replace the line-counter from 41c. Drawing translation is
+///     `(pad - scroll-x-px, pad - scroll-y-px)` — same coordinate
+///     system as the scrollbar ranges.
+///   * **WM_HSCROLL (276) handler.** Mirrors WM_VSCROLL for the
+///     horizontal axis.
+///   * **Shift+MouseWheel = horizontal scroll** (matches IE / Edge /
+///     Notepad++ convention).
+///   * **VK_LEFT (37) / VK_RIGHT (39)** scroll horizontally one
+///     char-width.
+///
+/// What this test exercises beyond Sprint 41c:
+///   * The new `nod_max_line_chars` runtime shim — the only new runtime
+///     addition Sprint 41d makes (one helper, parallel to
+///     `nod_count_newlines`).
+///   * The corrected editor model end-to-end: buffer / client / window
+///     all distinct.
+///
+/// Test fixture lives under `F:\scratch` per the project hard rule that
+/// test inputs must never live inside the NewOpenDylan repo. The
+/// fixture has deliberately long lines so the horizontal scrollbar
+/// engages on open.
+///
+/// `#[ignore]`-gated because it's interactive. The test runner spawns
+/// the EXE, the user scrolls / resizes / closes, and the test asserts
+/// exit code 0 after `.wait()` returns.
+#[test]
+#[ignore = "interactive: pops a real Win32 window. Run with `cargo test --test aot_ide_shell -- --ignored --nocapture aot_nod_ide_horizontal_scroll`."]
+#[serial]
+fn aot_nod_ide_horizontal_scroll() {
+    // The Sprint 41d Dylan body — pulled in from the standalone fixture
+    // file so the test and the `nod-driver build`-able source stay in
+    // lockstep automatically. (Sprint 41c embedded the body via an
+    // inline string literal which had to be hand-synchronised with the
+    // fixture; `include_str!` removes that footgun.)
+    let source = include_str!("../fixtures/nod-ide.dylan");
+
+    let (dir, exe_path) = build_exe("nod-ide-hscroll", source);
+
+    // Sprint 41d hard rule: test fixtures live under F:\scratch, NEVER
+    // inside the NewOpenDylan repo. Create the directory if it's
+    // missing (Windows users may not have F:\ populated); the test is
+    // already #[ignore]-gated so an absent F:\ drive just means the
+    // test never runs on that machine.
+    let scratch_root = PathBuf::from(r"F:\scratch");
+    if !scratch_root.is_dir() {
+        eprintln!(
+            "[sprint-41d headline] F:\\scratch is missing on this machine — \
+             this test requires F:\\scratch to exist (hard project rule: \
+             test inputs live there, not inside the repo). Skipping."
+        );
+        return;
+    }
+    let fixture_path = scratch_root.join("nod-ide-41d-long-lines.dylan");
+    // A fixture with intentionally long lines (well past the 1024-px
+    // window width) so the horizontal scrollbar engages immediately.
+    // Mix of long signatures, comment banners, and a tall block so
+    // both scrollbars do real work.
+    let long_line_a =
+        "// This is a deliberately long comment line designed to exceed the default 1024 pixel window width so the horizontal scrollbar engages immediately on open; you should be able to drag it to reveal more text.";
+    let long_line_b =
+        "define function very-long-function-name-that-keeps-going-and-going (parameter-one, parameter-two, parameter-three, parameter-four, parameter-five, parameter-six) => (result-with-a-long-name)";
+    let mut fixture_content = String::from(
+        "Module: long-lines-sample\n\n\
+         // long-lines-sample.dylan - Sprint 41d fixture for the\n\
+         // horizontally-scrollable nod-ide.\n\
+         //\n\
+         // Some lines below are intentionally wider than the default\n\
+         // 1024 px window so the horizontal scrollbar engages on open.\n\
+         // Total height is also taller than the window so the vertical\n\
+         // scrollbar engages too. Both should be usable simultaneously.\n\n",
+    );
+    fixture_content.push_str(long_line_a);
+    fixture_content.push('\n');
+    fixture_content.push_str(long_line_b);
+    fixture_content.push('\n');
+    fixture_content.push('\n');
+    for i in 1..=20 {
+        fixture_content.push_str(&format!(
+            "define function block-{i} () => ()\n  \
+                 format-out(\"block {i}: short line.\\n\");\n\
+             end function;\n\n",
+        ));
+    }
+    fixture_content.push_str(long_line_a);
+    fixture_content.push('\n');
+    fixture_content.push_str(long_line_b);
+    fixture_content.push('\n');
+    fixture_content.push_str(
+        "\n\
+         define function main () => ()\n  \
+             block-1();\n\
+         end function main;\n",
+    );
+    std::fs::write(&fixture_path, fixture_content).expect("write long-lines fixture");
+
+    eprintln!(
+        "[sprint-41d headline] AOT horizontally-scrollable nod-ide EXE built at {}; \
+         spawning with argv[1] = {}.\n  \
+         A WINDOW WILL APPEAR with BOTH a vertical scrollbar on the right \
+         and a horizontal scrollbar at the bottom.\n  \
+         * The window opens with horizontal scrollbar present (long lines wider than the window).\n  \
+         * DRAG the HORIZONTAL scrollbar - text scrolls left/right; long lines reveal their tails.\n  \
+         * SHIFT+MOUSEWHEEL - text scrolls left/right (3 chars per notch).\n  \
+         * LEFT / RIGHT ARROW KEYS - text scrolls one char-width left/right.\n  \
+         * RESIZE the window NARROWER - horizontal scrollbar thumb shrinks (more canvas hidden); text does NOT reflow.\n  \
+         * RESIZE the window WIDER (past the longest line) - horizontal scrollbar thumb fills the bar; no more horizontal scroll needed.\n  \
+         * Vertical scrolling (wheel / PgUp / PgDn / Home / End / drag) still works from Sprint 41c.\n  \
+         Click X to close. The test will then validate exit code 0.",
+        exe_path.display(),
+        fixture_path.display(),
+    );
+
+    let mut child = Command::new(&exe_path)
+        .arg(&fixture_path)
+        .spawn()
+        .expect("spawn AOT nod-ide (hscroll) EXE");
+    let status = child.wait().expect("wait for AOT nod-ide (hscroll) EXE");
+    let code = status.code().unwrap_or(-1);
+    eprintln!(
+        "[sprint-41d headline] AOT nod-ide (hscroll) EXE exited with code {code}"
+    );
+
+    assert_eq!(
+        code, 0,
+        "AOT nod-ide (hscroll) EXE must exit cleanly with code 0; exe={}",
+        exe_path.display()
+    );
+
+    let _ = remove_dir_all_best_effort(&dir);
+    // Leave the F:\scratch fixture in place so the user can rerun the
+    // EXE manually after the test. It's tiny (a few KB) and harmless.
+}

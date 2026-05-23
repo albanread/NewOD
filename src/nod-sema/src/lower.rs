@@ -376,6 +376,10 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // count + 1 (one line beyond the trailing newline). The IDE uses
     // this to size the vertical scrollbar.
     ("%count-newlines", "nod_count_newlines", 1, TypeEstimate::Integer),
+    // Sprint 41d — length in bytes of the longest non-newline run in a
+    // `<byte-string>`. The IDE uses this to size the horizontal
+    // scrollbar's client-area width (`buffer-max-cols × char-width`).
+    ("%max-line-chars", "nod_max_line_chars", 1, TypeEstimate::Integer),
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

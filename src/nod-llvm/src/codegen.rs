@@ -330,6 +330,8 @@ pub const NOD_SET_SCROLL_INFO_SYMBOL: &str = "nod_set_scroll_info";
 pub const NOD_GET_SCROLL_POS_SYMBOL: &str = "nod_get_scroll_pos";
 /// Count newlines in a `<byte-string>` and return count+1. Arity-1.
 pub const NOD_COUNT_NEWLINES_SYMBOL: &str = "nod_count_newlines";
+/// Sprint 41d — longest non-newline run length in a `<byte-string>`. Arity-1.
+pub const NOD_MAX_LINE_CHARS_SYMBOL: &str = "nod_max_line_chars";
 
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
@@ -499,6 +501,7 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_set_scroll_info", NOD_SET_SCROLL_INFO_SYMBOL, 7),
     ("nod_get_scroll_pos", NOD_GET_SCROLL_POS_SYMBOL, 2),
     ("nod_count_newlines", NOD_COUNT_NEWLINES_SYMBOL, 1),
+    ("nod_max_line_chars", NOD_MAX_LINE_CHARS_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {

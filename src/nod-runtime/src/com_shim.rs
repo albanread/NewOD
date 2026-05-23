@@ -2008,6 +2008,48 @@ pub unsafe extern "C-unwind" fn nod_count_newlines(s_word: u64) -> u64 {
     tag(n + 1)
 }
 
+// ─── Sprint 41d — longest-line-in-bytes helper ─────────────────────────────
+
+/// JIT-callable: return the length in bytes of the longest run of
+/// non-`'\n'` bytes in a Dylan `<byte-string>`. Used by the IDE to size
+/// the horizontal scrollbar (`buffer-max-cols` in the corrected editor
+/// model).
+///
+/// Why a shim rather than Dylan code:
+/// `<byte-string>` is not registered with the runtime's FIP (no
+/// `FipKind::ByteString` arm in `collections.rs`), and there is no
+/// `string-element` / `element(<byte-string>, i)` primitive exposed to
+/// Dylan yet. Walking the bytes from Dylan would require either adding
+/// FIP support or a per-index accessor — either is a bigger lift than
+/// the Sprint 41d brief allows. This shim mirrors `nod_count_newlines`
+/// exactly (read the live UTF-8 bytes, fold over them, fixnum-tag the
+/// result). When a proper byte-string FIP arm lands later we can
+/// retire both of these.
+///
+/// # Safety
+/// `s_word` must be a Dylan `<byte-string>` Word; `read_dylan_byte_string`
+/// panics on the wrong class.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_max_line_chars(s_word: u64) -> u64 {
+    let s = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(s_word));
+    let mut best: u64 = 0;
+    let mut cur: u64 = 0;
+    for b in s.bytes() {
+        if b == b'\n' {
+            if cur > best {
+                best = cur;
+            }
+            cur = 0;
+        } else {
+            cur += 1;
+        }
+    }
+    if cur > best {
+        best = cur;
+    }
+    tag(best)
+}
+
 // ─── Sprint 41c — scrollbar primitives ─────────────────────────────────────
 
 /// JIT-callable: configure the vertical or horizontal scrollbar on the

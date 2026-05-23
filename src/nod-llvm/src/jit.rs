@@ -92,6 +92,8 @@ use crate::codegen::{
     NOD_SET_SCROLL_INFO_SYMBOL,
     NOD_GET_SCROLL_POS_SYMBOL,
     NOD_COUNT_NEWLINES_SYMBOL,
+    // Sprint 41d — longest non-newline run helper.
+    NOD_MAX_LINE_CHARS_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -622,6 +624,8 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_get_scroll_pos as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_COUNT_NEWLINES_SYMBOL),
              nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_MAX_LINE_CHARS_SYMBOL),
+             nod_runtime::nod_max_line_chars as *const () as *mut std::ffi::c_void),
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
@@ -1324,6 +1328,8 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_SET_SCROLL_INFO_SYMBOL, nod_runtime::nod_set_scroll_info as *const () as *mut std::ffi::c_void),
         (NOD_GET_SCROLL_POS_SYMBOL, nod_runtime::nod_get_scroll_pos as *const () as *mut std::ffi::c_void),
         (NOD_COUNT_NEWLINES_SYMBOL, nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
+        // Sprint 41d — longest non-newline run helper.
+        (NOD_MAX_LINE_CHARS_SYMBOL, nod_runtime::nod_max_line_chars as *const () as *mut std::ffi::c_void),
     ]);
     v
 }
