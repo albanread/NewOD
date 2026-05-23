@@ -344,3 +344,102 @@ fn aot_messagebox_w_ignored() {
     // MB_OK → IDOK = 1.
     assert_eq!(stdout, "1\n", "stdout mismatch; stderr=\n{stderr}");
 }
+
+// ─── Sprint 40b — Win32 callbacks in AOT EXEs ────────────────────────────────
+//
+// The Sprint 32 trampoline pool (`src/nod-runtime/src/callbacks.rs`) already
+// statically links into every AOT EXE via `nod_runtime.lib`, and the
+// `nod_register_wndproc` / `nod_register_wndenumproc` externs are
+// `#[unsafe(no_mangle)]`-exported unconditionally. The codegen extern table
+// in `nod-llvm/src/codegen.rs` declares both symbols against the merged
+// LLVM module, so they appear in the AOT `.obj` and the linker resolves
+// them out of `nod_runtime.lib` exactly the same way it does for any other
+// runtime extern. The stdlib wrappers (`as-wndproc-callback` /
+// `as-wndenumproc-callback` in `stdlib.dylan`) are top-level functions
+// already merged into the user module by `compile_file_for_aot`, so the
+// surface is reachable from user Dylan code with no AOT-specific glue.
+//
+// Sprint 40a verified Sprint 24 cell-promotion works through AOT (the
+// `for-each` test sums a captured `total` across the loop body); the
+// headline below piggy-backs on the same mechanism — `count` is captured
+// by the `method` closure passed to `as-wndenumproc-callback`, promoted
+// into a `<cell>` because the closure mutates it, and observed AFTER
+// `EnumWindows` returns. So this test ALSO exercises Sprint 24's
+// closure-environment story round-tripping through a Win32 C-ABI call.
+
+/// **The Sprint 40b headline.** Build an AOT EXE that calls `EnumWindows`
+/// with a Dylan closure callback, captures-by-reference a counter from
+/// the enclosing scope, and prints the count after the OS returns.
+///
+/// Mirrors the Sprint 32 JIT headline `enum_windows_invokes_callback_for_each_top_level_window`
+/// in `winffi_callbacks.rs`. The Dylan source is identical-modulo
+/// the explicit `define c-function EnumWindows` declaration (Sprint 31's
+/// JIT-time bare-name materialisation doesn't carry through the AOT
+/// codegen path — bare `EnumWindows` reports `unknown callee`; that's
+/// pre-existing, unrelated to callbacks, and tracked separately).
+///
+/// Acceptance: every Windows desktop has at least the taskbar + a few
+/// always-present windows, so `count > 0` is required; the upper bound
+/// is intentionally loose to avoid flaking on busy machines.
+#[test]
+#[ignore]
+#[serial]
+fn aot_enum_windows_callback() {
+    let source = "Module: enum-windows\n\n\
+        define c-function EnumWindows\n  \
+            (callback :: <c-pointer>, lparam :: <c-pointer>)\n  \
+         => (success :: <c-bool>);\n  \
+            library: \"user32.dll\";\n\
+        end;\n\n\
+        define function main () => ()\n  \
+            let count = 0;\n  \
+            let cb = method (hwnd, lp) count := count + 1; #t end;\n  \
+            let cb-ptr = as-wndenumproc-callback(cb);\n  \
+            EnumWindows(cb-ptr, $NULL);\n  \
+            format-out(\"count: %d\\n\", count);\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("enum-windows", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    // Parse "count: N\n" and assert sane bounds.
+    let trimmed = stdout.trim_end();
+    let n_str = trimmed
+        .strip_prefix("count: ")
+        .unwrap_or_else(|| panic!("unexpected stdout shape: {stdout:?}; stderr=\n{stderr}"));
+    let n: i64 = n_str
+        .parse()
+        .unwrap_or_else(|e| panic!("count parse failed for {n_str:?}: {e}; stderr=\n{stderr}"));
+    assert!(
+        n > 0,
+        "EnumWindows must invoke the callback at least once, got count={n}; stderr=\n{stderr}"
+    );
+    assert!(
+        n < 100_000,
+        "callback count is suspiciously large ({n}); suggests runaway loop or marshaling bug; stderr=\n{stderr}"
+    );
+    eprintln!("[sprint-40b headline] AOT EnumWindows enumerated {n} top-level windows");
+}
+
+/// Smoke test that `as-wndproc-callback` registers a closure without
+/// actually creating a window. Returns a non-null `<c-pointer>` (the
+/// trampoline slot's address); we just print "ok" / "null". Doesn't
+/// exercise OS callback invocation (no message loop), so safe to run
+/// in CI without UI.
+///
+/// This proves the Sprint 32 `WNDPROC` registration path (arity-4
+/// closure → 32-slot pool → fixnum-tagged address) is reachable from
+/// AOT Dylan code, in addition to the `WNDENUMPROC` (arity-2) path
+/// exercised by the headline.
+#[test]
+#[ignore]
+#[serial]
+fn aot_register_wndproc_smoke() {
+    let source = "Module: wndproc-smoke\n\n\
+        define function main () => ()\n  \
+            let cb = method (hwnd, msg, wp, lp) 0 end;\n  \
+            let cb-ptr = as-wndproc-callback(cb);\n  \
+            if (cb-ptr = 0) format-out(\"null\\n\"); else format-out(\"ok\\n\"); end if;\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("wndproc-smoke", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "ok\n", "stdout mismatch; stderr=\n{stderr}");
+}
