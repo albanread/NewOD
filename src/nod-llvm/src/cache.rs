@@ -442,9 +442,20 @@ pub fn evict_to(dir: &Path, max_bytes: u64) -> usize {
         // Sprint 38: also remove the sibling `<hex>.manifest.json` so
         // no orphan manifest sits next to a deleted bitcode.
         let manifest_path = json_path.with_extension("manifest.json");
+        // Sprint 38f: same for the `<hex>.registrations.json` sidecar
+        // that nod-sema writes on the cold path. Filename has TWO
+        // dotted segments (`.registrations.json`), so the standard
+        // `with_extension` trick won't reach it — strip both
+        // extensions manually.
+        let regs_path = json_path
+            .file_stem()
+            .map(|stem| json_path.with_file_name(format!("{}.registrations.json", stem.to_string_lossy())));
         let _ = fs::remove_file(&json_path);
         let _ = fs::remove_file(&bc_path);
         let _ = fs::remove_file(&manifest_path);
+        if let Some(rp) = regs_path {
+            let _ = fs::remove_file(&rp);
+        }
         total = total.saturating_sub(meta.size_bytes);
         evicted += 1;
     }
@@ -452,7 +463,11 @@ pub fn evict_to(dir: &Path, max_bytes: u64) -> usize {
 }
 
 /// Test helper / `%jit-cache-clear()` primitive backend. Walks the
-/// directory and deletes every `*.bc` / `*.json` pair.
+/// directory and deletes every `*.bc` / `*.json` pair. The `.json`
+/// extension covers all three sidecars produced by the cache pipeline
+/// today: Sprint 37's `<hex>.json` (LRU metadata), Sprint 38a's
+/// `<hex>.manifest.json` (reloc table), and Sprint 38f's
+/// `<hex>.registrations.json` (sema-side registration replay data).
 pub fn clear_cache_dir(dir: &Path) {
     let read = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -519,6 +534,16 @@ pub struct JitCacheStats {
 struct StatsInner {
     hits: u64,
     misses: u64,
+    /// Sprint 38f: incremented when the on-disk replay path
+    /// (`try_on_disk_replay` in `nod-sema`) successfully loaded a
+    /// cached bitcode + manifest + registration sidecar trio and
+    /// produced an `<eval-entry>` pointer.
+    disk_hits: u64,
+    /// Sprint 38f: incremented when the on-disk replay path attempted
+    /// a load but had to fall through to a cold compile because one
+    /// of the three sidecar files was missing, corrupt, or
+    /// ABI-incompatible.
+    disk_misses: u64,
 }
 
 static STATS: LazyLock<Mutex<StatsInner>> = LazyLock::new(|| Mutex::new(StatsInner::default()));
@@ -533,6 +558,39 @@ pub fn record_miss() {
     if let Ok(mut g) = STATS.lock() {
         g.misses += 1;
     }
+}
+
+/// Sprint 38f — incremented when the on-disk replay path
+/// (`nod_sema::try_on_disk_replay`) found bitcode + manifest +
+/// registration sidecar on disk, all three were ABI-compatible, and
+/// `Jit::add_module_from_bitcode` succeeded. Distinguishes from
+/// [`record_hit`] (in-process hot cache) so tests can assert the disk
+/// path actually fired rather than silently falling through.
+pub fn record_disk_hit() {
+    if let Ok(mut g) = STATS.lock() {
+        g.disk_hits += 1;
+    }
+}
+
+/// Sprint 38f — incremented when the on-disk replay path attempted a
+/// load (the in-process cache missed) but the sidecars were absent,
+/// corrupt, or version-incompatible. Cold compile path then runs.
+pub fn record_disk_miss() {
+    if let Ok(mut g) = STATS.lock() {
+        g.disk_misses += 1;
+    }
+}
+
+/// Sprint 38f — `(disk_hits, disk_misses)` snapshot for test
+/// assertions. Companion to [`read_stats`] which exposes
+/// hits/misses/on-disk-bytes/entries but predates the disk-hit
+/// counters. Kept separate so the public `JitCacheStats` struct shape
+/// stays stable.
+pub fn disk_cache_stats() -> (u64, u64) {
+    STATS
+        .lock()
+        .map(|g| (g.disk_hits, g.disk_misses))
+        .unwrap_or((0, 0))
 }
 
 pub fn reset_stats() {

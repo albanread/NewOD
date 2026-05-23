@@ -14,10 +14,10 @@ pub mod symbols;
 pub use cache::{
     CacheKey, JitCacheStats, JitReplayResult, NOD_RUNTIME_ABI_VERSION, OPT_LEVEL, ReplayFn,
     cache_entry_count, cache_key, cache_key_for_dfm, cache_max_bytes, cache_size_on_disk,
-    clear_cache_dir, default_cache_dir, evict_to, in_process_clear, in_process_contains,
-    in_process_get, in_process_insert, read_cache_entry, read_cache_entry_with_manifest,
-    read_stats, record_hit, record_miss, reset_stats, target_triple, write_cache_entry,
-    write_cache_entry_with_manifest,
+    clear_cache_dir, default_cache_dir, disk_cache_stats, evict_to, in_process_clear,
+    in_process_contains, in_process_get, in_process_insert, read_cache_entry,
+    read_cache_entry_with_manifest, read_stats, record_disk_hit, record_disk_miss, record_hit,
+    record_miss, reset_stats, target_triple, write_cache_entry, write_cache_entry_with_manifest,
 };
 pub use codegen::{
     CodegenError, CodegenOutput, FunctionMap, codegen_module, codegen_module_with_key,

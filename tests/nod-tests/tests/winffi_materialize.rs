@@ -39,6 +39,14 @@ fn setup() {
     nod_runtime::ensure_conditions_registered();
     nod_runtime::ensure_c_ffi_error_registered();
     nod_runtime::_reset_handler_stack_for_tests();
+    // Sprint 38f: the materialization tests measure sema-side counters
+    // (`materialized_lifetime`). The disk-replay path skips sema, so a
+    // leftover bitcode + sidecar trio from a prior run would short-
+    // circuit the materialization. Clear both the in-process and
+    // on-disk caches so each test reliably observes a cold compile.
+    nod_llvm::in_process_clear();
+    let dir = nod_llvm::default_cache_dir();
+    nod_llvm::clear_cache_dir(&dir);
 }
 
 // ─── 1. Headline: bare GetTickCount64 ─────────────────────────────────────

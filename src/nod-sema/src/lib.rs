@@ -20,6 +20,7 @@ mod bench;
 pub mod c3;
 mod lower;
 pub mod optimise;
+pub mod sidecar;
 pub mod stdlib;
 
 pub use bench::{BenchResult, DispatchProfile, bench_fixture, dispatch_profile};
@@ -243,6 +244,23 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     }
     nod_llvm::record_miss();
 
+    // Sprint 38f — try the on-disk replay path BEFORE running the cold
+    // compile pipeline. Cross-process scenario: the in-process table is
+    // empty in a fresh subprocess, but a previous run may have left
+    // bitcode + manifest + registration sidecar on disk. If all three
+    // are present and ABI-compatible, `add_module_from_bitcode` is
+    // ~10× faster than the full parse→lower→codegen→MCJIT pipeline.
+    //
+    // Returns `Ok(Some(result))` on hit, `Ok(None)` if any sidecar is
+    // missing / corrupt / version-incompatible (cold path then runs),
+    // or `Err(_)` on a hard JIT failure (verify error, MCJIT engine
+    // creation failure). The cold path doesn't retry on `Err` — a JIT
+    // failure here means the bitcode on disk is broken in a way the
+    // cold path would also hit.
+    if let Some(result) = try_on_disk_replay(cache_key)? {
+        return Ok(result);
+    }
+
     let mut sm = nod_reader::SourceMap::new();
     let file_id = sm
         .add("<eval>", wrapped.to_string())
@@ -309,6 +327,17 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     // the relocation table it needs to bind external globals.
     let dir = nod_llvm::default_cache_dir();
     nod_llvm::write_cache_entry_with_manifest(&dir, cache_key, &bitcode, &manifest);
+    // Sprint 38f — also persist the registration sidecar so a fresh
+    // subprocess's `try_on_disk_replay` has the data needed to wire up
+    // `register_methods` / `register_blocks` /
+    // `register_top_level_functions` without re-running the cold
+    // pipeline. (Stub-entry registration is implicit — the manifest
+    // already carries `RelocKind::StubEntry` entries, and
+    // `stub_entry_slot_addr` eagerly resolves `LoadLibrary` +
+    // `GetProcAddress` at JIT-link time.)
+    let (ty_tag, ty_payload) = encode_type_tag(return_type);
+    let regs = sidecar::RegistrationSidecar::from_lowered_module(&lm, ty_tag, ty_payload);
+    regs.write(&dir, cache_key);
     // Run LRU eviction once on each insert if we're over the cap.
     let cap = nod_llvm::cache_max_bytes();
     if nod_llvm::cache_size_on_disk(&dir) > cap {
@@ -318,7 +347,6 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     // Install the in-process replay closure. The closure captures the
     // function pointer (`usize` to satisfy `Send + Sync` — pointers
     // aren't `Send` but `usize` is) and the encoded return type.
-    let (ty_tag, ty_payload) = encode_type_tag(return_type);
     let ptr_usize = ptr as usize;
     nod_llvm::in_process_insert(
         cache_key,
@@ -330,6 +358,252 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     );
 
     Ok(call_and_format(ptr, return_type))
+}
+
+/// Sprint 38f — on-disk cross-process replay path. The headline of
+/// Sprint 38 was supposed to be ≥10× subprocess speedup; Sprint 38a–38e
+/// shipped the relocation infrastructure (manifest, slot allocators,
+/// `add_module_from_bitcode`) but `eval_wrapped_source` never read it
+/// back from disk. This function closes that loop.
+///
+/// Steps on a successful hit:
+///   1. Read `<key>.bc` + `<key>.json` (Sprint 37 sidecar) +
+///      `<key>.manifest.json` (Sprint 38a sidecar) via
+///      `read_cache_entry_with_manifest`.
+///   2. Read `<key>.registrations.json` (Sprint 38f sidecar) via
+///      `RegistrationSidecar::read`.
+///   3. Spawn a fresh leaked `Context` + `Jit`.
+///   4. Call `Jit::add_module_from_bitcode` — this parses bitcode,
+///      walks the manifest, and `LLVMAddGlobalMapping`s each named
+///      external global against a fresh current-process address (which
+///      lazily allocates / resolves Win32 stub entries through
+///      `nod_runtime::stub_entry_slot_addr`).
+///   5. Replay the three sema-side registrations (methods, blocks,
+///      top-level functions) using the persisted data. Stub-entry
+///      registration is **not** needed — Sprint 38d's slot allocator
+///      eagerly resolves `LoadLibrary` + `GetProcAddress` during
+///      `resolve_reloc_kind` (called from `add_module_from_bitcode`),
+///      so the post-codegen `initialize_module_winffi` is redundant on
+///      this path.
+///   6. Look up `<eval-entry>` by name in the JIT.
+///   7. Leak the `Jit` (matches the cold path's lifetime discipline —
+///      MCJIT engines are never disposed).
+///   8. Install the in-process replay closure so subsequent calls hit
+///      the Sprint 37 hot path.
+///   9. Increment `record_disk_hit` and return the formatted result.
+///
+/// Returns `Ok(None)` if any sidecar is missing, corrupt, or
+/// ABI-incompatible — the caller falls through to the cold compile
+/// pipeline (which will overwrite the sidecars with fresh ones).
+///
+/// Returns `Err(_)` only on a hard JIT failure (bitcode that fails
+/// `verify` after a round-trip, MCJIT engine creation failure, or a
+/// reloc whose kind requires data the manifest didn't carry). These
+/// are not recoverable by re-running the cold path — they indicate a
+/// genuine sidecar corruption, so we surface the error rather than
+/// silently masking it.
+fn try_on_disk_replay(cache_key: nod_llvm::CacheKey) -> Result<Option<String>, EvalError> {
+    let dir = nod_llvm::default_cache_dir();
+
+    // Read the bitcode + manifest sidecars. Missing/malformed → disk
+    // miss; cold path runs.
+    let (bitcode, _meta, manifest) =
+        match nod_llvm::read_cache_entry_with_manifest(&dir, cache_key) {
+            Some(t) => t,
+            None => {
+                nod_llvm::record_disk_miss();
+                return Ok(None);
+            }
+        };
+
+    // Read the registration sidecar; ABI mismatch → disk miss.
+    let regs = match sidecar::RegistrationSidecar::read(&dir, cache_key) {
+        Some(r) if r.is_abi_compatible() => r,
+        _ => {
+            nod_llvm::record_disk_miss();
+            return Ok(None);
+        }
+    };
+
+    // Spawn a fresh Context + Jit. Same leak discipline as the cold
+    // path: each disk-replay miss-to-hit transition leaks one
+    // Context + Jit pair so the in-process replay closure stays valid
+    // for the process lifetime.
+    let ctx_box: Box<Context> = Box::new(Context::create());
+    let ctx_ref: &'static Context = Box::leak(ctx_box);
+    let mut jit_box: Box<Jit<'static>> = Box::new(Jit::new(ctx_ref).map_err(EvalError::Jit)?);
+    jit_box
+        .add_module_from_bitcode(ctx_ref, &bitcode, "__eval__", &manifest)
+        .map_err(EvalError::Jit)?;
+
+    // Replay the three sema-side registrations. The fourth (winffi
+    // stub init) is redundant on this path — see the doc comment
+    // above.
+    replay_register_methods(&jit_box, &regs.methods)?;
+    replay_register_blocks(&jit_box, &regs.blocks)?;
+    replay_register_top_level_functions(&jit_box, &regs.functions)?;
+
+    // SAFETY: see `eval_wrapped_source` for the lifetime rationale.
+    let ptr = unsafe { jit_box.get_function_ptr("<eval-entry>") }
+        .ok_or_else(|| EvalError::NoEntry("<eval-entry>".into()))?;
+
+    // Leak the Jit (engines are leak-by-omission; matches cold path).
+    let jit_static: &'static Jit<'static> = Box::leak(jit_box);
+    let _ = jit_static;
+
+    // Install the in-process replay closure so subsequent calls in
+    // this process hit the Sprint 37 hot path. The closure captures
+    // the pointer as `usize` (raw pointers aren't `Send + Sync`).
+    let ptr_usize = ptr as usize;
+    let ty_tag = regs.return_type_tag;
+    let ty_payload = regs.return_type_payload;
+    nod_llvm::in_process_insert(
+        cache_key,
+        Box::new(move || nod_llvm::JitReplayResult {
+            eval_entry_ptr: ptr_usize,
+            return_type_tag: ty_tag,
+            return_type_payload: ty_payload,
+        }),
+    );
+
+    nod_llvm::record_disk_hit();
+    let return_type = decode_type_tag(ty_tag, ty_payload);
+    Ok(Some(call_and_format(ptr, return_type)))
+}
+
+/// Sprint 38f — registration replay for methods, paralleling
+/// [`register_methods`] but reading from a [`PersistedMethod`] slice
+/// (the data persisted on the cold path) instead of a
+/// [`MethodRegistration`] slice (only available with a live
+/// `LoweredModule`).
+fn replay_register_methods(
+    jit: &Jit<'_>,
+    methods: &[sidecar::PersistedMethod],
+) -> Result<(), EvalError> {
+    use nod_runtime::ClassId;
+    for m in methods {
+        let ptr = unsafe { jit.get_function_ptr(&m.body_fn_name) }.ok_or_else(|| {
+            EvalError::NoEntry(format!(
+                "method body `{}` not JIT'd (on-disk replay)",
+                m.body_fn_name
+            ))
+        })?;
+        let specialisers: Vec<ClassId> =
+            m.specialisers.iter().copied().map(ClassId).collect();
+        // SAFETY: ptr is the live JIT'd address; specialisers came
+        // from the persisted sidecar that the cold-compile path wrote
+        // from the same module. Same contract as `register_methods`.
+        unsafe {
+            nod_runtime::add_method_named(
+                &m.generic_name,
+                specialisers,
+                ptr as *const u8,
+                m.param_count as usize,
+                &m.body_fn_name,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Sprint 38f — registration replay for blocks. Mirrors
+/// [`register_blocks`] but consumes a [`PersistedBlock`] slice. The
+/// class-name leak pattern matches the cold path (those names live
+/// for the process lifetime; the runtime stores raw pointers into
+/// them).
+fn replay_register_blocks(
+    jit: &Jit<'_>,
+    blocks: &[sidecar::PersistedBlock],
+) -> Result<(), EvalError> {
+    use nod_runtime::ClassId;
+    for b in blocks {
+        let body = unsafe { jit.get_function_ptr(&b.body_fn_name) }.ok_or_else(|| {
+            EvalError::NoEntry(format!(
+                "block body `{}` not JIT'd (on-disk replay)",
+                b.body_fn_name
+            ))
+        })?;
+        let cleanup = match &b.cleanup_fn_name {
+            Some(n) => Some(
+                unsafe { jit.get_function_ptr(n) }
+                    .ok_or_else(|| {
+                        EvalError::NoEntry(format!(
+                            "block cleanup `{n}` not JIT'd (on-disk replay)"
+                        ))
+                    })? as *const u8,
+            ),
+            None => None,
+        };
+        let afterwards = match &b.afterwards_fn_name {
+            Some(n) => Some(
+                unsafe { jit.get_function_ptr(n) }
+                    .ok_or_else(|| {
+                        EvalError::NoEntry(format!(
+                            "block afterwards `{n}` not JIT'd (on-disk replay)"
+                        ))
+                    })? as *const u8,
+            ),
+            None => None,
+        };
+        let handlers: Vec<nod_runtime::HandlerFn> = b
+            .handlers
+            .iter()
+            .map(|h| {
+                let p = unsafe { jit.get_function_ptr(&h.body_fn_name) }.ok_or_else(|| {
+                    EvalError::NoEntry(format!(
+                        "block handler `{}` not JIT'd (on-disk replay)",
+                        h.body_fn_name
+                    ))
+                })?;
+                let pinned: &'static str = Box::leak(h.class_name.clone().into_boxed_str());
+                Ok(nod_runtime::HandlerFn {
+                    class_id: ClassId(h.class_id),
+                    class_name_ptr: pinned.as_ptr(),
+                    class_name_len: pinned.len(),
+                    body: p as *const u8,
+                })
+            })
+            .collect::<Result<_, EvalError>>()?;
+        let handlers_static: &'static [nod_runtime::HandlerFn] =
+            Box::leak(handlers.into_boxed_slice());
+        nod_runtime::register_block_fns(
+            b.block_id,
+            nod_runtime::BlockFns {
+                body: body as *const u8,
+                cleanup,
+                afterwards,
+                handlers: handlers_static,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Sprint 38f — registration replay for top-level functions. Mirrors
+/// [`register_top_level_functions`] but consumes a
+/// [`PersistedFunction`] slice. The cold path already filtered out
+/// block-form thunks and `<eval-entry>` before persisting, so this
+/// just walks every entry and registers it under the persisted
+/// (source-) arity.
+fn replay_register_top_level_functions(
+    jit: &Jit<'_>,
+    functions: &[sidecar::PersistedFunction],
+) -> Result<(), EvalError> {
+    for f in functions {
+        let ptr = unsafe { jit.get_function_ptr(&f.name) }.ok_or_else(|| {
+            EvalError::NoEntry(format!(
+                "top-level function `{}` not JIT'd (on-disk replay)",
+                f.name
+            ))
+        })?;
+        // SAFETY: ptr is JIT-emitted; the arity matches the cold
+        // path's registration arity (closures: source arity; non-
+        // closures: params.len()).
+        unsafe {
+            nod_runtime::register_jit_function(&f.name, f.source_arity as usize, ptr as *const u8);
+        }
+    }
+    Ok(())
 }
 
 /// Sprint 37 — encode a `TypeEstimate` as a `(u32, u64)` pair that
