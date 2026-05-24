@@ -939,68 +939,85 @@ fn merge_stdlib_into_user_module(lm: &mut LoweredModule) {
         // crash, so we don't panic here.
         return;
     };
+    merge_modules(lm, stdlib_lm);
+}
+
+/// Sprint 44 Phase A — generalised module-merge.
+///
+/// Concatenate `from` into `into`, with `into` winning every
+/// collision. Originally extracted from `merge_stdlib_into_user_module`
+/// so the same primitive can be reused by Sprint 44's multi-file
+/// `compile_files_for_aot` path: it merges N per-file `LoweredModule`s
+/// pairwise into one combined user module before the stdlib is layered
+/// on top.
+///
+/// **Collision policy: "into" always wins.** When `from` carries a
+/// function or method whose `name` / `body_fn_name` is already present
+/// in `into`, the `from` entry is silently skipped. This matches the
+/// established stdlib-merge semantics ("user wins over stdlib") and
+/// keeps codegen from emitting duplicate LLVM definitions. Callers
+/// that need *error*-on-collision (e.g. detecting two user files
+/// defining the same function) must walk the inputs themselves before
+/// calling this — `compile_files_for_aot` does exactly that.
+///
+/// **Per-section semantics** (unchanged from the stdlib-only era):
+/// * **functions** — dedup on `name`; "into" wins.
+/// * **methods** — dedup on `body_fn_name`; "into" wins.
+/// * **blocks** — concatenate (block IDs are runtime-allocated and
+///   process-unique, so collisions are structurally impossible).
+/// * **closures** — extend `by_lifted_name` and
+///   `cell_locals_per_function` with `or_insert_with` (first writer
+///   wins; since "into" was populated first, that means "into" wins).
+/// * **user_classes** — Sprint 40a: prepend `from`'s classes ahead of
+///   `into`'s so the EXE-side `nod_aot_register_user_class` call
+///   sequence matches the JIT path's ClassId allocation order. For
+///   the stdlib case `from` is the stdlib (registered first in the
+///   JIT) and `into` is the user; for user-vs-user merges in
+///   `compile_files_for_aot`, the function is called in source-file
+///   order so the per-file classes interleave consistently with the
+///   driver's input order.
+pub(crate) fn merge_modules(into: &mut LoweredModule, from: &LoweredModule) {
     use std::collections::HashSet;
-    let user_fn_names: HashSet<String> =
-        lm.functions.iter().map(|f| f.name.clone()).collect();
-    for f in &stdlib_lm.functions {
-        if user_fn_names.contains(&f.name) {
-            // User overrides stdlib — skip the stdlib copy so codegen
-            // doesn't emit a duplicate LLVM function definition.
+    let existing_fn_names: HashSet<String> =
+        into.functions.iter().map(|f| f.name.clone()).collect();
+    for f in &from.functions {
+        if existing_fn_names.contains(&f.name) {
             continue;
         }
-        lm.functions.push(f.clone());
+        into.functions.push(f.clone());
     }
-    // Methods: dedup on `body_fn_name`. The stdlib's `define method`
-    // bodies have predictable names (`{generic}${specialisers}`); if
-    // the user happens to redefine the exact same method body the
-    // user's copy wins.
-    let user_method_bodies: HashSet<String> =
-        lm.methods.iter().map(|m| m.body_fn_name.clone()).collect();
-    for m in &stdlib_lm.methods {
-        if user_method_bodies.contains(&m.body_fn_name) {
+    let existing_method_bodies: HashSet<String> = into
+        .methods
+        .iter()
+        .map(|m| m.body_fn_name.clone())
+        .collect();
+    for m in &from.methods {
+        if existing_method_bodies.contains(&m.body_fn_name) {
             continue;
         }
-        lm.methods.push(m.clone());
+        into.methods.push(m.clone());
     }
-    // Blocks: ids are runtime-allocated so always unique. Just
-    // concatenate.
-    for b in &stdlib_lm.blocks {
-        lm.blocks.push(b.clone());
+    for b in &from.blocks {
+        into.blocks.push(b.clone());
     }
-    // Closures: extend the closure registry with stdlib's entries.
-    // The lifter names lifted thunks with monotonically-allocated
-    // numeric suffixes (`__anon-method-NNNN`); the stdlib's load
-    // pass runs before the user's, so stdlib closures occupy a lower
-    // numeric range. Cross-contamination is structurally impossible.
-    for (k, v) in &stdlib_lm.closures.by_lifted_name {
-        lm.closures
+    for (k, v) in &from.closures.by_lifted_name {
+        into.closures
             .by_lifted_name
             .entry(k.clone())
             .or_insert_with(|| v.clone());
     }
-    for (k, v) in &stdlib_lm.closures.cell_locals_per_function {
-        lm.closures
+    for (k, v) in &from.closures.cell_locals_per_function {
+        into.closures
             .cell_locals_per_function
             .entry(k.clone())
             .or_insert_with(|| v.clone());
     }
-    // Sprint 40a — user classes. The current stdlib doesn't define
-    // any (every built-in class is registered by `nod_runtime_init`'s
-    // `ensure_*_registered` seeds), but a future stdlib that uses
-    // `define class` would surface its entries here. Prepend stdlib
-    // classes ahead of the user's so the registration sequence in the
-    // EXE matches the JIT path's: stdlib loader registered its classes
-    // first, allocating the lowest user ClassIds; the user's classes
-    // followed. The EXE-side `nod_aot_resolve_relocs` walks
-    // `lm.user_classes` in order, calling `nod_aot_register_user_class`
-    // for each — preserving that order keeps the freshly-allocated
-    // `ClassId`s in lockstep with what the compiler observed.
-    if !stdlib_lm.user_classes.is_empty() {
+    if !from.user_classes.is_empty() {
         let mut merged: Vec<UserClassRegistration> =
-            Vec::with_capacity(stdlib_lm.user_classes.len() + lm.user_classes.len());
-        merged.extend(stdlib_lm.user_classes.iter().cloned());
-        merged.append(&mut lm.user_classes);
-        lm.user_classes = merged;
+            Vec::with_capacity(from.user_classes.len() + into.user_classes.len());
+        merged.extend(from.user_classes.iter().cloned());
+        merged.append(&mut into.user_classes);
+        into.user_classes = merged;
     }
 }
 
