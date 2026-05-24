@@ -345,6 +345,7 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%dwrite-create-text-format", "nod_dwrite_create_text_format", 4, TypeEstimate::Integer),
     ("%dwrite-create-text-layout", "nod_dwrite_create_text_layout", 5, TypeEstimate::Integer),
     ("%dwrite-get-layout-metrics", "nod_dwrite_get_layout_metrics", 1, TypeEstimate::Integer),
+    ("%dwrite-hit-test-position", "nod_dwrite_hit_test_text_position", 3, TypeEstimate::Integer),
     ("%count-non-zero-red", "nod_count_non_zero_red", 4, TypeEstimate::Integer),
     // Sprint 36 — HWND-bound swap chain + IDE-shell window-class primitives.
     // All return fixnum-tagged handles, atoms, or HRESULT-encoded results;

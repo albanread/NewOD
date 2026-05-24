@@ -1095,6 +1095,58 @@ pub unsafe extern "C-unwind" fn nod_dwrite_get_layout_metrics(layout_handle: u64
     tag((h << 32) | (w & 0xFFFF_FFFF))
 }
 
+/// JIT-callable: convert a text-position offset into pixel coordinates
+/// inside the layout box. Wraps `IDWriteTextLayout::HitTestTextPosition`.
+///
+/// Inputs:
+///   * `layout_handle` — a DWriteTextLayout handle.
+///   * `text_position` — UTF-16 code-unit offset into the layout's text.
+///     For ASCII-only buffers this is also the byte offset.
+///   * `is_trailing_x10` — 0 for the leading edge of the character at
+///     `text_position` (i.e. cursor BEFORE that character), non-zero
+///     for the trailing edge (cursor AFTER). The naming `_x10` is a
+///     parity tag — we untag with `untag()` like any other small int.
+///
+/// Returns: a packed u64 with `y_pixels` in the high 32 bits and
+/// `x_pixels` in the low 32 bits, each rounded to integer pixels.
+/// Coordinates are relative to the layout origin (0,0 = top-left of
+/// the box passed to `nod_d2d_draw_text_layout`). Returns 0 if the
+/// layout handle is invalid.
+///
+/// This is the canonical "text offset → pixel position" primitive for
+/// the IDE — cursor draw uses it, and the click-positioning sprint
+/// (43e-5) will use its inverse, `HitTestPoint`.
+///
+/// # Safety
+/// `layout_handle` must be a valid DWriteTextLayout.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_hit_test_text_position(
+    layout_handle: u64,
+    text_position: u64,
+    is_trailing_x10: u64,
+) -> u64 {
+    let Some(layout) = get_dwrite_text_layout(layout_handle) else {
+        return 0;
+    };
+    let pos = untag(text_position) as u32;
+    let is_trailing = windows::Win32::Foundation::BOOL::from(untag(is_trailing_x10) != 0);
+    let mut point_x: f32 = 0.0;
+    let mut point_y: f32 = 0.0;
+    let mut metrics =
+        windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS::default();
+    // SAFETY: layout valid; out-params on the stack.
+    if unsafe {
+        layout.HitTestTextPosition(pos, is_trailing, &mut point_x, &mut point_y, &mut metrics)
+    }
+    .is_err()
+    {
+        return 0;
+    }
+    let x = point_x.round() as i32 as u32 as u64;
+    let y = point_y.round() as i32 as u32 as u64;
+    tag((y << 32) | (x & 0xFFFF_FFFF))
+}
+
 // ─── Phase E — drawing primitives ────────────────────────────────────────
 
 /// JIT-callable: create a solid-color brush. RGBA channels are

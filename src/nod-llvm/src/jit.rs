@@ -72,6 +72,7 @@ use crate::codegen::{
     NOD_D2D_DRAW_RECTANGLE_SYMBOL, NOD_D2D_FILL_RECTANGLE_SYMBOL,
     NOD_DWRITE_CREATE_FACTORY_SYMBOL, NOD_DWRITE_CREATE_TEXT_FORMAT_SYMBOL,
     NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL, NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL,
+    NOD_DWRITE_HIT_TEST_TEXT_POSITION_SYMBOL,
     NOD_COUNT_NON_ZERO_RED_SYMBOL,
     // Sprint 36 — IDE-shell symbols.
     NOD_DXGI_FACTORY_FROM_D3D_DEVICE_SYMBOL,
@@ -594,6 +595,8 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_dwrite_create_text_layout as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL),
              nod_runtime::nod_dwrite_get_layout_metrics as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_DWRITE_HIT_TEST_TEXT_POSITION_SYMBOL),
+             nod_runtime::nod_dwrite_hit_test_text_position as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_COUNT_NON_ZERO_RED_SYMBOL),
              nod_runtime::nod_count_non_zero_red as *const () as *mut std::ffi::c_void),
             // Sprint 36 — HWND-bound swap chain + IDE-shell window

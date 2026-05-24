@@ -134,6 +134,7 @@ pub use com_shim::{
     nod_d3d11_last_mapped_row_pitch, nod_d3d11_last_staging_handle, nod_d3d11_unmap,
     nod_def_window_proc, nod_destroy_window, nod_dwrite_create_factory, nod_dwrite_create_text_format,
     nod_dwrite_create_text_layout, nod_dwrite_get_layout_metrics,
+    nod_dwrite_hit_test_text_position,
     nod_dxgi_create_factory, nod_dxgi_create_surface_from_texture,
     nod_dxgi_create_swap_chain_for_hwnd, nod_dxgi_device_from_d3d_device,
     nod_dxgi_factory_from_d3d_device, nod_dxgi_swap_chain_present,
@@ -155,8 +156,9 @@ pub use com_shim::{
 pub use callbacks::{
     CallbackSignature, POOL_SIZE as CALLBACK_POOL_SIZE, RegisterError as CallbackRegisterError,
     _occupied_count as _callback_occupied_count_for_tests,
-    _reset_callbacks_for_tests, nod_register_wndenumproc, nod_register_wndproc,
-    register_callback, slot_address as callback_slot_address,
+    _reset_callbacks_for_tests, callback_tenure_mode_enabled, nod_register_wndenumproc,
+    nod_register_wndproc, register_callback, set_callback_tenure_mode,
+    slot_address as callback_slot_address,
 };
 pub use conditions::{
     BlockFns, HandlerFn, HandlerFrame, MAX_BLOCK_CAPTURED, NlxPayload, _reset_block_registry_for_tests,

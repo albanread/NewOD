@@ -41,9 +41,36 @@
 //! later-sprint territory.
 
 use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::word::Word;
+
+/// Sprint 11d — runtime gate for the "tenure the closure graph at
+/// register_callback time" workaround. See `register_callback`'s doc
+/// for the rationale.
+///
+/// Default: `false`. The AOT wrapper (`aot::nod_aot_main_wrapper`)
+/// sets it to `true` at startup so production EXEs get the workaround.
+/// JIT-eval test paths leave it `false`, which keeps `collect_full`
+/// out of `register_callback` and avoids disturbing un-rooted JIT
+/// intermediate state held by the test harness across the call.
+///
+/// Set explicitly via [`set_callback_tenure_mode`].
+static CALLBACK_TENURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn the Sprint 11d "tenure on register_callback" workaround on or
+/// off at runtime. Called by `nod_aot_main_wrapper` at AOT process
+/// startup; JIT-eval setups leave it off.
+pub fn set_callback_tenure_mode(on: bool) {
+    CALLBACK_TENURE_ENABLED.store(on, Ordering::SeqCst);
+}
+
+/// True iff the Sprint 11d workaround is currently active. Inspectable
+/// for diagnostics and tests.
+pub fn callback_tenure_mode_enabled() -> bool {
+    CALLBACK_TENURE_ENABLED.load(Ordering::SeqCst)
+}
 
 // Per-thread "have I installed GC roots for this thread's
 // `ROOT_STACK`?" guards. Sprint 11c's root stack is thread-local, so
@@ -537,19 +564,36 @@ pub fn register_callback(
         // graph to Tenured so the suspected JIT-body root-bracketing
         // bug can't reclaim its env between minor cycles.
         //
-        // **Skipped under `cfg(test)`** — nod-runtime's own unit-test
-        // binary runs many tests in parallel that share the global
-        // `LITERAL_POOL` heap and hold un-rooted Word locals across
-        // operations. Driving `collect_full` from a concurrently-running
-        // serial callbacks test (`wndproc_synthetic_dispatch`, etc.)
-        // relocates the parallel test's targets and panics it. The
-        // workaround is still applied for integration tests (separate
-        // binary, no shared state) and AOT EXEs (production target).
-        // The callback-tests in this same binary don't actually need
-        // tenuring — they use Rust function pointers as the closure
-        // body, so the suspected JIT-body root bug never fires.
-        #[cfg(not(test))]
-        crate::collect_full();
+        // **Runtime-gated on `CALLBACK_TENURE_ENABLED`.** The AOT
+        // wrapper (`nod_aot_main_wrapper`) flips this on at process
+        // startup so production EXEs get the workaround. JIT-eval
+        // paths (the `eval_expr_to_string` test harness, the
+        // `nod-runtime --lib` parallel unit tests, the `ide_shell_*`
+        // integration tests) leave it off. Rationale:
+        //
+        //   * In an AOT-built IDE, by the time `register_callback`
+        //     runs, all live Words are precisely tracked: cells the
+        //     WNDPROC captures are reachable through the closure
+        //     itself, the closure is reachable through the registry
+        //     slot we just wrote, and Sprint 11b's spill-to-runtime
+        //     slots protect every live Word in JIT frames currently
+        //     on the stack. `collect_full` runs cleanly.
+        //
+        //   * In a JIT-eval test harness, intermediate values the
+        //     evaluator built while assembling the test's `let` chain
+        //     may live in non-registered slots that 11b's
+        //     populate-roots pass didn't see (the harness pulls Words
+        //     in and out of its own scaffolding). `collect_full`
+        //     evacuates those values' targets, leaves the harness
+        //     pointing at recycled memory, and the test
+        //     STATUS_ACCESS_VIOLATIONs the next time it dereferences.
+        //
+        // The gate matches the operative distinction: "are we running
+        // as a Dylan EXE that owns its process" vs "are we a JIT
+        // eval embedded in a Rust test harness".
+        if callback_tenure_mode_enabled() {
+            crate::collect_full();
+        }
 
         Ok(slot_id_local)
     }

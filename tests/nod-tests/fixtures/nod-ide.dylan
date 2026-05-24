@@ -844,36 +844,31 @@ define function main () => ()
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
                  %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
-                 // Sprint 43e-1 — visible cursor. Walk cached-flat up
-                 // to cursor-offset, tracking (line, col) per newline.
-                 // Then draw a 2px-wide vertical bar one line-height
-                 // tall at the cursor's pixel position, on top of the
-                 // already-drawn text. Same brush as the text (black)
-                 // for now; a separate accent-colour brush is a later
-                 // polish item.
+                 // Sprint 43e-1 (revised) — visible cursor via
+                 // DirectWrite hit-testing. Ask the text layout we
+                 // just drew where the cursor offset lives in pixels;
+                 // this is exact, no matter the font / size / kerning.
                  //
-                 // Walk style: plain `let`-bound mutable accumulators
-                 // (`line`, `col`, `i`). They aren't captured by any
-                 // inner closure, so Sprint 24's auto-cell-promotion
-                 // leaves them as plain SSA temps — no per-frame
-                 // allocation, no GC pressure from the cursor draw.
+                 // %dwrite-hit-test-position returns a packed u64 with
+                 // y-pixels in the high 32 bits and x-pixels in the
+                 // low 32 bits, relative to the layout origin (which
+                 // we passed as `pad - scroll-x-px, pad - scroll-y-px`
+                 // above). Trailing-edge flag = 0 → leading edge of
+                 // the character AT cursor-offset, i.e. cursor BEFORE
+                 // that character. cursor-offset clamped to flat-len
+                 // so an EOF cursor still hit-tests cleanly.
                  let cur-off = cursor-offset;
                  let flat-len = size(cached-flat);
-                 let cap = if (cur-off < flat-len) cur-off else flat-len end;
-                 let line = 0;
-                 let col = 0;
-                 let i = 0;
-                 until (i = cap)
-                   if (element(cached-flat, i) = 10)  // '\n'
-                     line := line + 1;
-                     col := 0;
-                   else
-                     col := col + 1;
-                   end;
-                   i := i + 1;
-                 end;
-                 let cx = pad + col * char-width - scroll-x-px;
-                 let cy = pad + line * line-height - scroll-y-px;
+                 let hit-pos = if (cur-off < flat-len) cur-off else flat-len end;
+                 let packed = %dwrite-hit-test-position(layout, hit-pos, 0);
+                 // Bit 31 might be set in the low 32 bits for large x;
+                 // we'll mask defensively. Use mod by 2^32 for the low
+                 // half and integer div for the high half.
+                 let two-to-32 = 4294967296;
+                 let hx = packed - (packed / two-to-32) * two-to-32;
+                 let hy = packed / two-to-32;
+                 let cx = pad - scroll-x-px + hx;
+                 let cy = pad - scroll-y-px + hy;
                  %d2d-fill-rectangle(dc, cx, cy, cx + 2, cy + line-height, brush);
                  %d2d-end-draw(dc);
                  %com-release(brush);

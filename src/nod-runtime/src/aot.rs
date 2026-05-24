@@ -774,6 +774,11 @@ unsafe extern "C-unwind" {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn nod_aot_main_wrapper() -> i32 {
     nod_runtime_init();
+    // Sprint 11d: enable the "tenure the callback graph at
+    // register_callback time" workaround for production EXEs. JIT
+    // eval paths leave this off because they have un-rooted
+    // intermediate harness state across the call.
+    crate::callbacks::set_callback_tenure_mode(true);
     // SAFETY: `nod_user_main` is link-time-resolved from the user's
     // `.obj` produced by `nod-llvm::aot::emit_object_file`. The AOT
     // post-processing pass guarantees a symbol of that exact name + the
