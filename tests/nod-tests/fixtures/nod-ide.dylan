@@ -1393,38 +1393,32 @@ define function main () => ()
                  // generation and tripped GcStallError::mid_evac_oom.
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
-                 // Sprint 43f-3 / 43f-4 — viewport-bounded syntax-
-                 // colouring scan with a SYNTACTICALLY SAFE start point.
+                 // Sprint 43f-5 — colour the WHOLE buffer, let DirectWrite
+                 // clip rendering to the visible region.
                  //
-                 // Earlier 43f-3 used a fixed overscan above the
-                 // viewport; that broke when a /* block comment */
-                 // started more than `overscan` lines above and the
-                 // tokeniser began mid-comment, colouring the visible
-                 // text as code. The symptom was syntax colours
-                 // changing as the user scrolled.
+                 // 43f-3 (fixed overscan) and 43f-4 (scan back to the
+                 // previous `define ...`) both tried to bound the
+                 // tokeniser to the visible region for performance.
+                 // Both produced visible artefacts at scroll boundaries:
+                 // 43f-3 mis-coloured when block comments spanned more
+                 // than `overscan` lines above the viewport; 43f-4
+                 // mis-coloured when editing non-Dylan files (Rust,
+                 // markdown, anything without a column-0 `define `).
                  //
-                 // 43f-4 finds a safe start by walking backwards from
-                 // the first visible line to the previous top-level
-                 // `define ...` line. Between two top-level Dylan
-                 // forms the tokeniser state is known-clean (no open
-                 // comment, no open string), so seeding the scan
-                 // there gives correct colouring regardless of scroll
-                 // position. A small overscan past the visible
-                 // bottom handles tokens that start visible and
-                 // extend below the viewport.
-                 let overscan-lines = 10;
-                 let first-visible-line = scroll-y-px / line-height;
-                 let lines-on-screen = viewport-height-px / line-height + 1;
-                 let total-lines = buffer-lines;
-                 let scan-last-line-uncapped = first-visible-line + lines-on-screen + overscan-lines;
-                 let scan-last-line = if (scan-last-line-uncapped < total-lines)
-                                        scan-last-line-uncapped
-                                      else total-lines end;
-                 let flat-len = size(cached-flat);
-                 let scan-start = find-safe-scan-start(cached-flat, source-text, first-visible-line);
-                 let scan-end = if (scan-last-line >= total-lines)
-                                  flat-len
-                                else rope-line-to-offset(source-text, scan-last-line) end;
+                 // The robust shape, per the user's instinct: think of
+                 // the window as a VIEW into a backing buffer that's
+                 // wholly tokenised. Per-paint cost on IDE-sized files
+                 // (~30 KB) is sub-millisecond; on much larger files
+                 // we can revisit with a per-line tokeniser-state cache
+                 // (compute on edit, lookup on paint).
+                 //
+                 // SetDrawingEffect calls for off-screen ranges store
+                 // metadata in the layout without painting; DirectWrite
+                 // clips the actual glyph rendering to the layout box
+                 // intersected with the render target — so the GPU
+                 // work is still bounded by the viewport.
+                 let scan-start = 0;
+                 let scan-end = size(cached-flat);
                  highlight-dylan-syntax(layout, cached-flat,
                                         scan-start, scan-end,
                                         keyword-brush, comment-brush,
