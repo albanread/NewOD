@@ -1076,8 +1076,11 @@ define function main () => ()
                  let cx = pad - scroll-x-px + hx;
                  let cy = pad - scroll-y-px + hy;
                  // Sprint 43e-6 — blink: only draw when cursor-on = 1.
+                 // Bar is 3px wide (was 2px) for visibility — at 1Hz
+                 // blink the eye latches the off-state better with a
+                 // slightly thicker beam.
                  if (cursor-on = 1)
-                   %d2d-fill-rectangle(dc, cx, cy, cx + 2, cy + line-height, brush);
+                   %d2d-fill-rectangle(dc, cx, cy, cx + 3, cy + line-height, brush);
                  else 0 end;
                  %d2d-end-draw(dc);
                  %com-release(brush);
@@ -1086,12 +1089,18 @@ define function main () => ()
                else 0 end;
                0
              elseif (msg = 275)  // WM_TIMER — Sprint 43e-6 cursor blink
-               // We start a 500 ms timer at window-create time
-               // (SetTimer in main()). Each tick toggles cursor-on
-               // and invalidates the window so the next WM_PAINT
-               // either draws the cursor bar (cursor-on = 1) or
-               // skips it (cursor-on = 0).
-               cursor-on := if (cursor-on = 1) 0 else 1 end;
+               // Toggle the blink state. Phrased as explicit if /
+               // else := 0 / := 1 (rather than `cursor-on := if (...)
+               // 0 else 1 end`) because the latter occasionally
+               // didn't visibly blink during testing — possibly a
+               // Dylan-side eval quirk, possibly just hard to see at
+               // 500ms with a 2px bar. This form makes the toggle
+               // unambiguous from the compiler's POV.
+               if (cursor-on = 1)
+                 cursor-on := 0;
+               else
+                 cursor-on := 1;
+               end;
                InvalidateRect(hwnd, 0, 0);
                0
              elseif (msg = 5)  // WM_SIZE
