@@ -290,6 +290,7 @@ pub const NOD_DWRITE_CREATE_TEXT_LAYOUT_SYMBOL: &str = "nod_dwrite_create_text_l
 pub const NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL: &str = "nod_dwrite_get_layout_metrics";
 pub const NOD_DWRITE_HIT_TEST_TEXT_POSITION_SYMBOL: &str = "nod_dwrite_hit_test_text_position";
 pub const NOD_DWRITE_HIT_TEST_POINT_SYMBOL: &str = "nod_dwrite_hit_test_point";
+pub const NOD_DWRITE_SET_DRAWING_EFFECT_SYMBOL: &str = "nod_dwrite_set_drawing_effect";
 pub const NOD_COUNT_NON_ZERO_RED_SYMBOL: &str = "nod_count_non_zero_red";
 
 // ─── Sprint 36 — HWND-bound swap chain + IDE-shell window plumbing ────────
@@ -507,6 +508,7 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_dwrite_get_layout_metrics", NOD_DWRITE_GET_LAYOUT_METRICS_SYMBOL, 1),
     ("nod_dwrite_hit_test_text_position", NOD_DWRITE_HIT_TEST_TEXT_POSITION_SYMBOL, 3),
     ("nod_dwrite_hit_test_point", NOD_DWRITE_HIT_TEST_POINT_SYMBOL, 3),
+    ("nod_dwrite_set_drawing_effect", NOD_DWRITE_SET_DRAWING_EFFECT_SYMBOL, 4),
     ("nod_count_non_zero_red", NOD_COUNT_NON_ZERO_RED_SYMBOL, 4),
     // Sprint 36 — HWND-bound swap chain + window-class registration helpers.
     // All fixnum in / fixnum out; see com_shim.rs for the C-ABI shapes.

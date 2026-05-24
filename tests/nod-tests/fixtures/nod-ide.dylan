@@ -824,6 +824,146 @@ define function move-cursor-vertical
   end
 end function;
 
+// ─── Sprint 43f-1 — syntax-colouring helpers ─────────────────────────────
+//
+// Walk a byte-string buffer looking for runs of Dylan identifier
+// characters. For each run, check against a hand-rolled keyword list.
+// If a match, ask DirectWrite to apply the keyword brush to that text
+// range via SetDrawingEffect.
+//
+// Identifier characters (Dylan's actual set is broader; this is the
+// usable subset for keyword detection):
+//   start:    [a-zA-Z]
+//   continue: [a-zA-Z0-9_-?!]
+//
+// All operands of `|` here are pure byte-comparisons, so the eager-|
+// compiler bug (task #251) doesn't bite.
+
+define function is-ident-start? (b :: <integer>) => (yes? :: <boolean>)
+  // ASCII A..Z (65..90) or a..z (97..122).
+  (b >= 65 & b <= 90) | (b >= 97 & b <= 122)
+end function;
+
+define function is-ident-cont? (b :: <integer>) => (yes? :: <boolean>)
+  // ident-start chars + digits 0..9 (48..57) + '-' (45) + '_' (95)
+  // + '?' (63) + '!' (33).
+  is-ident-start?(b) | (b >= 48 & b <= 57) | (b = 45) | (b = 95)
+    | (b = 63) | (b = 33)
+end function;
+
+define function bytes-equal-string?
+    (bytes :: <byte-string>, start :: <integer>, limit :: <integer>,
+     kw :: <byte-string>) => (eq? :: <boolean>)
+  let len = limit - start;
+  if (len ~= size(kw))
+    #f
+  else
+    // Sentinel-loop comparison; can't use a `|`-shortcircuit `until`
+    // condition because of the eager-| compiler bug. See task #251.
+    let i = 0;
+    let ok = #t;
+    let done = #f;
+    until (done)
+      if (i = len)
+        done := #t;
+      elseif (element(bytes, start + i) ~= element(kw, i))
+        ok := #f;
+        done := #t;
+      else
+        i := i + 1;
+      end;
+    end;
+    ok
+  end
+end function;
+
+define function is-dylan-keyword?
+    (bytes :: <byte-string>, start :: <integer>, limit :: <integer>)
+ => (kw? :: <boolean>)
+  let len = limit - start;
+  if (len = 2)
+    bytes-equal-string?(bytes, start, limit, "if")
+      | bytes-equal-string?(bytes, start, limit, "or")
+  elseif (len = 3)
+    bytes-equal-string?(bytes, start, limit, "end")
+      | bytes-equal-string?(bytes, start, limit, "let")
+      | bytes-equal-string?(bytes, start, limit, "for")
+      | bytes-equal-string?(bytes, start, limit, "and")
+      | bytes-equal-string?(bytes, start, limit, "not")
+      | bytes-equal-string?(bytes, start, limit, "use")
+  elseif (len = 4)
+    bytes-equal-string?(bytes, start, limit, "else")
+      | bytes-equal-string?(bytes, start, limit, "when")
+      | bytes-equal-string?(bytes, start, limit, "case")
+      | bytes-equal-string?(bytes, start, limit, "slot")
+      | bytes-equal-string?(bytes, start, limit, "from")
+      | bytes-equal-string?(bytes, start, limit, "make")
+  elseif (len = 5)
+    bytes-equal-string?(bytes, start, limit, "while")
+      | bytes-equal-string?(bytes, start, limit, "until")
+      | bytes-equal-string?(bytes, start, limit, "begin")
+      | bytes-equal-string?(bytes, start, limit, "local")
+      | bytes-equal-string?(bytes, start, limit, "block")
+      | bytes-equal-string?(bytes, start, limit, "macro")
+      | bytes-equal-string?(bytes, start, limit, "class")
+  elseif (len = 6)
+    bytes-equal-string?(bytes, start, limit, "define")
+      | bytes-equal-string?(bytes, start, limit, "method")
+      | bytes-equal-string?(bytes, start, limit, "select")
+      | bytes-equal-string?(bytes, start, limit, "elseif")
+      | bytes-equal-string?(bytes, start, limit, "unless")
+      | bytes-equal-string?(bytes, start, limit, "export")
+      | bytes-equal-string?(bytes, start, limit, "module")
+      | bytes-equal-string?(bytes, start, limit, "signal")
+      | bytes-equal-string?(bytes, start, limit, "return")
+  elseif (len = 7)
+    bytes-equal-string?(bytes, start, limit, "library")
+      | bytes-equal-string?(bytes, start, limit, "cleanup")
+      | bytes-equal-string?(bytes, start, limit, "finally")
+      | bytes-equal-string?(bytes, start, limit, "generic")
+      | bytes-equal-string?(bytes, start, limit, "keyword")
+  elseif (len = 8)
+    bytes-equal-string?(bytes, start, limit, "constant")
+      | bytes-equal-string?(bytes, start, limit, "function")
+      | bytes-equal-string?(bytes, start, limit, "variable")
+  elseif (len = 9)
+    bytes-equal-string?(bytes, start, limit, "otherwise")
+  else
+    #f
+  end
+end function;
+
+define function highlight-dylan-keywords
+    (layout, bytes :: <byte-string>, keyword-brush) => ()
+  let n = size(bytes);
+  let i = 0;
+  let done = #f;
+  until (done)
+    if (i >= n)
+      done := #t;
+    elseif (is-ident-start?(element(bytes, i)))
+      // Walk to the end of this identifier run.
+      let start = i;
+      i := i + 1;
+      let scan-done = #f;
+      until (scan-done)
+        if (i >= n)
+          scan-done := #t;
+        elseif (is-ident-cont?(element(bytes, i)))
+          i := i + 1;
+        else
+          scan-done := #t;
+        end;
+      end;
+      if (is-dylan-keyword?(bytes, start, i))
+        %dwrite-set-drawing-effect(layout, keyword-brush, start, i - start);
+      else 0 end;
+    else
+      i := i + 1;
+    end;
+  end;
+end function;
+
 define function main () => ()
   let arg-path = %argv1();
   // Sprint 43d — the buffer is a `<rope>` now. Load the file (or the
@@ -1041,6 +1181,11 @@ define function main () => ()
                  %d2d-begin-draw(dc);
                  %d2d-clear(dc, 255, 255, 255, 255);
                  let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);
+                 // Sprint 43f-1 — accent brushes for syntax colouring.
+                 //   keyword-brush: medium blue, used for Dylan keywords.
+                 //   (more colours land in 43f-2: comment-brush green,
+                 //   string-brush red, number-brush orange.)
+                 let keyword-brush = %d2d-create-solid-color-brush(dc, 30, 90, 200, 255);
                  // Sprint 43d hotfix — `cached-flat` is refreshed at every
                  // mutation; WM_PAINT just reuses it. Before caching
                  // we were paying an O(n) byte-string allocation per
@@ -1049,6 +1194,11 @@ define function main () => ()
                  // generation and tripped GcStallError::mid_evac_oom.
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
+                 // Sprint 43f-1 — walk cached-flat looking for identifier
+                 // runs; for each one matching a Dylan keyword, call
+                 // SetDrawingEffect on the layout so the run renders in
+                 // the keyword colour. Must be done BEFORE DrawTextLayout.
+                 highlight-dylan-keywords(layout, cached-flat, keyword-brush);
                  %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
                  // Sprint 43e-1 (revised) — visible cursor via
                  // DirectWrite hit-testing. Ask the text layout we
@@ -1084,6 +1234,7 @@ define function main () => ()
                  else 0 end;
                  %d2d-end-draw(dc);
                  %com-release(brush);
+                 %com-release(keyword-brush);
                  %com-release(layout);
                  %dxgi-swap-chain-present(swap);
                else 0 end;

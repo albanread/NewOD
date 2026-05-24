@@ -1199,6 +1199,52 @@ pub unsafe extern "C-unwind" fn nod_dwrite_hit_test_point(
     tag(pos)
 }
 
+/// JIT-callable: apply a drawing effect (typically a colored brush)
+/// to a range of text in a layout. Wraps
+/// `IDWriteTextLayout::SetDrawingEffect`. The brush becomes the
+/// foreground colour for that range when `DrawTextLayout` later
+/// renders the layout.
+///
+/// Inputs:
+///   * `layout_handle` — a DWriteTextLayout.
+///   * `brush_handle` — an ID2D1SolidColorBrush from
+///     `nod_d2d_create_solid_color_brush`.
+///   * `start` — UTF-16 code-unit offset of the range start.
+///   * `length` — UTF-16 code-unit count.
+///
+/// Returns 1 on success, 0 on error or bad handle. Used by the IDE's
+/// syntax-colouring pass (Sprint 43f-1) to paint Dylan keywords,
+/// comments, strings, etc. in distinct colours.
+///
+/// # Safety
+/// Both handles must be of the matching ComObject variants.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_set_drawing_effect(
+    layout_handle: u64,
+    brush_handle: u64,
+    start: u64,
+    length: u64,
+) -> u64 {
+    let Some(layout) = get_dwrite_text_layout(layout_handle) else {
+        return tag(0);
+    };
+    let Some(brush) = get_d2d_solid_brush(brush_handle) else {
+        return tag(0);
+    };
+    let range = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE {
+        startPosition: untag(start) as u32,
+        length: untag(length) as u32,
+    };
+    // SAFETY: layout and brush are valid for the call. The brush is
+    // ref-counted; SetDrawingEffect AddRefs it internally to keep it
+    // alive until the next SetDrawingEffect / layout drop.
+    let effect: windows::core::IUnknown = brush.clone().into();
+    if unsafe { layout.SetDrawingEffect(&effect, range) }.is_err() {
+        return tag(0);
+    }
+    tag(1)
+}
+
 // ─── Phase E — drawing primitives ────────────────────────────────────────
 
 /// JIT-callable: create a solid-color brush. RGBA channels are
