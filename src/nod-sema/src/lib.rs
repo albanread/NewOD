@@ -765,6 +765,153 @@ pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
     Ok(lm)
 }
 
+/// Sprint 44 — multi-file AOT compilation. Lower each `paths[i]`
+/// individually (re-using `compile_file_for_aot`'s per-file
+/// machinery), merge them pairwise into a single combined
+/// [`LoweredModule`], then layer the stdlib on top once at the end.
+///
+/// **Order matters.** Files are lowered in the order passed. Each
+/// file's lowering may register classes in the global class registry
+/// (`nod-runtime::class_metadata_for` etc.); subsequent files can
+/// reference those classes by name. So `paths[0]` must contain the
+/// definitions of any classes referenced by `paths[1..]`, and so on.
+/// For the IDE this lets us put low-level helpers in the first file
+/// and the entry point in the last. Same discipline as the stdlib:
+/// it lowers first, then user code references its classes.
+///
+/// **Module header consistency.** Every file's `Module:` header must
+/// declare the same module name (or all files must be header-less);
+/// otherwise we return [`EvalError::ModuleMismatch`]. This is the
+/// "same module, multiple files" model — Sprint 44 deliberately does
+/// not yet support cross-module imports (deferred to a real Dylan
+/// library / module system, see DEFERRED.md).
+///
+/// **Cross-file collisions.** If two user files declare a top-level
+/// definition with the same `body_fn_name` (functions or methods), we
+/// return [`EvalError::DuplicateUserDefinition`]. This is stricter
+/// than the user-vs-stdlib path where the user silently wins — there,
+/// "user wins" is the documented override mechanism; here, the user's
+/// intent is ambiguous and the right answer is to surface the
+/// collision so they can rename or move one of the definitions.
+///
+/// Passing a single path is equivalent to (and behaves identically
+/// to) calling `compile_file_for_aot` on that path — the merge loop
+/// is a no-op when there's only one file.
+pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError> {
+    if paths.is_empty() {
+        // No files = nothing to compile. Surface as a Lower error so
+        // callers don't need to special-case an empty input.
+        return Err(EvalError::Lower(vec![]));
+    }
+
+    // Same eager init as the single-file path — runs once thanks to
+    // `LazyLock` inside, but we call it before any per-file work so
+    // class-id allocation lines up between compiler and EXE.
+    nod_runtime::nod_runtime_init();
+    stdlib::ensure_loaded();
+
+    // Per-file lower step. Each iteration extends the global class
+    // registry (so later files can see classes defined earlier) and
+    // produces a per-file LoweredModule we'll merge together below.
+    //
+    // We keep track of the declared Module: header per file so we can
+    // raise `ModuleMismatch` upfront — better than lowering everything
+    // and discovering the mismatch at codegen time.
+    let mut per_file_lms: Vec<(std::path::PathBuf, LoweredModule)> =
+        Vec::with_capacity(paths.len());
+    let mut declared_modules: Vec<(std::path::PathBuf, String)> =
+        Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let src = std::fs::read_to_string(path).map_err(EvalError::Io)?;
+        let mut sm = nod_reader::SourceMap::new();
+        let file_id = sm
+            .add(path.to_path_buf(), src.clone())
+            .map_err(EvalError::SourceMap)?;
+        let toks = nod_reader::lex(&src, file_id);
+        let pre = nod_reader::scan_preamble(&src);
+        let mut module =
+            parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
+        // Extract this file's Module: header for later cross-file check.
+        let mod_name = module
+            .header
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("module"))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        declared_modules.push(((*path).to_path_buf(), mod_name));
+        // Expand macros + lower (no stdlib merge yet — we merge once
+        // at the end, after all user files are combined).
+        expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
+        let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+        per_file_lms.push(((*path).to_path_buf(), lm));
+    }
+
+    // Module-header consistency: every declared header must match.
+    // We use the first non-empty header as the reference; if every
+    // file is header-less, the empty string is the reference (still
+    // valid — they all agree on "no header").
+    let reference = declared_modules
+        .iter()
+        .map(|(_, m)| m.as_str())
+        .find(|m| !m.is_empty())
+        .unwrap_or("");
+    if declared_modules
+        .iter()
+        .any(|(_, m)| !m.is_empty() && m != reference)
+    {
+        return Err(EvalError::ModuleMismatch {
+            files: declared_modules,
+        });
+    }
+
+    // Cross-file function/method collision detection. We track which
+    // path first declared each `body_fn_name`; a second occurrence in
+    // a later file is an error.
+    use std::collections::HashMap;
+    let mut first_seen: HashMap<String, std::path::PathBuf> = HashMap::new();
+    for (path, lm) in &per_file_lms {
+        for f in &lm.functions {
+            if let Some(prior) = first_seen.get(&f.name) {
+                return Err(EvalError::DuplicateUserDefinition {
+                    name: f.name.clone(),
+                    first_path: prior.clone(),
+                    second_path: path.clone(),
+                });
+            }
+            first_seen.insert(f.name.clone(), path.clone());
+        }
+        for m in &lm.methods {
+            if let Some(prior) = first_seen.get(&m.body_fn_name) {
+                return Err(EvalError::DuplicateUserDefinition {
+                    name: m.body_fn_name.clone(),
+                    first_path: prior.clone(),
+                    second_path: path.clone(),
+                });
+            }
+            first_seen.insert(m.body_fn_name.clone(), path.clone());
+        }
+    }
+
+    // Merge per-file LMs into one. Start with the first as the base
+    // and fold the rest in; collisions are impossible at this point
+    // (we just checked), so `merge_modules`'s "into wins" policy is
+    // a no-op for our case. The block / closure / user-class
+    // concatenation logic does the real work.
+    let mut iter = per_file_lms.into_iter();
+    let (_first_path, mut combined) = iter
+        .next()
+        .expect("at least one file (checked at fn entry)");
+    for (_path, lm) in iter {
+        merge_modules(&mut combined, &lm);
+    }
+
+    // Final step: merge stdlib on top. This is the single-file path's
+    // last step too — exactly the same call.
+    merge_stdlib_into_user_module(&mut combined);
+    Ok(combined)
+}
+
 /// Sprint 39c — build the AOT registration payload from a (post-
 /// merge) [`LoweredModule`]. The driver passes the resulting
 /// [`nod_llvm::AotRegistrations`] to
@@ -1512,6 +1659,26 @@ pub enum EvalError {
         dll: String,
         symbol: String,
     },
+    /// Sprint 44: the multi-file `compile_files_for_aot` was given files
+    /// that declared incompatible `Module:` headers. Carries the list of
+    /// (file path, declared module name) pairs so the driver can surface
+    /// a helpful "all source files for one build must share the same
+    /// Module: header" diagnostic. An empty string in the second slot
+    /// means the file had no `Module:` header at all.
+    ModuleMismatch {
+        files: Vec<(std::path::PathBuf, String)>,
+    },
+    /// Sprint 44: two user source files (NOT user-vs-stdlib) declared a
+    /// top-level definition with the same `body_fn_name`. Stdlib-side
+    /// collisions still silently let the user win (see `merge_modules`),
+    /// but cross-user-file collisions are an error because the user's
+    /// intent is ambiguous. Carries the duplicated symbol and the two
+    /// source paths that produced it.
+    DuplicateUserDefinition {
+        name: String,
+        first_path: std::path::PathBuf,
+        second_path: std::path::PathBuf,
+    },
 }
 
 impl std::fmt::Display for EvalError {
@@ -1544,6 +1711,24 @@ impl std::fmt::Display for EvalError {
             EvalError::WinFfiInit { class_name, dll, symbol } => write!(
                 f,
                 "winffi init failed: {class_name} raised for `{symbol}@{dll}`"
+            ),
+            EvalError::ModuleMismatch { files } => {
+                write!(
+                    f,
+                    "module-header mismatch: all source files for one build must share the same `Module:` header\n"
+                )?;
+                for (p, m) in files {
+                    let m_disp = if m.is_empty() { "(no Module: header)" } else { m.as_str() };
+                    write!(f, "  {} → {m_disp}\n", p.display())?;
+                }
+                Ok(())
+            }
+            EvalError::DuplicateUserDefinition { name, first_path, second_path } => write!(
+                f,
+                "duplicate top-level definition `{name}` in both\n  {}\n  {}\n\
+                 (user-vs-user collisions are not allowed; stdlib overrides are still permitted)",
+                first_path.display(),
+                second_path.display(),
             ),
         }
     }
