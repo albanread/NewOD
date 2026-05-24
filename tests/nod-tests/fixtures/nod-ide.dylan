@@ -1129,18 +1129,22 @@ define function main () => ()
                    %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, clamped, 1);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 36)    // VK_HOME — top-left corner
-                 if (scroll-y-px ~= 0 | scroll-x-px ~= 0)
-                   scroll-y-px := 0;
-                   scroll-x-px := 0;
-                   %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, 0, 1);
-                   %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  0, 1);
+               elseif (vk = 36)    // VK_HOME — Sprint 43e-3 cursor to line start
+                 // Plain HOME moves the cursor to the first byte of
+                 // the current line. Ctrl+HOME (buffer top) is a
+                 // follow-up; needs GetKeyState wiring.
+                 let new-off = scan-line-start(cached-flat, cursor-offset);
+                 if (new-off ~= cursor-offset)
+                   cursor-offset := new-off;
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 35)    // VK_END — bottom of file
-                 if (scroll-y-px ~= v-max)
-                   scroll-y-px := v-max;
-                   %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, v-max, 1);
+               elseif (vk = 35)    // VK_END — Sprint 43e-3 cursor to line end
+                 // Plain END moves the cursor to the byte just before
+                 // the line-ending '\n' (or EOF). Ctrl+END (buffer
+                 // bottom) is a follow-up.
+                 let new-off = scan-line-end(cached-flat, cursor-offset, size(cached-flat));
+                 if (new-off ~= cursor-offset)
+                   cursor-offset := new-off;
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 37)    // VK_LEFT — Sprint 43e-2 cursor move
