@@ -43,6 +43,73 @@ declare which files they intend to make pass.
 
 ---
 
+## Sprints 21 → 43c at a glance
+
+This document was drafted up front and carries the detailed retros
+for Sprints 01–38c. The sprint cadence has continued well past the
+original 32-sprint plan — the front-end, runtime, and dispatch core
+matured fast enough that the work shifted into FFI, AOT, and a real
+Dylan-side IDE earlier than projected. Use the git log
+(`git log --oneline --grep='^Sprint'`) for the precise sequence; the
+per-sprint detail below is partially backfilled and partially still
+to-write. Headline arc:
+
+- **21 – 26**: closures (cell promotion), first-class function values,
+  `<table>` + content-based hashing, NewGC page-heap backend swap-in,
+  closure-based stdlib (`reduce` / `map` / `do` in Dylan), retire
+  hardcoded `Expr::Unless` / `Expr::Case` in favour of stdlib macros,
+  polish bundle (n-ary funcall, generic-dispatch trampoline).
+- **27 – 36**: the FFI arc. Vendored Win32 metadata DB →
+  `define c-function` syntax → API stub table + Win64 trampolines →
+  Win32 constants generated into stdlib → `<c-string>` /
+  `<c-wide-string>` marshaling → JIT-time bare-name materialization
+  → callback trampoline pool (closure → C fn-ptr) → `<c-struct>`
+  field accessors → COM via the `windows` crate (DXGI/D3D11/D2D/
+  DirectWrite) → an IDE shell that pops a real Win32 window.
+- **37 – 38g**: JIT object-code cache + cross-process bitcode replay.
+  Five categories of baked runtime addresses (immediates, static-area
+  pointers, stub entries, cache slots, generic-function pointers)
+  converted to externally-resolved globals so cached bitcode survives
+  a fresh process. Includes the on-disk replay wired into the
+  eval pipeline (38f) and headline subprocess cache-speedup test
+  (38g).
+- **39a – c**: AOT mode. `cargo run --bin nod-driver -- build foo.dylan
+  -o foo.exe` produces a standalone Win64 EXE. Dual-output
+  `nod-runtime` (rlib + staticlib), codegen `main`-stub injection,
+  object-file emission via `inkwell::TargetMachine`, stdlib pre-
+  compilation merged into user modules at build time.
+- **40a – d**: bring everything-Dylan-can-do into AOT. User-defined
+  classes registered at EXE start-up, Win32 callbacks (WNDPROC /
+  EnumWindows), the COM device chain, bare-name Win32 calls.
+- **41a – g**: build the IDE shell itself in Dylan. Message pump,
+  WM_SIZE handling, source viewer, vertical + horizontal scrolling,
+  menu bar (File + Help), File → Open / Save / Save As / Recent.
+  The `nod-ide.exe` binary at `F:\scratch\nod-ide.exe` is the
+  headline of this arc.
+- **42**: real string ops. Sprint 42-pre fixed a latent SSA
+  dominance bug in `lower_if` (env-merge across arm bodies) that
+  the rope sprint would have hit otherwise. Sprint 42a wired five
+  byte-string primitives in Rust and 12 stdlib methods in Dylan
+  (`size`, `element`, `concatenate`, `copy-sequence`, `subsequence`,
+  `starts-with?`, `ends-with?`, `find-substring`, `as-uppercase`,
+  `as-lowercase`), plus universal `=` dispatch for non-numeric
+  operands. Phase E retired five IDE Rust shims to pure Dylan
+  using the new methods — net −820 lines of glue across five layers
+  of wiring.
+- **43a – c**: the first non-trivial user data structure in Dylan.
+  An immutable `<rope>` (read core, edits via split + concat, line
+  indexing with cached newline counts per node), ~650 lines of
+  Dylan, 24 self-tests pass under AOT including a 200-op random-
+  edit walk that stresses NewGC with thousands of small
+  allocations.
+
+Sprint 38c is the last entry with a long-form retro below. Sprints
+38d through 43c are best understood from the commit log and the
+running code; the long-form backfill is a TODO for the next
+documentation pass.
+
+---
+
 ## Sprint 01 — Workspace Skeleton
 **Goal:** Compile an empty `nod-driver` binary and print a version banner.
 **Length:** 2 weeks
