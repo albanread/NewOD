@@ -136,6 +136,317 @@ define c-function MessageBoxW
     library: "user32.dll";
 end;
 
+// ─── Sprint 43d — inlined rope buffer ────────────────────────────────────
+//
+// The IDE's text buffer is a `<rope>` — a classical Boehm-style binary
+// tree of `<byte-string>` chunks. Reads + edits are O(log n) instead
+// of O(n) for the previous flat-`<byte-string>` buffer, which matters
+// once the file is non-trivial (~256k+) and the user is editing.
+//
+// The full data structure is documented and tested standalone in
+// `tests/nod-tests/fixtures/rope.dylan` (~650 lines + 24 self-tests
+// passing under AOT). What's reproduced below is the production
+// subset: classes, construction, read ops, concat, split, insert,
+// delete, line indexing, and `rope->string` for serialisation. The
+// self-test main and the deterministic test-buffer helpers stay in
+// the standalone fixture.
+//
+// Why inlined and not imported: nod-driver builds one Dylan file per
+// invocation today. Multi-file modules are a future sprint. Until
+// then, the rope source is duplicated — kept in sync by hand. Any
+// fix to the standalone fixture should be mirrored here (and
+// vice-versa).
+
+define class <rope> (<object>) end class;
+
+define class <rope-leaf> (<rope>)
+  slot rope-leaf-bytes    :: <byte-string>, init-keyword: bytes:;
+  slot rope-leaf-len      :: <integer>,     init-keyword: len:;
+  slot rope-leaf-newlines :: <integer>,     init-keyword: newlines:;
+end class;
+
+define class <rope-node> (<rope>)
+  slot rope-node-left     :: <rope>,    init-keyword: left:;
+  slot rope-node-right    :: <rope>,    init-keyword: right:;
+  slot rope-node-weight   :: <integer>, init-keyword: weight:;
+  slot rope-node-total    :: <integer>, init-keyword: total:;
+  slot rope-node-newlines :: <integer>, init-keyword: newlines:;
+end class;
+
+define function count-newlines-in (s) => (n :: <integer>)
+  let len = size(s);
+  let count = 0;
+  let i = 0;
+  until (i = len)
+    if (element(s, i) = 10)
+      count := count + 1;
+    else
+      #f
+    end;
+    i := i + 1;
+  end;
+  count
+end function;
+
+define method rope-size (r :: <rope-leaf>) => (n :: <integer>)
+  rope-leaf-len(r)
+end method;
+
+define method rope-size (r :: <rope-node>) => (n :: <integer>)
+  rope-node-total(r)
+end method;
+
+define method rope-newlines (r :: <rope-leaf>) => (n :: <integer>)
+  rope-leaf-newlines(r)
+end method;
+
+define method rope-newlines (r :: <rope-node>) => (n :: <integer>)
+  rope-node-newlines(r)
+end method;
+
+define method rope-element (r :: <rope-leaf>, i :: <integer>) => (b :: <integer>)
+  element(rope-leaf-bytes(r), i)
+end method;
+
+define method rope-element (r :: <rope-node>, i :: <integer>) => (b :: <integer>)
+  let w = rope-node-weight(r);
+  if (i < w)
+    rope-element(rope-node-left(r), i)
+  else
+    rope-element(rope-node-right(r), i - w)
+  end
+end method;
+
+define method rope-concatenate (a :: <rope>, b :: <rope>) => (r :: <rope>)
+  let asize = rope-size(a);
+  let bsize = rope-size(b);
+  if (asize = 0)
+    b
+  elseif (bsize = 0)
+    a
+  else
+    make(<rope-node>,
+         left: a, right: b,
+         weight: asize, total: asize + bsize,
+         newlines: rope-newlines(a) + rope-newlines(b))
+  end
+end method;
+
+define function empty-rope () => (r :: <rope-leaf>)
+  make(<rope-leaf>, bytes: "", len: 0, newlines: 0)
+end function;
+
+define method for-each-leaf (r :: <rope-leaf>, fn) => ()
+  fn(rope-leaf-bytes(r));
+  #f
+end method;
+
+define method for-each-leaf (r :: <rope-node>, fn) => ()
+  for-each-leaf(rope-node-left(r), fn);
+  for-each-leaf(rope-node-right(r), fn);
+  #f
+end method;
+
+define method rope-copy-into
+    (r :: <rope-leaf>, lo :: <integer>, hi :: <integer>,
+     dst :: <byte-string>, dst-off :: <integer>)
+ => (n :: <integer>)
+  let leaf-len = rope-leaf-len(r);
+  let a = if (lo > 0) lo else 0 end;
+  let b = if (hi < leaf-len) hi else leaf-len end;
+  if (a < b)
+    %byte-string-copy!(dst, dst-off, rope-leaf-bytes(r), a, b - a);
+    b - a
+  else
+    0
+  end
+end method;
+
+define method rope-copy-into
+    (r :: <rope-node>, lo :: <integer>, hi :: <integer>,
+     dst :: <byte-string>, dst-off :: <integer>)
+ => (n :: <integer>)
+  let w = rope-node-weight(r);
+  let from-left =
+    if (lo < w)
+      let left-hi = if (hi < w) hi else w end;
+      rope-copy-into(rope-node-left(r), lo, left-hi, dst, dst-off)
+    else
+      0
+    end;
+  let from-right =
+    if (hi > w)
+      let right-lo = if (lo > w) lo - w else 0 end;
+      let right-hi = hi - w;
+      rope-copy-into(rope-node-right(r), right-lo, right-hi,
+                     dst, dst-off + from-left)
+    else
+      0
+    end;
+  from-left + from-right
+end method;
+
+define function rope-substring
+    (r, lo :: <integer>, hi :: <integer>) => (s :: <byte-string>)
+  let n = hi - lo;
+  let result = %byte-string-allocate(n);
+  rope-copy-into(r, lo, hi, result, 0);
+  result
+end function;
+
+define function make-rope-from-string (s) => (r)
+  let n = size(s);
+  if (n <= 1024)
+    make(<rope-leaf>,
+         bytes: s, len: n,
+         newlines: count-newlines-in(s))
+  else
+    let mid = n / 2;
+    let left  = make-rope-from-string(copy-sequence(s, 0, mid));
+    let right = make-rope-from-string(copy-sequence(s, mid, n));
+    rope-concatenate(left, right)
+  end
+end function;
+
+define method rope-split-at (r :: <rope-leaf>, i :: <integer>) => (split)
+  let n = rope-leaf-len(r);
+  if (i <= 0)
+    pair(empty-rope(), r)
+  elseif (i >= n)
+    pair(r, empty-rope())
+  else
+    let bytes = rope-leaf-bytes(r);
+    let left-bytes  = copy-sequence(bytes, 0, i);
+    let right-bytes = copy-sequence(bytes, i, n);
+    pair(make(<rope-leaf>,
+              bytes: left-bytes,  len: i,
+              newlines: count-newlines-in(left-bytes)),
+         make(<rope-leaf>,
+              bytes: right-bytes, len: n - i,
+              newlines: count-newlines-in(right-bytes)))
+  end
+end method;
+
+define method rope-split-at (r :: <rope-node>, i :: <integer>) => (split)
+  let total = rope-node-total(r);
+  if (i <= 0)
+    pair(empty-rope(), r)
+  elseif (i >= total)
+    pair(r, empty-rope())
+  else
+    let w = rope-node-weight(r);
+    if (i = w)
+      pair(rope-node-left(r), rope-node-right(r))
+    elseif (i < w)
+      let inner = rope-split-at(rope-node-left(r), i);
+      pair(head(inner),
+           rope-concatenate(tail(inner), rope-node-right(r)))
+    else
+      let inner = rope-split-at(rope-node-right(r), i - w);
+      pair(rope-concatenate(rope-node-left(r), head(inner)),
+           tail(inner))
+    end
+  end
+end method;
+
+define function rope-insert (r, i :: <integer>, s) => (out)
+  let split = rope-split-at(r, i);
+  let middle = make-rope-from-string(s);
+  rope-concatenate(rope-concatenate(head(split), middle), tail(split))
+end function;
+
+define function rope-delete (r, lo :: <integer>, hi :: <integer>) => (out)
+  let first-split  = rope-split-at(r, lo);
+  let second-split = rope-split-at(tail(first-split), hi - lo);
+  rope-concatenate(head(first-split), tail(second-split))
+end function;
+
+define function rope->string (r) => (s)
+  rope-substring(r, 0, rope-size(r))
+end function;
+
+define method rope-line-count (r :: <rope>) => (n :: <integer>)
+  rope-newlines(r) + 1
+end method;
+
+define method rope-line-to-offset
+    (r :: <rope-leaf>, ln :: <integer>) => (off :: <integer>)
+  if (ln <= 0)
+    0
+  else
+    let bytes = rope-leaf-bytes(r);
+    let n     = rope-leaf-len(r);
+    let seen  = 0;
+    let pos   = 0;
+    let found = -1;
+    until (pos = n | found >= 0)
+      if (element(bytes, pos) = 10)
+        seen := seen + 1;
+        if (seen = ln)
+          found := pos + 1;
+        else
+          #f
+        end;
+      else
+        #f
+      end;
+      pos := pos + 1;
+    end;
+    if (found < 0) n else found end
+  end
+end method;
+
+define method rope-line-to-offset
+    (r :: <rope-node>, ln :: <integer>) => (off :: <integer>)
+  if (ln <= 0)
+    0
+  else
+    let left-newlines = rope-newlines(rope-node-left(r));
+    if (ln <= left-newlines)
+      rope-line-to-offset(rope-node-left(r), ln)
+    else
+      rope-node-weight(r)
+        + rope-line-to-offset(rope-node-right(r), ln - left-newlines)
+    end
+  end
+end method;
+
+// ─── Sprint 43d — rope-aware buffer-measurement helpers ──────────────────
+//
+// Replace the old `nod-count-newlines` / `nod-max-line-chars` calls
+// on `<byte-string>` with rope-aware versions. Line count is O(1)
+// (cached at every internal node). Longest line uses for-each-leaf
+// with running state — note this gives a CONSERVATIVE upper bound:
+// it treats every leaf boundary as a potential line continuation,
+// so the answer is right when the longest line is fully inside one
+// leaf and an over-estimate when a long line straddles leaves. Good
+// enough for sizing the horizontal scrollbar; we can tighten this
+// later if needed.
+
+define function nod-rope-line-count (r) => (n :: <integer>)
+  rope-line-count(r)
+end function;
+
+define function nod-rope-max-line-chars (r) => (best :: <integer>)
+  let best = 0;
+  let cur  = 0;
+  for-each-leaf(r,
+                method (leaf-bytes)
+                  let len = size(leaf-bytes);
+                  let i = 0;
+                  until (i = len)
+                    if (element(leaf-bytes, i) = 10)
+                      if (cur > best) best := cur; else #f end;
+                      cur := 0;
+                    else
+                      cur := cur + 1;
+                    end;
+                    i := i + 1;
+                  end;
+                end);
+  if (cur > best) cur else best end
+end function;
+
 // ─── Sprint 42a — pure-Dylan helpers (replace retired Rust shims) ─────────
 //
 // All the IDE's text-buffer scanning and recent-files persistence is now
@@ -410,16 +721,28 @@ end function;
 
 define function main () => ()
   let arg-path = %argv1();
-  let source-text = if (empty?(arg-path))
-                      "nod-ide: no argv[1] supplied; pass a Dylan source path as the first argument."
-                    else
-                      let bytes = %read-file(arg-path);
-                      if (empty?(bytes))
-                        "nod-ide: could not read the file passed via argv[1]."
+  // Sprint 43d — the buffer is a `<rope>` now. Load the file (or the
+  // no-file placeholder) into a flat byte-string, then wrap it via
+  // make-rope-from-string so every later read / edit goes through
+  // the rope's O(log n) ops.
+  let initial-bytes = if (empty?(arg-path))
+                        "nod-ide: no argv[1] supplied; pass a Dylan source path as the first argument."
                       else
-                        bytes
-                      end
-                    end;
+                        let bytes = %read-file(arg-path);
+                        if (empty?(bytes))
+                          "nod-ide: could not read the file passed via argv[1]."
+                        else
+                          bytes
+                        end
+                      end;
+  let source-text = make-rope-from-string(initial-bytes);
+  // Sprint 43d — cursor-offset is the byte position where the next
+  // WM_CHAR insertion lands (and what backspace removes the byte
+  // before). Captured by the WNDPROC closure → auto-promoted to a
+  // cell. Sprint 43e will surface this as a visible blinking
+  // caret + click-to-position; for now it tracks invisibly so we
+  // can prove insert/delete plumbing works end-to-end.
+  let cursor-offset = 0;
   // Sprint 41g — current-path is a captured cell (Sprint 24 auto cell
   // promotion: any `let`-bound name assigned inside the WNDPROC
   // closure becomes a cell). Same machinery that promoted source-text
@@ -434,8 +757,8 @@ define function main () => ()
   let dc           = %d2d-create-device-context(d2d-device);
   let dwrite       = %dwrite-create-factory();
   let format       = %dwrite-create-text-format(dwrite, "Consolas", 1400, "en-us");
-  let buffer-lines    = nod-count-newlines(source-text);
-  let buffer-max-cols = nod-max-line-chars(source-text);
+  let buffer-lines    = nod-rope-line-count(source-text);
+  let buffer-max-cols = nod-rope-max-line-chars(source-text);
   let char-width  = 8;
   let line-height = 18;
   let pad = 8;
@@ -483,7 +806,13 @@ define function main () => ()
                  %d2d-begin-draw(dc);
                  %d2d-clear(dc, 255, 255, 255, 255);
                  let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);
-                 let layout = %dwrite-create-text-layout(dwrite, source-text, format,
+                 // Sprint 43d — DirectWrite takes a flat byte-string, so
+                 // serialise the rope on every WM_PAINT. O(n) per frame
+                 // but correct; the visible-viewport-only optimisation
+                 // (`rope-substring(buffer, top-line-offset,
+                 // bottom-line-offset)`) is a later sprint.
+                 let flat = rope->string(source-text);
+                 let layout = %dwrite-create-text-layout(dwrite, flat, format,
                                                          client-width-px, client-height-px);
                  %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
                  %d2d-end-draw(dc);
@@ -679,6 +1008,48 @@ define function main () => ()
                    %set-scroll-info(hwnd, 0, 0, client-width-px, viewport-width-px, clamped, 1);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
+               elseif (vk = 8)     // VK_BACK — Sprint 43d backspace
+                 // Delete the byte at cursor-offset - 1. The rope is
+                 // persistent — `source-text := rope-delete(...)` makes
+                 // a new sibling tree sharing almost every leaf with
+                 // the old one. Update cursor, recompute metrics,
+                 // re-issue scroll info, repaint.
+                 if (cursor-offset > 0)
+                   source-text := rope-delete(source-text, cursor-offset - 1, cursor-offset);
+                   cursor-offset := cursor-offset - 1;
+                   buffer-lines := nod-rope-line-count(source-text);
+                   buffer-max-cols := nod-rope-max-line-chars(source-text);
+                   client-width-px  := buffer-max-cols * char-width;
+                   client-height-px := buffer-lines * line-height;
+                   %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, scroll-y-px, 1);
+                   %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  scroll-x-px, 1);
+                   InvalidateRect(hwnd, 0, 0);
+                 else 0 end;
+               else 0 end;
+               0
+             elseif (msg = 258)  // WM_CHAR — Sprint 43d character input
+               // wparam carries the character as a UTF-16 code unit.
+               // Phase-2 simplicity: accept only ASCII-printable
+               // (32..126), Tab (9), or Enter (13, translated to
+               // '\n'=10 for our internal representation). Backspace
+               // (8) is handled in WM_KEYDOWN; everything else is
+               // dropped silently. Full Unicode/IME input is a later
+               // sprint.
+               let ch = wparam;
+               let insert? = (ch >= 32 & ch <= 126) | (ch = 9) | (ch = 13);
+               if (insert?)
+                 let byte-code = if (ch = 13) 10 else ch end;
+                 let one-byte = %byte-string-allocate(1);
+                 %byte-string-element-setter(byte-code, one-byte, 0);
+                 source-text := rope-insert(source-text, cursor-offset, one-byte);
+                 cursor-offset := cursor-offset + 1;
+                 buffer-lines := nod-rope-line-count(source-text);
+                 buffer-max-cols := nod-rope-max-line-chars(source-text);
+                 client-width-px  := buffer-max-cols * char-width;
+                 client-height-px := buffer-lines * line-height;
+                 %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, scroll-y-px, 1);
+                 %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  scroll-x-px, 1);
+                 InvalidateRect(hwnd, 0, 0);
                else 0 end;
                0
              elseif (msg = 273)  // WM_COMMAND — Sprint 41e/g menu dispatch
@@ -690,10 +1061,16 @@ define function main () => ()
                  if (~ empty?(new-path))
                    let new-source = %read-file(new-path);
                    if (~ empty?(new-source))
-                     source-text := new-source;
+                     // Sprint 43d — wrap the freshly read bytes in a
+                     // rope before storing. All subsequent reads /
+                     // edits use rope ops. Reset cursor to the
+                     // top of the freshly loaded buffer.
+                     let new-rope = make-rope-from-string(new-source);
+                     source-text := new-rope;
+                     cursor-offset := 0;
                      current-path := new-path;
-                     buffer-lines := nod-count-newlines(new-source);
-                     buffer-max-cols := nod-max-line-chars(new-source);
+                     buffer-lines := nod-rope-line-count(new-rope);
+                     buffer-max-cols := nod-rope-max-line-chars(new-rope);
                      client-width-px  := buffer-max-cols * char-width;
                      client-height-px := buffer-lines * line-height;
                      scroll-x-px := 0;
@@ -717,7 +1094,10 @@ define function main () => ()
                  if (empty?(current-path))
                    let chosen = %show-save-file-dialog(hwnd);
                    if (~ empty?(chosen))
-                     let ok = %write-file(chosen, source-text);
+                     // Sprint 43d — serialise rope to flat bytes for
+                     // %write-file. Sprint 43e+ can switch to leaf-
+                     // by-leaf streaming once we have %write-file-append.
+                     let ok = %write-file(chosen, rope->string(source-text));
                      if (ok = 1)
                        current-path := chosen;
                        recent-paths := nod-add-recent(chosen, recent-paths);
@@ -727,14 +1107,14 @@ define function main () => ()
                      else 0 end;
                    else 0 end;
                  else
-                   %write-file(current-path, source-text);
+                   %write-file(current-path, rope->string(source-text));
                    0
                  end;
                  0
                elseif (cmd-id = 102)    // File → Save As...
                  let chosen = %show-save-file-dialog(hwnd);
                  if (~ empty?(chosen))
-                   let ok = %write-file(chosen, source-text);
+                   let ok = %write-file(chosen, rope->string(source-text));
                    if (ok = 1)
                      current-path := chosen;
                      recent-paths := nod-add-recent(chosen, recent-paths);
@@ -770,10 +1150,14 @@ define function main () => ()
                    let path = head(cursor);
                    let bytes = %read-file(path);
                    if (~ empty?(bytes))
-                     source-text := bytes;
+                     // Sprint 43d — wrap in rope, same as Open does;
+                     // also reset cursor for the new buffer.
+                     let rope = make-rope-from-string(bytes);
+                     source-text := rope;
+                     cursor-offset := 0;
                      current-path := path;
-                     buffer-lines := nod-count-newlines(bytes);
-                     buffer-max-cols := nod-max-line-chars(bytes);
+                     buffer-lines := nod-rope-line-count(rope);
+                     buffer-max-cols := nod-rope-max-line-chars(rope);
                      client-width-px  := buffer-max-cols * char-width;
                      client-height-px := buffer-lines * line-height;
                      scroll-x-px := 0;
