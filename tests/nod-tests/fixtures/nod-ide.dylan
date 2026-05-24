@@ -736,6 +736,15 @@ define function main () => ()
                         end
                       end;
   let source-text = make-rope-from-string(initial-bytes);
+  // Sprint 43d hotfix — cache the serialised flat-string view of the
+  // rope across WM_PAINT calls. The old byte-string buffer cost zero
+  // allocation per paint (the byte-string Word was passed straight
+  // to DirectWrite); the rope serialisation costs O(n) per paint.
+  // Win32 sends WM_PAINT on InvalidateRect, focus changes, drags,
+  // etc., so caching is the difference between "stable IDE" and
+  // "GC pressure crash". Invalidate the cache (set to "") at every
+  // mutation site — Open, Recent, WM_CHAR, VK_BACK, Save-As reload.
+  let cached-flat = initial-bytes;
   // Sprint 43d — cursor-offset is the byte position where the next
   // WM_CHAR insertion lands (and what backspace removes the byte
   // before). Captured by the WNDPROC closure → auto-promoted to a
@@ -806,13 +815,13 @@ define function main () => ()
                  %d2d-begin-draw(dc);
                  %d2d-clear(dc, 255, 255, 255, 255);
                  let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);
-                 // Sprint 43d — DirectWrite takes a flat byte-string, so
-                 // serialise the rope on every WM_PAINT. O(n) per frame
-                 // but correct; the visible-viewport-only optimisation
-                 // (`rope-substring(buffer, top-line-offset,
-                 // bottom-line-offset)`) is a later sprint.
-                 let flat = rope->string(source-text);
-                 let layout = %dwrite-create-text-layout(dwrite, flat, format,
+                 // Sprint 43d hotfix — `cached-flat` is refreshed at every
+                 // mutation; WM_PAINT just reuses it. Before caching
+                 // we were paying an O(n) byte-string allocation per
+                 // paint, which under Win32's WM_PAINT cadence (drags,
+                 // focus changes, scrolls) outran the GC's destination
+                 // generation and tripped GcStallError::mid_evac_oom.
+                 let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
                  %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
                  %d2d-end-draw(dc);
@@ -1013,10 +1022,12 @@ define function main () => ()
                  // persistent — `source-text := rope-delete(...)` makes
                  // a new sibling tree sharing almost every leaf with
                  // the old one. Update cursor, recompute metrics,
-                 // re-issue scroll info, repaint.
+                 // refresh cached-flat (so WM_PAINT doesn't pay for
+                 // serialisation), re-issue scroll info, repaint.
                  if (cursor-offset > 0)
                    source-text := rope-delete(source-text, cursor-offset - 1, cursor-offset);
                    cursor-offset := cursor-offset - 1;
+                   cached-flat := rope->string(source-text);
                    buffer-lines := nod-rope-line-count(source-text);
                    buffer-max-cols := nod-rope-max-line-chars(source-text);
                    client-width-px  := buffer-max-cols * char-width;
@@ -1043,6 +1054,7 @@ define function main () => ()
                  %byte-string-element-setter(byte-code, one-byte, 0);
                  source-text := rope-insert(source-text, cursor-offset, one-byte);
                  cursor-offset := cursor-offset + 1;
+                 cached-flat := rope->string(source-text);
                  buffer-lines := nod-rope-line-count(source-text);
                  buffer-max-cols := nod-rope-max-line-chars(source-text);
                  client-width-px  := buffer-max-cols * char-width;
@@ -1063,11 +1075,11 @@ define function main () => ()
                    if (~ empty?(new-source))
                      // Sprint 43d — wrap the freshly read bytes in a
                      // rope before storing. All subsequent reads /
-                     // edits use rope ops. Reset cursor to the
-                     // top of the freshly loaded buffer.
+                     // edits use rope ops. Reset cursor + cache.
                      let new-rope = make-rope-from-string(new-source);
                      source-text := new-rope;
                      cursor-offset := 0;
+                     cached-flat := new-source;
                      current-path := new-path;
                      buffer-lines := nod-rope-line-count(new-rope);
                      buffer-max-cols := nod-rope-max-line-chars(new-rope);
@@ -1097,7 +1109,7 @@ define function main () => ()
                      // Sprint 43d — serialise rope to flat bytes for
                      // %write-file. Sprint 43e+ can switch to leaf-
                      // by-leaf streaming once we have %write-file-append.
-                     let ok = %write-file(chosen, rope->string(source-text));
+                     let ok = %write-file(chosen, cached-flat);
                      if (ok = 1)
                        current-path := chosen;
                        recent-paths := nod-add-recent(chosen, recent-paths);
@@ -1107,14 +1119,14 @@ define function main () => ()
                      else 0 end;
                    else 0 end;
                  else
-                   %write-file(current-path, rope->string(source-text));
+                   %write-file(current-path, cached-flat);
                    0
                  end;
                  0
                elseif (cmd-id = 102)    // File → Save As...
                  let chosen = %show-save-file-dialog(hwnd);
                  if (~ empty?(chosen))
-                   let ok = %write-file(chosen, rope->string(source-text));
+                   let ok = %write-file(chosen, cached-flat);
                    if (ok = 1)
                      current-path := chosen;
                      recent-paths := nod-add-recent(chosen, recent-paths);
@@ -1151,10 +1163,11 @@ define function main () => ()
                    let bytes = %read-file(path);
                    if (~ empty?(bytes))
                      // Sprint 43d — wrap in rope, same as Open does;
-                     // also reset cursor for the new buffer.
+                     // also reset cursor + cache for the new buffer.
                      let rope = make-rope-from-string(bytes);
                      source-text := rope;
                      cursor-offset := 0;
+                     cached-flat := bytes;
                      current-path := path;
                      buffer-lines := nod-rope-line-count(rope);
                      buffer-max-cols := nod-rope-max-line-chars(rope);
