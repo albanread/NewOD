@@ -1254,22 +1254,34 @@ define function main () => ()
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 36)    // VK_HOME — Sprint 43e-3 cursor to line start
-                 // Plain HOME moves the cursor to the first byte of
-                 // the current line. Ctrl+HOME (buffer top) is a
-                 // follow-up; needs GetKeyState wiring.
-                 let new-off = scan-line-start(cached-flat, cursor-offset);
+               elseif (vk = 36)    // VK_HOME — Sprint 43e-3 / 43e-8
+                 // Plain HOME → start of current line.
+                 // Ctrl+HOME → start of buffer (offset 0).
+                 //
+                 // GetKeyState(17 = VK_CONTROL) returns a SHORT;
+                 // the high bit is set when the key is currently
+                 // pressed. Depending on whether the trampoline
+                 // sign- or zero-extends the SHORT, we see either
+                 // a negative value (sign-extended) or a value
+                 // >= 32768 (zero-extended). Test both — they're
+                 // pure comparisons, so the eager `|` is safe.
+                 let ks = GetKeyState(17);
+                 let ctrl? = (ks < 0) | (ks > 32767);
+                 let new-off = if (ctrl?) 0
+                               else scan-line-start(cached-flat, cursor-offset) end;
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
                    update-ideal-col();
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 35)    // VK_END — Sprint 43e-3 cursor to line end
-                 // Plain END moves the cursor to the byte just before
-                 // the line-ending '\n' (or EOF). Ctrl+END (buffer
-                 // bottom) is a follow-up.
-                 let new-off = scan-line-end(cached-flat, cursor-offset, size(cached-flat));
+               elseif (vk = 35)    // VK_END — Sprint 43e-3 / 43e-8
+                 // Plain END → end of current line.
+                 // Ctrl+END → end of buffer (size(cached-flat)).
+                 let ks = GetKeyState(17);
+                 let ctrl? = (ks < 0) | (ks > 32767);
+                 let new-off = if (ctrl?) size(cached-flat)
+                               else scan-line-end(cached-flat, cursor-offset, size(cached-flat)) end;
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
                    update-ideal-col();
