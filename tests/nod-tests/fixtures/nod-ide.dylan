@@ -956,12 +956,25 @@ end function;
 // is harmless. Two-byte lookahead (e.g. `//`, `/*`) uses nested if
 // to defensively bounds-check before reading the second byte.
 
+// Sprint 43f-3 — viewport-bounded scan. Callers pass [start, limit)
+// instead of always tokenising the whole buffer; SetDrawingEffect
+// positions are absolute (relative to the whole layout), so applying
+// effects only to the visible byte range is sound. Off-screen tokens
+// get no colour, and DirectWrite's render clip means the user can't
+// see them anyway.
+//
+// For correctness across long block comments / strings that started
+// well above the viewport, the caller is expected to back `start`
+// up by a few lines of overscan. The tokeniser itself doesn't care
+// where `start` is — it just walks bytes within [start, limit).
+
 define function highlight-dylan-syntax
     (layout, bytes :: <byte-string>,
+     start :: <integer>, limit :: <integer>,
      keyword-brush, comment-brush, string-brush,
      number-brush, class-brush) => ()
-  let n = size(bytes);
-  let i = 0;
+  let n = limit;
+  let i = start;
   let done = #f;
   until (done)
     if (i >= n)
@@ -1330,13 +1343,39 @@ define function main () => ()
                  // generation and tripped GcStallError::mid_evac_oom.
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
-                 // Sprint 43f-2 — full tokenising syntax-colouring pass.
-                 // Walks cached-flat once, recognises comments / strings
-                 // / numbers / class names / keywords, and applies the
-                 // right brush to each via SetDrawingEffect. Must run
-                 // before DrawTextLayout so the effects are in place
-                 // when DirectWrite renders.
+                 // Sprint 43f-3 — viewport-bounded syntax-colouring scan.
+                 //
+                 // The text in the window is a VIEW into cached-flat:
+                 // we only need to colour the lines the user can
+                 // currently see. DirectWrite clips the painting
+                 // anyway, but tokenising the WHOLE buffer per paint
+                 // is wasted CPU. Bound the tokeniser to the visible
+                 // line range (plus a small overscan for context).
+                 //
+                 // Overscan handles cross-line tokens that started a
+                 // few lines above the viewport (block comments,
+                 // multi-line strings). 10 lines is enough for almost
+                 // all real Dylan code; the rare long-block-comment
+                 // case can be polished later via an end-of-line
+                 // tokeniser-state cache.
+                 let overscan-lines = 10;
+                 let first-visible-line = scroll-y-px / line-height;
+                 let lines-on-screen = viewport-height-px / line-height + 1;
+                 let scan-first-line = if (first-visible-line > overscan-lines)
+                                         first-visible-line - overscan-lines
+                                       else 0 end;
+                 let total-lines = buffer-lines;
+                 let scan-last-line-uncapped = first-visible-line + lines-on-screen + overscan-lines;
+                 let scan-last-line = if (scan-last-line-uncapped < total-lines)
+                                        scan-last-line-uncapped
+                                      else total-lines end;
+                 let flat-len = size(cached-flat);
+                 let scan-start = rope-line-to-offset(source-text, scan-first-line);
+                 let scan-end = if (scan-last-line >= total-lines)
+                                  flat-len
+                                else rope-line-to-offset(source-text, scan-last-line) end;
                  highlight-dylan-syntax(layout, cached-flat,
+                                        scan-start, scan-end,
                                         keyword-brush, comment-brush,
                                         string-brush, number-brush,
                                         class-brush);
