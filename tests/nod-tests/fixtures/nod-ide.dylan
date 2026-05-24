@@ -739,45 +739,79 @@ end function;
 // vertical walk does NOT preserve the "ideal" column (the cursor sticks
 // to whatever shorter intermediate line allowed). Most editors keep a
 // remembered ideal column; we'll add that in a follow-up if it bothers.
+//
+// **Note on `|` and `&`.** Dylan's `|` and `&` are supposed to
+// short-circuit per spec, but our compiler currently lowers them to
+// eager `BoolOr` / `BoolAnd` PrimOps (see task #251). So writing
+// `until (i = 0 | element(bytes, i - 1) = 10)` evaluates
+// `element(bytes, -1)` when `i = 0` — which signals
+// `<out-of-range-error>` and aborts the WNDPROC. Until the compiler
+// gains real short-circuit semantics, we use sentinel-loop helpers
+// (`scan-line-start` / `scan-line-end`) that guard the bounds
+// explicitly with nested `if` / `elseif`.
+
+define function scan-line-start
+    (bytes :: <byte-string>, from :: <integer>) => (i :: <integer>)
+  // Find the largest `i <= from` such that either `i = 0` or
+  // `element(bytes, i - 1) = '\n'`.
+  let i = from;
+  let done = #f;
+  until (done)
+    if (i = 0)
+      done := #t;
+    elseif (element(bytes, i - 1) = 10)
+      done := #t;
+    else
+      i := i - 1;
+    end;
+  end;
+  i
+end function;
+
+define function scan-line-end
+    (bytes :: <byte-string>, from :: <integer>, n :: <integer>)
+ => (i :: <integer>)
+  // Find the smallest `i >= from` such that either `i = n` or
+  // `element(bytes, i) = '\n'`. `n` is `size(bytes)`, passed in by
+  // the caller to avoid re-computing it.
+  let i = from;
+  let done = #f;
+  until (done)
+    if (i = n)
+      done := #t;
+    elseif (element(bytes, i) = 10)
+      done := #t;
+    else
+      i := i + 1;
+    end;
+  end;
+  i
+end function;
 
 define function move-cursor-vertical
     (bytes :: <byte-string>, offset :: <integer>, direction :: <integer>)
  => (new :: <integer>)
   let n = size(bytes);
   let off = if (offset > n) n else offset end;
-  // Scan back to current line's start (byte after the previous \n, or 0).
-  let cur-line-start = off;
-  until (cur-line-start = 0 | element(bytes, cur-line-start - 1) = 10)
-    cur-line-start := cur-line-start - 1;
-  end;
+  let cur-line-start = scan-line-start(bytes, off);
   let cur-col = off - cur-line-start;
   if (direction < 0)
     if (cur-line-start = 0)
       offset
     else
-      let prev-line-end = cur-line-start - 1;  // index of the '\n'
-      let prev-line-start = prev-line-end;
-      until (prev-line-start = 0 | element(bytes, prev-line-start - 1) = 10)
-        prev-line-start := prev-line-start - 1;
-      end;
+      let prev-line-end = cur-line-start - 1;     // index of the '\n'
+      let prev-line-start = scan-line-start(bytes, prev-line-end);
       let prev-line-len = prev-line-end - prev-line-start;
       let target-col = if (cur-col < prev-line-len) cur-col else prev-line-len end;
       prev-line-start + target-col
     end
   else
-    // Forward: scan to end of current line.
-    let cur-line-end = off;
-    until (cur-line-end = n | element(bytes, cur-line-end) = 10)
-      cur-line-end := cur-line-end + 1;
-    end;
+    let cur-line-end = scan-line-end(bytes, off, n);
     if (cur-line-end = n)
       offset
     else
       let next-line-start = cur-line-end + 1;
-      let next-line-end = next-line-start;
-      until (next-line-end = n | element(bytes, next-line-end) = 10)
-        next-line-end := next-line-end + 1;
-      end;
+      let next-line-end = scan-line-end(bytes, next-line-start, n);
       let next-line-len = next-line-end - next-line-start;
       let target-col = if (cur-col < next-line-len) cur-col else next-line-len end;
       next-line-start + target-col
