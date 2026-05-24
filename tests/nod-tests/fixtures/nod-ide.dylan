@@ -789,12 +789,17 @@ define function scan-line-end
 end function;
 
 define function move-cursor-vertical
-    (bytes :: <byte-string>, offset :: <integer>, direction :: <integer>)
+    (bytes :: <byte-string>, offset :: <integer>, direction :: <integer>,
+     ideal-col :: <integer>)
  => (new :: <integer>)
+  // Sprint 43e-7 — `ideal-col` is the column the caller wants the
+  // cursor restored to on the target line, clamped to the target
+  // line's length. Letting the caller pass it (rather than us
+  // recomputing from `offset`) is what makes a long → short → long
+  // vertical walk preserve the original column.
   let n = size(bytes);
   let off = if (offset > n) n else offset end;
   let cur-line-start = scan-line-start(bytes, off);
-  let cur-col = off - cur-line-start;
   if (direction < 0)
     if (cur-line-start = 0)
       offset
@@ -802,7 +807,7 @@ define function move-cursor-vertical
       let prev-line-end = cur-line-start - 1;     // index of the '\n'
       let prev-line-start = scan-line-start(bytes, prev-line-end);
       let prev-line-len = prev-line-end - prev-line-start;
-      let target-col = if (cur-col < prev-line-len) cur-col else prev-line-len end;
+      let target-col = if (ideal-col < prev-line-len) ideal-col else prev-line-len end;
       prev-line-start + target-col
     end
   else
@@ -813,7 +818,7 @@ define function move-cursor-vertical
       let next-line-start = cur-line-end + 1;
       let next-line-end = scan-line-end(bytes, next-line-start, n);
       let next-line-len = next-line-end - next-line-start;
-      let target-col = if (cur-col < next-line-len) cur-col else next-line-len end;
+      let target-col = if (ideal-col < next-line-len) ideal-col else next-line-len end;
       next-line-start + target-col
     end
   end
@@ -857,6 +862,13 @@ define function main () => ()
   // when it's 1. Each cursor-mutating handler resets it to 1 so
   // the cursor stays solid during active typing/movement.
   let cursor-on = 1;
+  // Sprint 43e-7 — ideal-column memory. Every horizontal cursor
+  // move (left/right/home/end/click/typing/backspace) updates this
+  // to the cursor's current column. Vertical moves (up/down/pgup/
+  // pgdn) pass it to move-cursor-vertical so the cursor restores
+  // to the original column when a long → short → long walk crosses
+  // a shorter intermediate line.
+  let ideal-col = 0;
   // Sprint 41g — current-path is a captured cell (Sprint 24 auto cell
   // promotion: any `let`-bound name assigned inside the WNDPROC
   // closure becomes a cell). Same machinery that promoted source-text
@@ -930,6 +942,15 @@ define function main () => ()
   // per cursor move where n is the byte distance from start of
   // buffer to the cursor. Sub-millisecond for typical files; rope-
   // aware line lookup is a follow-up if it ever matters.
+  // Sprint 43e-7 — record the cursor's current column as the new
+  // ideal-col. Called by horizontal moves (left/right/home/end/
+  // click/typing/backspace); vertical moves (up/down/pgup/pgdn)
+  // skip this so the ideal column survives the vertical walk.
+  let update-ideal-col = method ()
+    let ls = scan-line-start(cached-flat, cursor-offset);
+    ideal-col := cursor-offset - ls;
+    0
+  end;
   let ensure-cursor-visible = method (hwnd)
     // Sprint 43e-6 — reset the blink phase. Any caller that moved
     // the cursor wants it visibly solid for the next ~500 ms;
@@ -1212,7 +1233,7 @@ define function main () => ()
                  let new-off = cursor-offset;
                  let i = 0;
                  until (i = lines-per-page)
-                   new-off := move-cursor-vertical(cached-flat, new-off, -1);
+                   new-off := move-cursor-vertical(cached-flat, new-off, -1, ideal-col);
                    i := i + 1;
                  end;
                  if (new-off ~= cursor-offset)
@@ -1225,7 +1246,7 @@ define function main () => ()
                  let new-off = cursor-offset;
                  let i = 0;
                  until (i = lines-per-page)
-                   new-off := move-cursor-vertical(cached-flat, new-off, 1);
+                   new-off := move-cursor-vertical(cached-flat, new-off, 1, ideal-col);
                    i := i + 1;
                  end;
                  if (new-off ~= cursor-offset)
@@ -1240,6 +1261,7 @@ define function main () => ()
                  let new-off = scan-line-start(cached-flat, cursor-offset);
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
+                   update-ideal-col();
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
@@ -1250,6 +1272,7 @@ define function main () => ()
                  let new-off = scan-line-end(cached-flat, cursor-offset, size(cached-flat));
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
+                   update-ideal-col();
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
@@ -1260,6 +1283,7 @@ define function main () => ()
                  // scrollbar, and (if we add them) Ctrl+arrows.
                  if (cursor-offset > 0)
                    cursor-offset := cursor-offset - 1;
+                   update-ideal-col();
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
@@ -1267,6 +1291,7 @@ define function main () => ()
                  let buf-len = size(cached-flat);
                  if (cursor-offset < buf-len)
                    cursor-offset := cursor-offset + 1;
+                   update-ideal-col();
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
@@ -1274,14 +1299,14 @@ define function main () => ()
                  // move-cursor-vertical returns the input unchanged at
                  // the top of the buffer, so the `~=` guard skips the
                  // pointless repaint.
-                 let new-off = move-cursor-vertical(cached-flat, cursor-offset, -1);
+                 let new-off = move-cursor-vertical(cached-flat, cursor-offset, -1, ideal-col);
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
                    ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 40)    // VK_DOWN — Sprint 43e-2 cursor move
-                 let new-off = move-cursor-vertical(cached-flat, cursor-offset, 1);
+                 let new-off = move-cursor-vertical(cached-flat, cursor-offset, 1, ideal-col);
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
                    ensure-cursor-visible(hwnd);
@@ -1304,6 +1329,7 @@ define function main () => ()
                    client-height-px := buffer-lines * line-height;
                    %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, scroll-y-px, 1);
                    %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  scroll-x-px, 1);
+                   update-ideal-col();
                    // Sprint 43e-4 — after backspace the cursor may have
                    // walked off the left edge of the viewport on a wrap;
                    // pull the viewport back to keep it visible.
@@ -1341,6 +1367,7 @@ define function main () => ()
                              else new-off end;
                if (clamped ~= cursor-offset)
                  cursor-offset := clamped;
+                 update-ideal-col();
                  ensure-cursor-visible(hwnd);
                  InvalidateRect(hwnd, 0, 0);
                else 0 end;
@@ -1368,6 +1395,7 @@ define function main () => ()
                  client-height-px := buffer-lines * line-height;
                  %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, scroll-y-px, 1);
                  %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  scroll-x-px, 1);
+                 update-ideal-col();
                  // Sprint 43e-4 — keep the cursor on screen after the
                  // insertion advanced it past the right edge of the
                  // viewport. Common case: typing at the end of a
@@ -1392,6 +1420,7 @@ define function main () => ()
                      source-text := new-rope;
                      cursor-offset := 0;
                      cursor-on := 1;
+                     ideal-col := 0;
                      cached-flat := new-source;
                      current-path := new-path;
                      buffer-lines := nod-rope-line-count(new-rope);
@@ -1481,6 +1510,7 @@ define function main () => ()
                      source-text := rope;
                      cursor-offset := 0;
                      cursor-on := 1;
+                     ideal-col := 0;
                      cached-flat := bytes;
                      current-path := path;
                      buffer-lines := nod-rope-line-count(rope);
