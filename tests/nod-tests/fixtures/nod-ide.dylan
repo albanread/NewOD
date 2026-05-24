@@ -933,33 +933,160 @@ define function is-dylan-keyword?
   end
 end function;
 
-define function highlight-dylan-keywords
-    (layout, bytes :: <byte-string>, keyword-brush) => ()
+define function is-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 48 & b <= 57
+end function;
+
+// Sprint 43f-2 — full tokenising syntax-colouring pass. Walks the
+// buffer recognising five token kinds:
+//
+//   * line comment   "// ... <newline>"          → comment-brush
+//   * block comment  "/* ... */"                 → comment-brush
+//   * string literal "\"...\""                   → string-brush
+//   * number literal digits [+ . e E + -]        → number-brush
+//   * class name     "<ident>"                   → class-brush
+//   * identifier     ident chars                 → keyword-brush iff
+//                                                  matches keyword list
+//
+// Anything else stays default (black). The scan is single-pass O(n)
+// over `bytes`; per-paint cost is sub-millisecond for IDE-size files.
+//
+// All `&` / `|` chains used here have pure operands only (byte
+// comparisons + arithmetic), so the eager-| compiler bug (task #251)
+// is harmless. Two-byte lookahead (e.g. `//`, `/*`) uses nested if
+// to defensively bounds-check before reading the second byte.
+
+define function highlight-dylan-syntax
+    (layout, bytes :: <byte-string>,
+     keyword-brush, comment-brush, string-brush,
+     number-brush, class-brush) => ()
   let n = size(bytes);
   let i = 0;
   let done = #f;
   until (done)
     if (i >= n)
       done := #t;
-    elseif (is-ident-start?(element(bytes, i)))
-      // Walk to the end of this identifier run.
-      let start = i;
-      i := i + 1;
-      let scan-done = #f;
-      until (scan-done)
-        if (i >= n)
-          scan-done := #t;
-        elseif (is-ident-cont?(element(bytes, i)))
-          i := i + 1;
-        else
-          scan-done := #t;
-        end;
-      end;
-      if (is-dylan-keyword?(bytes, start, i))
-        %dwrite-set-drawing-effect(layout, keyword-brush, start, i - start);
-      else 0 end;
     else
-      i := i + 1;
+      let b = element(bytes, i);
+      if (b = 47)              // '/' — comment lookahead
+        if (i + 1 < n)
+          let b2 = element(bytes, i + 1);
+          if (b2 = 47)         // line comment "//..."
+            let start = i;
+            i := i + 2;
+            let scan-done = #f;
+            until (scan-done)
+              if (i >= n)
+                scan-done := #t;
+              elseif (element(bytes, i) = 10)  // '\n'
+                scan-done := #t;
+              else
+                i := i + 1;
+              end;
+            end;
+            %dwrite-set-drawing-effect(layout, comment-brush, start, i - start);
+          elseif (b2 = 42)     // block comment "/* ... */"
+            let start = i;
+            i := i + 2;
+            let scan-done = #f;
+            until (scan-done)
+              if (i >= n)
+                scan-done := #t;
+              elseif (i + 1 < n & element(bytes, i) = 42 & element(bytes, i + 1) = 47)
+                i := i + 2;
+                scan-done := #t;
+              else
+                i := i + 1;
+              end;
+            end;
+            %dwrite-set-drawing-effect(layout, comment-brush, start, i - start);
+          else
+            i := i + 1;
+          end;
+        else
+          i := i + 1;
+        end;
+      elseif (b = 34)          // '"' — string literal
+        let start = i;
+        i := i + 1;
+        let scan-done = #f;
+        until (scan-done)
+          if (i >= n)
+            scan-done := #t;
+          elseif (element(bytes, i) = 92 & i + 1 < n)  // '\\' escape
+            i := i + 2;
+          elseif (element(bytes, i) = 34)              // closing '"'
+            i := i + 1;
+            scan-done := #t;
+          elseif (element(bytes, i) = 10)              // unterminated — stop at EOL
+            scan-done := #t;
+          else
+            i := i + 1;
+          end;
+        end;
+        %dwrite-set-drawing-effect(layout, string-brush, start, i - start);
+      elseif (b = 60)          // '<' — class name "<ident>"
+        if (i + 1 < n & is-ident-start?(element(bytes, i + 1)))
+          let start = i;
+          i := i + 2;
+          let scan-done = #f;
+          until (scan-done)
+            if (i >= n)
+              scan-done := #t;
+            elseif (element(bytes, i) = 62)  // '>'
+              i := i + 1;
+              scan-done := #t;
+            elseif (is-ident-cont?(element(bytes, i)))
+              i := i + 1;
+            else
+              // Not a clean class name — bail without colouring.
+              i := start + 1;
+              scan-done := #t;
+            end;
+          end;
+          // Only colour if we actually closed with '>'.
+          if (i > start + 1 & element(bytes, i - 1) = 62)
+            %dwrite-set-drawing-effect(layout, class-brush, start, i - start);
+          else 0 end;
+        else
+          i := i + 1;
+        end;
+      elseif (is-digit?(b))    // number literal
+        let start = i;
+        i := i + 1;
+        let scan-done = #f;
+        until (scan-done)
+          if (i >= n)
+            scan-done := #t;
+          else
+            let c = element(bytes, i);
+            if (is-digit?(c) | c = 46 | c = 101 | c = 69 | c = 43 | c = 45)
+              i := i + 1;
+            else
+              scan-done := #t;
+            end;
+          end;
+        end;
+        %dwrite-set-drawing-effect(layout, number-brush, start, i - start);
+      elseif (is-ident-start?(b))
+        let start = i;
+        i := i + 1;
+        let scan-done = #f;
+        until (scan-done)
+          if (i >= n)
+            scan-done := #t;
+          elseif (is-ident-cont?(element(bytes, i)))
+            i := i + 1;
+          else
+            scan-done := #t;
+          end;
+        end;
+        if (is-dylan-keyword?(bytes, start, i))
+          %dwrite-set-drawing-effect(layout, keyword-brush, start, i - start);
+        else 0 end;
+      else
+        i := i + 1;
+      end;
     end;
   end;
 end function;
@@ -1181,11 +1308,20 @@ define function main () => ()
                  %d2d-begin-draw(dc);
                  %d2d-clear(dc, 255, 255, 255, 255);
                  let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);
-                 // Sprint 43f-1 — accent brushes for syntax colouring.
-                 //   keyword-brush: medium blue, used for Dylan keywords.
-                 //   (more colours land in 43f-2: comment-brush green,
-                 //   string-brush red, number-brush orange.)
+                 // Sprint 43f-1 / 43f-2 — syntax-colour brushes.
+                 //   keyword: medium blue (define, end, method, …)
+                 //   comment: muted green (// and /* */)
+                 //   string:  brick red ("...")
+                 //   number:  purple (literals)
+                 //   class:   teal (<foo>, <byte-string>, …)
+                 // Picked from common editor palettes; colours are
+                 // distinguishable on both light and dark text without
+                 // overpowering the default black.
                  let keyword-brush = %d2d-create-solid-color-brush(dc, 30, 90, 200, 255);
+                 let comment-brush = %d2d-create-solid-color-brush(dc, 30, 130, 50, 255);
+                 let string-brush  = %d2d-create-solid-color-brush(dc, 170, 50, 30, 255);
+                 let number-brush  = %d2d-create-solid-color-brush(dc, 130, 50, 170, 255);
+                 let class-brush   = %d2d-create-solid-color-brush(dc, 20, 130, 140, 255);
                  // Sprint 43d hotfix — `cached-flat` is refreshed at every
                  // mutation; WM_PAINT just reuses it. Before caching
                  // we were paying an O(n) byte-string allocation per
@@ -1194,11 +1330,16 @@ define function main () => ()
                  // generation and tripped GcStallError::mid_evac_oom.
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
-                 // Sprint 43f-1 — walk cached-flat looking for identifier
-                 // runs; for each one matching a Dylan keyword, call
-                 // SetDrawingEffect on the layout so the run renders in
-                 // the keyword colour. Must be done BEFORE DrawTextLayout.
-                 highlight-dylan-keywords(layout, cached-flat, keyword-brush);
+                 // Sprint 43f-2 — full tokenising syntax-colouring pass.
+                 // Walks cached-flat once, recognises comments / strings
+                 // / numbers / class names / keywords, and applies the
+                 // right brush to each via SetDrawingEffect. Must run
+                 // before DrawTextLayout so the effects are in place
+                 // when DirectWrite renders.
+                 highlight-dylan-syntax(layout, cached-flat,
+                                        keyword-brush, comment-brush,
+                                        string-brush, number-brush,
+                                        class-brush);
                  %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
                  // Sprint 43e-1 (revised) — visible cursor via
                  // DirectWrite hit-testing. Ask the text layout we
@@ -1235,6 +1376,10 @@ define function main () => ()
                  %d2d-end-draw(dc);
                  %com-release(brush);
                  %com-release(keyword-brush);
+                 %com-release(comment-brush);
+                 %com-release(string-brush);
+                 %com-release(number-brush);
+                 %com-release(class-brush);
                  %com-release(layout);
                  %dxgi-swap-chain-present(swap);
                else 0 end;
