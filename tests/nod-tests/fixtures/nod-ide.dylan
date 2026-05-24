@@ -1154,6 +1154,83 @@ define function highlight-dylan-syntax
   end;
 end function;
 
+// ─── Sprint 43g — gutter helpers (line numbers) ──────────────────────────
+
+// Render a non-negative integer to a decimal byte-string. Uses
+// repeated /10 + mod (`n - (n / 10) * 10`) to extract digits.
+define function integer-to-string (n :: <integer>) => (s :: <byte-string>)
+  if (n = 0)
+    "0"
+  else
+    // Count digits.
+    let m = n;
+    let digits = 0;
+    until (m = 0)
+      digits := digits + 1;
+      m := m / 10;
+    end;
+    // Write digits right-to-left.
+    let s = %byte-string-allocate(digits);
+    let m = n;
+    let i = digits - 1;
+    let done = #f;
+    until (done)
+      if (i < 0)
+        done := #t;
+      else
+        let d = m - (m / 10) * 10;     // m mod 10
+        %byte-string-element-setter(48 + d, s, i);   // '0' + digit
+        m := m / 10;
+        i := i - 1;
+      end;
+    end;
+    s
+  end
+end function;
+
+// Build a multi-line right-padded line-numbers string covering the
+// inclusive range [first .. last], each number padded to `width`
+// characters. Lines joined with '\n'. Caller hands the result to
+// DirectWrite as the text of a layout sized to width × line-height.
+//
+// Right-alignment is achieved with leading spaces — the font is
+// monospaced so visual alignment is exact without needing DirectWrite's
+// SetTextAlignment shim.
+
+define function build-line-numbers-block
+    (from-line :: <integer>, to-line :: <integer>, width :: <integer>)
+ => (out :: <byte-string>)
+  let acc = "";
+  let i = from-line;
+  let done = #f;
+  until (done)
+    if (i > to-line)
+      done := #t;
+    else
+      let n-str = integer-to-string(i);
+      let pad-count = width - size(n-str);
+      let padded = if (pad-count <= 0)
+                     n-str
+                   else
+                     let p = %byte-string-allocate(pad-count);
+                     let k = 0;
+                     until (k = pad-count)
+                       %byte-string-element-setter(32, p, k);   // ' '
+                       k := k + 1;
+                     end;
+                     concatenate(p, n-str)
+                   end;
+      acc := if (i = from-line)
+               padded
+             else
+               concatenate(acc, concatenate("\n", padded))
+             end;
+      i := i + 1;
+    end;
+  end;
+  acc
+end function;
+
 define function main () => ()
   let arg-path = %argv1();
   // Sprint 43d — the buffer is a `<rope>` now. Load the file (or the
@@ -1224,6 +1301,20 @@ define function main () => ()
   let char-width  = 8;
   let line-height = 18;
   let pad = 8;
+  // Sprint 43g — left gutter. Three columns reserved:
+  //   * fold-gutter   — placeholder for collapse/expand triangles
+  //   * error-gutter  — placeholder for diagnostic markers
+  //   * line-num-gutter — visible 1-based line numbers (functional)
+  // total-gutter-px is the width added BEFORE pad on the left side
+  // of the source-text viewport. Everywhere the text used to be
+  // drawn at x = pad - scroll-x-px, it now uses x = gutter-px + pad
+  // - scroll-x-px. Click handler subtracts gutter-px from the
+  // client X before computing the buffer position; clicks landing
+  // inside the gutter are ignored (no cursor move).
+  let fold-gutter-px     = 14;
+  let error-gutter-px    = 14;
+  let line-num-gutter-px = 40;     // fits 5 monospace digits at 8 px each
+  let gutter-px = fold-gutter-px + error-gutter-px + line-num-gutter-px;
   let client-width-px  = buffer-max-cols * char-width;
   let client-height-px = buffer-lines * line-height;
   let window-width    = 1024;
@@ -1371,6 +1462,14 @@ define function main () => ()
                  %d2d-begin-draw(dc);
                  %d2d-clear(dc, 255, 255, 255, 255);
                  let brush  = %d2d-create-solid-color-brush(dc, 0, 0, 0, 255);
+                 // Sprint 43g — gutter brushes.
+                 //   gutter-bg-brush:   light grey background fill.
+                 //   gutter-text-brush: medium grey for line numbers.
+                 //   gutter-edge-brush: darker grey for the 1px
+                 //                      right-edge separator line.
+                 let gutter-bg-brush   = %d2d-create-solid-color-brush(dc, 240, 240, 240, 255);
+                 let gutter-text-brush = %d2d-create-solid-color-brush(dc, 130, 130, 130, 255);
+                 let gutter-edge-brush = %d2d-create-solid-color-brush(dc, 200, 200, 200, 255);
                  // Sprint 43f-1 / 43f-2 — syntax-colour brushes.
                  //   keyword: medium blue (define, end, method, …)
                  //   comment: muted green (// and /* */)
@@ -1424,7 +1523,10 @@ define function main () => ()
                                         keyword-brush, comment-brush,
                                         string-brush, number-brush,
                                         class-brush);
-                 %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
+                 // Sprint 43g — text-layout origin shifts right by
+                 // `gutter-px` so the gutter columns get the left
+                 // strip of the viewport.
+                 %d2d-draw-text-layout(dc, gutter-px + pad - scroll-x-px, pad - scroll-y-px, layout, brush);
                  // Sprint 43e-1 (revised) — visible cursor via
                  // DirectWrite hit-testing. Ask the text layout we
                  // just drew where the cursor offset lives in pixels;
@@ -1448,7 +1550,7 @@ define function main () => ()
                  let two-to-32 = 4294967296;
                  let hx = packed - (packed / two-to-32) * two-to-32;
                  let hy = packed / two-to-32;
-                 let cx = pad - scroll-x-px + hx;
+                 let cx = gutter-px + pad - scroll-x-px + hx;
                  let cy = pad - scroll-y-px + hy;
                  // Sprint 43e-6 — blink: only draw when cursor-on = 1.
                  // Bar is 3px wide (was 2px) for visibility — at 1Hz
@@ -1457,6 +1559,36 @@ define function main () => ()
                  if (cursor-on = 1)
                    %d2d-fill-rectangle(dc, cx, cy, cx + 3, cy + line-height, brush);
                  else 0 end;
+                 // Sprint 43g — gutter rendering. Drawn AFTER the
+                 // text so the gutter sits on top, hiding any text
+                 // that might've been horizontally-scrolled into
+                 // negative x territory (text origin = gutter-px +
+                 // pad - scroll-x-px; for scroll-x-px > pad the
+                 // text could otherwise bleed under the gutter).
+                 //
+                 //   1. Fill the gutter background (light grey).
+                 //   2. Draw a 1px darker separator at the right edge.
+                 //   3. Build a multi-line line-numbers string for
+                 //      the visible range + small overscan.
+                 //   4. Create a temporary text layout sized to the
+                 //      line-num gutter column; draw it at the
+                 //      line-num gutter origin.
+                 %d2d-fill-rectangle(dc, 0, 0, gutter-px, viewport-height-px, gutter-bg-brush);
+                 %d2d-fill-rectangle(dc, gutter-px - 1, 0, gutter-px, viewport-height-px, gutter-edge-brush);
+                 let first-visible-line = scroll-y-px / line-height;
+                 let lines-on-screen = viewport-height-px / line-height + 1;
+                 let total-lines = buffer-lines;
+                 let last-line-uncapped = first-visible-line + lines-on-screen;
+                 let last-line = if (last-line-uncapped < total-lines)
+                                   last-line-uncapped
+                                 else total-lines end;
+                 let ln-block = build-line-numbers-block(first-visible-line + 1, last-line, 5);
+                 let ln-layout = %dwrite-create-text-layout(dwrite, ln-block, format,
+                                                            line-num-gutter-px, viewport-height-px);
+                 let ln-origin-x = fold-gutter-px + error-gutter-px;
+                 let ln-origin-y = pad + first-visible-line * line-height - scroll-y-px;
+                 %d2d-draw-text-layout(dc, ln-origin-x, ln-origin-y, ln-layout, gutter-text-brush);
+                 %com-release(ln-layout);
                  %d2d-end-draw(dc);
                  %com-release(brush);
                  %com-release(keyword-brush);
@@ -1464,6 +1596,9 @@ define function main () => ()
                  %com-release(string-brush);
                  %com-release(number-brush);
                  %com-release(class-brush);
+                 %com-release(gutter-bg-brush);
+                 %com-release(gutter-text-brush);
+                 %com-release(gutter-edge-brush);
                  %com-release(layout);
                  %dxgi-swap-chain-present(swap);
                else 0 end;
@@ -1744,13 +1879,14 @@ define function main () => ()
                  else 0 end;
                else 0 end;
                0
-             elseif (msg = 513)  // WM_LBUTTONDOWN — Sprint 43e-5 cursor positioning
+             elseif (msg = 513)  // WM_LBUTTONDOWN — Sprint 43e-5 / 43g cursor positioning
                // lParam packs the click position as (y << 16) | x in
                // client-area coordinates (top-left of the window's
-               // client area = (0, 0)). Convert to layout-relative
-               // coordinates by adding the scroll offsets and
-               // subtracting the pad. Then ask DirectWrite to
-               // hit-test that point against the current layout.
+               // client area = (0, 0)). Subtract gutter-px + pad to
+               // convert to layout-relative coordinates; add scroll
+               // offsets. Clicks inside the gutter (cx-client <
+               // gutter-px) don't move the cursor — later sprints can
+               // bind those to fold-toggle or error-tooltip.
                //
                // We create a fresh text layout per click — cheaper
                // than caching it across mutations and clicks are
@@ -1758,7 +1894,10 @@ define function main () => ()
                // immediately after the hit-test.
                let cx-client = %lo-word(lparam);
                let cy-client = %hi-word(lparam);
-               let layout-x = cx-client + scroll-x-px - pad;
+               if (cx-client < gutter-px)
+                 0   // ignore gutter clicks for now
+               else
+               let layout-x = cx-client + scroll-x-px - pad - gutter-px;
                let layout-y = cy-client + scroll-y-px - pad;
                let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                        client-width-px, client-height-px);
@@ -1777,6 +1916,7 @@ define function main () => ()
                  ensure-cursor-visible(hwnd);
                  InvalidateRect(hwnd, 0, 0);
                else 0 end;
+               end;   // close the gutter-click if/else
                0
              elseif (msg = 258)  // WM_CHAR — Sprint 43d character input
                // wparam carries the character as a UTF-16 code unit.
