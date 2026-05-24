@@ -117,10 +117,35 @@ impl Word {
         }
     }
 
-    /// Decode a pointer payload. Returns `None` for fixnum-tagged words.
+    /// Decode a pointer payload. Returns `None` for fixnum-tagged words
+    /// AND for pointer-tagged words whose post-mask address isn't
+    /// 8-byte aligned.
+    ///
+    /// The alignment check is structurally guaranteed for any
+    /// `Word` produced by `from_ptr` (the constructor `debug_assert`s
+    /// it), but a `Word::from_raw` round-trip from JIT'd code can
+    /// surface a tagged-pointer-shaped value that doesn't actually
+    /// point at a heap object — e.g. when 8 consecutive bytes of a
+    /// `<byte-string>` payload happen to look like a tagged pointer
+    /// and a runtime probe (`collection_size`, `try_simple_object_vector`,
+    /// …) calls `as_ptr` on them while walking conservatively. Before
+    /// this check, the misidentified pointer would deref into raw
+    /// payload bytes and trip an alignment assertion deep inside the
+    /// `Wrapper`-load. After this check, the runtime probe simply
+    /// gets `None` and short-circuits to "not that class".
+    ///
+    /// This is a defensive guardrail, not a real fix — the proper
+    /// solution is Sprint 11d (`gc.statepoint` precise roots so the
+    /// runtime never has to guess what is a pointer). Until then,
+    /// alignment validation here turns a class of crashes into
+    /// silent fall-through.
     pub fn as_ptr<T>(self) -> Option<*const T> {
         if self.is_pointer() {
-            Some((self.0 & !1) as *const T)
+            let addr = self.0 & !1;
+            if addr & 0b111 != 0 {
+                return None;
+            }
+            Some(addr as *const T)
         } else {
             None
         }
@@ -129,7 +154,11 @@ impl Word {
     /// Same as `as_ptr` but mutable.
     pub fn as_mut_ptr<T>(self) -> Option<*mut T> {
         if self.is_pointer() {
-            Some((self.0 & !1) as *mut T)
+            let addr = self.0 & !1;
+            if addr & 0b111 != 0 {
+                return None;
+            }
+            Some(addr as *mut T)
         } else {
             None
         }
