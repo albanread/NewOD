@@ -937,6 +937,56 @@ define function is-digit? (b :: <integer>) => (yes? :: <boolean>)
   b >= 48 & b <= 57
 end function;
 
+// Sprint 43f-4 — find a syntactically safe byte offset to seed the
+// tokeniser from, by walking lines backward from the first visible
+// line until we hit one beginning with "define ". Dylan top-level
+// forms (`define class`, `define method`, `define function`,
+// `define library`, `define module`, `define variable`, etc.) are
+// self-contained — once we're between two top-level forms, the
+// tokeniser state is known-clean (not in a comment, not in a
+// string). Starting the scan there gives correct colouring no
+// matter where the user scrolled.
+//
+// If no `define` line is found above (e.g. very top of file, or a
+// `module:`/`library:` header file), fall back to offset 0.
+//
+// Why "starts with `define `" specifically:
+//   - // line comments don't start with `define`
+//   - /* block comments */ — if `define` appears INSIDE a block
+//     comment, it would still need to be at column 0 of its line
+//     for us to false-positive; that's a contrived enough case
+//     to ignore. Real Dylan code never has top-level-aligned
+//     `define ` inside a block comment.
+//   - String literals — same argument.
+
+define function find-safe-scan-start
+    (bytes :: <byte-string>, source, first-visible-line :: <integer>)
+ => (offset :: <integer>)
+  let candidate = first-visible-line;
+  let result = 0;
+  let done = #f;
+  let n = size(bytes);
+  until (done)
+    if (candidate <= 0)
+      done := #t;
+    else
+      let off = rope-line-to-offset(source, candidate);
+      // Need 7 bytes for "define " — keyword (6) plus space.
+      if (off + 7 > n)
+        candidate := candidate - 1;
+      elseif (~ bytes-equal-string?(bytes, off, off + 6, "define"))
+        candidate := candidate - 1;
+      elseif (element(bytes, off + 6) ~= 32)  // ' '
+        candidate := candidate - 1;
+      else
+        result := off;
+        done := #t;
+      end;
+    end;
+  end;
+  result
+end function;
+
 // Sprint 43f-2 — full tokenising syntax-colouring pass. Walks the
 // buffer recognising five token kinds:
 //
@@ -1343,34 +1393,35 @@ define function main () => ()
                  // generation and tripped GcStallError::mid_evac_oom.
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
-                 // Sprint 43f-3 — viewport-bounded syntax-colouring scan.
+                 // Sprint 43f-3 / 43f-4 — viewport-bounded syntax-
+                 // colouring scan with a SYNTACTICALLY SAFE start point.
                  //
-                 // The text in the window is a VIEW into cached-flat:
-                 // we only need to colour the lines the user can
-                 // currently see. DirectWrite clips the painting
-                 // anyway, but tokenising the WHOLE buffer per paint
-                 // is wasted CPU. Bound the tokeniser to the visible
-                 // line range (plus a small overscan for context).
+                 // Earlier 43f-3 used a fixed overscan above the
+                 // viewport; that broke when a /* block comment */
+                 // started more than `overscan` lines above and the
+                 // tokeniser began mid-comment, colouring the visible
+                 // text as code. The symptom was syntax colours
+                 // changing as the user scrolled.
                  //
-                 // Overscan handles cross-line tokens that started a
-                 // few lines above the viewport (block comments,
-                 // multi-line strings). 10 lines is enough for almost
-                 // all real Dylan code; the rare long-block-comment
-                 // case can be polished later via an end-of-line
-                 // tokeniser-state cache.
+                 // 43f-4 finds a safe start by walking backwards from
+                 // the first visible line to the previous top-level
+                 // `define ...` line. Between two top-level Dylan
+                 // forms the tokeniser state is known-clean (no open
+                 // comment, no open string), so seeding the scan
+                 // there gives correct colouring regardless of scroll
+                 // position. A small overscan past the visible
+                 // bottom handles tokens that start visible and
+                 // extend below the viewport.
                  let overscan-lines = 10;
                  let first-visible-line = scroll-y-px / line-height;
                  let lines-on-screen = viewport-height-px / line-height + 1;
-                 let scan-first-line = if (first-visible-line > overscan-lines)
-                                         first-visible-line - overscan-lines
-                                       else 0 end;
                  let total-lines = buffer-lines;
                  let scan-last-line-uncapped = first-visible-line + lines-on-screen + overscan-lines;
                  let scan-last-line = if (scan-last-line-uncapped < total-lines)
                                         scan-last-line-uncapped
                                       else total-lines end;
                  let flat-len = size(cached-flat);
-                 let scan-start = rope-line-to-offset(source-text, scan-first-line);
+                 let scan-start = find-safe-scan-start(cached-flat, source-text, first-visible-line);
                  let scan-end = if (scan-last-line >= total-lines)
                                   flat-len
                                 else rope-line-to-offset(source-text, scan-last-line) end;
