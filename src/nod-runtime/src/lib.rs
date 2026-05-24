@@ -139,16 +139,16 @@ pub use com_shim::{
     nod_dxgi_factory_from_d3d_device, nod_dxgi_swap_chain_present,
     nod_dxgi_swap_chain_resize_buffers, nod_get_argv1, nod_get_scroll_pos, nod_hi_word, nod_lo_word,
     nod_post_message, nod_pump_one_message, nod_read_file_to_string,
-    nod_count_newlines, nod_max_line_chars, nod_register_window_class, nod_run_message_loop, nod_set_scroll_info,
+    nod_register_window_class, nod_run_message_loop, nod_set_scroll_info,
     // Sprint 41e — Win32 file-open common dialog shim (wraps
     // GetOpenFileNameW + the 88-byte OPENFILENAMEW struct).
     nod_show_open_file_dialog,
     // Sprint 41g — Win32 file-save common dialog shim (wraps
     // GetSaveFileNameW + the same OPENFILENAMEW struct) and the
     // `<byte-string>`-to-file write shim that backs File → Save and
-    // File → Save As. Plus recent-files helpers (load/add/basename)
-    // that own the on-disk persistence + dedup/cap-at-5 logic.
-    nod_add_recent, nod_basename, nod_load_recent,
+    // File → Save As. Sprint 42a Phase E retired the recent-files /
+    // basename / count-newlines / max-line-chars shims — those live
+    // in pure Dylan in nod-ide.dylan now.
     nod_show_save_file_dialog, nod_write_file_from_string,
     register as com_register, registry_len as com_registry_len,
 };

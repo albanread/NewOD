@@ -382,14 +382,6 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // takes (hwnd, nbar). Both return fixnum-tagged integers.
     ("%set-scroll-info", "nod_set_scroll_info", 7, TypeEstimate::Integer),
     ("%get-scroll-pos", "nod_get_scroll_pos", 2, TypeEstimate::Integer),
-    // Sprint 41c — count '\n' bytes in a `<byte-string>` and return that
-    // count + 1 (one line beyond the trailing newline). The IDE uses
-    // this to size the vertical scrollbar.
-    ("%count-newlines", "nod_count_newlines", 1, TypeEstimate::Integer),
-    // Sprint 41d — length in bytes of the longest non-newline run in a
-    // `<byte-string>`. The IDE uses this to size the horizontal
-    // scrollbar's client-area width (`buffer-max-cols × char-width`).
-    ("%max-line-chars", "nod_max_line_chars", 1, TypeEstimate::Integer),
     // Sprint 41e — File → Open. Wraps Win32 `GetOpenFileNameW` plus the
     // 88-byte `OPENFILENAMEW` struct in a single shim that returns the
     // chosen path as a `<byte-string>` (or `nil` if the user cancelled).
@@ -403,15 +395,12 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // `GetSaveFileNameW` with OFN_OVERWRITEPROMPT.
     ("%write-file", "nod_write_file_from_string", 2, TypeEstimate::Integer),
     ("%show-save-file-dialog", "nod_show_save_file_dialog", 1, TypeEstimate::Top),
-    // Sprint 41g — Recent-files persistence helpers + basename.
-    // `%load-recent` reads F:\scratch\nod-ide-recent.txt and returns a
-    // `<pair>`-spined Dylan list (or nil if empty). `%add-recent`
-    // prepends a path, dedups, caps at 5, writes back, returns the new
-    // list. `%basename` returns the last path component for the title
-    // bar.
-    ("%load-recent", "nod_load_recent", 0, TypeEstimate::Top),
-    ("%add-recent", "nod_add_recent", 1, TypeEstimate::Top),
-    ("%basename", "nod_basename", 1, TypeEstimate::Top),
+    // Sprint 41g's `%load-recent`, `%add-recent`, `%basename` primitives
+    // (and Sprint 41c's `%count-newlines` / 41d's `%max-line-chars`) are
+    // retired — Sprint 42a Phase E moved all of them into pure Dylan
+    // in `tests/nod-tests/fixtures/nod-ide.dylan`, built on the
+    // byte-string ops (`size`, `element`, `concatenate`, `copy-sequence`,
+    // `=`) plus the `%read-file` / `%write-file` primitives.
 ];
 
 fn lookup_primitive(name: &str) -> Option<(&'static str, usize, TypeEstimate)> {

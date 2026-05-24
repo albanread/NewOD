@@ -95,18 +95,11 @@ use crate::codegen::{
     // Sprint 41c — scrollbar primitives.
     NOD_SET_SCROLL_INFO_SYMBOL,
     NOD_GET_SCROLL_POS_SYMBOL,
-    NOD_COUNT_NEWLINES_SYMBOL,
-    // Sprint 41d — longest non-newline run helper.
-    NOD_MAX_LINE_CHARS_SYMBOL,
     // Sprint 41e — File → Open dialog shim.
     NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL,
     // Sprint 41g — File → Save / Save As shims.
     NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL,
     NOD_WRITE_FILE_FROM_STRING_SYMBOL,
-    // Sprint 41g — Recent-files list helpers + basename.
-    NOD_LOAD_RECENT_SYMBOL,
-    NOD_ADD_RECENT_SYMBOL,
-    NOD_BASENAME_SYMBOL,
 };
 use crate::jit_mm;
 
@@ -656,10 +649,6 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_set_scroll_info as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_GET_SCROLL_POS_SYMBOL),
              nod_runtime::nod_get_scroll_pos as *const () as *mut std::ffi::c_void),
-            (module.get_function(NOD_COUNT_NEWLINES_SYMBOL),
-             nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
-            (module.get_function(NOD_MAX_LINE_CHARS_SYMBOL),
-             nod_runtime::nod_max_line_chars as *const () as *mut std::ffi::c_void),
             // Sprint 41e — File → Open shim binding for the cold path
             // (`cargo run --bin nod-driver eval`). The AOT EXE path
             // pulls the same symbol out of nod_runtime.lib's staticlib.
@@ -671,13 +660,9 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_write_file_from_string as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL),
              nod_runtime::nod_show_save_file_dialog as *const () as *mut std::ffi::c_void),
-            // Sprint 41g — Recent-files persistence + basename.
-            (module.get_function(NOD_LOAD_RECENT_SYMBOL),
-             nod_runtime::nod_load_recent as *const () as *mut std::ffi::c_void),
-            (module.get_function(NOD_ADD_RECENT_SYMBOL),
-             nod_runtime::nod_add_recent as *const () as *mut std::ffi::c_void),
-            (module.get_function(NOD_BASENAME_SYMBOL),
-             nod_runtime::nod_basename as *const () as *mut std::ffi::c_void),
+            // Sprint 42a Phase E retired the recent-files / basename /
+            // count-newlines / max-line-chars shims — those are now
+            // pure Dylan in nod-ide.dylan.
         ];
         #[cfg(windows)]
         sprint_20b_extern_decls.extend(com_mappings);
@@ -1385,9 +1370,6 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         // binding live.
         (NOD_SET_SCROLL_INFO_SYMBOL, nod_runtime::nod_set_scroll_info as *const () as *mut std::ffi::c_void),
         (NOD_GET_SCROLL_POS_SYMBOL, nod_runtime::nod_get_scroll_pos as *const () as *mut std::ffi::c_void),
-        (NOD_COUNT_NEWLINES_SYMBOL, nod_runtime::nod_count_newlines as *const () as *mut std::ffi::c_void),
-        // Sprint 41d — longest non-newline run helper.
-        (NOD_MAX_LINE_CHARS_SYMBOL, nod_runtime::nod_max_line_chars as *const () as *mut std::ffi::c_void),
         // Sprint 41e — File → Open shim, surfaced through the
         // cache-replay symbol-mapping path so a cache hit keeps the
         // `%show-open-file-dialog` binding live.
@@ -1397,11 +1379,8 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         // both `%write-file` and `%show-save-file-dialog` bindings live.
         (NOD_WRITE_FILE_FROM_STRING_SYMBOL, nod_runtime::nod_write_file_from_string as *const () as *mut std::ffi::c_void),
         (NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL, nod_runtime::nod_show_save_file_dialog as *const () as *mut std::ffi::c_void),
-        // Sprint 41g — Recent-files helpers + basename, surfaced through
-        // the cache-replay symbol-mapping path.
-        (NOD_LOAD_RECENT_SYMBOL, nod_runtime::nod_load_recent as *const () as *mut std::ffi::c_void),
-        (NOD_ADD_RECENT_SYMBOL, nod_runtime::nod_add_recent as *const () as *mut std::ffi::c_void),
-        (NOD_BASENAME_SYMBOL, nod_runtime::nod_basename as *const () as *mut std::ffi::c_void),
+        // Sprint 42a Phase E retired the count-newlines / max-line-chars
+        // / recent-files / basename shims — those are pure Dylan now.
     ]);
     v
 }

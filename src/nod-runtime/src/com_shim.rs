@@ -1984,71 +1984,10 @@ pub unsafe extern "C-unwind" fn nod_get_argv1() -> u64 {
     }
 }
 
-// ─── Sprint 41c — line-count helper ────────────────────────────────────────
-
-/// JIT-callable: count newline-terminated lines in a Dylan `<byte-string>`.
-/// Returns `count('\n' bytes in s) + 1` — i.e. a file ending in `\n` is
-/// counted as having one fewer "real" line than the byte count would
-/// suggest, but trailing-newline files are universal and the IDE wants
-/// "scroll over this much vertical space", which is exactly what
-/// `newlines + 1` measures (the last "line" past a trailing newline is
-/// the empty cursor position).
-///
-/// This is the path-of-least-resistance shim: a byte-string iterator
-/// would require adding a `FipKind::ByteString` arm to
-/// `collections.rs`, which is a deeper change than Sprint 41c needs.
-///
-/// # Safety
-/// `s_word` must be a Dylan `<byte-string>` Word; `read_dylan_byte_string`
-/// panics on the wrong class.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn nod_count_newlines(s_word: u64) -> u64 {
-    let s = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(s_word));
-    let n = s.bytes().filter(|&b| b == b'\n').count() as u64;
-    tag(n + 1)
-}
-
-// ─── Sprint 41d — longest-line-in-bytes helper ─────────────────────────────
-
-/// JIT-callable: return the length in bytes of the longest run of
-/// non-`'\n'` bytes in a Dylan `<byte-string>`. Used by the IDE to size
-/// the horizontal scrollbar (`buffer-max-cols` in the corrected editor
-/// model).
-///
-/// Why a shim rather than Dylan code:
-/// `<byte-string>` is not registered with the runtime's FIP (no
-/// `FipKind::ByteString` arm in `collections.rs`), and there is no
-/// `string-element` / `element(<byte-string>, i)` primitive exposed to
-/// Dylan yet. Walking the bytes from Dylan would require either adding
-/// FIP support or a per-index accessor — either is a bigger lift than
-/// the Sprint 41d brief allows. This shim mirrors `nod_count_newlines`
-/// exactly (read the live UTF-8 bytes, fold over them, fixnum-tag the
-/// result). When a proper byte-string FIP arm lands later we can
-/// retire both of these.
-///
-/// # Safety
-/// `s_word` must be a Dylan `<byte-string>` Word; `read_dylan_byte_string`
-/// panics on the wrong class.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn nod_max_line_chars(s_word: u64) -> u64 {
-    let s = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(s_word));
-    let mut best: u64 = 0;
-    let mut cur: u64 = 0;
-    for b in s.bytes() {
-        if b == b'\n' {
-            if cur > best {
-                best = cur;
-            }
-            cur = 0;
-        } else {
-            cur += 1;
-        }
-    }
-    if cur > best {
-        best = cur;
-    }
-    tag(best)
-}
+// Sprint 41c's `nod_count_newlines` and Sprint 41d's `nod_max_line_chars`
+// shims were retired in Sprint 42a Phase E — both are now pure Dylan in
+// `tests/nod-tests/fixtures/nod-ide.dylan` (`nod-count-newlines` /
+// `nod-max-line-chars`) using the byte-string `size` and `element` ops.
 
 // ─── Sprint 41c — scrollbar primitives ─────────────────────────────────────
 
@@ -2309,130 +2248,12 @@ pub unsafe extern "C-unwind" fn nod_show_save_file_dialog(hwnd_word: u64) -> u64
     crate::intern_string_literal(&s).raw()
 }
 
-// ─── Sprint 41g — Recent-files persistence + basename ────────────────────
-//
-// The brief sketches the recent-list helpers as "pure Dylan, using existing
-// %read-file / new %write-file" — but that path needs per-byte string
-// access plus byte-string equality, and the runtime currently exposes
-// neither to Dylan. Adding either would be a substantial detour (FIP arm
-// for `<byte-string>` + an `element` method + equality dispatch); the path
-// of least resistance is three small shims that do the recent-list
-// machinery in Rust and surface the result as a Dylan `<pair>`-spined
-// list of `<byte-string>`s. The Dylan-side IDE code stays trivial: it
-// reads the recent list, walks the spine to populate the submenu, and on
-// each Open / Save As call asks the shim to prepend the new path. The
-// dedup + cap-at-5 logic lives in one place (here), which is also where
-// the file I/O lives.
-
-const RECENT_FILE_PATH: &str = r"F:\scratch\nod-ide-recent.txt";
-const RECENT_MAX_ENTRIES: usize = 5;
-
-/// Read the recent-file list from `F:\scratch\nod-ide-recent.txt`. Returns
-/// a Vec of paths, most-recent first, capped at `RECENT_MAX_ENTRIES`.
-/// Missing file / read error / empty file all return an empty Vec.
-fn read_recent_list() -> Vec<String> {
-    let raw = match std::fs::read_to_string(RECENT_FILE_PATH) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    raw.lines()
-        .filter(|line| !line.is_empty())
-        .take(RECENT_MAX_ENTRIES)
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Build a Dylan `<pair>`-spined list from a slice of paths. Each path
-/// is interned as a `<byte-string>` literal (long-lived static-area
-/// allocation, same lifetime story as `nod_read_file_to_string`'s
-/// return value). The spine itself is heap-allocated via `alloc_pair`.
-fn paths_to_dylan_list(paths: &[String]) -> u64 {
-    let nil = crate::literal_pool_immediates().nil;
-    let mut tail = nil;
-    for s in paths.iter().rev() {
-        let head = crate::intern_string_literal(s);
-        tail = crate::with_literal_pool(|pool| pool.heap.alloc_pair(head, tail, &pool.classes));
-    }
-    tail.raw()
-}
-
-/// JIT-callable: read the recent-files list from disk and return it as
-/// a Dylan list (`<pair>` spine, `<byte-string>` heads, `nil`-terminated).
-/// Most-recent first, capped at 5 entries. Missing file or empty file
-/// returns the `nil` immediate (which Dylan's `empty?` recognises as
-/// "empty list").
-///
-/// # Safety
-/// No unsafe operations beyond the FFI boundary; literal-pool allocation
-/// is mutex-protected.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn nod_load_recent() -> u64 {
-    let paths = read_recent_list();
-    paths_to_dylan_list(&paths)
-}
-
-/// JIT-callable: prepend `new_path_word` to the recent-files list,
-/// dedup (remove any existing occurrence of the same path), cap the
-/// result at 5 entries, write it back to disk, and return the new list
-/// as a Dylan `<pair>`-spined list. If `new_path_word` is nil or an
-/// empty string, the list is loaded + returned unchanged.
-///
-/// The disk write goes to `F:\scratch\nod-ide-recent.txt`, one path per
-/// line, no trailing newline gymnastics (`writeln`-style with one `\n`
-/// after every entry except the last). On a write error the in-memory
-/// list is still returned — the IDE keeps working, the next launch just
-/// won't see the new entry. (We don't surface the error to Dylan; the
-/// failure mode is "you didn't persist", not "your program is broken".)
-///
-/// # Safety
-/// `new_path_word` must be a valid Dylan Word. If it's a `<byte-string>`
-/// the path is read via `read_dylan_byte_string`; otherwise it's
-/// ignored (treated as nil — the load-and-return path).
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn nod_add_recent(new_path_word: u64) -> u64 {
-    let mut paths = read_recent_list();
-    let nil_raw = crate::literal_pool_immediates().nil.raw();
-    if new_path_word != nil_raw {
-        let new_path = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(new_path_word));
-        if !new_path.is_empty() {
-            paths.retain(|p| p != &new_path);
-            paths.insert(0, new_path);
-            paths.truncate(RECENT_MAX_ENTRIES);
-            let serialized = paths.join("\n");
-            // Best-effort write. Swallow errors — recent-list persistence
-            // is a quality-of-life feature, not a correctness gate.
-            let _ = std::fs::write(RECENT_FILE_PATH, serialized);
-        }
-    }
-    paths_to_dylan_list(&paths)
-}
-
-/// JIT-callable: return the basename (last path component) of a
-/// `<byte-string>` path. Splits on '\\' or '/' — Windows accepts both —
-/// and returns the substring after the final separator. If there's no
-/// separator, returns the full path. If the input is the `nil` immediate
-/// or an empty string, returns the empty `<byte-string>`.
-///
-/// Used by the IDE to compute the window title (e.g.
-/// `"F:\scratch\foo.dylan" -> "foo.dylan"`).
-///
-/// # Safety
-/// `path_word` must be a valid Dylan Word. Same convention as
-/// `nod_add_recent` — nil short-circuits, anything else is read as a
-/// `<byte-string>`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn nod_basename(path_word: u64) -> u64 {
-    let nil_raw = crate::literal_pool_immediates().nil.raw();
-    if path_word == nil_raw {
-        return crate::intern_string_literal("").raw();
-    }
-    let full = crate::winffi::read_dylan_byte_string(crate::word::Word::from_raw(path_word));
-    let base = match full.rfind(['\\', '/']) {
-        Some(i) => &full[i + 1..],
-        None => full.as_str(),
-    };
-    crate::intern_string_literal(base).raw()
-}
+// Sprint 41g's recent-files persistence shims (`nod_load_recent` /
+// `nod_add_recent`) and `nod_basename` were retired in Sprint 42a Phase
+// E — all that logic now lives in pure Dylan in
+// `tests/nod-tests/fixtures/nod-ide.dylan` over the byte-string
+// methods (`size`, `element`, `concatenate`, `copy-sequence`, `=`) and
+// the `%read-file` / `%write-file` primitives.
 
 // ─── UTF-16 helpers ───────────────────────────────────────────────────────
 

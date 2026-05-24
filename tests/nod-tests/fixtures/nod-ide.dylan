@@ -25,11 +25,10 @@ Module: nod-ide
 //
 // The recent-files list persists across runs in
 // F:\scratch\nod-ide-recent.txt — one absolute path per line,
-// most-recent first, capped at 5. Persistence + dedup + cap logic lives
-// in the runtime shim (`%load-recent` / `%add-recent`) — see the
-// rationale in `nod-runtime/src/com_shim.rs` (no per-byte string access
-// or string equality is exposed to Dylan yet, so the helpers live in
-// Rust until those primitives land).
+// most-recent first, capped at 5. Sprint 42a: persistence + dedup + cap
+// is now pure Dylan (`nod-load-recent` / `nod-add-recent` /
+// `nod-save-recent`) built on the byte-string ops landed in stdlib —
+// the old `nod_load_recent` / `nod_add_recent` Rust shims are gone.
 //
 // IMPORTANT — the editor is still read-only (no cursor, no editing —
 // that's Sprint 41h or later). Save in this sprint rewrites the file
@@ -137,6 +136,224 @@ define c-function MessageBoxW
     library: "user32.dll";
 end;
 
+// ─── Sprint 42a — pure-Dylan helpers (replace retired Rust shims) ─────────
+//
+// All the IDE's text-buffer scanning and recent-files persistence is now
+// pure Dylan over the Sprint 42a `<byte-string>` ops: `size`, `element`
+// (the byte at an index), `concatenate`, `copy-sequence`, plus the
+// Sprint 42a `=` method on `<byte-string>` (content equality). The five
+// Rust shims (`nod_count_newlines`, `nod_max_line_chars`, `nod_basename`,
+// `nod_load_recent`, `nod_add_recent`) are gone — this is the proof
+// that the byte-string stdlib methods are usable for real work.
+//
+// Where we still call Rust:
+//   * `%read-file` / `%write-file` — file I/O proper (Sprint 41b / 41g).
+//   * `%byte-string-element` — primitive byte read (5-op surface).
+//   * `pair` / `head` / `tail` / `empty?` / `nil` — list builtins
+//     (Sprint 16; can't be specialised on `<byte-string>` yet — see the
+//     `empty?` note in stdlib.dylan).
+// Everything else here is plain Dylan calling the stdlib methods.
+
+// ── Count newlines in a byte-string buffer ────────────────────────────────
+// Returns 1 + the number of `\n` bytes (the line count, matching the
+// "lines = newlines + 1" convention the IDE used pre-42a).
+
+define function nod-count-newlines (s) => (lines)
+  let n = size(s);
+  let count = 1;
+  let i = 0;
+  until (i = n)
+    if (element(s, i) = 10)        // 10 = '\n'
+      count := count + 1;
+    else
+      #f
+    end;
+    i := i + 1;
+  end;
+  count
+end function;
+
+// ── Longest line length in bytes ──────────────────────────────────────────
+
+define function nod-max-line-chars (s) => (best)
+  let n = size(s);
+  let best = 0;
+  let cur = 0;
+  let i = 0;
+  until (i = n)
+    if (element(s, i) = 10)        // 10 = '\n'
+      if (cur > best) best := cur; else #f end;
+      cur := 0;
+    else
+      cur := cur + 1;
+    end;
+    i := i + 1;
+  end;
+  if (cur > best) cur else best end
+end function;
+
+// ── basename(path) — last `\`-or-`/`-separated component ──────────────────
+// Returns the empty string for nil or an empty byte-string.
+
+define function nod-basename (path) => (base)
+  if (empty?(path))               // empty?(nil) = #t for the list-builtin
+    ""
+  else
+    let n = size(path);
+    if (n = 0)
+      path
+    else
+      // Scan for the LAST '\' (92) or '/' (47). sep-pos = -1 means
+      // "no separator found, return path unchanged".
+      let sep-pos = -1;
+      let i = 0;
+      until (i = n)
+        let b = element(path, i);
+        if (b = 92 | b = 47)
+          sep-pos := i;
+        else
+          #f
+        end;
+        i := i + 1;
+      end;
+      if (sep-pos < 0)
+        path
+      else
+        copy-sequence(path, sep-pos + 1, n)
+      end
+    end
+  end
+end function;
+
+// ── List helpers — reverse, filter-out, take-first ────────────────────────
+//
+// Recent-files manipulation is built on a small kit of list ops. The
+// stdlib's `do` / `map` / `reduce` exist but want a first-class function
+// arg; for the simple loops we have, raw `head`/`tail`/`pair` walks are
+// clearer.
+
+define function nod-reverse-list (lst) => (rev)
+  let result = nil();
+  let cursor = lst;
+  until (empty?(cursor))
+    result := pair(head(cursor), result);
+    cursor := tail(cursor);
+  end;
+  result
+end function;
+
+define function nod-remove-from-list (item, lst) => (filtered)
+  // Walk lst, dropping any entry that equals `item` (byte-string `=`).
+  // Build reversed, then flip — keeps the original order without an
+  // append.
+  let acc = nil();
+  let cursor = lst;
+  until (empty?(cursor))
+    let p = head(cursor);
+    if (p = item)
+      #f   // skip — drop this entry
+    else
+      acc := pair(p, acc);
+    end;
+    cursor := tail(cursor);
+  end;
+  nod-reverse-list(acc)
+end function;
+
+define function nod-take-first (lst, n) => (taken)
+  let acc = nil();
+  let cursor = lst;
+  let i = 0;
+  until (empty?(cursor) | i = n)
+    acc := pair(head(cursor), acc);
+    cursor := tail(cursor);
+    i := i + 1;
+  end;
+  nod-reverse-list(acc)
+end function;
+
+// ── Split a byte-string on `\n`, returning a list of byte-strings ─────────
+
+define function nod-split-on-newline (bytes) => (lines)
+  let n = size(bytes);
+  if (n = 0)
+    nil()
+  else
+    let acc = nil();
+    let lo = 0;
+    let i = 0;
+    until (i = n)
+      if (element(bytes, i) = 10)
+        let line = copy-sequence(bytes, lo, i);
+        acc := pair(line, acc);
+        lo := i + 1;
+      else
+        #f
+      end;
+      i := i + 1;
+    end;
+    // Trailing segment (after the last '\n', or the only segment if
+    // there's no '\n' at all). Skip if the buffer ended with a newline.
+    if (lo < n)
+      let tail-line = copy-sequence(bytes, lo, n);
+      acc := pair(tail-line, acc);
+    else
+      #f
+    end;
+    nod-reverse-list(acc)
+  end
+end function;
+
+// ── Join a list of byte-strings with `\n` ─────────────────────────────────
+
+define function nod-join-with-newline (lst) => (joined)
+  if (empty?(lst))
+    ""
+  else
+    let cursor = lst;
+    let result = head(cursor);
+    cursor := tail(cursor);
+    until (empty?(cursor))
+      result := concatenate(result, "\n");
+      result := concatenate(result, head(cursor));
+      cursor := tail(cursor);
+    end;
+    result
+  end
+end function;
+
+// ── Recent-files load / save / prepend-dedupe ─────────────────────────────
+// Persists to F:\scratch\nod-ide-recent.txt — one path per line,
+// most-recent first, capped at 5 entries. Missing/empty file → empty
+// list. Write errors are silently ignored (best-effort persistence;
+// the IDE keeps working, the user just loses the entry on next launch).
+
+define function nod-load-recent () => (lst)
+  let bytes = %read-file("F:\\scratch\\nod-ide-recent.txt");
+  nod-split-on-newline(bytes)
+end function;
+
+define function nod-save-recent (recent-list) => ()
+  let serialized = nod-join-with-newline(recent-list);
+  %write-file("F:\\scratch\\nod-ide-recent.txt", serialized);
+  #f
+end function;
+
+define function nod-add-recent (path, recent-list) => (new-list)
+  // nil or empty-string path → no-op (treat as "nothing to remember").
+  if (empty?(path))
+    recent-list
+  elseif (size(path) = 0)
+    recent-list
+  else
+    let deduped  = nod-remove-from-list(path, recent-list);
+    let prepended = pair(path, deduped);
+    let capped    = nod-take-first(prepended, 5);
+    nod-save-recent(capped);
+    capped
+  end
+end function;
+
 // ─── Helper: walk a recent-paths list, rebuild a submenu ────────────────
 //
 // Tears down every item in `recent-menu` (RemoveMenu at position 0
@@ -166,7 +383,7 @@ define function rebuild-recent-submenu (recent-menu, paths) => ()
     let i = 0;
     until (empty?(cursor) | i > 4)
       let p = head(cursor);
-      let label = %basename(p);
+      let label = nod-basename(p);
       AppendMenuW(recent-menu, 0, 301 + i, label);
       cursor := tail(cursor);
       i := i + 1;
@@ -177,20 +394,17 @@ end function;
 // ─── Helper: set the window title to "basename - NewOpenDylan IDE" ──────
 //
 // If `path` is nil / empty, sets the title to the bare program name.
-// `%basename` extracts the last `\`-or-`/`-separated component.
+// Otherwise: "<basename> — NewOpenDylan IDE". Sprint 42a finally lets
+// us build the title via `concatenate` (was held back in 41g for lack
+// of string-concat on `<byte-string>`).
 
 define function update-title (hwnd, path) => ()
   if (empty?(path))
     SetWindowTextW(hwnd, "NewOpenDylan IDE");
   else
-    let base = %basename(path);
-    // We can't string-concatenate user data yet (no string-concat
-    // primitive exposed to Dylan-source byte-strings). Title-shows-
-    // basename-only is good enough for the Sprint 41g headline; the
-    // " - NewOpenDylan IDE" tail is a polish item once string-concat
-    // lands. For now the title is just the basename, which is what
-    // the user actually wants to see at a glance anyway.
-    SetWindowTextW(hwnd, base);
+    let base   = nod-basename(path);
+    let suffix = concatenate(base, " - NewOpenDylan IDE");
+    SetWindowTextW(hwnd, suffix);
   end;
 end function;
 
@@ -211,7 +425,7 @@ define function main () => ()
   // closure becomes a cell). Same machinery that promoted source-text
   // in Sprint 41e.
   let current-path = arg-path;
-  let recent-paths = %load-recent();
+  let recent-paths = nod-load-recent();
   let d3d-device   = %d3d11-create-device();
   let dxgi-factory = %dxgi-factory-from-d3d-device(d3d-device);
   let dxgi-device  = %dxgi-device-from-d3d-device(d3d-device);
@@ -220,8 +434,8 @@ define function main () => ()
   let dc           = %d2d-create-device-context(d2d-device);
   let dwrite       = %dwrite-create-factory();
   let format       = %dwrite-create-text-format(dwrite, "Consolas", 1400, "en-us");
-  let buffer-lines    = %count-newlines(source-text);
-  let buffer-max-cols = %max-line-chars(source-text);
+  let buffer-lines    = nod-count-newlines(source-text);
+  let buffer-max-cols = nod-max-line-chars(source-text);
   let char-width  = 8;
   let line-height = 18;
   let pad = 8;
@@ -478,15 +692,15 @@ define function main () => ()
                    if (~ empty?(new-source))
                      source-text := new-source;
                      current-path := new-path;
-                     buffer-lines := %count-newlines(new-source);
-                     buffer-max-cols := %max-line-chars(new-source);
+                     buffer-lines := nod-count-newlines(new-source);
+                     buffer-max-cols := nod-max-line-chars(new-source);
                      client-width-px  := buffer-max-cols * char-width;
                      client-height-px := buffer-lines * line-height;
                      scroll-x-px := 0;
                      scroll-y-px := 0;
                      %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, 0, 1);
                      %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  0, 1);
-                     recent-paths := %add-recent(new-path);
+                     recent-paths := nod-add-recent(new-path, recent-paths);
                      rebuild-recent-submenu(recent-menu, recent-paths);
                      DrawMenuBar(hwnd);
                      update-title(hwnd, new-path);
@@ -506,7 +720,7 @@ define function main () => ()
                      let ok = %write-file(chosen, source-text);
                      if (ok = 1)
                        current-path := chosen;
-                       recent-paths := %add-recent(chosen);
+                       recent-paths := nod-add-recent(chosen, recent-paths);
                        rebuild-recent-submenu(recent-menu, recent-paths);
                        DrawMenuBar(hwnd);
                        update-title(hwnd, chosen);
@@ -523,7 +737,7 @@ define function main () => ()
                    let ok = %write-file(chosen, source-text);
                    if (ok = 1)
                      current-path := chosen;
-                     recent-paths := %add-recent(chosen);
+                     recent-paths := nod-add-recent(chosen, recent-paths);
                      rebuild-recent-submenu(recent-menu, recent-paths);
                      DrawMenuBar(hwnd);
                      update-title(hwnd, chosen);
@@ -558,15 +772,15 @@ define function main () => ()
                    if (~ empty?(bytes))
                      source-text := bytes;
                      current-path := path;
-                     buffer-lines := %count-newlines(bytes);
-                     buffer-max-cols := %max-line-chars(bytes);
+                     buffer-lines := nod-count-newlines(bytes);
+                     buffer-max-cols := nod-max-line-chars(bytes);
                      client-width-px  := buffer-max-cols * char-width;
                      client-height-px := buffer-lines * line-height;
                      scroll-x-px := 0;
                      scroll-y-px := 0;
                      %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, 0, 1);
                      %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  0, 1);
-                     recent-paths := %add-recent(path);
+                     recent-paths := nod-add-recent(path, recent-paths);
                      rebuild-recent-submenu(recent-menu, recent-paths);
                      DrawMenuBar(hwnd);
                      update-title(hwnd, path);

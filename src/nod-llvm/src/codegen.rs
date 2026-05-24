@@ -328,10 +328,8 @@ pub const NOD_HI_WORD_SYMBOL: &str = "nod_hi_word";
 pub const NOD_SET_SCROLL_INFO_SYMBOL: &str = "nod_set_scroll_info";
 /// Read a scrollbar's current position. Arity-2.
 pub const NOD_GET_SCROLL_POS_SYMBOL: &str = "nod_get_scroll_pos";
-/// Count newlines in a `<byte-string>` and return count+1. Arity-1.
-pub const NOD_COUNT_NEWLINES_SYMBOL: &str = "nod_count_newlines";
-/// Sprint 41d — longest non-newline run length in a `<byte-string>`. Arity-1.
-pub const NOD_MAX_LINE_CHARS_SYMBOL: &str = "nod_max_line_chars";
+// `nod_count_newlines` / `nod_max_line_chars` consts removed in Sprint 42a
+// Phase E — those shims are now pure Dylan in nod-ide.dylan.
 
 // ─── Sprint 41e — File → Open common dialog ──────────────────────────────
 /// Shim that wraps `GetOpenFileNameW` + an `OPENFILENAMEW` struct, returning
@@ -349,15 +347,9 @@ pub const NOD_WRITE_FILE_FROM_STRING_SYMBOL: &str = "nod_write_file_from_string"
 /// path as a `<byte-string>` Word (or `nil` on cancel). Arity-1
 /// (owner HWND).
 pub const NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL: &str = "nod_show_save_file_dialog";
-/// Load the recent-files list from `F:\scratch\nod-ide-recent.txt` and
-/// return as a `<pair>`-spined Dylan list. Arity-0.
-pub const NOD_LOAD_RECENT_SYMBOL: &str = "nod_load_recent";
-/// Prepend a path to the recent-files list (dedup + cap at 5), persist
-/// back to disk, return the new list. Arity-1.
-pub const NOD_ADD_RECENT_SYMBOL: &str = "nod_add_recent";
-/// Last path component of a `<byte-string>`, splitting on `\` or `/`.
-/// Arity-1.
-pub const NOD_BASENAME_SYMBOL: &str = "nod_basename";
+// `nod_load_recent` / `nod_add_recent` / `nod_basename` consts removed
+// in Sprint 42a Phase E — Dylan now handles recent-list persistence
+// (and basename) via its own helpers built on the byte-string ops.
 
 // ─── Sprint 22 — <table> + hashing ─────────────────────────────────────────
 pub const NOD_MAKE_TABLE_SYMBOL: &str = "nod_make_table";
@@ -542,8 +534,10 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     // SetScrollInfo flattened to 7 u64 args; GetScrollPos takes (hwnd, nbar).
     ("nod_set_scroll_info", NOD_SET_SCROLL_INFO_SYMBOL, 7),
     ("nod_get_scroll_pos", NOD_GET_SCROLL_POS_SYMBOL, 2),
-    ("nod_count_newlines", NOD_COUNT_NEWLINES_SYMBOL, 1),
-    ("nod_max_line_chars", NOD_MAX_LINE_CHARS_SYMBOL, 1),
+    // Sprint 42a Phase E retired five IDE shims (`nod_count_newlines`,
+    // `nod_max_line_chars`, `nod_load_recent`, `nod_add_recent`,
+    // `nod_basename`) — those are now pure Dylan in nod-ide.dylan
+    // over the byte-string ops and the file-I/O primitives.
     // Sprint 41e — File → Open dialog shim.
     ("nod_show_open_file_dialog", NOD_SHOW_OPEN_FILE_DIALOG_SYMBOL, 1),
     // Sprint 41g — File → Save / Save As shims. `nod_write_file_from_string`
@@ -551,10 +545,6 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     // mirrors the open-dialog shim but calls `GetSaveFileNameW`.
     ("nod_write_file_from_string", NOD_WRITE_FILE_FROM_STRING_SYMBOL, 2),
     ("nod_show_save_file_dialog", NOD_SHOW_SAVE_FILE_DIALOG_SYMBOL, 1),
-    // Sprint 41g — Recent-files list helpers + basename.
-    ("nod_load_recent", NOD_LOAD_RECENT_SYMBOL, 0),
-    ("nod_add_recent", NOD_ADD_RECENT_SYMBOL, 1),
-    ("nod_basename", NOD_BASENAME_SYMBOL, 1),
 ];
 
 fn sprint_20b_primitive(name: &str) -> Option<(&'static str, usize)> {
