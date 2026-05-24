@@ -143,6 +143,7 @@ impl Word {
         if self.is_pointer() {
             let addr = self.0 & !1;
             if addr & 0b111 != 0 {
+                diag_misaligned("as_ptr", self.0);
                 return None;
             }
             Some(addr as *const T)
@@ -156,6 +157,7 @@ impl Word {
         if self.is_pointer() {
             let addr = self.0 & !1;
             if addr & 0b111 != 0 {
+                diag_misaligned("as_mut_ptr", self.0);
                 return None;
             }
             Some(addr as *mut T)
@@ -163,6 +165,37 @@ impl Word {
             None
         }
     }
+}
+
+/// Sprint 11d diagnostic: when the alignment guard in `as_ptr` /
+/// `as_mut_ptr` fires, dump the raw Word and a Rust backtrace iff the
+/// env var `NOD_GC_DIAG` is set. Silent in production. The backtrace
+/// shows which runtime probe called us with a tagged-pointer-shaped
+/// Word that wasn't a real heap pointer — the call chain across the
+/// JIT boundary is the missing piece we need to fix the upstream
+/// arithmetic bug.
+///
+/// Decoding tip: ASCII bytes (e.g. source-text payload) show up as
+/// printable characters when read little-endian, so `0x212f2f0a74692066`
+/// reads as " it\n//!f".
+fn diag_misaligned(site: &str, raw: u64) {
+    if std::env::var_os("NOD_GC_DIAG").is_none() {
+        return;
+    }
+    let addr = raw & !1;
+    // Decode the raw bytes as ASCII for the common "byte-string payload
+    // pretending to be a pointer" case. Non-printable bytes show as '.'.
+    let mut ascii = [b'.'; 8];
+    for i in 0..8 {
+        let b = ((raw >> (i * 8)) & 0xff) as u8;
+        ascii[i] = if (0x20..0x7f).contains(&b) { b } else { b'.' };
+    }
+    let ascii_s = std::str::from_utf8(&ascii).unwrap_or("????????");
+    eprintln!(
+        "[NOD_GC_DIAG] Word::{site} alignment guard: raw=0x{raw:016x} \
+         addr=0x{addr:016x} ascii=\"{ascii_s}\"\n{}",
+        std::backtrace::Backtrace::capture()
+    );
 }
 
 impl fmt::Debug for Word {
