@@ -37,17 +37,46 @@ Module: rope
 
 define class <rope> (<object>) end class;
 
+// Sprint 43c: every node caches its own newline count so line-indexing
+// ops (`rope-line-count`, `rope-line-to-offset`) descend in O(log n)
+// without scanning bytes. For a leaf the count is computed once at
+// construction; for an internal node it's left.newlines +
+// right.newlines, kept in sync by `rope-concatenate`.
+
 define class <rope-leaf> (<rope>)
-  slot rope-leaf-bytes :: <byte-string>, init-keyword: bytes:;
-  slot rope-leaf-len   :: <integer>,     init-keyword: len:;
+  slot rope-leaf-bytes    :: <byte-string>, init-keyword: bytes:;
+  slot rope-leaf-len      :: <integer>,     init-keyword: len:;
+  slot rope-leaf-newlines :: <integer>,     init-keyword: newlines:;
 end class;
 
 define class <rope-node> (<rope>)
-  slot rope-node-left   :: <rope>,    init-keyword: left:;
-  slot rope-node-right  :: <rope>,    init-keyword: right:;
-  slot rope-node-weight :: <integer>, init-keyword: weight:;
-  slot rope-node-total  :: <integer>, init-keyword: total:;
+  slot rope-node-left     :: <rope>,    init-keyword: left:;
+  slot rope-node-right    :: <rope>,    init-keyword: right:;
+  slot rope-node-weight   :: <integer>, init-keyword: weight:;
+  slot rope-node-total    :: <integer>, init-keyword: total:;
+  slot rope-node-newlines :: <integer>, init-keyword: newlines:;
 end class;
+
+// ─── newline-count helper (Sprint 43c) ───────────────────────────────────
+//
+// Count `\n` bytes (10) in a `<byte-string>`. Used at leaf-construction
+// time to populate the cached `rope-leaf-newlines` slot. Internal-node
+// counts are computed compositionally as left.newlines + right.newlines.
+
+define function count-newlines-in (s) => (n :: <integer>)
+  let len = size(s);
+  let count = 0;
+  let i = 0;
+  until (i = len)
+    if (element(s, i) = 10)
+      count := count + 1;
+    else
+      #f
+    end;
+    i := i + 1;
+  end;
+  count
+end function;
 
 // ─── rope-size — O(1), cached at each node ───────────────────────────────
 
@@ -57,6 +86,16 @@ end method;
 
 define method rope-size (r :: <rope-node>) => (n :: <integer>)
   rope-node-total(r)
+end method;
+
+// Polymorphic newline count — same cache, different slot name per class.
+
+define method rope-newlines (r :: <rope-leaf>) => (n :: <integer>)
+  rope-leaf-newlines(r)
+end method;
+
+define method rope-newlines (r :: <rope-node>) => (n :: <integer>)
+  rope-node-newlines(r)
 end method;
 
 // ─── rope-element — O(log n) tree descent ────────────────────────────────
@@ -91,7 +130,8 @@ define method rope-concatenate (a :: <rope>, b :: <rope>) => (r :: <rope>)
   else
     make(<rope-node>,
          left: a, right: b,
-         weight: asize, total: asize + bsize)
+         weight: asize, total: asize + bsize,
+         newlines: rope-newlines(a) + rope-newlines(b))
   end
 end method;
 
@@ -99,7 +139,7 @@ end method;
 // `rope-concatenate` and the result of `split-at` at index 0 or `size(r)`.
 
 define function empty-rope () => (r :: <rope-leaf>)
-  make(<rope-leaf>, bytes: "", len: 0)
+  make(<rope-leaf>, bytes: "", len: 0, newlines: 0)
 end function;
 
 // ─── for-each-leaf — in-order leaf walk ──────────────────────────────────
@@ -186,7 +226,9 @@ end function;
 define function make-rope-from-string (s) => (r)
   let n = size(s);
   if (n <= 1024)
-    make(<rope-leaf>, bytes: s, len: n)
+    make(<rope-leaf>,
+         bytes: s, len: n,
+         newlines: count-newlines-in(s))
   else
     let mid = n / 2;
     let left  = make-rope-from-string(copy-sequence(s, 0, mid));
@@ -223,8 +265,12 @@ define method rope-split-at (r :: <rope-leaf>, i :: <integer>) => (split)
     let bytes = rope-leaf-bytes(r);
     let left-bytes  = copy-sequence(bytes, 0, i);
     let right-bytes = copy-sequence(bytes, i, n);
-    pair(make(<rope-leaf>, bytes: left-bytes,  len: i),
-         make(<rope-leaf>, bytes: right-bytes, len: n - i))
+    pair(make(<rope-leaf>,
+              bytes: left-bytes,  len: i,
+              newlines: count-newlines-in(left-bytes)),
+         make(<rope-leaf>,
+              bytes: right-bytes, len: n - i,
+              newlines: count-newlines-in(right-bytes)))
   end
 end method;
 
@@ -280,6 +326,112 @@ define function rope->string (r) => (s)
   rope-substring(r, 0, rope-size(r))
 end function;
 
+// ─── Sprint 43c — line-indexing API ──────────────────────────────────────
+//
+// Convention: a buffer has `1 + count('\n' in buffer)` lines. Line 0
+// starts at offset 0; line k (k > 0) starts at the byte after the kth
+// `\n`. Examples:
+//   ""                  → 1 line  (line 0 starts at offset 0, length 0)
+//   "abc"               → 1 line  (line 0 = "abc")
+//   "abc\n"             → 2 lines (line 0 = "abc", line 1 = "")
+//   "abc\ndef"          → 2 lines (line 0 = "abc", line 1 = "def")
+//   "abc\ndef\n"        → 3 lines (the third is the trailing empty line)
+//
+// rope-line-to-offset(r, ln) returns the offset of the FIRST byte of
+// line `ln`. For ln out of range, returns rope-size(r) (one-past-end,
+// the "empty trailing line" offset). For ln = 0, returns 0.
+//
+// rope-offset-to-line(r, off) returns the line number containing the
+// byte at offset `off`. Equivalent to "count newlines in [0, off)".
+
+define method rope-line-count (r :: <rope>) => (n :: <integer>)
+  rope-newlines(r) + 1
+end method;
+
+// ─── rope-line-to-offset ────────────────────────────────────────────────
+
+define method rope-line-to-offset
+    (r :: <rope-leaf>, ln :: <integer>) => (off :: <integer>)
+  if (ln <= 0)
+    0
+  else
+    let bytes = rope-leaf-bytes(r);
+    let n     = rope-leaf-len(r);
+    let seen  = 0;
+    let pos   = 0;
+    let found = -1;
+    until (pos = n | found >= 0)
+      if (element(bytes, pos) = 10)
+        seen := seen + 1;
+        if (seen = ln)
+          found := pos + 1;
+        else
+          #f
+        end;
+      else
+        #f
+      end;
+      pos := pos + 1;
+    end;
+    if (found < 0) n else found end
+  end
+end method;
+
+define method rope-line-to-offset
+    (r :: <rope-node>, ln :: <integer>) => (off :: <integer>)
+  if (ln <= 0)
+    0
+  else
+    let left-newlines = rope-newlines(rope-node-left(r));
+    if (ln <= left-newlines)
+      // Line `ln` starts inside the left subtree (because left holds at
+      // least `left-newlines` line boundaries — boundary k starts line k).
+      rope-line-to-offset(rope-node-left(r), ln)
+    else
+      // Line `ln` starts in the right subtree. Subtract the line
+      // boundaries left already accounts for, and add the left's total
+      // byte size to translate back to the global offset.
+      rope-node-weight(r)
+        + rope-line-to-offset(rope-node-right(r), ln - left-newlines)
+    end
+  end
+end method;
+
+// ─── rope-offset-to-line ────────────────────────────────────────────────
+// "Which line is byte `off` on?" = count newlines in [0, off).
+
+define method rope-offset-to-line
+    (r :: <rope-leaf>, off :: <integer>) => (ln :: <integer>)
+  let bytes = rope-leaf-bytes(r);
+  let n     = rope-leaf-len(r);
+  let limit = if (off < 0) 0 elseif (off > n) n else off end;
+  let count = 0;
+  let i = 0;
+  until (i = limit)
+    if (element(bytes, i) = 10)
+      count := count + 1;
+    else
+      #f
+    end;
+    i := i + 1;
+  end;
+  count
+end method;
+
+define method rope-offset-to-line
+    (r :: <rope-node>, off :: <integer>) => (ln :: <integer>)
+  let w = rope-node-weight(r);
+  if (off <= w)
+    // Stay within left subtree.
+    rope-offset-to-line(rope-node-left(r), off)
+  else
+    // Counted all of left's newlines + however many are in right's
+    // [0, off-w) prefix.
+    rope-newlines(rope-node-left(r))
+      + rope-offset-to-line(rope-node-right(r), off - w)
+  end
+end method;
+
 // ─── Self-tests (run as part of `main`) ──────────────────────────────────
 //
 // Build a deterministic test buffer where byte[i] = i mod 256, drive
@@ -295,6 +447,24 @@ define function make-test-bytes (n :: <integer>) => (s :: <byte-string>)
     %byte-string-element-setter(b, s, i);
     i := i + 1;
   end;
+  s
+end function;
+
+// 600-byte chunk filled with 'a' (97) except for a single `\n` (10) at
+// `nl-pos`. Used in line-indexing tests to give us multi-leaf ropes
+// with known newline locations — we can't use make-test-bytes here
+// because its `i mod 256` pattern produces incidental `\n` bytes at
+// positions 10, 266, 522, …, ruining the line count.
+
+define function make-newline-chunk
+    (n :: <integer>, nl-pos :: <integer>) => (s :: <byte-string>)
+  let s = %byte-string-allocate(n);
+  let i = 0;
+  until (i = n)
+    %byte-string-element-setter(97, s, i);     // 'a'
+    i := i + 1;
+  end;
+  %byte-string-element-setter(10, s, nl-pos);  // single '\n'
   s
 end function;
 
@@ -530,6 +700,87 @@ define function main () => ()
   else
     format-out("FAIL: stress walk mismatch (cur=%d ref=%d)\n",
                rope-size(cur), rope-size(ref));
+  end;
+
+  // ─── Test 12: rope-line-count basic shapes ─────────────────────────
+  // Convention: 1 + count('\n'). Empty buffer = 1 line.
+  let lc-empty = rope-line-count(make-rope-from-string(""));
+  let lc-noeol = rope-line-count(make-rope-from-string("abc"));
+  let lc-trail = rope-line-count(make-rope-from-string("abc\n"));
+  let lc-three = rope-line-count(make-rope-from-string("a\nb\nc"));
+  if (lc-empty = 1 & lc-noeol = 1 & lc-trail = 2 & lc-three = 3)
+    format-out("PASS: rope-line-count on simple buffers\n");
+  else
+    format-out("FAIL: line counts empty=%d noeol=%d\n", lc-empty, lc-noeol);
+    format-out("FAIL: line counts trail=%d three=%d\n", lc-trail, lc-three);
+  end;
+
+  // ─── Test 13: rope-line-to-offset on single leaf ───────────────────
+  // "abc\ndef\nghi" — lines at 0, 4, 8.
+  let multiline = make-rope-from-string("abc\ndef\nghi");
+  let l0 = rope-line-to-offset(multiline, 0);
+  let l1 = rope-line-to-offset(multiline, 1);
+  let l2 = rope-line-to-offset(multiline, 2);
+  if (l0 = 0 & l1 = 4 & l2 = 8)
+    format-out("PASS: rope-line-to-offset on single-leaf buffer\n");
+  else
+    format-out("FAIL: line offsets: l0=%d l1=%d l2=%d\n", l0, l1, l2);
+  end;
+
+  // ─── Test 14: rope-line-to-offset across leaf boundaries ───────────
+  // Build a multi-leaf rope by concatenating four 600-byte chunks,
+  // each containing exactly one '\n' at position 100. So the combined
+  // buffer is 2400 bytes long with newlines at 100, 700, 1300, 1900.
+  // The four leaves are explicitly concat'd so we get a 4-deep tree.
+  let chunk-with-nl = make-newline-chunk(600, 100);
+  let r4 = rope-concatenate(
+             rope-concatenate(make-rope-from-string(chunk-with-nl),
+                              make-rope-from-string(chunk-with-nl)),
+             rope-concatenate(make-rope-from-string(chunk-with-nl),
+                              make-rope-from-string(chunk-with-nl)));
+  // 4 newlines → 5 lines.
+  let r4-lines = rope-line-count(r4);
+  let r4-l0    = rope-line-to-offset(r4, 0);
+  let r4-l2    = rope-line-to-offset(r4, 2);   // after newline at 700
+  let r4-l4    = rope-line-to-offset(r4, 4);   // after newline at 1900
+  if (r4-lines = 5 & r4-l0 = 0 & r4-l2 = 701 & r4-l4 = 1901)
+    format-out("PASS: rope-line-to-offset across leaf boundaries\n");
+  else
+    format-out("FAIL: r4 lines=%d l0=%d\n", r4-lines, r4-l0);
+    format-out("FAIL: r4 l2=%d l4=%d (want 701, 1901)\n", r4-l2, r4-l4);
+  end;
+
+  // ─── Test 15: rope-offset-to-line round-trips line-to-offset ───────
+  // For each line k in r4, offset-to-line(line-to-offset(k)) should
+  // return k.
+  let rt-ok = #t;
+  let k = 0;
+  until (k = 5)
+    let off = rope-line-to-offset(r4, k);
+    let back = rope-offset-to-line(r4, off);
+    if (back ~= k) rt-ok := #f else #f end;
+    k := k + 1;
+  end;
+  if (rt-ok)
+    format-out("PASS: rope-line-to-offset / rope-offset-to-line round-trip\n");
+  else
+    format-out("FAIL: line/offset round-trip\n");
+  end;
+
+  // ─── Test 16: line counts survive insert / delete ──────────────────
+  // Start with a 3-line buffer. Insert a 2-newline chunk in the middle;
+  // line count should grow by 2. Then delete it again; line count back
+  // to original.
+  let base = make-rope-from-string("aaa\nbbb\nccc");
+  let inserted-nl = rope-insert(base, 4, "xx\nyy\nzz");
+  let after-ins   = rope-line-count(inserted-nl);
+  let after-del   = rope-line-count(rope-delete(inserted-nl, 4, 12));
+  let base-count  = rope-line-count(base);
+  if (base-count = 3 & after-ins = 5 & after-del = 3)
+    format-out("PASS: line count tracks through insert + delete\n");
+  else
+    format-out("FAIL: line counts base=%d ins=%d del=%d (want 3 5 3)\n",
+               base-count, after-ins, after-del);
   end;
 
   format-out("DONE\n");

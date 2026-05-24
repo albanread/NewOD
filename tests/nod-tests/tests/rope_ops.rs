@@ -167,6 +167,12 @@ fn rope_self_test_passes_under_aot() {
         "PASS: rope-insert across leaf boundary grows size correctly",
         "PASS: insert-then-delete round-trips the original",
         "PASS: 200-op GC-stress walk byte-matches reference",
+        // Sprint 43c — line indexing
+        "PASS: rope-line-count on simple buffers",
+        "PASS: rope-line-to-offset on single-leaf buffer",
+        "PASS: rope-line-to-offset across leaf boundaries",
+        "PASS: rope-line-to-offset / rope-offset-to-line round-trip",
+        "PASS: line count tracks through insert + delete",
     ];
     for label in &expected_passes {
         assert!(
