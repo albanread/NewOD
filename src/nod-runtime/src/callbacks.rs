@@ -462,6 +462,45 @@ pub enum RegisterError {
 ///
 /// Sprint 32: registrations are leak-by-design — there's no
 /// unregistration path. A later sprint adds release semantics.
+///
+/// ## Sprint 11d workaround — eager tenure of the closure reachable graph
+///
+/// After the closure Word is stored in the registry, we drive a full
+/// GC cycle (`collect_full`). Rationale, recorded in
+/// [`docs/NEWGC_BUG_ENV_RECLAIM_ANALYSIS.md`]:
+///
+/// The IDE crashed under keyboard input with the closure's
+/// `<environment>` reclaimed by minor GC despite being reachable
+/// through `registry → closure → env-ptr → env`. The GC team built
+/// four synthetic reproducers covering the production callback path
+/// with real trampoline dispatch + cell mutation + heavy allocation
+/// pressure; all four pass. The remaining differentiator is the
+/// JIT-compiled closure body: if the Sprint 11b alloca-root brackets
+/// around `env_ptr` are missing for some JIT call site, env becomes
+/// unreachable after the minor cycle that fires inside the body.
+///
+/// `collect_full` promotes every reachable object to Tenured (see
+/// `heap.rs::collect_full`'s "G0→G1 → G1→Tenured → Tenured→Tenured
+/// with live root closure" cascade). After this call, the closure,
+/// its `<environment>`, the cells SOV, every `<cell>`, and every
+/// cell's *current* value Word are all Tenured. Subsequent minor GCs
+/// never move them — so a stale env-ptr Word inside the JIT body
+/// (the suspected bug) refers to a still-valid address. Mutations
+/// to cell values still work via the write-barrier + dirty-card path,
+/// which the trampoline reproducer
+/// (`gc_callback_env::callback_closure_env_survives_cell_mutation_under_promotion`)
+/// proves is correct.
+///
+/// **This is a workaround, not the fix.** The structural fix lives in
+/// nod-sema's lowering of closure-body env_ptr argument roots. When
+/// that lands and the JIT-fixture reproducer test
+/// (`gc_callback_env_jit_fixture`, planned) is green without this
+/// tenuring, the `collect_full` call can be removed. Keeping it as
+/// belt-and-suspenders is also semantically defensible — long-lived
+/// callback closures shouldn't churn through generations.
+///
+/// One-time cost: a single full GC per `register_callback` (typically
+/// 1-2 calls per process at startup for an IDE-shaped workload).
 pub fn register_callback(
     closure: Word,
     sig: CallbackSignature,
@@ -472,19 +511,48 @@ pub fn register_callback(
     };
     install_gc_roots_for_this_thread(sig, registry);
 
-    let mut guard = registry.lock().expect("callback registry poisoned");
+    {
+        let mut guard = registry.lock().expect("callback registry poisoned");
 
-    let free = (0..POOL_SIZE).find(|&i| !guard.occupied[i]);
-    let Some(slot_id) = free else {
-        return Err(RegisterError::PoolFull);
-    };
-    // SAFETY: under the registry mutex; cell address is stable; we
-    // are the sole writer.
-    unsafe {
-        *guard.closures[slot_id].get() = closure;
+        let free = (0..POOL_SIZE).find(|&i| !guard.occupied[i]);
+        let Some(slot_id) = free else {
+            return Err(RegisterError::PoolFull);
+        };
+        // SAFETY: under the registry mutex; cell address is stable; we
+        // are the sole writer.
+        unsafe {
+            *guard.closures[slot_id].get() = closure;
+        }
+        guard.occupied[slot_id] = true;
+
+        // Drop the registry guard BEFORE driving `collect_full` — the
+        // collector visits this slot as a root and re-acquires no
+        // registry mutex, but holding our registry guard across a
+        // GC cycle would be a needless and lock-order-fragile thing
+        // to do. Save the slot_id, release the guard, GC, return.
+        let slot_id_local = slot_id;
+        drop(guard);
+
+        // Sprint 11d workaround — see fn doc above. Force the closure
+        // graph to Tenured so the suspected JIT-body root-bracketing
+        // bug can't reclaim its env between minor cycles.
+        //
+        // **Skipped under `cfg(test)`** — nod-runtime's own unit-test
+        // binary runs many tests in parallel that share the global
+        // `LITERAL_POOL` heap and hold un-rooted Word locals across
+        // operations. Driving `collect_full` from a concurrently-running
+        // serial callbacks test (`wndproc_synthetic_dispatch`, etc.)
+        // relocates the parallel test's targets and panics it. The
+        // workaround is still applied for integration tests (separate
+        // binary, no shared state) and AOT EXEs (production target).
+        // The callback-tests in this same binary don't actually need
+        // tenuring — they use Rust function pointers as the closure
+        // body, so the suspected JIT-body root bug never fires.
+        #[cfg(not(test))]
+        crate::collect_full();
+
+        Ok(slot_id_local)
     }
-    guard.occupied[slot_id] = true;
-    Ok(slot_id)
 }
 
 /// Return the raw address of the trampoline function for the given
