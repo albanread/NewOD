@@ -146,6 +146,7 @@ fn rope_self_test_passes_under_aot() {
     // Every PASS line the Dylan main promises. Keep these in lockstep
     // with `tests/nod-tests/fixtures/rope.dylan::main`.
     let expected_passes = [
+        // Sprint 43a — read-only core
         "PASS: small rope size",
         "PASS: small rope elements",
         "PASS: big rope size",
@@ -154,6 +155,18 @@ fn rope_self_test_passes_under_aot() {
         "PASS: rope-concatenate",
         "PASS: for-each-leaf covers all bytes",
         "PASS: rope-substring full range == original",
+        // Sprint 43b — split / insert / delete
+        "PASS: rope-split-at boundary + interior sizes",
+        "PASS: split-at + concatenate round-trips",
+        "PASS: rope-insert at interior position",
+        "PASS: rope-insert at start",
+        "PASS: rope-insert at end",
+        "PASS: rope-delete interior range",
+        "PASS: rope-delete prefix",
+        "PASS: rope-delete suffix",
+        "PASS: rope-insert across leaf boundary grows size correctly",
+        "PASS: insert-then-delete round-trips the original",
+        "PASS: 200-op GC-stress walk byte-matches reference",
     ];
     for label in &expected_passes {
         assert!(

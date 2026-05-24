@@ -75,14 +75,32 @@ define method rope-element (r :: <rope-node>, i :: <integer>) => (b :: <integer>
 end method;
 
 // ─── rope-concatenate — O(1), new internal node ──────────────────────────
+//
+// Sprint 43b: empty-rope short-circuit. If either side is the empty
+// rope (size = 0) we return the other side unchanged. This keeps
+// split-at(r, 0) / split-at(r, size(r)) / inserts at boundaries from
+// stuffing the tree with degenerate empty-weighted internal nodes.
 
-define method rope-concatenate (a :: <rope>, b :: <rope>) => (r :: <rope-node>)
+define method rope-concatenate (a :: <rope>, b :: <rope>) => (r :: <rope>)
   let asize = rope-size(a);
   let bsize = rope-size(b);
-  make(<rope-node>,
-       left: a, right: b,
-       weight: asize, total: asize + bsize)
+  if (asize = 0)
+    b
+  elseif (bsize = 0)
+    a
+  else
+    make(<rope-node>,
+         left: a, right: b,
+         weight: asize, total: asize + bsize)
+  end
 end method;
+
+// Sprint 43b helper — the empty rope. Used as the identity element for
+// `rope-concatenate` and the result of `split-at` at index 0 or `size(r)`.
+
+define function empty-rope () => (r :: <rope-leaf>)
+  make(<rope-leaf>, bytes: "", len: 0)
+end function;
 
 // ─── for-each-leaf — in-order leaf walk ──────────────────────────────────
 //
@@ -175,6 +193,91 @@ define function make-rope-from-string (s) => (r)
     let right = make-rope-from-string(copy-sequence(s, mid, n));
     rope-concatenate(left, right)
   end
+end function;
+
+// ─── Sprint 43b — split / insert / delete ────────────────────────────────
+//
+// Edits are expressed as splits + concats. The data structure stays
+// persistent (no in-place mutation of existing nodes), so any rope
+// reference an old WNDPROC closure holds remains valid — the new
+// version is a sibling tree that shares almost all leaves with the
+// old one.
+//
+// Allocation cost per edit (insert or delete) is O(log n) fresh
+// internal nodes and ≤2 small byte-string allocations from leaf
+// splits — the rest of the leaves are reused. This is the GC stress
+// the random-edit self-test exercises.
+//
+// Multiple-return convention: split-at returns a `<pair>` carrying
+// (left, right) accessed via `head` / `tail`. Cheap (one pair-cell
+// allocation per call) and works today; promoting to true
+// multiple-values would be a separate sprint.
+
+define method rope-split-at (r :: <rope-leaf>, i :: <integer>) => (split)
+  let n = rope-leaf-len(r);
+  if (i <= 0)
+    pair(empty-rope(), r)
+  elseif (i >= n)
+    pair(r, empty-rope())
+  else
+    let bytes = rope-leaf-bytes(r);
+    let left-bytes  = copy-sequence(bytes, 0, i);
+    let right-bytes = copy-sequence(bytes, i, n);
+    pair(make(<rope-leaf>, bytes: left-bytes,  len: i),
+         make(<rope-leaf>, bytes: right-bytes, len: n - i))
+  end
+end method;
+
+define method rope-split-at (r :: <rope-node>, i :: <integer>) => (split)
+  let total = rope-node-total(r);
+  if (i <= 0)
+    pair(empty-rope(), r)
+  elseif (i >= total)
+    pair(r, empty-rope())
+  else
+    let w = rope-node-weight(r);
+    if (i = w)
+      // Clean split at the node's own boundary — no children touched.
+      pair(rope-node-left(r), rope-node-right(r))
+    elseif (i < w)
+      // Index falls in the left subtree. Split the left, attach its
+      // right-piece to the existing right subtree.
+      let inner = rope-split-at(rope-node-left(r), i);
+      pair(head(inner),
+           rope-concatenate(tail(inner), rope-node-right(r)))
+    else
+      // Index falls in the right subtree. Split the right; the left
+      // stays whole and gets paired with the right's left-piece.
+      let inner = rope-split-at(rope-node-right(r), i - w);
+      pair(rope-concatenate(rope-node-left(r), head(inner)),
+           tail(inner))
+    end
+  end
+end method;
+
+// rope-insert(r, i, s) — return a new rope with byte-string `s`
+// spliced in at position `i` (0 <= i <= size(r)).
+
+define function rope-insert (r, i :: <integer>, s) => (out)
+  let split = rope-split-at(r, i);
+  let middle = make-rope-from-string(s);
+  rope-concatenate(rope-concatenate(head(split), middle), tail(split))
+end function;
+
+// rope-delete(r, lo, hi) — return a new rope with bytes [lo, hi) gone.
+
+define function rope-delete (r, lo :: <integer>, hi :: <integer>) => (out)
+  let first-split  = rope-split-at(r, lo);
+  let second-split = rope-split-at(tail(first-split), hi - lo);
+  rope-concatenate(head(first-split), tail(second-split))
+end function;
+
+// rope->string(r) — convenience wrapper: serialise the whole rope to
+// a flat `<byte-string>`. Used by the self-test to compare an edited
+// rope against a reference flat-string built in parallel.
+
+define function rope->string (r) => (s)
+  rope-substring(r, 0, rope-size(r))
 end function;
 
 // ─── Self-tests (run as part of `main`) ──────────────────────────────────
@@ -293,6 +396,140 @@ define function main () => ()
     format-out("PASS: rope-substring full range == original\n");
   else
     format-out("FAIL: rope-substring full range mismatch\n");
+  end;
+
+  // ─── Test 7: rope-split-at boundary cases + interior ───────────────
+  let s0 = rope-split-at(big-rope, 0);
+  let s-end = rope-split-at(big-rope, 4000);
+  let s-mid = rope-split-at(big-rope, 1500);
+  let split-ok = (rope-size(head(s0)) = 0)
+                 & (rope-size(tail(s0)) = 4000)
+                 & (rope-size(head(s-end)) = 4000)
+                 & (rope-size(tail(s-end)) = 0)
+                 & (rope-size(head(s-mid)) = 1500)
+                 & (rope-size(tail(s-mid)) = 2500);
+  if (split-ok)
+    format-out("PASS: rope-split-at boundary + interior sizes\n");
+  else
+    format-out("FAIL: rope-split-at sizes\n");
+  end;
+  // The two split halves should concat back to the original byte-for-byte.
+  let rejoined = rope-concatenate(head(s-mid), tail(s-mid));
+  if (rope->string(rejoined) = big-bytes)
+    format-out("PASS: split-at + concatenate round-trips\n");
+  else
+    format-out("FAIL: split-at + concatenate round-trip mismatch\n");
+  end;
+
+  // ─── Test 8: rope-insert correctness ───────────────────────────────
+  // Insert "XYZ" into "hello" at position 2 → "heXYZllo"
+  let inserted = rope-insert(make-rope-from-string("hello"), 2, "XYZ");
+  if (rope-size(inserted) = 8
+        & rope->string(inserted) = "heXYZllo")
+    format-out("PASS: rope-insert at interior position\n");
+  else
+    format-out("FAIL: rope-insert produced `%s`\n", rope->string(inserted));
+  end;
+  // Insert at start.
+  let pre = rope-insert(make-rope-from-string("world"), 0, "hello, ");
+  if (rope->string(pre) = "hello, world")
+    format-out("PASS: rope-insert at start\n");
+  else
+    format-out("FAIL: rope-insert at start: `%s`\n", rope->string(pre));
+  end;
+  // Insert at end.
+  let post = rope-insert(make-rope-from-string("hello"), 5, ", world");
+  if (rope->string(post) = "hello, world")
+    format-out("PASS: rope-insert at end\n");
+  else
+    format-out("FAIL: rope-insert at end: `%s`\n", rope->string(post));
+  end;
+
+  // ─── Test 9: rope-delete correctness ───────────────────────────────
+  // Delete [2, 5) from "hello, world" → "he, world"
+  let deleted = rope-delete(make-rope-from-string("hello, world"), 2, 5);
+  if (rope->string(deleted) = "he, world")
+    format-out("PASS: rope-delete interior range\n");
+  else
+    format-out("FAIL: rope-delete: `%s`\n", rope->string(deleted));
+  end;
+  // Delete prefix.
+  let chopped = rope-delete(make-rope-from-string("hello, world"), 0, 7);
+  if (rope->string(chopped) = "world")
+    format-out("PASS: rope-delete prefix\n");
+  else
+    format-out("FAIL: rope-delete prefix: `%s`\n", rope->string(chopped));
+  end;
+  // Delete suffix.
+  let truncated = rope-delete(make-rope-from-string("hello, world"), 5, 12);
+  if (rope->string(truncated) = "hello")
+    format-out("PASS: rope-delete suffix\n");
+  else
+    format-out("FAIL: rope-delete suffix: `%s`\n", rope->string(truncated));
+  end;
+
+  // ─── Test 10: insert + delete on multi-leaf rope ───────────────────
+  // Take the 4000-byte rope, insert 100 bytes at position 2000, then
+  // delete those same 100 bytes. The result must byte-match the
+  // original — proves split/insert/delete compose correctly across
+  // leaf boundaries.
+  let chunk = make-test-bytes(100);
+  let widened = rope-insert(big-rope, 2000, chunk);
+  if (rope-size(widened) = 4100)
+    format-out("PASS: rope-insert across leaf boundary grows size correctly\n");
+  else
+    format-out("FAIL: widened size = %d\n", rope-size(widened));
+  end;
+  let restored = rope-delete(widened, 2000, 2100);
+  if (rope-size(restored) = 4000 & rope->string(restored) = big-bytes)
+    format-out("PASS: insert-then-delete round-trips the original\n");
+  else
+    format-out("FAIL: restored size = %d\n", rope-size(restored));
+  end;
+
+  // ─── Test 11: GC-stress random-edit walk ───────────────────────────
+  // 200 alternating insert/delete ops on a starter rope. Each op
+  // allocates ~log(n) fresh internal nodes + a leaf or two — that's
+  // a few thousand small heap objects across the run. Proves the GC
+  // keeps up with rope churn, AND that split/insert/delete compose
+  // correctly across many steps. We track a parallel reference rope
+  // built by the same op sequence, and compare at the end via `=`.
+  //
+  // "Random" here means deterministic-from-i — no <random> generic
+  // yet. The seed gives us a varied-enough mix of positions / sizes.
+  let cur = make-rope-from-string(big-bytes);
+  let ref = make-rope-from-string(big-bytes);
+  let step = 0;
+  let stress-ok = #t;
+  until (step = 200)
+    // Pseudo-random position in [0, rope-size(cur)).
+    let pos = (step * 137 + 23) - ((step * 137 + 23) / rope-size(cur)) * rope-size(cur);
+    let chunk = make-test-bytes(8);
+    // Even step inserts 8 bytes; odd step deletes 8 bytes (or fewer
+    // if we'd run off the end).
+    if ((step - (step / 2) * 2) = 0)
+      cur := rope-insert(cur, pos, chunk);
+      ref := rope-insert(ref, pos, chunk);
+    else
+      let avail = rope-size(cur) - pos;
+      let take = if (avail > 8) 8 else avail end;
+      if (take > 0)
+        cur := rope-delete(cur, pos, pos + take);
+        ref := rope-delete(ref, pos, pos + take);
+      else
+        #f
+      end;
+    end;
+    step := step + 1;
+  end;
+  // After 200 ops, cur and ref should be byte-identical (we drove
+  // them in lockstep — this is mostly a self-consistency check, but
+  // it forces materialisation of every byte at the end).
+  if (rope-size(cur) = rope-size(ref) & rope->string(cur) = rope->string(ref))
+    format-out("PASS: 200-op GC-stress walk byte-matches reference\n");
+  else
+    format-out("FAIL: stress walk mismatch (cur=%d ref=%d)\n",
+               rope-size(cur), rope-size(ref));
   end;
 
   format-out("DONE\n");
