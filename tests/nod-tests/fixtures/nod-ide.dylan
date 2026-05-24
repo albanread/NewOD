@@ -805,7 +805,27 @@ define function main () => ()
   AppendMenuW(help-menu, 0,    200, "&About");
   AppendMenuW(menu-bar,  16,   help-menu, "&Help");
   rebuild-recent-submenu(recent-menu, recent-paths);
-  let wp = method (hwnd, msg, wparam, lparam)
+  // Sprint 11d — split the WNDPROC into two parts:
+  //
+  //   `handle-wm-message`: a regular Dylan function. Allowed to
+  //     allocate freely; runs from a precisely-tracked Dylan frame so
+  //     Sprint 11b's safepoint-root machinery sees every live Word
+  //     across each allocating call.
+  //
+  //   `wp`: the OS-facing callback shell. Does no allocation. The only
+  //     thing it does is forward to `handle-wm-message`. The Rust
+  //     trampoline in nod-runtime/src/callbacks.rs::wndproc_dispatch
+  //     calls into `wp` via `nod_funcall4`; `wp` makes exactly one
+  //     Dylan-to-Dylan call into `handle-wm-message`, which is wrapped
+  //     by 11b's begin_safepoint / end_safepoint pair.
+  //
+  // The rule: never let the registered callback closure itself
+  // allocate. Win32 callbacks aren't part of the normal Dylan call
+  // flow — they're re-entered out of a native frame the GC can't
+  // describe — so we keep the work in a separate frame that *is*
+  // part of the normal flow. Long-term, a `define-window-class` macro
+  // generates this shell shape; for now we hand-wire it.
+  let handle-wm-message = method (hwnd, msg, wparam, lparam)
              if (msg = 15)  // WM_PAINT
                if (swap ~= 0)
                  if (bitmap = 0)
@@ -1195,6 +1215,11 @@ define function main () => ()
              else
                DefWindowProcW(hwnd, msg, wparam, lparam)
              end
+           end;
+  // Sprint 11d — the OS-facing shell. One Dylan call, no allocations.
+  // See the `handle-wm-message` definition above for the contract.
+  let wp = method (hwnd, msg, wparam, lparam)
+             handle-wm-message(hwnd, msg, wparam, lparam)
            end;
   let cb = as-wndproc-callback(wp);
   let atom = %register-window-class(cb, "NodIDE");
