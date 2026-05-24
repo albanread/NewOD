@@ -799,58 +799,72 @@ pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
 /// is a no-op when there's only one file.
 pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError> {
     if paths.is_empty() {
-        // No files = nothing to compile. Surface as a Lower error so
-        // callers don't need to special-case an empty input.
         return Err(EvalError::Lower(vec![]));
     }
 
-    // Same eager init as the single-file path — runs once thanks to
-    // `LazyLock` inside, but we call it before any per-file work so
-    // class-id allocation lines up between compiler and EXE.
+    // Same eager init as the single-file path.
     nod_runtime::nod_runtime_init();
     stdlib::ensure_loaded();
 
-    // Per-file lower step. Each iteration extends the global class
-    // registry (so later files can see classes defined earlier) and
-    // produces a per-file LoweredModule we'll merge together below.
+    // **AST-level merge, NOT LoweredModule-level merge.** The earlier
+    // Sprint 44 attempt lowered each file separately and tried to
+    // stitch the `LoweredModule`s together via a `merge_modules`
+    // helper. That silently dropped six fields the merge didn't know
+    // about (`c_functions`, `c_function_stub_table`, `sealing`,
+    // `resolutions`, `warnings`, plus any future addition) and — more
+    // catastrophically — invalidated the per-file `WinFfiCall`
+    // stub-table indices baked into the lowered IR, because each
+    // file's `lower_module_full` numbers its stub-table entries from
+    // 0 independently. When the merged stub-table only contained
+    // file 1's entries, file 2's call sites still indexed into it as
+    // if they were file-2-local, hit the wrong row, and Win32 got
+    // junk pointers — observed as a runtime panic
+    // `winffi: expected Dylan <byte-string> ... got raw Word 0x18520`
+    // on the very first string-typed Win32 call.
     //
-    // We keep track of the declared Module: header per file so we can
-    // raise `ModuleMismatch` upfront — better than lowering everything
-    // and discovering the mismatch at codegen time.
-    let mut per_file_lms: Vec<(std::path::PathBuf, LoweredModule)> =
-        Vec::with_capacity(paths.len());
+    // The fix mirrors how `nod-sema::stdlib::load_stdlib` already
+    // composes its own multi-file source: parse each file separately,
+    // concatenate their `items` into one combined `Module` AST, then
+    // call `lower_module_full` exactly once. All counters, registries,
+    // and per-module tables are assigned in a single coherent pass —
+    // no merge fragility, no fields-I-forgot-to-merge bugs.
+    //
+    // The first file's preamble carries the module header that the
+    // post-merge `Module` reports; we still verify every file's
+    // declared `Module:` value agrees before merging.
+    let mut sm = nod_reader::SourceMap::new();
     let mut declared_modules: Vec<(std::path::PathBuf, String)> =
         Vec::with_capacity(paths.len());
+    let mut merged: Option<nod_reader::Module> = None;
 
     for path in paths {
         let src = std::fs::read_to_string(path).map_err(EvalError::Io)?;
-        let mut sm = nod_reader::SourceMap::new();
         let file_id = sm
             .add(path.to_path_buf(), src.clone())
             .map_err(EvalError::SourceMap)?;
         let toks = nod_reader::lex(&src, file_id);
         let pre = nod_reader::scan_preamble(&src);
-        let mut module =
+        let mut parsed =
             parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
-        // Extract this file's Module: header for later cross-file check.
-        let mod_name = module
+
+        let mod_name = parsed
             .header
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("module"))
             .map(|(_, v)| v.trim().to_string())
             .unwrap_or_default();
         declared_modules.push(((*path).to_path_buf(), mod_name));
-        // Expand macros + lower (no stdlib merge yet — we merge once
-        // at the end, after all user files are combined).
-        expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
-        let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
-        per_file_lms.push(((*path).to_path_buf(), lm));
+
+        match &mut merged {
+            None => merged = Some(parsed),
+            Some(m) => m.items.append(&mut parsed.items),
+        }
     }
 
-    // Module-header consistency: every declared header must match.
-    // We use the first non-empty header as the reference; if every
-    // file is header-less, the empty string is the reference (still
-    // valid — they all agree on "no header").
+    // Module-header consistency check: every file must declare the
+    // same `Module:` value (or all be header-less). The first
+    // non-empty declared value is the reference; any disagreement is
+    // an error before we touch lowering.
     let reference = declared_modules
         .iter()
         .map(|(_, m)| m.as_str())
@@ -865,63 +879,76 @@ pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError
         });
     }
 
-    // Cross-file function/method collision detection.
+    let mut module = merged.expect("at least one file (checked at fn entry)");
+
+    // Cross-file duplicate-definition detection at AST level. The
+    // lowering pass DOESN'T diagnose this — it silently uses one body
+    // for codegen and registers the other's name in the AOT resolver,
+    // which then surfaces as an `unresolved external symbol` linker
+    // error several minutes into the build. We catch it upfront here
+    // so the user gets a clear "two files defined `helper`" message
+    // instead of a cryptic LNK2019.
     //
-    // Subtle point: a single file's lowering can legitimately produce
-    // multiple `lm.functions` / `lm.methods` entries with the same
-    // `name` / `body_fn_name` — e.g. slot getter/setter pairs sharing
-    // a body name, or class-lowering boilerplate emitted more than
-    // once. `merge_stdlib_into_user_module` collapses those via a
-    // `HashSet` and the duplicates are harmless. Only collisions
-    // **across files** matter (two user files both defining
-    // `helper`), because that's where the user's intent is ambiguous.
-    //
-    // So we walk per-file and build a per-file deduped set first,
-    // then check if any name in that set was already first-claimed by
-    // a different file. Within a single file, repeated occurrences
-    // are silently allowed (and `merge_modules` will collapse them
-    // for codegen).
-    use std::collections::{HashMap, HashSet};
-    let mut first_seen: HashMap<String, std::path::PathBuf> = HashMap::new();
-    for (path, lm) in &per_file_lms {
-        let mut names_in_this_file: HashSet<String> = HashSet::new();
-        for f in &lm.functions {
-            names_in_this_file.insert(f.name.clone());
-        }
-        for m in &lm.methods {
-            names_in_this_file.insert(m.body_fn_name.clone());
-        }
-        for name in &names_in_this_file {
-            if let Some(prior) = first_seen.get(name)
-                && prior != path
+    // We don't track WHICH source file each item came from after the
+    // AST merge (the spans still point at the right SourceMap entry,
+    // but reconstructing the file path from the span here would be
+    // more wiring than the value justifies), so the diagnostic names
+    // the duplicated identifier and the user finds it via grep.
+    {
+        use nod_reader::Item;
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut first_duplicate: Option<String> = None;
+        for item in &module.items {
+            let name = match item {
+                // `define function` / `define class` / etc. introduce a
+                // unique top-level binding; duplicates across files are
+                // an error. `define method` is DELIBERATELY excluded —
+                // multiple methods on the same generic legitimately share
+                // the generic's name (that's how multi-method dispatch
+                // works), and dedup at this level would false-positive on
+                // every IDE rope method (`rope-size <rope-leaf>`,
+                // `rope-size <rope-node>`, …).
+                Item::DefineFunction { name, .. }
+                | Item::DefineGeneric { name, .. }
+                | Item::DefineConstant { name, .. }
+                | Item::DefineVariable { name, .. }
+                | Item::DefineClass { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(n) = name
+                && !seen.insert(n.clone())
             {
-                return Err(EvalError::DuplicateUserDefinition {
-                    name: name.clone(),
-                    first_path: prior.clone(),
-                    second_path: path.clone(),
-                });
+                first_duplicate = Some(n);
+                break;
             }
-            first_seen.insert(name.clone(), path.clone());
+        }
+        if let Some(name) = first_duplicate {
+            // We don't know which two files contributed the dup — use
+            // the first and last passed paths as a hint. Better than
+            // nothing; if the user has more than two files we point at
+            // the bookends and they grep for the name.
+            return Err(EvalError::DuplicateUserDefinition {
+                name,
+                first_path: paths[0].to_path_buf(),
+                second_path: paths[paths.len() - 1].to_path_buf(),
+            });
         }
     }
 
-    // Merge per-file LMs into one. Start with the first as the base
-    // and fold the rest in; collisions are impossible at this point
-    // (we just checked), so `merge_modules`'s "into wins" policy is
-    // a no-op for our case. The block / closure / user-class
-    // concatenation logic does the real work.
-    let mut iter = per_file_lms.into_iter();
-    let (_first_path, mut combined) = iter
-        .next()
-        .expect("at least one file (checked at fn entry)");
-    for (_path, lm) in iter {
-        merge_modules(&mut combined, &lm);
-    }
-
-    // Final step: merge stdlib on top. This is the single-file path's
-    // last step too — exactly the same call.
-    merge_stdlib_into_user_module(&mut combined);
-    Ok(combined)
+    // Single macro-expansion + lowering pass over the combined AST.
+    // Everything sees everything: cross-file function references
+    // resolve naturally (they're all in the same `module.items`
+    // list), the closure lifter sees the union of top-level names,
+    // c-function stub-table indices are assigned monotonically across
+    // the whole user module, and `register_user_class` runs in
+    // source-file order without any per-file segmentation. The
+    // resulting `LoweredModule` is structurally identical to what
+    // the single-file path produces from a hand-concatenated source.
+    expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
+    let mut lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    merge_stdlib_into_user_module(&mut lm);
+    Ok(lm)
 }
 
 /// Sprint 39c — build the AOT registration payload from a (post-
