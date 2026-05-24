@@ -1179,24 +1179,37 @@ define function main () => ()
                let h-max = if (client-width-px > viewport-width-px)
                              client-width-px - viewport-width-px
                            else 0 end;
-               if (vk = 33)        // VK_PRIOR (PgUp)
-                 let new-pos = scroll-y-px - (viewport-height-px - line-height);
-                 let clamped = if (new-pos < 0) 0
-                               elseif (new-pos > v-max) v-max
-                               else new-pos end;
-                 if (clamped ~= scroll-y-px)
-                   scroll-y-px := clamped;
-                   %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, clamped, 1);
+               if (vk = 33)        // VK_PRIOR (PgUp) — Sprint 43e-4b cursor move
+                 // Move the cursor up by one screenful of lines. The
+                 // ensure-cursor-visible call then pulls the viewport
+                 // along so the cursor stays on screen. Walk one line
+                 // at a time via move-cursor-vertical — simple but
+                 // O(page) cached-flat walks per press; optimisation
+                 // (single-pass walk preserving the ideal column) is a
+                 // follow-up if PgUp/PgDn ever feels sluggish.
+                 let lines-per-page = viewport-height-px / line-height;
+                 let new-off = cursor-offset;
+                 let i = 0;
+                 until (i = lines-per-page)
+                   new-off := move-cursor-vertical(cached-flat, new-off, -1);
+                   i := i + 1;
+                 end;
+                 if (new-off ~= cursor-offset)
+                   cursor-offset := new-off;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 34)    // VK_NEXT (PgDn)
-                 let new-pos = scroll-y-px + (viewport-height-px - line-height);
-                 let clamped = if (new-pos < 0) 0
-                               elseif (new-pos > v-max) v-max
-                               else new-pos end;
-                 if (clamped ~= scroll-y-px)
-                   scroll-y-px := clamped;
-                   %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, clamped, 1);
+               elseif (vk = 34)    // VK_NEXT (PgDn) — Sprint 43e-4b cursor move
+                 let lines-per-page = viewport-height-px / line-height;
+                 let new-off = cursor-offset;
+                 let i = 0;
+                 until (i = lines-per-page)
+                   new-off := move-cursor-vertical(cached-flat, new-off, 1);
+                   i := i + 1;
+                 end;
+                 if (new-off ~= cursor-offset)
+                   cursor-offset := new-off;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 36)    // VK_HOME — Sprint 43e-3 cursor to line start
