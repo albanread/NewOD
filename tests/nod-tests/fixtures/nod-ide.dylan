@@ -719,6 +719,72 @@ define function update-title (hwnd, path) => ()
   end;
 end function;
 
+// ─── Sprint 43e-2 — cursor movement helpers ──────────────────────────────
+//
+// Compute the byte offset that VK_UP / VK_DOWN should land the cursor on.
+// `direction = -1` for up, `+1` for down. The math:
+//
+//   1. Find the start of the current line by scanning backward for '\n'.
+//   2. Current column = offset - current-line-start.
+//   3. Find the previous / next line's start + length.
+//   4. Clamp column to fit on the target line.
+//   5. Return target-line-start + clamped-column.
+//
+// At the top / bottom of the buffer the move is a no-op (returns the
+// input offset unchanged). The caller checks for "no change" and skips
+// the InvalidateRect when it's a no-op.
+//
+// Column behaviour: we recompute the column from the cursor's current
+// byte position each time, so a long line → short line → long line
+// vertical walk does NOT preserve the "ideal" column (the cursor sticks
+// to whatever shorter intermediate line allowed). Most editors keep a
+// remembered ideal column; we'll add that in a follow-up if it bothers.
+
+define function move-cursor-vertical
+    (bytes :: <byte-string>, offset :: <integer>, direction :: <integer>)
+ => (new :: <integer>)
+  let n = size(bytes);
+  let off = if (offset > n) n else offset end;
+  // Scan back to current line's start (byte after the previous \n, or 0).
+  let cur-line-start = off;
+  until (cur-line-start = 0 | element(bytes, cur-line-start - 1) = 10)
+    cur-line-start := cur-line-start - 1;
+  end;
+  let cur-col = off - cur-line-start;
+  if (direction < 0)
+    if (cur-line-start = 0)
+      offset
+    else
+      let prev-line-end = cur-line-start - 1;  // index of the '\n'
+      let prev-line-start = prev-line-end;
+      until (prev-line-start = 0 | element(bytes, prev-line-start - 1) = 10)
+        prev-line-start := prev-line-start - 1;
+      end;
+      let prev-line-len = prev-line-end - prev-line-start;
+      let target-col = if (cur-col < prev-line-len) cur-col else prev-line-len end;
+      prev-line-start + target-col
+    end
+  else
+    // Forward: scan to end of current line.
+    let cur-line-end = off;
+    until (cur-line-end = n | element(bytes, cur-line-end) = 10)
+      cur-line-end := cur-line-end + 1;
+    end;
+    if (cur-line-end = n)
+      offset
+    else
+      let next-line-start = cur-line-end + 1;
+      let next-line-end = next-line-start;
+      until (next-line-end = n | element(bytes, next-line-end) = 10)
+        next-line-end := next-line-end + 1;
+      end;
+      let next-line-len = next-line-end - next-line-start;
+      let target-col = if (cur-col < next-line-len) cur-col else next-line-len end;
+      next-line-start + target-col
+    end
+  end
+end function;
+
 define function main () => ()
   let arg-path = %argv1();
   // Sprint 43d — the buffer is a `<rope>` now. Load the file (or the
@@ -1043,24 +1109,34 @@ define function main () => ()
                    %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, v-max, 1);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 37)    // VK_LEFT
-                 let new-pos = scroll-x-px - char-width;
-                 let clamped = if (new-pos < 0) 0
-                               elseif (new-pos > h-max) h-max
-                               else new-pos end;
-                 if (clamped ~= scroll-x-px)
-                   scroll-x-px := clamped;
-                   %set-scroll-info(hwnd, 0, 0, client-width-px, viewport-width-px, clamped, 1);
+               elseif (vk = 37)    // VK_LEFT — Sprint 43e-2 cursor move
+                 // Rebound from horizontal scroll to cursor move per the
+                 // universal text-editor convention. Horizontal scroll
+                 // stays available via Shift+MouseWheel, the horizontal
+                 // scrollbar, and (if we add them) Ctrl+arrows.
+                 if (cursor-offset > 0)
+                   cursor-offset := cursor-offset - 1;
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
-               elseif (vk = 39)    // VK_RIGHT
-                 let new-pos = scroll-x-px + char-width;
-                 let clamped = if (new-pos < 0) 0
-                               elseif (new-pos > h-max) h-max
-                               else new-pos end;
-                 if (clamped ~= scroll-x-px)
-                   scroll-x-px := clamped;
-                   %set-scroll-info(hwnd, 0, 0, client-width-px, viewport-width-px, clamped, 1);
+               elseif (vk = 39)    // VK_RIGHT — Sprint 43e-2 cursor move
+                 let buf-len = size(cached-flat);
+                 if (cursor-offset < buf-len)
+                   cursor-offset := cursor-offset + 1;
+                   InvalidateRect(hwnd, 0, 0);
+                 else 0 end;
+               elseif (vk = 38)    // VK_UP — Sprint 43e-2 cursor move
+                 // move-cursor-vertical returns the input unchanged at
+                 // the top of the buffer, so the `~=` guard skips the
+                 // pointless repaint.
+                 let new-off = move-cursor-vertical(cached-flat, cursor-offset, -1);
+                 if (new-off ~= cursor-offset)
+                   cursor-offset := new-off;
+                   InvalidateRect(hwnd, 0, 0);
+                 else 0 end;
+               elseif (vk = 40)    // VK_DOWN — Sprint 43e-2 cursor move
+                 let new-off = move-cursor-vertical(cached-flat, cursor-offset, 1);
+                 if (new-off ~= cursor-offset)
+                   cursor-offset := new-off;
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 8)     // VK_BACK — Sprint 43d backspace
