@@ -1291,6 +1291,39 @@ define function main () => ()
                  else 0 end;
                else 0 end;
                0
+             elseif (msg = 513)  // WM_LBUTTONDOWN — Sprint 43e-5 cursor positioning
+               // lParam packs the click position as (y << 16) | x in
+               // client-area coordinates (top-left of the window's
+               // client area = (0, 0)). Convert to layout-relative
+               // coordinates by adding the scroll offsets and
+               // subtracting the pad. Then ask DirectWrite to
+               // hit-test that point against the current layout.
+               //
+               // We create a fresh text layout per click — cheaper
+               // than caching it across mutations and clicks are
+               // rare compared to keystrokes. The layout is released
+               // immediately after the hit-test.
+               let cx-client = %lo-word(lparam);
+               let cy-client = %hi-word(lparam);
+               let layout-x = cx-client + scroll-x-px - pad;
+               let layout-y = cy-client + scroll-y-px - pad;
+               let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
+                                                       client-width-px, client-height-px);
+               let new-off = %dwrite-hit-test-point(layout, layout-x, layout-y);
+               %com-release(layout);
+               // Clamp to buffer bounds. HitTestPoint returns the
+               // closest valid offset even for out-of-bounds clicks
+               // but we belt-and-brace it.
+               let buf-len = size(cached-flat);
+               let clamped = if (new-off < 0) 0
+                             elseif (new-off > buf-len) buf-len
+                             else new-off end;
+               if (clamped ~= cursor-offset)
+                 cursor-offset := clamped;
+                 ensure-cursor-visible(hwnd);
+                 InvalidateRect(hwnd, 0, 0);
+               else 0 end;
+               0
              elseif (msg = 258)  // WM_CHAR — Sprint 43d character input
                // wparam carries the character as a UTF-16 code unit.
                // Phase-2 simplicity: accept only ASCII-printable

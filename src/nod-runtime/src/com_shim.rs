@@ -1147,6 +1147,58 @@ pub unsafe extern "C-unwind" fn nod_dwrite_hit_test_text_position(
     tag((y << 32) | (x & 0xFFFF_FFFF))
 }
 
+/// JIT-callable: convert layout-relative pixel coordinates into a text-
+/// position offset. Wraps `IDWriteTextLayout::HitTestPoint`. Inverse
+/// of `nod_dwrite_hit_test_text_position`.
+///
+/// Used by the IDE's mouse-click handler: given a (layout-relative)
+/// click point, return the UTF-16 code-unit offset where the cursor
+/// should land. For ASCII-only buffers this equals the byte offset.
+///
+/// Inputs:
+///   * `layout_handle` — a DWriteTextLayout handle.
+///   * `point_x` — x in DIPs, relative to layout origin.
+///   * `point_y` — y in DIPs, relative to layout origin.
+///
+/// Returns the text-position offset as a Dylan-tagged fixnum. If the
+/// click was on the trailing edge of a character (closer to its right
+/// edge than its left), the returned offset is one PAST the character
+/// — i.e. the cursor sits *after* the character. This matches what
+/// every text editor does for mid-character clicks. Returns 0 if the
+/// layout handle is invalid.
+///
+/// # Safety
+/// `layout_handle` must be a valid DWriteTextLayout.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_hit_test_point(
+    layout_handle: u64,
+    point_x: u64,
+    point_y: u64,
+) -> u64 {
+    let Some(layout) = get_dwrite_text_layout(layout_handle) else {
+        return tag(0);
+    };
+    let px = untag_i64(point_x) as f32;
+    let py = untag_i64(point_y) as f32;
+    let mut is_trailing = windows::Win32::Foundation::BOOL::from(false);
+    let mut is_inside = windows::Win32::Foundation::BOOL::from(false);
+    let mut metrics =
+        windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS::default();
+    // SAFETY: layout valid; out-params on the stack.
+    if unsafe {
+        layout.HitTestPoint(px, py, &mut is_trailing, &mut is_inside, &mut metrics)
+    }
+    .is_err()
+    {
+        return tag(0);
+    }
+    let mut pos = metrics.textPosition as u64;
+    if is_trailing.as_bool() {
+        pos += metrics.length as u64;
+    }
+    tag(pos)
+}
+
 // ─── Phase E — drawing primitives ────────────────────────────────────────
 
 /// JIT-callable: create a solid-color brush. RGBA channels are
