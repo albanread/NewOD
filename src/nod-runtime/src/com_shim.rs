@@ -1199,6 +1199,51 @@ pub unsafe extern "C-unwind" fn nod_dwrite_hit_test_point(
     tag(pos)
 }
 
+/// JIT-callable: force a uniform line height on a text format, so
+/// every text layout created from it lays out lines exactly
+/// `line_spacing_x10 / 10` DIPs apart with the baseline at
+/// `baseline_x10 / 10` DIPs from the top of each line. Wraps
+/// `IDWriteTextFormat::SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,
+/// lineSpacing, baseline)`.
+///
+/// The IDE uses this to make DirectWrite's per-line pixel count
+/// match the Dylan-side `line-height` constant — without this,
+/// the gutter's line numbers drift relative to the text as the
+/// user scrolls (cumulative ~1px/line offset because Consolas's
+/// natural line height isn't exactly the constant we picked).
+///
+/// `_x10` is a parity tag — values are untagged like any small
+/// integer, then divided by 10. Lets the IDE specify
+/// "18.0 DIPs" as the integer 180 without needing a float shim.
+///
+/// # Safety
+/// `format_handle` must be a valid DWriteTextFormat.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_dwrite_set_line_spacing(
+    format_handle: u64,
+    line_spacing_x10: u64,
+    baseline_x10: u64,
+) -> u64 {
+    let Some(format) = get_dwrite_text_format(format_handle) else {
+        return tag(0);
+    };
+    let spacing = (untag(line_spacing_x10) as f32) / 10.0;
+    let baseline = (untag(baseline_x10) as f32) / 10.0;
+    // SAFETY: format is valid; method is a constant enum.
+    if unsafe {
+        format.SetLineSpacing(
+            windows::Win32::Graphics::DirectWrite::DWRITE_LINE_SPACING_METHOD_UNIFORM,
+            spacing,
+            baseline,
+        )
+    }
+    .is_err()
+    {
+        return tag(0);
+    }
+    tag(1)
+}
+
 /// JIT-callable: apply a drawing effect (typically a colored brush)
 /// to a range of text in a layout. Wraps
 /// `IDWriteTextLayout::SetDrawingEffect`. The brush becomes the

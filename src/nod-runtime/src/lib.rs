@@ -135,7 +135,7 @@ pub use com_shim::{
     nod_def_window_proc, nod_destroy_window, nod_dwrite_create_factory, nod_dwrite_create_text_format,
     nod_dwrite_create_text_layout, nod_dwrite_get_layout_metrics,
     nod_dwrite_hit_test_point, nod_dwrite_hit_test_text_position,
-    nod_dwrite_set_drawing_effect,
+    nod_dwrite_set_drawing_effect, nod_dwrite_set_line_spacing,
     nod_dxgi_create_factory, nod_dxgi_create_surface_from_texture,
     nod_dxgi_create_swap_chain_for_hwnd, nod_dxgi_device_from_d3d_device,
     nod_dxgi_factory_from_d3d_device, nod_dxgi_swap_chain_present,

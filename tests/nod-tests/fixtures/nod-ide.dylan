@@ -1296,6 +1296,14 @@ define function main () => ()
   let dc           = %d2d-create-device-context(d2d-device);
   let dwrite       = %dwrite-create-factory();
   let format       = %dwrite-create-text-format(dwrite, "Consolas", 1400, "en-us");
+  // Sprint 43g-fix — force uniform 18.0 DIP line height with baseline
+  // at 14.4 DIPs so DirectWrite's line stride matches the Dylan-side
+  // line-height constant exactly. Without this, Consolas's natural
+  // line height (~17 px at 14 DIPs) produces a cumulative 1 px/line
+  // drift that makes the gutter's line numbers visibly slide up/down
+  // by one relative to the source text as the user scrolls.
+  // Encoding: x10 tag — 180 means 18.0 DIPs, 144 means 14.4 DIPs.
+  %dwrite-set-line-spacing(format, 180, 144);
   let buffer-lines    = nod-rope-line-count(source-text);
   let buffer-max-cols = nod-rope-max-line-chars(source-text);
   let char-width  = 8;
