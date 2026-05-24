@@ -4326,6 +4326,20 @@ impl FunctionBuilder {
                 if *op == BinOp::Assign {
                     return self.lower_assign(lhs, rhs, *span, env, ctx);
                 }
+                // Task #251 — Dylan `|` (or) and `&` (and) are
+                // SHORT-CIRCUIT, not bitwise. `a | b` evaluates `a`,
+                // returns it if true (anything not `#f`), else returns
+                // `b`. `a & b` evaluates `a`, returns it if false, else
+                // returns `b`. Both can produce ANY Word, not just
+                // `#t`/`#f`. We lower these to a 3-block CFG (mirrors
+                // `lower_if`) so the right operand only runs when
+                // needed — required for correctness when the right
+                // side has side effects or would fault if reached
+                // unconditionally (e.g. `until (i = n | element(bs, i)
+                // = 10)` indexes out of range when `i = n`).
+                if matches!(*op, BinOp::Or | BinOp::And) {
+                    return self.lower_short_circuit(*op, lhs, rhs, env, ctx);
+                }
                 let l = self.lower_expr(lhs, env, ctx)?;
                 let r = self.lower_expr(rhs, env, ctx)?;
                 let lt = self.func.temp_type(l);
@@ -5483,6 +5497,145 @@ impl FunctionBuilder {
             class: check,
         });
         Ok(dst)
+    }
+
+    /// Task #251 — short-circuit lowering for Dylan's `|` (or) and
+    /// `&` (and). Mirrors `lower_if`'s 3-block CFG with env merging,
+    /// but the "short-circuit" edge just forwards the lhs value
+    /// without re-evaluating it.
+    ///
+    /// CFG shape (for `a | b`):
+    /// ```text
+    ///   cur:                            lhs evaluated here; env mutations
+    ///     l = lower(lhs)                from `lhs` stick unconditionally.
+    ///     if l then sc_edge else rhs_b
+    ///   sc_edge:                        Trivial trampoline — `Terminator::If`
+    ///     jump join(l, pre_rhs_env...)  can't carry args, so we jump from
+    ///                                   here with `l` + the pre-rhs values
+    ///                                   of every name `rhs` would rebind.
+    ///   rhs_b:
+    ///     r = lower(rhs)                env mutations from `rhs` only
+    ///     jump join(r, post_rhs_env...) committed on this path.
+    ///   join(result_param, ...phi):
+    ///     // result_param IS the BinOp's value; merge vars rebound in
+    ///     // env so post-binop code sees correctly-phi'd values.
+    /// ```
+    ///
+    /// For `a & b` the only difference is the branch edges flip:
+    /// truthy goes to `rhs_b`, falsy goes to `sc_edge`. The result
+    /// type at the join is `l_ty.join(r_ty)` — same convention as
+    /// `lower_if`.
+    fn lower_short_circuit(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        debug_assert!(matches!(op, BinOp::Or | BinOp::And));
+
+        // Step 1: lower lhs in the current block. Any env mutations
+        // from `lhs` are committed for every path through this point
+        // (lhs always runs, regardless of short-circuit choice). No
+        // merging needed for lhs-side rebindings.
+        let l = self.lower_expr(lhs, env, ctx)?;
+        let l_ty = self.func.temp_type(l);
+
+        // Step 2: walk rhs upfront to find every name it would rebind,
+        // so we know what phi params the join block needs. Same
+        // discipline as `lower_if`'s `assigned_in_arms` collection.
+        let mut assigned_in_rhs: HashSet<String> = HashSet::new();
+        collect_assigned_in_expr(rhs, env, &mut assigned_in_rhs);
+        let mut merge_names: Vec<String> = assigned_in_rhs.into_iter().collect();
+        merge_names.sort(); // deterministic param order
+        merge_names.retain(|n| env.contains_key(n));
+        let pre_rhs_env = env.clone();
+
+        // Step 3: allocate the three blocks. `sc_edge` is the trivial
+        // trampoline that carries the short-circuit args; `rhs_b` is
+        // where the right operand runs; `join_b` is the merge point.
+        let sc_idx = self.next_block;
+        let rhs_idx = self.next_block + 1;
+        let join_idx = self.next_block + 2;
+        let sc_edge = self.new_block(format!("sc_edge{sc_idx}"));
+        let rhs_b = self.new_block(format!("sc_rhs{rhs_idx}"));
+        let join_b = self.new_block(format!("sc_join{join_idx}"));
+
+        // Step 4: terminate cur with `If`, routing by op:
+        //   Or:  truthy → sc_edge (return l), falsy → rhs_b
+        //   And: truthy → rhs_b,              falsy → sc_edge (return l)
+        let (then_block, else_block) = match op {
+            BinOp::Or => (sc_edge, rhs_b),
+            BinOp::And => (rhs_b, sc_edge),
+            _ => unreachable!(),
+        };
+        self.terminate_current(Terminator::If {
+            cond: l,
+            then_block,
+            else_block,
+        });
+
+        // Step 5: emit sc_edge — jump to join carrying lhs as the
+        // value param and the pre-rhs env values for every merge name.
+        let sc_merge_temps: Vec<TempId> = merge_names
+            .iter()
+            .map(|n| *pre_rhs_env.get(n).expect("merge name in pre-rhs env"))
+            .collect();
+        let mut sc_args: Vec<TempId> = Vec::with_capacity(1 + sc_merge_temps.len());
+        sc_args.push(l);
+        sc_args.extend(sc_merge_temps.iter().copied());
+        self.switch_to(sc_edge);
+        self.terminate_current(Terminator::Jump {
+            target: join_b,
+            args: sc_args,
+        });
+
+        // Step 6: emit rhs_b — lower the right operand against a fresh
+        // copy of the pre-rhs env (mutations on this path don't leak
+        // to the sc_edge path). After lowering, jump to join with the
+        // rhs result + post-rhs env values for every merge name.
+        // `lower_expr` may extend the CFG (e.g. nested `if`); we
+        // terminate `self.current` (which `lower_expr` leaves us at),
+        // not necessarily `rhs_b` itself.
+        *env = pre_rhs_env.clone();
+        self.switch_to(rhs_b);
+        let r = self.lower_expr(rhs, env, ctx)?;
+        let r_ty = self.func.temp_type(r);
+        let rhs_merge_temps: Vec<TempId> = merge_names
+            .iter()
+            .map(|n| *env.get(n).expect("merge name bound after rhs eval"))
+            .collect();
+        let mut rhs_args: Vec<TempId> = Vec::with_capacity(1 + rhs_merge_temps.len());
+        rhs_args.push(r);
+        rhs_args.extend(rhs_merge_temps.iter().copied());
+        self.terminate_current(Terminator::Jump {
+            target: join_b,
+            args: rhs_args,
+        });
+
+        // Step 7: build join block params. Value param first, then one
+        // per merged name. Order MUST match jump-args order above.
+        let joined_ty = l_ty.join(r_ty);
+        let join_value_param = self.add_block_param(join_b, joined_ty);
+        let mut join_var_params: Vec<TempId> = Vec::with_capacity(merge_names.len());
+        for (i, _n) in merge_names.iter().enumerate() {
+            // Type for each merge param: join of pre-rhs (sc path) and
+            // post-rhs (rhs path) types for that name.
+            let sc_ty = self.func.temp_type(sc_merge_temps[i]);
+            let rhs_ty = self.func.temp_type(rhs_merge_temps[i]);
+            let ty = sc_ty.join(rhs_ty);
+            let p = self.add_block_param(join_b, ty);
+            join_var_params.push(p);
+        }
+
+        // Step 8: switch to join and rebind env so post-binop code
+        // sees phi'd values for every merged name.
+        self.switch_to(join_b);
+        for (n, p) in merge_names.iter().zip(join_var_params.iter()) {
+            env.insert(n.clone(), *p);
+        }
+        Ok(join_value_param)
     }
 
     fn lower_if(

@@ -740,15 +740,14 @@ end function;
 // to whatever shorter intermediate line allowed). Most editors keep a
 // remembered ideal column; we'll add that in a follow-up if it bothers.
 //
-// **Note on `|` and `&`.** Dylan's `|` and `&` are supposed to
-// short-circuit per spec, but our compiler currently lowers them to
-// eager `BoolOr` / `BoolAnd` PrimOps (see task #251). So writing
-// `until (i = 0 | element(bytes, i - 1) = 10)` evaluates
-// `element(bytes, -1)` when `i = 0` — which signals
-// `<out-of-range-error>` and aborts the WNDPROC. Until the compiler
-// gains real short-circuit semantics, we use sentinel-loop helpers
-// (`scan-line-start` / `scan-line-end`) that guard the bounds
-// explicitly with nested `if` / `elseif`.
+// **Note on `|` and `&`.** Dylan's `|` and `&` short-circuit per
+// spec; task #251 fixed our compiler to honour that (3-block CFG
+// lowering in `nod-sema/src/lower.rs::lower_short_circuit`). The
+// sentinel-loop helpers (`scan-line-start` / `scan-line-end`) below
+// were originally written to dodge the eager-| bug; they are kept
+// as-is because they read cleanly and the manual bounds-guard makes
+// the scan invariant obvious. New code can use plain
+// `until (i = 0 | element(bytes, i - 1) = 10)` style now.
 
 define function scan-line-start
     (bytes :: <byte-string>, from :: <integer>) => (i :: <integer>)
@@ -858,8 +857,9 @@ define function bytes-equal-string?
   if (len ~= size(kw))
     #f
   else
-    // Sentinel-loop comparison; can't use a `|`-shortcircuit `until`
-    // condition because of the eager-| compiler bug. See task #251.
+    // Sentinel-loop comparison. Task #251 fixed `|` to short-circuit
+    // properly, so a `|`-condition `until` would also work now —
+    // kept as-is for readability.
     let i = 0;
     let ok = #t;
     let done = #f;
