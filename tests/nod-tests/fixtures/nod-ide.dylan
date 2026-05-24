@@ -905,6 +905,76 @@ define function main () => ()
   AppendMenuW(help-menu, 0,    200, "&About");
   AppendMenuW(menu-bar,  16,   help-menu, "&Help");
   rebuild-recent-submenu(recent-menu, recent-paths);
+  // Sprint 43e-4 — auto-scroll-to-cursor helper.
+  //
+  // Called by every cursor-mutating handler (arrow keys, Home/End,
+  // WM_CHAR, VK_BACK). Computes the cursor's pixel position in
+  // buffer coordinates, then nudges scroll-x-px / scroll-y-px so the
+  // cursor sits inside the viewport. If the cursor is already
+  // visible the scrolls are left alone; if it's off the left/right
+  // edge, scrolls horizontally; if off the top/bottom, scrolls
+  // vertically.
+  //
+  // Reads cached-flat, cursor-offset, scroll-{x,y}-px, viewport-
+  // {width,height}-px, client-{width,height}-px, char-width, line-
+  // height; mutates scroll-{x,y}-px; calls %set-scroll-info if a
+  // scroll changed. Closes over main()'s lexical scope so callers
+  // pass only the HWND.
+  //
+  // Line-number computation walks cached-flat once per call. O(n)
+  // per cursor move where n is the byte distance from start of
+  // buffer to the cursor. Sub-millisecond for typical files; rope-
+  // aware line lookup is a follow-up if it ever matters.
+  let ensure-cursor-visible = method (hwnd)
+    let bytes = cached-flat;
+    let cur = cursor-offset;
+    let line-start = scan-line-start(bytes, cur);
+    let col = cur - line-start;
+    // Count newlines in bytes[0 .. line-start) → line index.
+    let line = 0;
+    let i = 0;
+    until (i = line-start)
+      if (element(bytes, i) = 10) line := line + 1; else 0 end;
+      i := i + 1;
+    end;
+    let cx = col * char-width;
+    let cy = line * line-height;
+    // Desired scroll positions: closest to current that keeps the
+    // cursor's char-width × line-height rect inside the viewport.
+    let new-sx = scroll-x-px;
+    if (cx < new-sx)
+      new-sx := cx;
+    elseif (cx + char-width > new-sx + viewport-width-px)
+      new-sx := cx + char-width - viewport-width-px;
+    else 0 end;
+    let new-sy = scroll-y-px;
+    if (cy < new-sy)
+      new-sy := cy;
+    elseif (cy + line-height > new-sy + viewport-height-px)
+      new-sy := cy + line-height - viewport-height-px;
+    else 0 end;
+    // Clamp to [0, max] for each axis. Negative scroll would draw
+    // the buffer past the pad; over-max would draw past the buffer.
+    let h-max = if (client-width-px > viewport-width-px)
+                  client-width-px - viewport-width-px
+                else 0 end;
+    let v-max = if (client-height-px > viewport-height-px)
+                  client-height-px - viewport-height-px
+                else 0 end;
+    if (new-sx < 0) new-sx := 0 else 0 end;
+    if (new-sx > h-max) new-sx := h-max else 0 end;
+    if (new-sy < 0) new-sy := 0 else 0 end;
+    if (new-sy > v-max) new-sy := v-max else 0 end;
+    if (new-sx ~= scroll-x-px)
+      scroll-x-px := new-sx;
+      %set-scroll-info(hwnd, 0, 0, client-width-px, viewport-width-px, new-sx, 1);
+    else 0 end;
+    if (new-sy ~= scroll-y-px)
+      scroll-y-px := new-sy;
+      %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, new-sy, 1);
+    else 0 end;
+    0
+  end;
   // Sprint 11d — split the WNDPROC into two parts:
   //
   //   `handle-wm-message`: a regular Dylan function. Allowed to
@@ -1136,6 +1206,7 @@ define function main () => ()
                  let new-off = scan-line-start(cached-flat, cursor-offset);
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 35)    // VK_END — Sprint 43e-3 cursor to line end
@@ -1145,6 +1216,7 @@ define function main () => ()
                  let new-off = scan-line-end(cached-flat, cursor-offset, size(cached-flat));
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 37)    // VK_LEFT — Sprint 43e-2 cursor move
@@ -1154,12 +1226,14 @@ define function main () => ()
                  // scrollbar, and (if we add them) Ctrl+arrows.
                  if (cursor-offset > 0)
                    cursor-offset := cursor-offset - 1;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 39)    // VK_RIGHT — Sprint 43e-2 cursor move
                  let buf-len = size(cached-flat);
                  if (cursor-offset < buf-len)
                    cursor-offset := cursor-offset + 1;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 38)    // VK_UP — Sprint 43e-2 cursor move
@@ -1169,12 +1243,14 @@ define function main () => ()
                  let new-off = move-cursor-vertical(cached-flat, cursor-offset, -1);
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 40)    // VK_DOWN — Sprint 43e-2 cursor move
                  let new-off = move-cursor-vertical(cached-flat, cursor-offset, 1);
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                elseif (vk = 8)     // VK_BACK — Sprint 43d backspace
@@ -1194,6 +1270,10 @@ define function main () => ()
                    client-height-px := buffer-lines * line-height;
                    %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, scroll-y-px, 1);
                    %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  scroll-x-px, 1);
+                   // Sprint 43e-4 — after backspace the cursor may have
+                   // walked off the left edge of the viewport on a wrap;
+                   // pull the viewport back to keep it visible.
+                   ensure-cursor-visible(hwnd);
                    InvalidateRect(hwnd, 0, 0);
                  else 0 end;
                else 0 end;
@@ -1221,6 +1301,11 @@ define function main () => ()
                  client-height-px := buffer-lines * line-height;
                  %set-scroll-info(hwnd, 1, 0, client-height-px, viewport-height-px, scroll-y-px, 1);
                  %set-scroll-info(hwnd, 0, 0, client-width-px,  viewport-width-px,  scroll-x-px, 1);
+                 // Sprint 43e-4 — keep the cursor on screen after the
+                 // insertion advanced it past the right edge of the
+                 // viewport. Common case: typing at the end of a
+                 // long line.
+                 ensure-cursor-visible(hwnd);
                  InvalidateRect(hwnd, 0, 0);
                else 0 end;
                0
