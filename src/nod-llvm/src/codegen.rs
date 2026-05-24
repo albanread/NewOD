@@ -371,6 +371,16 @@ pub const NOD_TABLE_VALUES_SYMBOL: &str = "nod_table_values";
 pub const NOD_OBJECT_HASH_SYMBOL: &str = "nod_object_hash";
 pub const NOD_OBJECT_EQUAL_P_SYMBOL: &str = "nod_object_equal_p";
 
+// Sprint 42a — <byte-string> primitives. Five-op minimum surface; all
+// user-visible byte-string methods (`size`, `element`, `concatenate`,
+// `copy-sequence`, `starts-with?`, `find-substring`, `as-uppercase`, …)
+// live in `stdlib.dylan` and call these.
+pub const NOD_BYTE_STRING_ALLOCATE_SYMBOL: &str = "nod_byte_string_allocate";
+pub const NOD_BYTE_STRING_SIZE_SYMBOL: &str = "nod_byte_string_size";
+pub const NOD_BYTE_STRING_ELEMENT_SYMBOL: &str = "nod_byte_string_element";
+pub const NOD_BYTE_STRING_ELEMENT_SETTER_SYMBOL: &str = "nod_byte_string_element_setter";
+pub const NOD_BYTE_STRING_COPY_BYTES_SYMBOL: &str = "nod_byte_string_copy_bytes";
+
 /// Sprint 20b: `(dylan-name-as-emitted-by-lower, runtime-symbol, arity)`.
 /// The lower pass emits the LHS name as the DirectCall callee; codegen
 /// matches it here and emits a call into the RHS extern.
@@ -418,6 +428,12 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_table_values", NOD_TABLE_VALUES_SYMBOL, 1),
     ("nod_object_hash", NOD_OBJECT_HASH_SYMBOL, 1),
     ("nod_object_equal_p", NOD_OBJECT_EQUAL_P_SYMBOL, 2),
+    // Sprint 42a — <byte-string> primitives.
+    ("nod_byte_string_allocate", NOD_BYTE_STRING_ALLOCATE_SYMBOL, 1),
+    ("nod_byte_string_size", NOD_BYTE_STRING_SIZE_SYMBOL, 1),
+    ("nod_byte_string_element", NOD_BYTE_STRING_ELEMENT_SYMBOL, 2),
+    ("nod_byte_string_element_setter", NOD_BYTE_STRING_ELEMENT_SETTER_SYMBOL, 3),
+    ("nod_byte_string_copy_bytes", NOD_BYTE_STRING_COPY_BYTES_SYMBOL, 5),
     // Sprint 24 — closures.
     ("nod_make_cell", NOD_MAKE_CELL_SYMBOL, 1),
     ("nod_cell_get", NOD_CELL_GET_SYMBOL, 1),
@@ -1564,9 +1580,26 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
 
         // Resolve the resolved-method body fn we want to call. The
-        // body must be in the module's function table (it was added by
-        // the lowering pass that registered the method definition).
-        let Some(&callee_fn) = self.function_map.get(method) else {
+        // body either lives in this module (lowering put it in the
+        // function table) OR lives in a different already-JIT'd
+        // module — most commonly stdlib, when the dispatch narrower
+        // resolves a user call to a stdlib `define method` body. In
+        // the cross-module case we declare an extern that the engine
+        // resolves via `nod_runtime::find_method_body_ptr` — the same
+        // fallback `emit_direct_call` uses for `Dispatch`→`DirectCall`
+        // rewrites. Without this, narrower-promoted calls like
+        // `size("hello")` → `DirectCall("size$8")` against a stdlib-
+        // resident specialiser would hit UnknownCallee.
+        let callee_fn = if let Some(&f) = self.function_map.get(method) {
+            f
+        } else if let Some(existing) = self.module.get_function(method) {
+            existing
+        } else if nod_runtime::find_method_body_ptr(method).is_some() {
+            let params: Vec<BasicMetadataTypeEnum<'ctx>> =
+                (0..args.len()).map(|_| i64ty.into()).collect();
+            let fty = i64ty.fn_type(&params, false);
+            self.module.add_function(method, fty, None)
+        } else {
             return Err(CodegenError::UnknownCallee {
                 in_function: self.func.name.clone(),
                 callee: method.to_string(),
@@ -1607,19 +1640,24 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .map_err(map_err)?;
         for (i, body_name) in fallback_chain.iter().enumerate() {
             // Ensure an extern function declaration exists for the
-            // body symbol — same shape as `callee_fn`.
-            let fn_val = match self.module.get_function(body_name) {
-                Some(f) => f,
-                None => {
-                    // The chain method bodies are added to the module
-                    // when their `Function` is lowered. If we don't
-                    // see them, raise an error so we don't silently
-                    // emit a broken sealed-direct.
-                    return Err(CodegenError::UnknownCallee {
-                        in_function: self.func.name.clone(),
-                        callee: body_name.clone(),
-                    });
-                }
+            // body symbol — same shape as `callee_fn`. Same three-tier
+            // fallback as the resolved method above: this-module
+            // function table → already-declared extern → declare a
+            // fresh extern backed by `find_method_body_ptr`.
+            let fn_val = if let Some(&f) = self.function_map.get(body_name.as_str()) {
+                f
+            } else if let Some(existing) = self.module.get_function(body_name) {
+                existing
+            } else if nod_runtime::find_method_body_ptr(body_name).is_some() {
+                let params: Vec<BasicMetadataTypeEnum<'ctx>> =
+                    (0..args.len()).map(|_| i64ty.into()).collect();
+                let fty = i64ty.fn_type(&params, false);
+                self.module.add_function(body_name, fty, None)
+            } else {
+                return Err(CodegenError::UnknownCallee {
+                    in_function: self.func.name.clone(),
+                    callee: body_name.clone(),
+                });
             };
             let fn_ptr_as_ptr = fn_val.as_global_value().as_pointer_value();
             let fn_ptr_as_int = self

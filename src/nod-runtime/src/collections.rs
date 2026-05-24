@@ -359,6 +359,10 @@ pub enum FipKind {
     Range = 3,
     /// `<stretchy-vector>` — `%state` is an integer index.
     StretchyVector = 4,
+    /// Sprint 42a — `<byte-string>` — `%state` is an integer byte
+    /// index; current-element yields the byte as a fixnum-tagged
+    /// `<integer>`.
+    ByteString = 5,
 }
 
 impl FipKind {
@@ -369,6 +373,7 @@ impl FipKind {
             2 => Some(FipKind::List),
             3 => Some(FipKind::Range),
             4 => Some(FipKind::StretchyVector),
+            5 => Some(FipKind::ByteString),
             _ => None,
         }
     }
@@ -602,6 +607,35 @@ pub fn forward_iteration_protocol(c: Word) -> Option<Word> {
             FipKind::List,
         ));
     }
+    // Sprint 42a — `<byte-string>` FIP. state-object = the byte-string,
+    // limit = byte count, current-key = byte index (starts at 0),
+    // current-element = first byte as a fixnum-tagged `<integer>`.
+    if cid == ClassId::BYTE_STRING {
+        // SAFETY: class match guarantees the layout.
+        let bs = unsafe {
+            crate::strings::try_byte_string(c, ClassId::BYTE_STRING)
+                .expect("class match")
+        };
+        let len = bs.len as i64;
+        let zero = Word::from_fixnum(0).expect("0 fits");
+        let limit = Word::from_fixnum(len).expect("len fits");
+        let finished = len == 0;
+        let first_element = if finished {
+            imm.nil
+        } else {
+            // SAFETY: bounds 0 < len.
+            let b = unsafe { bs.bytes() }[0];
+            Word::from_fixnum(b as i64).expect("byte fits fixnum")
+        };
+        return Some(make_iter_state(
+            c,
+            limit,
+            finished,
+            zero,
+            first_element,
+            FipKind::ByteString,
+        ));
+    }
     None
 }
 
@@ -715,6 +749,40 @@ pub fn iter_state_advance(state: Word) -> Word {
                     let next_w = Word::from_fixnum(next).expect("range val fits");
                     write_slot(state, iter_state_slot_offset("state-object"), next_w);
                     write_slot(state, iter_state_slot_offset("current-element"), next_w);
+                }
+            }
+        }
+        FipKind::ByteString => {
+            // Sprint 42a — state-object = the byte-string itself;
+            // current-key = byte index; limit = byte count; element =
+            // current byte (fixnum).
+            let cur_idx = snap.current_key.as_fixnum().unwrap_or(0);
+            let len = snap.limit.as_fixnum().unwrap_or(0);
+            let next_idx = cur_idx + 1;
+            if next_idx >= len {
+                // SAFETY: state is an <iteration-state>.
+                unsafe {
+                    write_slot(state, iter_state_slot_offset("finished-state?"), imm.true_);
+                }
+            } else {
+                let next_key = Word::from_fixnum(next_idx).expect("idx fits");
+                // SAFETY: state_object is a <byte-string> (FIP guarantees).
+                let bs = unsafe {
+                    crate::strings::try_byte_string(snap.state_object, ClassId::BYTE_STRING)
+                        .expect("FIP state-object is a <byte-string>")
+                };
+                // SAFETY: bounds checked above; bytes are inline.
+                let next_byte = unsafe { bs.bytes() }[next_idx as usize];
+                let next_elem =
+                    Word::from_fixnum(next_byte as i64).expect("byte fits fixnum");
+                // SAFETY: state is an <iteration-state>.
+                unsafe {
+                    write_slot(state, iter_state_slot_offset("current-key"), next_key);
+                    write_slot(
+                        state,
+                        iter_state_slot_offset("current-element"),
+                        next_elem,
+                    );
                 }
             }
         }
@@ -1112,6 +1180,15 @@ pub fn collection_size(c: Word) -> Option<i64> {
         }
         return Some(count);
     }
+    // Sprint 42a — `<byte-string>` returns its byte count.
+    if cid == ClassId::BYTE_STRING {
+        // SAFETY: class match.
+        let bs = unsafe {
+            crate::strings::try_byte_string(c, ClassId::BYTE_STRING)
+                .expect("class match")
+        };
+        return Some(bs.len as i64);
+    }
     None
 }
 
@@ -1211,6 +1288,25 @@ pub fn collection_element(c: Word, key: i64, default: Option<Word>) -> Result<Wo
                 }
             }
         }
+    }
+    // Sprint 42a — `<byte-string>` returns the byte at `key` as a
+    // fixnum-tagged `<integer>` (0..255).
+    if cid == ClassId::BYTE_STRING {
+        // SAFETY: class match.
+        let bs = unsafe {
+            crate::strings::try_byte_string(c, ClassId::BYTE_STRING)
+                .expect("class match")
+        };
+        let len = bs.len as i64;
+        if key < 0 || key >= len {
+            return match default {
+                Some(d) => Ok(d),
+                None => Err(OutOfRange { value: c, bounds: len }),
+            };
+        }
+        // SAFETY: bounds checked above.
+        let b = unsafe { bs.bytes() }[key as usize];
+        return Ok(Word::from_fixnum(b as i64).expect("byte fits fixnum"));
     }
     // Unrecognised collection.
     Err(OutOfRange { value: c, bounds: 0 })
@@ -1492,6 +1588,8 @@ pub fn is_collection(w: Word) -> bool {
     if cid == ClassId::SIMPLE_OBJECT_VECTOR
         || cid == ClassId::PAIR
         || cid == ClassId::EMPTY_LIST
+        // Sprint 42a — byte-strings participate in size / element / FIP.
+        || cid == ClassId::BYTE_STRING
     {
         return true;
     }

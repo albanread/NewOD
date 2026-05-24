@@ -214,7 +214,10 @@ pub use lists::{
 pub use roots::RootSet;
 pub use stack_map::{LiveSlot, ParkedFrame, StackMap, StackMapEntry, walk_parked_frame};
 pub use static_area::StaticArea;
-pub use strings::{ByteString, try_byte_string};
+pub use strings::{
+    ByteString, nod_byte_string_allocate, nod_byte_string_copy_bytes, nod_byte_string_element,
+    nod_byte_string_element_setter, nod_byte_string_size, try_byte_string,
+};
 pub use structs::{
     c_struct_class_id, ensure_structs_registered, filetime_class_id, is_c_struct_instance,
     msg_class_id, nod_struct_get_i32, nod_struct_get_i64, nod_struct_get_pointer,

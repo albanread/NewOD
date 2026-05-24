@@ -266,6 +266,16 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // `env`. The lowerer emits this at every closure-creation site that
     // captures at least one variable.
     ("%make-closure", "nod_make_closure", 3, TypeEstimate::Top),
+    // Sprint 42a — <byte-string> primitives. Minimum surface (allocate,
+    // size, byte-read, byte-write, bulk-copy); all higher-level ops
+    // (`concatenate`, `copy-sequence`, `subsequence`, `starts-with?`,
+    // `ends-with?`, `find-substring`, `as-uppercase`, `as-lowercase`,
+    // `empty?`) live in `stdlib.dylan` and call these.
+    ("%byte-string-allocate", "nod_byte_string_allocate", 1, TypeEstimate::Top),
+    ("%byte-string-size", "nod_byte_string_size", 1, TypeEstimate::Integer),
+    ("%byte-string-element", "nod_byte_string_element", 2, TypeEstimate::Integer),
+    ("%byte-string-element-setter", "nod_byte_string_element_setter", 3, TypeEstimate::Integer),
+    ("%byte-string-copy!", "nod_byte_string_copy_bytes", 5, TypeEstimate::Integer),
     // Sprint 22 — <table> + hashing.
     ("%make-table", "nod_make_table", 1, TypeEstimate::Top),
     ("%table-size", "nod_table_size", 1, TypeEstimate::Integer),
@@ -4327,6 +4337,44 @@ impl FunctionBuilder {
                 let r = self.lower_expr(rhs, env, ctx)?;
                 let lt = self.func.temp_type(l);
                 let rt = self.func.temp_type(r);
+                // Sprint 42a — generic `=` dispatch for non-numeric operands.
+                // When both operands are pointer-shaped (neither statically
+                // `<integer>` nor any float), `=`/`==`/`~=`/`~==` route
+                // through `%object-equal?` so byte-strings, symbols, and
+                // other heap objects get content equality instead of
+                // pointer-compare. The Rust shim (`nod_object_equal_p`)
+                // checks raw-bit identity first, so fixnum-tagged Words
+                // (which carry their value in the bits) round-trip
+                // identically to `PrimOp::EqInt`. We invert via `BoolNot`
+                // for the negative operators.
+                //
+                // The integer / float fast paths below stay exactly as
+                // they were — this only diverts when neither operand has
+                // a known numeric estimate.
+                if matches!(*op, BinOp::Eq | BinOp::EqEq | BinOp::Ne | BinOp::NeEq)
+                    && !lt.is_integer()
+                    && !lt.is_float()
+                    && !rt.is_integer()
+                    && !rt.is_float()
+                {
+                    let eq_dst = self.fresh_temp(TypeEstimate::Boolean);
+                    self.push(Computation::DirectCall {
+                        dst: eq_dst,
+                        callee: "nod_object_equal_p".to_string(),
+                        args: vec![l, r],
+                        safepoint_roots: Vec::new(),
+                    });
+                    if matches!(*op, BinOp::Ne | BinOp::NeEq) {
+                        let neg_dst = self.fresh_temp(TypeEstimate::Boolean);
+                        self.push(Computation::PrimOp {
+                            dst: neg_dst,
+                            op: PrimOp::BoolNot,
+                            args: vec![eq_dst],
+                        });
+                        return Ok(neg_dst);
+                    }
+                    return Ok(eq_dst);
+                }
                 let op = select_binop(*op, lt, rt, *span)?;
                 let dst = self.fresh_temp(op.result_type());
                 self.push(Computation::PrimOp {

@@ -35,6 +35,10 @@ use crate::codegen::{
     NOD_TABLE_ELEMENT_OR_DEFAULT_SYMBOL, NOD_TABLE_ELEMENT_SETTER_SYMBOL, NOD_TABLE_ELEMENT_SYMBOL,
     NOD_TABLE_KEYS_SYMBOL, NOD_TABLE_REMOVE_KEY_SYMBOL, NOD_TABLE_SIZE_SYMBOL,
     NOD_TABLE_VALUES_SYMBOL,
+    // Sprint 42a — <byte-string> primitives.
+    NOD_BYTE_STRING_ALLOCATE_SYMBOL, NOD_BYTE_STRING_COPY_BYTES_SYMBOL,
+    NOD_BYTE_STRING_ELEMENT_SETTER_SYMBOL, NOD_BYTE_STRING_ELEMENT_SYMBOL,
+    NOD_BYTE_STRING_SIZE_SYMBOL,
     // Sprint 24 — closures.
     NOD_CELL_GET_SYMBOL, NOD_CELL_SET_SYMBOL, NOD_ENV_CELL_SYMBOL,
     NOD_MAKE_CELL_SYMBOL, NOD_MAKE_CLOSURE_SYMBOL, NOD_MAKE_ENVIRONMENT_SYMBOL,
@@ -367,6 +371,27 @@ impl<'ctx> Jit<'ctx> {
             (
                 module.get_function(NOD_OBJECT_EQUAL_P_SYMBOL),
                 nod_runtime::nod_object_equal_p as *const () as *mut std::ffi::c_void,
+            ),
+            // Sprint 42a — <byte-string> primitives.
+            (
+                module.get_function(NOD_BYTE_STRING_ALLOCATE_SYMBOL),
+                nod_runtime::nod_byte_string_allocate as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_BYTE_STRING_SIZE_SYMBOL),
+                nod_runtime::nod_byte_string_size as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_BYTE_STRING_ELEMENT_SYMBOL),
+                nod_runtime::nod_byte_string_element as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_BYTE_STRING_ELEMENT_SETTER_SYMBOL),
+                nod_runtime::nod_byte_string_element_setter as *const () as *mut std::ffi::c_void,
+            ),
+            (
+                module.get_function(NOD_BYTE_STRING_COPY_BYTES_SYMBOL),
+                nod_runtime::nod_byte_string_copy_bytes as *const () as *mut std::ffi::c_void,
             ),
             // Sprint 24 — closures.
             (
@@ -1299,6 +1324,12 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_TABLE_VALUES_SYMBOL, nod_runtime::nod_table_values as *const () as *mut std::ffi::c_void),
         (NOD_OBJECT_HASH_SYMBOL, nod_runtime::nod_object_hash as *const () as *mut std::ffi::c_void),
         (NOD_OBJECT_EQUAL_P_SYMBOL, nod_runtime::nod_object_equal_p as *const () as *mut std::ffi::c_void),
+        // Sprint 42a — <byte-string> primitives.
+        (NOD_BYTE_STRING_ALLOCATE_SYMBOL, nod_runtime::nod_byte_string_allocate as *const () as *mut std::ffi::c_void),
+        (NOD_BYTE_STRING_SIZE_SYMBOL, nod_runtime::nod_byte_string_size as *const () as *mut std::ffi::c_void),
+        (NOD_BYTE_STRING_ELEMENT_SYMBOL, nod_runtime::nod_byte_string_element as *const () as *mut std::ffi::c_void),
+        (NOD_BYTE_STRING_ELEMENT_SETTER_SYMBOL, nod_runtime::nod_byte_string_element_setter as *const () as *mut std::ffi::c_void),
+        (NOD_BYTE_STRING_COPY_BYTES_SYMBOL, nod_runtime::nod_byte_string_copy_bytes as *const () as *mut std::ffi::c_void),
         (NOD_MAKE_CELL_SYMBOL, nod_runtime::nod_make_cell as *const () as *mut std::ffi::c_void),
         (NOD_CELL_GET_SYMBOL, nod_runtime::nod_cell_get as *const () as *mut std::ffi::c_void),
         (NOD_CELL_SET_SYMBOL, nod_runtime::nod_cell_set as *const () as *mut std::ffi::c_void),
