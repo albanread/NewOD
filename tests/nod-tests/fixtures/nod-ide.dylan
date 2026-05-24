@@ -844,6 +844,37 @@ define function main () => ()
                  let layout = %dwrite-create-text-layout(dwrite, cached-flat, format,
                                                          client-width-px, client-height-px);
                  %d2d-draw-text-layout(dc, pad - scroll-x-px, pad - scroll-y-px, layout, brush);
+                 // Sprint 43e-1 — visible cursor. Walk cached-flat up
+                 // to cursor-offset, tracking (line, col) per newline.
+                 // Then draw a 2px-wide vertical bar one line-height
+                 // tall at the cursor's pixel position, on top of the
+                 // already-drawn text. Same brush as the text (black)
+                 // for now; a separate accent-colour brush is a later
+                 // polish item.
+                 //
+                 // Walk style: plain `let`-bound mutable accumulators
+                 // (`line`, `col`, `i`). They aren't captured by any
+                 // inner closure, so Sprint 24's auto-cell-promotion
+                 // leaves them as plain SSA temps — no per-frame
+                 // allocation, no GC pressure from the cursor draw.
+                 let cur-off = cursor-offset;
+                 let flat-len = size(cached-flat);
+                 let cap = if (cur-off < flat-len) cur-off else flat-len end;
+                 let line = 0;
+                 let col = 0;
+                 let i = 0;
+                 until (i = cap)
+                   if (element(cached-flat, i) = 10)  // '\n'
+                     line := line + 1;
+                     col := 0;
+                   else
+                     col := col + 1;
+                   end;
+                   i := i + 1;
+                 end;
+                 let cx = pad + col * char-width - scroll-x-px;
+                 let cy = pad + line * line-height - scroll-y-px;
+                 %d2d-fill-rectangle(dc, cx, cy, cx + 2, cy + line-height, brush);
                  %d2d-end-draw(dc);
                  %com-release(brush);
                  %com-release(layout);
