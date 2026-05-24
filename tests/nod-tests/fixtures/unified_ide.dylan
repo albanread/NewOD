@@ -1,30 +1,1235 @@
 Module: nod-ide
 
-// Sprint 44 — IDE module split (part 5 of 5: main + handle-wm-message).
+// Sprint 41g — Save, Save As, Recent files submenu on top of Sprint 41e's
+// File / Help menu bar.
 //
-// This file holds the WNDPROC dispatcher and the `main` function that
-// builds the device chain, registers the window class, creates the
-// HWND, runs the message loop, and tears down. Everything it needs is
-// defined in the sibling files (built together by `nod-driver`):
+// Sprint 41e shipped File → Open / Exit + Help → About. Sprint 41g extends
+// the File menu so it now looks like:
 //
-//   ide_win_calls.dylan   — Win32 c-function declarations
-//   ide_rope.dylan        — rope buffer + line-count / max-line-chars
-//   ide_helpers.dylan     — pure-Dylan text / list / recent-files / title
-//   ide_syntax.dylan      — cursor + scan + syntax-colour + gutter
-//   nod-ide.dylan         — (this file) main + WNDPROC entry
+//   File
+//     Open...      (cmd-id 100)
+//     Save         (cmd-id 101)
+//     Save As...   (cmd-id 102)
+//     ────────
+//     Recent ▶                                  (NEW submenu)
+//       1. F:\scratch\foo.dylan   (cmd-id 301)
+//       2. F:\scratch\bar.txt     (cmd-id 302)
+//       (etc., max 5 entries)
+//     ────────
+//     Exit         (cmd-id 199)
+//   Help
+//     About        (cmd-id 200)
 //
-// The pre-split monolithic version is preserved verbatim at
-// `unified_ide.dylan` for diffing / rollback.
-
-// Sprint 41g — File menu (Open / Save / Save As / Recent) on top of the
-// Sprint 41e File / Help menu bar. The window title shows the current
-// file's basename, e.g. "foo.dylan - NewOpenDylan IDE". The recent
-// files list persists across runs in F:\scratch\nod-ide-recent.txt
-// (most-recent first, capped at 5).
+// The window title shows the current file's basename, e.g.
+// "foo.dylan - NewOpenDylan IDE".
+//
+// The recent-files list persists across runs in
+// F:\scratch\nod-ide-recent.txt — one absolute path per line,
+// most-recent first, capped at 5. Sprint 42a: persistence + dedup + cap
+// is now pure Dylan (`nod-load-recent` / `nod-add-recent` /
+// `nod-save-recent`) built on the byte-string ops landed in stdlib —
+// the old `nod_load_recent` / `nod_add_recent` Rust shims are gone.
+//
+// IMPORTANT — the editor is still read-only (no cursor, no editing —
+// that's Sprint 41h or later). Save in this sprint rewrites the file
+// with its current in-memory contents. That's intentional: the plumbing
+// (file picker, byte-string write, recent-list maintenance, title bar)
+// is ready for when editing arrives.
 //
 // MessageBoxW-from-WNDPROC remains broken (Sprint 41f investigation,
 // see docs/duim-research/07-probe-findings.md); Help → About still
 // uses the SetWindowTextW workaround.
+
+define c-function CreateWindowExW
+  (dwExStyle :: <c-int>, lpClassName :: <c-pointer>, lpWindowName :: <c-wide-string>,
+   dwStyle :: <c-int>, x :: <c-int>, y :: <c-int>, nWidth :: <c-int>, nHeight :: <c-int>,
+   hWndParent :: <c-pointer>, hMenu :: <c-pointer>, hInstance :: <c-pointer>,
+   lpParam :: <c-pointer>)
+ => (hwnd :: <c-pointer>);
+    library: "user32.dll";
+end;
+
+define c-function ShowWindow
+  (hwnd :: <c-pointer>, nCmdShow :: <c-int>)
+ => (was-visible :: <c-bool>);
+    library: "user32.dll";
+end;
+
+define c-function UpdateWindow
+  (hwnd :: <c-pointer>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+define c-function InvalidateRect
+  (hwnd :: <c-pointer>, lpRect :: <c-pointer>, bErase :: <c-bool>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+define c-function DefWindowProcW
+  (hwnd :: <c-pointer>, msg :: <c-int>,
+   wparam :: <c-pointer>, lparam :: <c-pointer>)
+ => (lresult :: <c-pointer>);
+    library: "user32.dll";
+end;
+
+define c-function PostQuitMessage
+  (exit-code :: <c-int>)
+ => ();
+    library: "user32.dll";
+end;
+
+// Sprint 41e — menu API declarations (explicit so the AppendMenuW
+// 4th-arg lpNewItem stays `<c-wide-string>` for menu items; we pass
+// the HMENU for popup submenus via the 3rd-arg `uIDNewItem` which is
+// typed `<c-pointer>` to accept both fixnum ids and HMENU values).
+define c-function CreateMenu
+  ()
+ => (hmenu :: <c-pointer>);
+    library: "user32.dll";
+end;
+
+define c-function CreatePopupMenu
+  ()
+ => (hmenu :: <c-pointer>);
+    library: "user32.dll";
+end;
+
+define c-function AppendMenuW
+  (hmenu :: <c-pointer>, uFlags :: <c-int>, uIDNewItem :: <c-pointer>,
+   lpNewItem :: <c-wide-string>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+// Sprint 41g — menu rebuild helpers. `RemoveMenu` with MF_BYPOSITION
+// (1024) removes the item at the given index; positions shift after
+// removal so calling with position 0 repeatedly tears the submenu
+// down. `DrawMenuBar` forces the OS to repaint the menu bar after
+// programmatic changes (the submenu's own popup is rebuilt on the
+// next click so we don't have to invalidate it explicitly).
+define c-function RemoveMenu
+  (hmenu :: <c-pointer>, uPosition :: <c-int>, uFlags :: <c-int>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+define c-function DrawMenuBar
+  (hwnd :: <c-pointer>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+// SetWindowTextW is the Help → About workaround (see Sprint 41e
+// notes) and is also what we use for the per-file title.
+define c-function SetWindowTextW
+  (hwnd :: <c-pointer>, lpString :: <c-wide-string>)
+ => (success :: <c-bool>);
+    library: "user32.dll";
+end;
+
+define c-function MessageBoxW
+  (hwnd :: <c-pointer>, lpText :: <c-wide-string>, lpCaption :: <c-wide-string>,
+   uType :: <c-int>)
+ => (result :: <c-int>);
+    library: "user32.dll";
+end;
+
+// ─── Sprint 43d — inlined rope buffer ────────────────────────────────────
+//
+// The IDE's text buffer is a `<rope>` — a classical Boehm-style binary
+// tree of `<byte-string>` chunks. Reads + edits are O(log n) instead
+// of O(n) for the previous flat-`<byte-string>` buffer, which matters
+// once the file is non-trivial (~256k+) and the user is editing.
+//
+// The full data structure is documented and tested standalone in
+// `tests/nod-tests/fixtures/rope.dylan` (~650 lines + 24 self-tests
+// passing under AOT). What's reproduced below is the production
+// subset: classes, construction, read ops, concat, split, insert,
+// delete, line indexing, and `rope->string` for serialisation. The
+// self-test main and the deterministic test-buffer helpers stay in
+// the standalone fixture.
+//
+// Why inlined and not imported: nod-driver builds one Dylan file per
+// invocation today. Multi-file modules are a future sprint. Until
+// then, the rope source is duplicated — kept in sync by hand. Any
+// fix to the standalone fixture should be mirrored here (and
+// vice-versa).
+
+define class <rope> (<object>) end class;
+
+define class <rope-leaf> (<rope>)
+  slot rope-leaf-bytes    :: <byte-string>, init-keyword: bytes:;
+  slot rope-leaf-len      :: <integer>,     init-keyword: len:;
+  slot rope-leaf-newlines :: <integer>,     init-keyword: newlines:;
+end class;
+
+define class <rope-node> (<rope>)
+  slot rope-node-left     :: <rope>,    init-keyword: left:;
+  slot rope-node-right    :: <rope>,    init-keyword: right:;
+  slot rope-node-weight   :: <integer>, init-keyword: weight:;
+  slot rope-node-total    :: <integer>, init-keyword: total:;
+  slot rope-node-newlines :: <integer>, init-keyword: newlines:;
+end class;
+
+define function count-newlines-in (s) => (n :: <integer>)
+  let len = size(s);
+  let count = 0;
+  let i = 0;
+  until (i = len)
+    if (element(s, i) = 10)
+      count := count + 1;
+    else
+      #f
+    end;
+    i := i + 1;
+  end;
+  count
+end function;
+
+define method rope-size (r :: <rope-leaf>) => (n :: <integer>)
+  rope-leaf-len(r)
+end method;
+
+define method rope-size (r :: <rope-node>) => (n :: <integer>)
+  rope-node-total(r)
+end method;
+
+define method rope-newlines (r :: <rope-leaf>) => (n :: <integer>)
+  rope-leaf-newlines(r)
+end method;
+
+define method rope-newlines (r :: <rope-node>) => (n :: <integer>)
+  rope-node-newlines(r)
+end method;
+
+define method rope-element (r :: <rope-leaf>, i :: <integer>) => (b :: <integer>)
+  element(rope-leaf-bytes(r), i)
+end method;
+
+define method rope-element (r :: <rope-node>, i :: <integer>) => (b :: <integer>)
+  let w = rope-node-weight(r);
+  if (i < w)
+    rope-element(rope-node-left(r), i)
+  else
+    rope-element(rope-node-right(r), i - w)
+  end
+end method;
+
+define method rope-concatenate (a :: <rope>, b :: <rope>) => (r :: <rope>)
+  let asize = rope-size(a);
+  let bsize = rope-size(b);
+  if (asize = 0)
+    b
+  elseif (bsize = 0)
+    a
+  else
+    make(<rope-node>,
+         left: a, right: b,
+         weight: asize, total: asize + bsize,
+         newlines: rope-newlines(a) + rope-newlines(b))
+  end
+end method;
+
+define function empty-rope () => (r :: <rope-leaf>)
+  make(<rope-leaf>, bytes: "", len: 0, newlines: 0)
+end function;
+
+define method for-each-leaf (r :: <rope-leaf>, fn) => ()
+  fn(rope-leaf-bytes(r));
+  #f
+end method;
+
+define method for-each-leaf (r :: <rope-node>, fn) => ()
+  for-each-leaf(rope-node-left(r), fn);
+  for-each-leaf(rope-node-right(r), fn);
+  #f
+end method;
+
+define method rope-copy-into
+    (r :: <rope-leaf>, lo :: <integer>, hi :: <integer>,
+     dst :: <byte-string>, dst-off :: <integer>)
+ => (n :: <integer>)
+  let leaf-len = rope-leaf-len(r);
+  let a = if (lo > 0) lo else 0 end;
+  let b = if (hi < leaf-len) hi else leaf-len end;
+  if (a < b)
+    %byte-string-copy!(dst, dst-off, rope-leaf-bytes(r), a, b - a);
+    b - a
+  else
+    0
+  end
+end method;
+
+define method rope-copy-into
+    (r :: <rope-node>, lo :: <integer>, hi :: <integer>,
+     dst :: <byte-string>, dst-off :: <integer>)
+ => (n :: <integer>)
+  let w = rope-node-weight(r);
+  let from-left =
+    if (lo < w)
+      let left-hi = if (hi < w) hi else w end;
+      rope-copy-into(rope-node-left(r), lo, left-hi, dst, dst-off)
+    else
+      0
+    end;
+  let from-right =
+    if (hi > w)
+      let right-lo = if (lo > w) lo - w else 0 end;
+      let right-hi = hi - w;
+      rope-copy-into(rope-node-right(r), right-lo, right-hi,
+                     dst, dst-off + from-left)
+    else
+      0
+    end;
+  from-left + from-right
+end method;
+
+define function rope-substring
+    (r, lo :: <integer>, hi :: <integer>) => (s :: <byte-string>)
+  let n = hi - lo;
+  let result = %byte-string-allocate(n);
+  rope-copy-into(r, lo, hi, result, 0);
+  result
+end function;
+
+define function make-rope-from-string (s) => (r)
+  let n = size(s);
+  if (n <= 1024)
+    make(<rope-leaf>,
+         bytes: s, len: n,
+         newlines: count-newlines-in(s))
+  else
+    let mid = n / 2;
+    let left  = make-rope-from-string(copy-sequence(s, 0, mid));
+    let right = make-rope-from-string(copy-sequence(s, mid, n));
+    rope-concatenate(left, right)
+  end
+end function;
+
+define method rope-split-at (r :: <rope-leaf>, i :: <integer>) => (split)
+  let n = rope-leaf-len(r);
+  if (i <= 0)
+    pair(empty-rope(), r)
+  elseif (i >= n)
+    pair(r, empty-rope())
+  else
+    let bytes = rope-leaf-bytes(r);
+    let left-bytes  = copy-sequence(bytes, 0, i);
+    let right-bytes = copy-sequence(bytes, i, n);
+    pair(make(<rope-leaf>,
+              bytes: left-bytes,  len: i,
+              newlines: count-newlines-in(left-bytes)),
+         make(<rope-leaf>,
+              bytes: right-bytes, len: n - i,
+              newlines: count-newlines-in(right-bytes)))
+  end
+end method;
+
+define method rope-split-at (r :: <rope-node>, i :: <integer>) => (split)
+  let total = rope-node-total(r);
+  if (i <= 0)
+    pair(empty-rope(), r)
+  elseif (i >= total)
+    pair(r, empty-rope())
+  else
+    let w = rope-node-weight(r);
+    if (i = w)
+      pair(rope-node-left(r), rope-node-right(r))
+    elseif (i < w)
+      let inner = rope-split-at(rope-node-left(r), i);
+      pair(head(inner),
+           rope-concatenate(tail(inner), rope-node-right(r)))
+    else
+      let inner = rope-split-at(rope-node-right(r), i - w);
+      pair(rope-concatenate(rope-node-left(r), head(inner)),
+           tail(inner))
+    end
+  end
+end method;
+
+define function rope-insert (r, i :: <integer>, s) => (out)
+  let split = rope-split-at(r, i);
+  let middle = make-rope-from-string(s);
+  rope-concatenate(rope-concatenate(head(split), middle), tail(split))
+end function;
+
+define function rope-delete (r, lo :: <integer>, hi :: <integer>) => (out)
+  let first-split  = rope-split-at(r, lo);
+  let second-split = rope-split-at(tail(first-split), hi - lo);
+  rope-concatenate(head(first-split), tail(second-split))
+end function;
+
+define function rope->string (r) => (s)
+  rope-substring(r, 0, rope-size(r))
+end function;
+
+define method rope-line-count (r :: <rope>) => (n :: <integer>)
+  rope-newlines(r) + 1
+end method;
+
+define method rope-line-to-offset
+    (r :: <rope-leaf>, ln :: <integer>) => (off :: <integer>)
+  if (ln <= 0)
+    0
+  else
+    let bytes = rope-leaf-bytes(r);
+    let n     = rope-leaf-len(r);
+    let seen  = 0;
+    let pos   = 0;
+    let found = -1;
+    until (pos = n | found >= 0)
+      if (element(bytes, pos) = 10)
+        seen := seen + 1;
+        if (seen = ln)
+          found := pos + 1;
+        else
+          #f
+        end;
+      else
+        #f
+      end;
+      pos := pos + 1;
+    end;
+    if (found < 0) n else found end
+  end
+end method;
+
+define method rope-line-to-offset
+    (r :: <rope-node>, ln :: <integer>) => (off :: <integer>)
+  if (ln <= 0)
+    0
+  else
+    let left-newlines = rope-newlines(rope-node-left(r));
+    if (ln <= left-newlines)
+      rope-line-to-offset(rope-node-left(r), ln)
+    else
+      rope-node-weight(r)
+        + rope-line-to-offset(rope-node-right(r), ln - left-newlines)
+    end
+  end
+end method;
+
+// ─── Sprint 43d — rope-aware buffer-measurement helpers ──────────────────
+//
+// Replace the old `nod-count-newlines` / `nod-max-line-chars` calls
+// on `<byte-string>` with rope-aware versions. Line count is O(1)
+// (cached at every internal node). Longest line uses for-each-leaf
+// with running state — note this gives a CONSERVATIVE upper bound:
+// it treats every leaf boundary as a potential line continuation,
+// so the answer is right when the longest line is fully inside one
+// leaf and an over-estimate when a long line straddles leaves. Good
+// enough for sizing the horizontal scrollbar; we can tighten this
+// later if needed.
+
+define function nod-rope-line-count (r) => (n :: <integer>)
+  rope-line-count(r)
+end function;
+
+define function nod-rope-max-line-chars (r) => (best :: <integer>)
+  let best = 0;
+  let cur  = 0;
+  for-each-leaf(r,
+                method (leaf-bytes)
+                  let len = size(leaf-bytes);
+                  let i = 0;
+                  until (i = len)
+                    if (element(leaf-bytes, i) = 10)
+                      if (cur > best) best := cur; else #f end;
+                      cur := 0;
+                    else
+                      cur := cur + 1;
+                    end;
+                    i := i + 1;
+                  end;
+                end);
+  if (cur > best) cur else best end
+end function;
+
+// ─── Sprint 42a — pure-Dylan helpers (replace retired Rust shims) ─────────
+//
+// All the IDE's text-buffer scanning and recent-files persistence is now
+// pure Dylan over the Sprint 42a `<byte-string>` ops: `size`, `element`
+// (the byte at an index), `concatenate`, `copy-sequence`, plus the
+// Sprint 42a `=` method on `<byte-string>` (content equality). The five
+// Rust shims (`nod_count_newlines`, `nod_max_line_chars`, `nod_basename`,
+// `nod_load_recent`, `nod_add_recent`) are gone — this is the proof
+// that the byte-string stdlib methods are usable for real work.
+//
+// Where we still call Rust:
+//   * `%read-file` / `%write-file` — file I/O proper (Sprint 41b / 41g).
+//   * `%byte-string-element` — primitive byte read (5-op surface).
+//   * `pair` / `head` / `tail` / `empty?` / `nil` — list builtins
+//     (Sprint 16; can't be specialised on `<byte-string>` yet — see the
+//     `empty?` note in stdlib.dylan).
+// Everything else here is plain Dylan calling the stdlib methods.
+
+// ── Count newlines in a byte-string buffer ────────────────────────────────
+// Returns 1 + the number of `\n` bytes (the line count, matching the
+// "lines = newlines + 1" convention the IDE used pre-42a).
+
+define function nod-count-newlines (s) => (lines)
+  let n = size(s);
+  let count = 1;
+  let i = 0;
+  until (i = n)
+    if (element(s, i) = 10)        // 10 = '\n'
+      count := count + 1;
+    else
+      #f
+    end;
+    i := i + 1;
+  end;
+  count
+end function;
+
+// ── Longest line length in bytes ──────────────────────────────────────────
+
+define function nod-max-line-chars (s) => (best)
+  let n = size(s);
+  let best = 0;
+  let cur = 0;
+  let i = 0;
+  until (i = n)
+    if (element(s, i) = 10)        // 10 = '\n'
+      if (cur > best) best := cur; else #f end;
+      cur := 0;
+    else
+      cur := cur + 1;
+    end;
+    i := i + 1;
+  end;
+  if (cur > best) cur else best end
+end function;
+
+// ── basename(path) — last `\`-or-`/`-separated component ──────────────────
+// Returns the empty string for nil or an empty byte-string.
+
+define function nod-basename (path) => (base)
+  if (empty?(path))               // empty?(nil) = #t for the list-builtin
+    ""
+  else
+    let n = size(path);
+    if (n = 0)
+      path
+    else
+      // Scan for the LAST '\' (92) or '/' (47). sep-pos = -1 means
+      // "no separator found, return path unchanged".
+      let sep-pos = -1;
+      let i = 0;
+      until (i = n)
+        let b = element(path, i);
+        if (b = 92 | b = 47)
+          sep-pos := i;
+        else
+          #f
+        end;
+        i := i + 1;
+      end;
+      if (sep-pos < 0)
+        path
+      else
+        copy-sequence(path, sep-pos + 1, n)
+      end
+    end
+  end
+end function;
+
+// ── List helpers — reverse, filter-out, take-first ────────────────────────
+//
+// Recent-files manipulation is built on a small kit of list ops. The
+// stdlib's `do` / `map` / `reduce` exist but want a first-class function
+// arg; for the simple loops we have, raw `head`/`tail`/`pair` walks are
+// clearer.
+
+define function nod-reverse-list (lst) => (rev)
+  let result = nil();
+  let cursor = lst;
+  until (empty?(cursor))
+    result := pair(head(cursor), result);
+    cursor := tail(cursor);
+  end;
+  result
+end function;
+
+define function nod-remove-from-list (item, lst) => (filtered)
+  // Walk lst, dropping any entry that equals `item` (byte-string `=`).
+  // Build reversed, then flip — keeps the original order without an
+  // append.
+  let acc = nil();
+  let cursor = lst;
+  until (empty?(cursor))
+    let p = head(cursor);
+    if (p = item)
+      #f   // skip — drop this entry
+    else
+      acc := pair(p, acc);
+    end;
+    cursor := tail(cursor);
+  end;
+  nod-reverse-list(acc)
+end function;
+
+define function nod-take-first (lst, n) => (taken)
+  let acc = nil();
+  let cursor = lst;
+  let i = 0;
+  until (empty?(cursor) | i = n)
+    acc := pair(head(cursor), acc);
+    cursor := tail(cursor);
+    i := i + 1;
+  end;
+  nod-reverse-list(acc)
+end function;
+
+// ── Split a byte-string on `\n`, returning a list of byte-strings ─────────
+
+define function nod-split-on-newline (bytes) => (lines)
+  let n = size(bytes);
+  if (n = 0)
+    nil()
+  else
+    let acc = nil();
+    let lo = 0;
+    let i = 0;
+    until (i = n)
+      if (element(bytes, i) = 10)
+        let line = copy-sequence(bytes, lo, i);
+        acc := pair(line, acc);
+        lo := i + 1;
+      else
+        #f
+      end;
+      i := i + 1;
+    end;
+    // Trailing segment (after the last '\n', or the only segment if
+    // there's no '\n' at all). Skip if the buffer ended with a newline.
+    if (lo < n)
+      let tail-line = copy-sequence(bytes, lo, n);
+      acc := pair(tail-line, acc);
+    else
+      #f
+    end;
+    nod-reverse-list(acc)
+  end
+end function;
+
+// ── Join a list of byte-strings with `\n` ─────────────────────────────────
+
+define function nod-join-with-newline (lst) => (joined)
+  if (empty?(lst))
+    ""
+  else
+    let cursor = lst;
+    let result = head(cursor);
+    cursor := tail(cursor);
+    until (empty?(cursor))
+      result := concatenate(result, "\n");
+      result := concatenate(result, head(cursor));
+      cursor := tail(cursor);
+    end;
+    result
+  end
+end function;
+
+// ── Recent-files load / save / prepend-dedupe ─────────────────────────────
+// Persists to F:\scratch\nod-ide-recent.txt — one path per line,
+// most-recent first, capped at 5 entries. Missing/empty file → empty
+// list. Write errors are silently ignored (best-effort persistence;
+// the IDE keeps working, the user just loses the entry on next launch).
+
+define function nod-load-recent () => (lst)
+  let bytes = %read-file("F:\\scratch\\nod-ide-recent.txt");
+  nod-split-on-newline(bytes)
+end function;
+
+define function nod-save-recent (recent-list) => ()
+  let serialized = nod-join-with-newline(recent-list);
+  %write-file("F:\\scratch\\nod-ide-recent.txt", serialized);
+  #f
+end function;
+
+define function nod-add-recent (path, recent-list) => (new-list)
+  // nil or empty-string path → no-op (treat as "nothing to remember").
+  if (empty?(path))
+    recent-list
+  elseif (size(path) = 0)
+    recent-list
+  else
+    let deduped  = nod-remove-from-list(path, recent-list);
+    let prepended = pair(path, deduped);
+    let capped    = nod-take-first(prepended, 5);
+    nod-save-recent(capped);
+    capped
+  end
+end function;
+
+// ─── Helper: walk a recent-paths list, rebuild a submenu ────────────────
+//
+// Tears down every item in `recent-menu` (RemoveMenu at position 0
+// while it returns success) and re-appends one MF_STRING entry per
+// path. If the list is empty, appends a single disabled "(empty)" item
+// (MF_GRAYED = 1) so the submenu is still visible to the user.
+//
+// Command ids are 301..305 — five slots for the five recent entries.
+// Walking the spine with `pair`/`head`/`tail`/`empty?` is the standard
+// Sprint 16 list-iteration pattern; the loop terminates either when
+// the list is exhausted or when `i` reaches the 5-entry cap (defensive
+// — `nod_add_recent` already caps at 5).
+
+define function rebuild-recent-submenu (recent-menu, paths) => ()
+  // Tear down whatever was there. RemoveMenu returns #t (BOOL true)
+  // on success / #f when the position is out of range — that's our
+  // natural loop guard.
+  let removed = RemoveMenu(recent-menu, 0, 1024);
+  until (~ removed)
+    removed := RemoveMenu(recent-menu, 0, 1024);
+  end;
+  if (empty?(paths))
+    // (empty) placeholder — disabled (MF_GRAYED = 1), no cmd-id.
+    AppendMenuW(recent-menu, 1, 0, "(empty)");
+  else
+    let cursor = paths;
+    let i = 0;
+    until (empty?(cursor) | i > 4)
+      let p = head(cursor);
+      let label = nod-basename(p);
+      AppendMenuW(recent-menu, 0, 301 + i, label);
+      cursor := tail(cursor);
+      i := i + 1;
+    end;
+  end;
+end function;
+
+// ─── Helper: set the window title to "basename - NewOpenDylan IDE" ──────
+//
+// If `path` is nil / empty, sets the title to the bare program name.
+// Otherwise: "<basename> — NewOpenDylan IDE". Sprint 42a finally lets
+// us build the title via `concatenate` (was held back in 41g for lack
+// of string-concat on `<byte-string>`).
+
+define function update-title (hwnd, path) => ()
+  if (empty?(path))
+    SetWindowTextW(hwnd, "NewOpenDylan IDE");
+  else
+    let base   = nod-basename(path);
+    let suffix = concatenate(base, " - NewOpenDylan IDE");
+    SetWindowTextW(hwnd, suffix);
+  end;
+end function;
+
+// ─── Sprint 43e-2 — cursor movement helpers ──────────────────────────────
+//
+// Compute the byte offset that VK_UP / VK_DOWN should land the cursor on.
+// `direction = -1` for up, `+1` for down. The math:
+//
+//   1. Find the start of the current line by scanning backward for '\n'.
+//   2. Current column = offset - current-line-start.
+//   3. Find the previous / next line's start + length.
+//   4. Clamp column to fit on the target line.
+//   5. Return target-line-start + clamped-column.
+//
+// At the top / bottom of the buffer the move is a no-op (returns the
+// input offset unchanged). The caller checks for "no change" and skips
+// the InvalidateRect when it's a no-op.
+//
+// Column behaviour: we recompute the column from the cursor's current
+// byte position each time, so a long line → short line → long line
+// vertical walk does NOT preserve the "ideal" column (the cursor sticks
+// to whatever shorter intermediate line allowed). Most editors keep a
+// remembered ideal column; we'll add that in a follow-up if it bothers.
+//
+// **Note on `|` and `&`.** Dylan's `|` and `&` short-circuit per
+// spec; task #251 fixed our compiler to honour that (3-block CFG
+// lowering in `nod-sema/src/lower.rs::lower_short_circuit`). The
+// sentinel-loop helpers (`scan-line-start` / `scan-line-end`) below
+// were originally written to dodge the eager-| bug; they are kept
+// as-is because they read cleanly and the manual bounds-guard makes
+// the scan invariant obvious. New code can use plain
+// `until (i = 0 | element(bytes, i - 1) = 10)` style now.
+
+define function scan-line-start
+    (bytes :: <byte-string>, from :: <integer>) => (i :: <integer>)
+  // Find the largest `i <= from` such that either `i = 0` or
+  // `element(bytes, i - 1) = '\n'`.
+  let i = from;
+  let done = #f;
+  until (done)
+    if (i = 0)
+      done := #t;
+    elseif (element(bytes, i - 1) = 10)
+      done := #t;
+    else
+      i := i - 1;
+    end;
+  end;
+  i
+end function;
+
+define function scan-line-end
+    (bytes :: <byte-string>, from :: <integer>, n :: <integer>)
+ => (i :: <integer>)
+  // Find the smallest `i >= from` such that either `i = n` or
+  // `element(bytes, i) = '\n'`. `n` is `size(bytes)`, passed in by
+  // the caller to avoid re-computing it.
+  let i = from;
+  let done = #f;
+  until (done)
+    if (i = n)
+      done := #t;
+    elseif (element(bytes, i) = 10)
+      done := #t;
+    else
+      i := i + 1;
+    end;
+  end;
+  i
+end function;
+
+define function move-cursor-vertical
+    (bytes :: <byte-string>, offset :: <integer>, direction :: <integer>,
+     ideal-col :: <integer>)
+ => (new :: <integer>)
+  // Sprint 43e-7 — `ideal-col` is the column the caller wants the
+  // cursor restored to on the target line, clamped to the target
+  // line's length. Letting the caller pass it (rather than us
+  // recomputing from `offset`) is what makes a long → short → long
+  // vertical walk preserve the original column.
+  let n = size(bytes);
+  let off = if (offset > n) n else offset end;
+  let cur-line-start = scan-line-start(bytes, off);
+  if (direction < 0)
+    if (cur-line-start = 0)
+      offset
+    else
+      let prev-line-end = cur-line-start - 1;     // index of the '\n'
+      let prev-line-start = scan-line-start(bytes, prev-line-end);
+      let prev-line-len = prev-line-end - prev-line-start;
+      let target-col = if (ideal-col < prev-line-len) ideal-col else prev-line-len end;
+      prev-line-start + target-col
+    end
+  else
+    let cur-line-end = scan-line-end(bytes, off, n);
+    if (cur-line-end = n)
+      offset
+    else
+      let next-line-start = cur-line-end + 1;
+      let next-line-end = scan-line-end(bytes, next-line-start, n);
+      let next-line-len = next-line-end - next-line-start;
+      let target-col = if (ideal-col < next-line-len) ideal-col else next-line-len end;
+      next-line-start + target-col
+    end
+  end
+end function;
+
+// ─── Sprint 43f-1 — syntax-colouring helpers ─────────────────────────────
+//
+// Walk a byte-string buffer looking for runs of Dylan identifier
+// characters. For each run, check against a hand-rolled keyword list.
+// If a match, ask DirectWrite to apply the keyword brush to that text
+// range via SetDrawingEffect.
+//
+// Identifier characters (Dylan's actual set is broader; this is the
+// usable subset for keyword detection):
+//   start:    [a-zA-Z]
+//   continue: [a-zA-Z0-9_-?!]
+//
+// All operands of `|` here are pure byte-comparisons, so the eager-|
+// compiler bug (task #251) doesn't bite.
+
+define function is-ident-start? (b :: <integer>) => (yes? :: <boolean>)
+  // ASCII A..Z (65..90) or a..z (97..122).
+  (b >= 65 & b <= 90) | (b >= 97 & b <= 122)
+end function;
+
+define function is-ident-cont? (b :: <integer>) => (yes? :: <boolean>)
+  // ident-start chars + digits 0..9 (48..57) + '-' (45) + '_' (95)
+  // + '?' (63) + '!' (33).
+  is-ident-start?(b) | (b >= 48 & b <= 57) | (b = 45) | (b = 95)
+    | (b = 63) | (b = 33)
+end function;
+
+define function bytes-equal-string?
+    (bytes :: <byte-string>, start :: <integer>, limit :: <integer>,
+     kw :: <byte-string>) => (eq? :: <boolean>)
+  let len = limit - start;
+  if (len ~= size(kw))
+    #f
+  else
+    // Sentinel-loop comparison. Task #251 fixed `|` to short-circuit
+    // properly, so a `|`-condition `until` would also work now —
+    // kept as-is for readability.
+    let i = 0;
+    let ok = #t;
+    let done = #f;
+    until (done)
+      if (i = len)
+        done := #t;
+      elseif (element(bytes, start + i) ~= element(kw, i))
+        ok := #f;
+        done := #t;
+      else
+        i := i + 1;
+      end;
+    end;
+    ok
+  end
+end function;
+
+define function is-dylan-keyword?
+    (bytes :: <byte-string>, start :: <integer>, limit :: <integer>)
+ => (kw? :: <boolean>)
+  let len = limit - start;
+  if (len = 2)
+    bytes-equal-string?(bytes, start, limit, "if")
+      | bytes-equal-string?(bytes, start, limit, "or")
+  elseif (len = 3)
+    bytes-equal-string?(bytes, start, limit, "end")
+      | bytes-equal-string?(bytes, start, limit, "let")
+      | bytes-equal-string?(bytes, start, limit, "for")
+      | bytes-equal-string?(bytes, start, limit, "and")
+      | bytes-equal-string?(bytes, start, limit, "not")
+      | bytes-equal-string?(bytes, start, limit, "use")
+  elseif (len = 4)
+    bytes-equal-string?(bytes, start, limit, "else")
+      | bytes-equal-string?(bytes, start, limit, "when")
+      | bytes-equal-string?(bytes, start, limit, "case")
+      | bytes-equal-string?(bytes, start, limit, "slot")
+      | bytes-equal-string?(bytes, start, limit, "from")
+      | bytes-equal-string?(bytes, start, limit, "make")
+  elseif (len = 5)
+    bytes-equal-string?(bytes, start, limit, "while")
+      | bytes-equal-string?(bytes, start, limit, "until")
+      | bytes-equal-string?(bytes, start, limit, "begin")
+      | bytes-equal-string?(bytes, start, limit, "local")
+      | bytes-equal-string?(bytes, start, limit, "block")
+      | bytes-equal-string?(bytes, start, limit, "macro")
+      | bytes-equal-string?(bytes, start, limit, "class")
+  elseif (len = 6)
+    bytes-equal-string?(bytes, start, limit, "define")
+      | bytes-equal-string?(bytes, start, limit, "method")
+      | bytes-equal-string?(bytes, start, limit, "select")
+      | bytes-equal-string?(bytes, start, limit, "elseif")
+      | bytes-equal-string?(bytes, start, limit, "unless")
+      | bytes-equal-string?(bytes, start, limit, "export")
+      | bytes-equal-string?(bytes, start, limit, "module")
+      | bytes-equal-string?(bytes, start, limit, "signal")
+      | bytes-equal-string?(bytes, start, limit, "return")
+  elseif (len = 7)
+    bytes-equal-string?(bytes, start, limit, "library")
+      | bytes-equal-string?(bytes, start, limit, "cleanup")
+      | bytes-equal-string?(bytes, start, limit, "finally")
+      | bytes-equal-string?(bytes, start, limit, "generic")
+      | bytes-equal-string?(bytes, start, limit, "keyword")
+  elseif (len = 8)
+    bytes-equal-string?(bytes, start, limit, "constant")
+      | bytes-equal-string?(bytes, start, limit, "function")
+      | bytes-equal-string?(bytes, start, limit, "variable")
+  elseif (len = 9)
+    bytes-equal-string?(bytes, start, limit, "otherwise")
+  else
+    #f
+  end
+end function;
+
+define function is-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 48 & b <= 57
+end function;
+
+// Sprint 43f-4 — find a syntactically safe byte offset to seed the
+// tokeniser from, by walking lines backward from the first visible
+// line until we hit one beginning with "define ". Dylan top-level
+// forms (`define class`, `define method`, `define function`,
+// `define library`, `define module`, `define variable`, etc.) are
+// self-contained — once we're between two top-level forms, the
+// tokeniser state is known-clean (not in a comment, not in a
+// string). Starting the scan there gives correct colouring no
+// matter where the user scrolled.
+//
+// If no `define` line is found above (e.g. very top of file, or a
+// `module:`/`library:` header file), fall back to offset 0.
+//
+// Why "starts with `define `" specifically:
+//   - // line comments don't start with `define`
+//   - /* block comments */ — if `define` appears INSIDE a block
+//     comment, it would still need to be at column 0 of its line
+//     for us to false-positive; that's a contrived enough case
+//     to ignore. Real Dylan code never has top-level-aligned
+//     `define ` inside a block comment.
+//   - String literals — same argument.
+
+define function find-safe-scan-start
+    (bytes :: <byte-string>, source, first-visible-line :: <integer>)
+ => (offset :: <integer>)
+  let candidate = first-visible-line;
+  let result = 0;
+  let done = #f;
+  let n = size(bytes);
+  until (done)
+    if (candidate <= 0)
+      done := #t;
+    else
+      let off = rope-line-to-offset(source, candidate);
+      // Need 7 bytes for "define " — keyword (6) plus space.
+      if (off + 7 > n)
+        candidate := candidate - 1;
+      elseif (~ bytes-equal-string?(bytes, off, off + 6, "define"))
+        candidate := candidate - 1;
+      elseif (element(bytes, off + 6) ~= 32)  // ' '
+        candidate := candidate - 1;
+      else
+        result := off;
+        done := #t;
+      end;
+    end;
+  end;
+  result
+end function;
+
+// Sprint 43f-2 — full tokenising syntax-colouring pass. Walks the
+// buffer recognising five token kinds:
+//
+//   * line comment   "// ... <newline>"          → comment-brush
+//   * block comment  "/* ... */"                 → comment-brush
+//   * string literal "\"...\""                   → string-brush
+//   * number literal digits [+ . e E + -]        → number-brush
+//   * class name     "<ident>"                   → class-brush
+//   * identifier     ident chars                 → keyword-brush iff
+//                                                  matches keyword list
+//
+// Anything else stays default (black). The scan is single-pass O(n)
+// over `bytes`; per-paint cost is sub-millisecond for IDE-size files.
+//
+// All `&` / `|` chains used here have pure operands only (byte
+// comparisons + arithmetic), so the eager-| compiler bug (task #251)
+// is harmless. Two-byte lookahead (e.g. `//`, `/*`) uses nested if
+// to defensively bounds-check before reading the second byte.
+
+// Sprint 43f-3 — viewport-bounded scan. Callers pass [start, limit)
+// instead of always tokenising the whole buffer; SetDrawingEffect
+// positions are absolute (relative to the whole layout), so applying
+// effects only to the visible byte range is sound. Off-screen tokens
+// get no colour, and DirectWrite's render clip means the user can't
+// see them anyway.
+//
+// For correctness across long block comments / strings that started
+// well above the viewport, the caller is expected to back `start`
+// up by a few lines of overscan. The tokeniser itself doesn't care
+// where `start` is — it just walks bytes within [start, limit).
+
+define function highlight-dylan-syntax
+    (layout, bytes :: <byte-string>,
+     start :: <integer>, limit :: <integer>,
+     keyword-brush, comment-brush, string-brush,
+     number-brush, class-brush) => ()
+  let n = limit;
+  let i = start;
+  let done = #f;
+  until (done)
+    if (i >= n)
+      done := #t;
+    else
+      let b = element(bytes, i);
+      if (b = 47)              // '/' — comment lookahead
+        if (i + 1 < n)
+          let b2 = element(bytes, i + 1);
+          if (b2 = 47)         // line comment "//..."
+            let start = i;
+            i := i + 2;
+            let scan-done = #f;
+            until (scan-done)
+              if (i >= n)
+                scan-done := #t;
+              elseif (element(bytes, i) = 10)  // '\n'
+                scan-done := #t;
+              else
+                i := i + 1;
+              end;
+            end;
+            %dwrite-set-drawing-effect(layout, comment-brush, start, i - start);
+          elseif (b2 = 42)     // block comment "/* ... */"
+            let start = i;
+            i := i + 2;
+            let scan-done = #f;
+            until (scan-done)
+              if (i >= n)
+                scan-done := #t;
+              elseif (i + 1 < n & element(bytes, i) = 42 & element(bytes, i + 1) = 47)
+                i := i + 2;
+                scan-done := #t;
+              else
+                i := i + 1;
+              end;
+            end;
+            %dwrite-set-drawing-effect(layout, comment-brush, start, i - start);
+          else
+            i := i + 1;
+          end;
+        else
+          i := i + 1;
+        end;
+      elseif (b = 34)          // '"' — string literal
+        let start = i;
+        i := i + 1;
+        let scan-done = #f;
+        until (scan-done)
+          if (i >= n)
+            scan-done := #t;
+          elseif (element(bytes, i) = 92 & i + 1 < n)  // '\\' escape
+            i := i + 2;
+          elseif (element(bytes, i) = 34)              // closing '"'
+            i := i + 1;
+            scan-done := #t;
+          elseif (element(bytes, i) = 10)              // unterminated — stop at EOL
+            scan-done := #t;
+          else
+            i := i + 1;
+          end;
+        end;
+        %dwrite-set-drawing-effect(layout, string-brush, start, i - start);
+      elseif (b = 60)          // '<' — class name "<ident>"
+        if (i + 1 < n & is-ident-start?(element(bytes, i + 1)))
+          let start = i;
+          i := i + 2;
+          let scan-done = #f;
+          until (scan-done)
+            if (i >= n)
+              scan-done := #t;
+            elseif (element(bytes, i) = 62)  // '>'
+              i := i + 1;
+              scan-done := #t;
+            elseif (is-ident-cont?(element(bytes, i)))
+              i := i + 1;
+            else
+              // Not a clean class name — bail without colouring.
+              i := start + 1;
+              scan-done := #t;
+            end;
+          end;
+          // Only colour if we actually closed with '>'.
+          if (i > start + 1 & element(bytes, i - 1) = 62)
+            %dwrite-set-drawing-effect(layout, class-brush, start, i - start);
+          else 0 end;
+        else
+          i := i + 1;
+        end;
+      elseif (is-digit?(b))    // number literal
+        let start = i;
+        i := i + 1;
+        let scan-done = #f;
+        until (scan-done)
+          if (i >= n)
+            scan-done := #t;
+          else
+            let c = element(bytes, i);
+            if (is-digit?(c) | c = 46 | c = 101 | c = 69 | c = 43 | c = 45)
+              i := i + 1;
+            else
+              scan-done := #t;
+            end;
+          end;
+        end;
+        %dwrite-set-drawing-effect(layout, number-brush, start, i - start);
+      elseif (is-ident-start?(b))
+        let start = i;
+        i := i + 1;
+        let scan-done = #f;
+        until (scan-done)
+          if (i >= n)
+            scan-done := #t;
+          elseif (is-ident-cont?(element(bytes, i)))
+            i := i + 1;
+          else
+            scan-done := #t;
+          end;
+        end;
+        if (is-dylan-keyword?(bytes, start, i))
+          %dwrite-set-drawing-effect(layout, keyword-brush, start, i - start);
+        else 0 end;
+      else
+        i := i + 1;
+      end;
+    end;
+  end;
+end function;
+
+// ─── Sprint 43g — gutter helpers (line numbers) ──────────────────────────
+
+// Render a non-negative integer to a decimal byte-string. Uses
+// repeated /10 + mod (`n - (n / 10) * 10`) to extract digits.
+define function integer-to-string (n :: <integer>) => (s :: <byte-string>)
+  if (n = 0)
+    "0"
+  else
+    // Count digits.
+    let m = n;
+    let digits = 0;
+    until (m = 0)
+      digits := digits + 1;
+      m := m / 10;
+    end;
+    // Write digits right-to-left.
+    let s = %byte-string-allocate(digits);
+    let m = n;
+    let i = digits - 1;
+    let done = #f;
+    until (done)
+      if (i < 0)
+        done := #t;
+      else
+        let d = m - (m / 10) * 10;     // m mod 10
+        %byte-string-element-setter(48 + d, s, i);   // '0' + digit
+        m := m / 10;
+        i := i - 1;
+      end;
+    end;
+    s
+  end
+end function;
+
+// Build a multi-line right-padded line-numbers string covering the
+// inclusive range [first .. last], each number padded to `width`
+// characters. Lines joined with '\n'. Caller hands the result to
+// DirectWrite as the text of a layout sized to width × line-height.
+//
+// Right-alignment is achieved with leading spaces — the font is
+// monospaced so visual alignment is exact without needing DirectWrite's
+// SetTextAlignment shim.
+
+define function build-line-numbers-block
+    (from-line :: <integer>, to-line :: <integer>, width :: <integer>)
+ => (out :: <byte-string>)
+  let acc = "";
+  let i = from-line;
+  let done = #f;
+  until (done)
+    if (i > to-line)
+      done := #t;
+    else
+      let n-str = integer-to-string(i);
+      let pad-count = width - size(n-str);
+      let padded = if (pad-count <= 0)
+                     n-str
+                   else
+                     let p = %byte-string-allocate(pad-count);
+                     let k = 0;
+                     until (k = pad-count)
+                       %byte-string-element-setter(32, p, k);   // ' '
+                       k := k + 1;
+                     end;
+                     concatenate(p, n-str)
+                   end;
+      acc := if (i = from-line)
+               padded
+             else
+               concatenate(acc, concatenate("\n", padded))
+             end;
+      i := i + 1;
+    end;
+  end;
+  acc
+end function;
 
 define function main () => ()
   let arg-path = %argv1();

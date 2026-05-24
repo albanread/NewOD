@@ -1,6 +1,28 @@
 //! AST → DFM lowering.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Sprint 44 — process-global counter for `__anon-method-NNNN`
+/// synthetic names. Previously local to `LiftState`, which reset to 0
+/// on every `lower_module_full` call; that's fine for single-file
+/// builds (the stdlib merge silently dedups its `__anon-method-0`
+/// against the user's), but multi-file user builds need monotonically-
+/// increasing names across files so `merge_modules`'s "first writer
+/// wins" closure-registry merge doesn't drop one closure's metadata
+/// into the bucket of another closure with the same numeric suffix.
+///
+/// Tests that want deterministic per-test names can call
+/// `_reset_anon_method_counter_for_tests()`.
+static ANON_METHOD_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Test helper: reset the process-global anon-method counter to 0.
+/// Useful for tests that snapshot lowering output and need stable
+/// `__anon-method-N` indices. Production builds should never call
+/// this — Sprint 44's multi-file path relies on monotone allocation.
+pub fn _reset_anon_method_counter_for_tests() {
+    ANON_METHOD_COUNTER.store(0, Ordering::SeqCst);
+}
 
 use nod_dfm::{
     Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp,
@@ -3351,8 +3373,6 @@ struct LiftState<'a> {
     /// by `check_free_vars` to distinguish "captured local" from
     /// "top-level reference".
     top: &'a HashSet<String>,
-    /// Counter for `__anon-method-NNNN` synthetic names.
-    counter: u32,
     /// Sink for lifted `Item::DefineFunction`s.
     new_items: Vec<Item>,
     /// Lift-time diagnostics.
@@ -3408,7 +3428,6 @@ fn lift_anonymous_methods(
     }
     let mut state = LiftState {
         top: &top_level_names,
-        counter: 0,
         new_items: Vec::new(),
         errors: Vec::new(),
         registry: ClosureRegistry::default(),
@@ -3617,8 +3636,10 @@ fn lift_expr(
             }
 
             // Synthesise a fresh top-level name for the lifted body.
-            let lifted_name = format!("__anon-method-{}", st.counter);
-            st.counter += 1;
+            // Sprint 44: counter is process-global so multi-file
+            // builds don't collide on `__anon-method-0` between files.
+            let id = ANON_METHOD_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let lifted_name = format!("__anon-method-{}", id);
 
             // Record this closure's captured locals against the
             // enclosing function so the lowerer cell-promotes them.

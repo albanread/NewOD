@@ -865,31 +865,43 @@ pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError
         });
     }
 
-    // Cross-file function/method collision detection. We track which
-    // path first declared each `body_fn_name`; a second occurrence in
-    // a later file is an error.
-    use std::collections::HashMap;
+    // Cross-file function/method collision detection.
+    //
+    // Subtle point: a single file's lowering can legitimately produce
+    // multiple `lm.functions` / `lm.methods` entries with the same
+    // `name` / `body_fn_name` — e.g. slot getter/setter pairs sharing
+    // a body name, or class-lowering boilerplate emitted more than
+    // once. `merge_stdlib_into_user_module` collapses those via a
+    // `HashSet` and the duplicates are harmless. Only collisions
+    // **across files** matter (two user files both defining
+    // `helper`), because that's where the user's intent is ambiguous.
+    //
+    // So we walk per-file and build a per-file deduped set first,
+    // then check if any name in that set was already first-claimed by
+    // a different file. Within a single file, repeated occurrences
+    // are silently allowed (and `merge_modules` will collapse them
+    // for codegen).
+    use std::collections::{HashMap, HashSet};
     let mut first_seen: HashMap<String, std::path::PathBuf> = HashMap::new();
     for (path, lm) in &per_file_lms {
+        let mut names_in_this_file: HashSet<String> = HashSet::new();
         for f in &lm.functions {
-            if let Some(prior) = first_seen.get(&f.name) {
-                return Err(EvalError::DuplicateUserDefinition {
-                    name: f.name.clone(),
-                    first_path: prior.clone(),
-                    second_path: path.clone(),
-                });
-            }
-            first_seen.insert(f.name.clone(), path.clone());
+            names_in_this_file.insert(f.name.clone());
         }
         for m in &lm.methods {
-            if let Some(prior) = first_seen.get(&m.body_fn_name) {
+            names_in_this_file.insert(m.body_fn_name.clone());
+        }
+        for name in &names_in_this_file {
+            if let Some(prior) = first_seen.get(name)
+                && prior != path
+            {
                 return Err(EvalError::DuplicateUserDefinition {
-                    name: m.body_fn_name.clone(),
+                    name: name.clone(),
                     first_path: prior.clone(),
                     second_path: path.clone(),
                 });
             }
-            first_seen.insert(m.body_fn_name.clone(), path.clone());
+            first_seen.insert(name.clone(), path.clone());
         }
     }
 

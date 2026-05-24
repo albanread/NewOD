@@ -101,6 +101,78 @@ fn remove_dir_all_best_effort(p: &Path) -> std::io::Result<()> {
 /// Build the Dylan source to an EXE under a temp dir, return the EXE
 /// path. The temp dir is kept for forensic inspection — it's cleaned
 /// up by the caller on success only. Panics on build failure.
+/// Sprint 44 — build an EXE from a set of existing fixture files,
+/// passing every path to `nod-driver build` as a positional argument.
+/// Mirrors `build_exe` but expects on-disk fixtures (no `include_str!`
+/// trick) so the multi-file IDE split can be driven through the real
+/// `nod-driver build a.dylan b.dylan c.dylan ...` code path.
+fn build_exe_from_fixtures(
+    test_name: &str,
+    fixture_paths: &[PathBuf],
+) -> (PathBuf, PathBuf) {
+    assert!(
+        !fixture_paths.is_empty(),
+        "build_exe_from_fixtures needs at least one path"
+    );
+    for p in fixture_paths {
+        assert!(
+            p.is_file(),
+            "fixture path {} is not a regular file",
+            p.display()
+        );
+    }
+    let dir = make_temp_dir(test_name);
+    let exe_path = dir.join("output.exe");
+
+    let workspace = workspace_root();
+    let build = Command::new("cargo")
+        .current_dir(&workspace)
+        .args(["build", "-p", "nod-driver", "-p", "nod-runtime"])
+        .output()
+        .expect("spawn cargo build");
+    if !build.status.success() {
+        panic!(
+            "cargo build failed: {}\nstderr:\n{}",
+            build.status,
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--quiet".into(),
+        "--bin".into(),
+        "nod-driver".into(),
+        "--".into(),
+        "build".into(),
+    ];
+    for p in fixture_paths {
+        args.push(p.to_str().unwrap().to_string());
+    }
+    args.push("-o".into());
+    args.push(exe_path.to_str().unwrap().to_string());
+
+    let driver = Command::new("cargo")
+        .current_dir(&workspace)
+        .args(&args)
+        .output()
+        .expect("spawn nod-driver");
+    if !driver.status.success() {
+        panic!(
+            "nod-driver build failed: {}\nstdout:\n{}\nstderr:\n{}",
+            driver.status,
+            String::from_utf8_lossy(&driver.stdout),
+            String::from_utf8_lossy(&driver.stderr)
+        );
+    }
+    assert!(
+        exe_path.is_file(),
+        "EXE not produced at {}",
+        exe_path.display()
+    );
+    (dir, exe_path)
+}
+
 fn build_exe(test_name: &str, source: &str) -> (PathBuf, PathBuf) {
     let dir = make_temp_dir(test_name);
     let src_path = dir.join("input.dylan");
@@ -323,13 +395,35 @@ fn aot_ide_shell_window_renders_hello_dylan() {
 #[ignore = "interactive: pops a real Win32 window with Save/SaveAs/Recent. Run with `cargo test --test aot_ide_shell -- --ignored --nocapture aot_nod_ide_save_and_recent`."]
 #[serial]
 fn aot_nod_ide_save_and_recent() {
-    // Same `include_str!` trick as 41d/41e/41f: standalone fixture
-    // file is the canonical source; the test embeds it via include_str!
-    // so the standalone `nod-driver build`-able file and the test stay
-    // in lockstep automatically.
-    let source = include_str!("../fixtures/nod-ide.dylan");
+    // Sprint 44 — the IDE is now split across 5 .dylan files in the
+    // fixtures directory (all sharing `Module: nod-ide`). Earlier
+    // sprints used `include_str!` to inline the single monolithic
+    // fixture into the test binary; now we hand the on-disk paths
+    // straight to `nod-driver build` so the multi-file front-end
+    // pipeline (compile_files_for_aot → per-file lower → merge →
+    // codegen) gets exercised end-to-end through the headline test.
+    //
+    // The pre-split monolithic copy is preserved as
+    // `unified_ide.dylan` (not loaded — just a safety/diff reference).
+    //
+    // Order matters: ide_win_calls.dylan first so its c-function
+    // bindings are visible to later files; ide_rope.dylan next so
+    // every later file can refer to the rope classes; then helpers,
+    // syntax, and finally nod-ide.dylan with main + WNDPROC.
+    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let fixture_paths: Vec<PathBuf> = [
+        "ide_win_calls.dylan",
+        "ide_rope.dylan",
+        "ide_helpers.dylan",
+        "ide_syntax.dylan",
+        "nod-ide.dylan",
+    ]
+    .iter()
+    .map(|name| fixtures_dir.join(name))
+    .collect();
 
-    let (dir, exe_path) = build_exe("nod-ide-save-recent", source);
+    let (dir, exe_path) =
+        build_exe_from_fixtures("nod-ide-save-recent", &fixture_paths);
 
     let scratch_root = PathBuf::from(r"F:\scratch");
     if !scratch_root.is_dir() {
