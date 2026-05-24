@@ -34,18 +34,27 @@ enum Command {
         /// Path to a `.dylan` file or a `.lid` library manifest.
         input: Option<PathBuf>,
     },
-    /// Sprint 39a — compile a Dylan source file to a standalone Windows
-    /// EXE. Pipeline: parse → expand → lower → codegen → AOT entry-stub
+    /// Sprint 39a — compile a Dylan source file (or, Sprint 44, set of
+    /// source files in the same module) to a standalone Windows EXE.
+    /// Pipeline: parse → expand → lower → codegen → AOT entry-stub
     /// injection → emit `.obj` → link against `nod_runtime.lib`.
     ///
-    /// Out of scope for Sprint 39a: `define c-function` declarations
-    /// (Sprint 39b lands Win32-import handling), stdlib pre-compilation
-    /// (Sprint 39c). Programs that use either feature will fail to
-    /// link with a missing-symbol error from `link.exe`.
+    /// **Multi-file (Sprint 44):** pass more than one positional path
+    /// to merge them into one build. Every input file's `Module:`
+    /// header must declare the same module name; cross-file collisions
+    /// (two files defining the same top-level function) are an error.
+    /// Files are lowered front-to-back, so later files can reference
+    /// classes/methods defined in earlier files. The default output
+    /// name is derived from the FIRST positional path.
+    ///
+    /// Out of scope: cross-module imports (waits for a real Dylan
+    /// library system — see DEFERRED.md).
     Build {
-        /// Path to a `.dylan` source file with a `define function main`.
-        input: PathBuf,
-        /// Output EXE path. Defaults to `<input stem>.exe`.
+        /// One or more `.dylan` source files. Exactly one of them must
+        /// contain `define function main` (the EXE entry point).
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// Output EXE path. Defaults to `<first input stem>.exe`.
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
         /// Print the chosen target triple, object path, and linker
@@ -109,9 +118,12 @@ fn main() -> ExitCode {
             eprintln!("nod-driver compile: not yet implemented (input: {target})");
             ExitCode::from(2)
         }
-        Some(Command::Build { input, output, verbose }) => {
-            let out = output.unwrap_or_else(|| default_exe_path(&input));
-            run_build(&input, &out, verbose)
+        Some(Command::Build { inputs, output, verbose }) => {
+            // Sprint 44 — multi-file builds. `clap`'s `required = true`
+            // on `Vec<PathBuf>` guarantees at least one input; the
+            // first drives the default output name.
+            let out = output.unwrap_or_else(|| default_exe_path(&inputs[0]));
+            run_build(&inputs, &out, verbose)
         }
         Some(Command::Repl) => {
             eprintln!("nod-driver repl: not yet implemented (see Sprint 08).");
@@ -223,13 +235,19 @@ fn locate_runtime_staticlib() -> Result<PathBuf, String> {
     ))
 }
 
-fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -> ExitCode {
+fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> ExitCode {
     use nod_llvm::LlvmContext as Context;
     use nod_llvm::OptimizationLevel;
 
-    // Step 1 — front-end pipeline. `compile_file_for_aot` ensures
-    // stdlib is loaded, parses, macro-expands, lowers.
-    let lm = match nod_sema::compile_file_for_aot(input) {
+    // Sprint 44 — multi-file front-end. For a single input the
+    // pipeline is identical to the Sprint 39 single-file path (the
+    // merge loop in `compile_files_for_aot` is a no-op for N=1);
+    // for N>1 the function checks that every file declares the same
+    // `Module:` header, lowers each in order, detects cross-file
+    // duplicate definitions, then merges everything into one
+    // `LoweredModule` before the stdlib is layered on.
+    let path_refs: Vec<&std::path::Path> = inputs.iter().map(|p| p.as_path()).collect();
+    let lm = match nod_sema::compile_files_for_aot(&path_refs) {
         Ok(lm) => lm,
         Err(e) => {
             eprintln!("nod build: {e}");
@@ -253,9 +271,13 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
         return ExitCode::from(1);
     }
 
-    // Step 2 — codegen.
+    // Step 2 — codegen. The LLVM module name is taken from the FIRST
+    // input file's stem (matches the default output-EXE naming). For
+    // a multi-file build this is purely a debug label — codegen
+    // emits one merged LLVM module containing every function across
+    // every input file.
     let ctx = Context::create();
-    let module_name = input
+    let module_name = inputs[0]
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("dylan-module");
@@ -333,7 +355,9 @@ fn run_build(input: &std::path::Path, output: &std::path::Path, verbose: bool) -
             "nod build: triple    = {}",
             nod_llvm::aot::default_triple_string()
         );
-        eprintln!("nod build: input    = {}", input.display());
+        for (i, p) in inputs.iter().enumerate() {
+            eprintln!("nod build: input[{i}] = {}", p.display());
+        }
         eprintln!("nod build: object   = {}", obj_path.display());
         eprintln!("nod build: runtime  = {}", runtime_lib.display());
         eprintln!("nod build: output   = {}", output.display());
