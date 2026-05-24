@@ -869,6 +869,12 @@ define function main () => ()
   // to the original column when a long → short → long walk crosses
   // a shorter intermediate line.
   let ideal-col = 0;
+  // Sprint 43e-8 — track Ctrl modifier state manually. WM_KEYDOWN
+  // for VK_CONTROL (17) sets this to 1; WM_KEYUP (msg 257) for
+  // VK_CONTROL clears it to 0. Avoids needing GetKeyState (which
+  // isn't currently in the Win32 projection for unknown reasons
+  // — investigate separately as a follow-up).
+  let ctrl-down = 0;
   // Sprint 41g — current-path is a captured cell (Sprint 24 auto cell
   // promotion: any `let`-bound name assigned inside the WNDPROC
   // closure becomes a cell). Same machinery that promoted source-text
@@ -1213,8 +1219,17 @@ define function main () => ()
                  else 0 end;
                end;
                0
+             elseif (msg = 257)  // WM_KEYUP — Sprint 43e-8 track Ctrl release
+               let vk = %lo-word(wparam);
+               if (vk = 17)        // VK_CONTROL
+                 ctrl-down := 0;
+               else 0 end;
+               0
              elseif (msg = 256)  // WM_KEYDOWN
                let vk = %lo-word(wparam);
+               if (vk = 17)        // Sprint 43e-8 — track Ctrl press
+                 ctrl-down := 1;
+               else 0 end;
                let v-max = if (client-height-px > viewport-height-px)
                              client-height-px - viewport-height-px
                            else 0 end;
@@ -1257,17 +1272,9 @@ define function main () => ()
                elseif (vk = 36)    // VK_HOME — Sprint 43e-3 / 43e-8
                  // Plain HOME → start of current line.
                  // Ctrl+HOME → start of buffer (offset 0).
-                 //
-                 // GetKeyState(17 = VK_CONTROL) returns a SHORT;
-                 // the high bit is set when the key is currently
-                 // pressed. Depending on whether the trampoline
-                 // sign- or zero-extends the SHORT, we see either
-                 // a negative value (sign-extended) or a value
-                 // >= 32768 (zero-extended). Test both — they're
-                 // pure comparisons, so the eager `|` is safe.
-                 let ks = GetKeyState(17);
-                 let ctrl? = (ks < 0) | (ks > 32767);
-                 let new-off = if (ctrl?) 0
+                 // Modifier state from the `ctrl-down` cell that
+                 // VK_CONTROL up/down events maintain.
+                 let new-off = if (ctrl-down = 1) 0
                                else scan-line-start(cached-flat, cursor-offset) end;
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
@@ -1278,9 +1285,7 @@ define function main () => ()
                elseif (vk = 35)    // VK_END — Sprint 43e-3 / 43e-8
                  // Plain END → end of current line.
                  // Ctrl+END → end of buffer (size(cached-flat)).
-                 let ks = GetKeyState(17);
-                 let ctrl? = (ks < 0) | (ks > 32767);
-                 let new-off = if (ctrl?) size(cached-flat)
+                 let new-off = if (ctrl-down = 1) size(cached-flat)
                                else scan-line-end(cached-flat, cursor-offset, size(cached-flat)) end;
                  if (new-off ~= cursor-offset)
                    cursor-offset := new-off;
