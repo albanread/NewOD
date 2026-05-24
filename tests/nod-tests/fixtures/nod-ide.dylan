@@ -852,6 +852,11 @@ define function main () => ()
   // caret + click-to-position; for now it tracks invisibly so we
   // can prove insert/delete plumbing works end-to-end.
   let cursor-offset = 0;
+  // Sprint 43e-6 — blinking cursor. SetTimer(500ms) toggles this
+  // cell on every WM_TIMER; WM_PAINT only draws the cursor bar
+  // when it's 1. Each cursor-mutating handler resets it to 1 so
+  // the cursor stays solid during active typing/movement.
+  let cursor-on = 1;
   // Sprint 41g — current-path is a captured cell (Sprint 24 auto cell
   // promotion: any `let`-bound name assigned inside the WNDPROC
   // closure becomes a cell). Same machinery that promoted source-text
@@ -926,6 +931,10 @@ define function main () => ()
   // buffer to the cursor. Sub-millisecond for typical files; rope-
   // aware line lookup is a follow-up if it ever matters.
   let ensure-cursor-visible = method (hwnd)
+    // Sprint 43e-6 — reset the blink phase. Any caller that moved
+    // the cursor wants it visibly solid for the next ~500 ms;
+    // otherwise the bar flickers mid-keystroke.
+    cursor-on := 1;
     let bytes = cached-flat;
     let cur = cursor-offset;
     let line-start = scan-line-start(bytes, cur);
@@ -1039,12 +1048,24 @@ define function main () => ()
                  let hy = packed / two-to-32;
                  let cx = pad - scroll-x-px + hx;
                  let cy = pad - scroll-y-px + hy;
-                 %d2d-fill-rectangle(dc, cx, cy, cx + 2, cy + line-height, brush);
+                 // Sprint 43e-6 — blink: only draw when cursor-on = 1.
+                 if (cursor-on = 1)
+                   %d2d-fill-rectangle(dc, cx, cy, cx + 2, cy + line-height, brush);
+                 else 0 end;
                  %d2d-end-draw(dc);
                  %com-release(brush);
                  %com-release(layout);
                  %dxgi-swap-chain-present(swap);
                else 0 end;
+               0
+             elseif (msg = 275)  // WM_TIMER — Sprint 43e-6 cursor blink
+               // We start a 500 ms timer at window-create time
+               // (SetTimer in main()). Each tick toggles cursor-on
+               // and invalidates the window so the next WM_PAINT
+               // either draws the cursor bar (cursor-on = 1) or
+               // skips it (cursor-on = 0).
+               cursor-on := if (cursor-on = 1) 0 else 1 end;
+               InvalidateRect(hwnd, 0, 0);
                0
              elseif (msg = 5)  // WM_SIZE
                if (swap ~= 0 & wparam ~= 1)
@@ -1370,6 +1391,7 @@ define function main () => ()
                      let new-rope = make-rope-from-string(new-source);
                      source-text := new-rope;
                      cursor-offset := 0;
+                     cursor-on := 1;
                      cached-flat := new-source;
                      current-path := new-path;
                      buffer-lines := nod-rope-line-count(new-rope);
@@ -1458,6 +1480,7 @@ define function main () => ()
                      let rope = make-rope-from-string(bytes);
                      source-text := rope;
                      cursor-offset := 0;
+                     cursor-on := 1;
                      cached-flat := bytes;
                      current-path := path;
                      buffer-lines := nod-rope-line-count(rope);
@@ -1508,5 +1531,11 @@ define function main () => ()
   update-title(hwnd, current-path);
   ShowWindow(hwnd, 5);
   UpdateWindow(hwnd);
+  // Sprint 43e-6 — start a 500 ms blink timer. WM_TIMER (msg 275)
+  // fires on this thread's message pump every ~500 ms; the
+  // handler toggles `cursor-on` and invalidates the window so the
+  // cursor bar appears / disappears between paints.
+  // Args: (hwnd, idEvent=1, uElapse=500ms, lpTimerFunc=NULL).
+  SetTimer(hwnd, 1, 500, 0);
   %run-message-loop();
 end function main;
