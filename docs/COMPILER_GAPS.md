@@ -84,8 +84,8 @@ Sort by ID. New gaps append. Don't renumber.
 * **Regression test**: `tests/nod-tests/tests/sema.rs::
   gap_002_define_constant_resolves_from_function_body`.
 * **Scope**: small. ~30 lines of sema.
-* **Status**: **fixed in SHA TBD** (this commit). `define variable`
-  is a separate, deeper gap — see GAP-004.
+* **Status**: **fixed in SHA `59e6f9f`**. `define variable` is a
+  separate, deeper gap — see GAP-004.
 
 ## GAP-004 — `define variable` not lowered
 
