@@ -69,7 +69,7 @@ Sort by ID. New gaps append. Don't renumber.
 * **Regression test**: `tests/nod-tests/tests/sema.rs::
   gap_001_string_stream_round_trips`.
 * **Scope**: small. ~70 lines of Dylan in stdlib.dylan.
-* **Status**: **fixed in SHA TBD** (this commit). The full stream
+* **Status**: **fixed in SHA `a689fcd`** (this commit). The full stream
   hierarchy (`<file-stream>`, `<input-stream>` for the parser, etc.)
   is its own future sprint when the IDE / Sprint 46+ parser need
   them.
