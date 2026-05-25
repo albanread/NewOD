@@ -42,6 +42,28 @@ pub struct Temporary {
     pub type_estimate: TypeEstimate,
 }
 
+/// Planned physical location of a GC root at a safepoint.
+///
+/// Sprint 45c introduces this as the first step away from the
+/// temp-identity-based safepoint contract. The active runtime path
+/// still uses `safepoint_roots: Vec<TempId>` plus spill/reload shims,
+/// but codegen planning and debug surfaces can now talk in terms of
+/// *where* a root will live rather than only *which temp* is live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafepointLocation {
+    /// Root lives in a compiler-owned frame slot.
+    FrameSlot(u32),
+    /// Root lives in a saved general-purpose register slot.
+    SavedRegister(u8),
+}
+
+/// One root and its planned location at a safepoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SafepointRootLocation {
+    pub temp: TempId,
+    pub location: SafepointLocation,
+}
+
 #[derive(Clone, Debug)]
 pub enum Computation {
     Const {

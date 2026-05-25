@@ -16,6 +16,7 @@ use llvm_sys::execution_engine::{
 use crate::symbols::{ModuleManifest, RelocKind};
 use crate::codegen::{
     CodegenOutput, FORMAT_OUT_SYMBOL, NOD_APPLY_SYMBOL, NOD_CARD_MARK_SYMBOL,
+    JIT_SAFEPOINT_METADATA_SYMBOL_PREFIX,
     NOD_COLLECTION_CONCATENATE_SYMBOL, NOD_COLLECTION_SIZE_SYMBOL, NOD_CONDITION_MESSAGE_SYMBOL,
     NOD_DISPATCH_BINARY_SYMBOL, NOD_DISPATCH_SYMBOL, NOD_DISPATCH_UNARY_SYMBOL, NOD_EMPTY_P_SYMBOL,
     NOD_FIP_ADVANCE_SYMBOL, NOD_FIP_CURRENT_ELEMENT_SYMBOL, NOD_FIP_FINISHED_P_SYMBOL,
@@ -26,6 +27,7 @@ use crate::codegen::{
     NOD_MAKE_STRETCHY_VECTOR_SYMBOL, NOD_MAKE_SYMBOL, NOD_NEXT_METHOD_SYMBOL, NOD_NIL_SYMBOL, NOD_PAIR_ALLOC_SYMBOL,
     NOD_PAIR_HEAD_SYMBOL, NOD_PAIR_TAIL_SYMBOL, NOD_POP_SEALED_CHAIN_SYMBOL,
     NOD_PUSH_SEALED_CHAIN_SYMBOL, NOD_RANGE_BY_SYMBOL, NOD_RANGE_FROM_SYMBOL, NOD_RANGE_TO_SYMBOL,
+    NOD_JIT_BEGIN_SAFEPOINT_SYMBOL, NOD_JIT_END_SAFEPOINT_SYMBOL,
     NOD_REGISTER_ROOT_SYMBOL, NOD_RUN_BLOCK_SYMBOL, NOD_SIGNAL_SYMBOL,
     NOD_SOV_ELEMENT_SETTER_SYMBOL, NOD_SOV_ELEMENT_SYMBOL, NOD_SOV_SIZE_SYMBOL,
     NOD_STRETCHY_VECTOR_ELEMENT_SETTER_SYMBOL, NOD_STRETCHY_VECTOR_ELEMENT_SYMBOL,
@@ -150,7 +152,13 @@ impl<'ctx> Jit<'ctx> {
     /// Verify the codegen'd module, install it into a fresh MCJIT engine,
     /// and finalize so symbols become callable.
     pub fn add_module(&mut self, output: CodegenOutput<'ctx>) -> Result<(), JitError> {
-        let CodegenOutput { module, manifest, .. } = output;
+        let CodegenOutput {
+            module,
+            manifest,
+            safepoint_namespace,
+            safepoint_installs,
+            ..
+        } = output;
         module.verify().map_err(|e| JitError::Verify(e.to_string()))?;
 
         // Sprint 38b — capture (GlobalValue, current-process address)
@@ -191,6 +199,8 @@ impl<'ctx> Jit<'ctx> {
         let dispatch_binary_fn = module.get_function(NOD_DISPATCH_BINARY_SYMBOL);
         let dispatch_variadic_fn = module.get_function(NOD_DISPATCH_SYMBOL);
         let card_mark_fn = module.get_function(NOD_CARD_MARK_SYMBOL);
+        let jit_begin_safepoint_fn = module.get_function(NOD_JIT_BEGIN_SAFEPOINT_SYMBOL);
+        let jit_end_safepoint_fn = module.get_function(NOD_JIT_END_SAFEPOINT_SYMBOL);
         let register_root_fn = module.get_function(NOD_REGISTER_ROOT_SYMBOL);
         let unregister_root_fn = module.get_function(NOD_UNREGISTER_ROOT_SYMBOL);
         let next_method_fn = module.get_function(NOD_NEXT_METHOD_SYMBOL);
@@ -791,6 +801,14 @@ impl<'ctx> Jit<'ctx> {
             // SAFETY: nod_card_mark is `extern "C" fn(u64)`.
             unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), addr) };
         }
+        if let Some(f) = jit_begin_safepoint_fn {
+            let addr = nod_runtime::nod_jit_begin_safepoint as *const () as *mut std::ffi::c_void;
+            unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), addr) };
+        }
+        if let Some(f) = jit_end_safepoint_fn {
+            let addr = nod_runtime::nod_jit_end_safepoint as *const () as *mut std::ffi::c_void;
+            unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), addr) };
+        }
         // Sprint 11b: precise-roots brackets every potentially-
         // allocating call. The runtime exposes the two C-ABI shims;
         // codegen declares them and we resolve them here.
@@ -940,6 +958,28 @@ impl<'ctx> Jit<'ctx> {
             unsafe { LLVMAddGlobalMapping(engine, global.as_value_ref(), *addr) };
         }
 
+        if !safepoint_installs.is_empty() {
+            nod_runtime::register_jit_safepoints(
+                safepoint_installs
+                    .into_iter()
+                    .map(|site| nod_runtime::JitSafepointEntry {
+                        namespace: safepoint_namespace,
+                        site_id: site.site_id,
+                        slots: site
+                            .roots
+                            .into_iter()
+                            .map(|root| match root.location {
+                                nod_dfm::SafepointLocation::FrameSlot(slot_idx) => slot_idx,
+                                nod_dfm::SafepointLocation::SavedRegister(_) => {
+                                    panic!("JIT precise safepoints do not yet support saved-register roots")
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            );
+        }
+
         self.engines.push(engine);
         Ok(())
     }
@@ -1014,6 +1054,7 @@ impl<'ctx> Jit<'ctx> {
         // resolver as `add_module` by collecting `(name, addr)` pairs
         // and re-walking after MCJIT engine creation.
         let standard_externs = standard_extern_addresses();
+        let embedded_jit_safepoints = collect_embedded_jit_safepoints(&module);
         let mut standard_bindings: Vec<(inkwell::values::FunctionValue<'ctx>, *mut std::ffi::c_void)> =
             Vec::new();
         for (name, addr) in &standard_externs {
@@ -1091,6 +1132,9 @@ impl<'ctx> Jit<'ctx> {
         for (f, addr) in &cross_module_externs {
             unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), *addr) };
         }
+        if !embedded_jit_safepoints.is_empty() {
+            nod_runtime::register_jit_safepoints(embedded_jit_safepoints);
+        }
 
         self.engines.push(engine);
         Ok(())
@@ -1128,6 +1172,51 @@ pub fn bitcode_to_ir_text(bitcode: &[u8]) -> Result<String, JitError> {
     let module = inkwell::module::Module::parse_bitcode_from_buffer(&buffer, &ctx)
         .map_err(|e| JitError::Verify(e.to_string()))?;
     Ok(module.print_to_string().to_string())
+}
+
+fn parse_jit_safepoint_metadata_symbol(name: &str) -> Option<nod_runtime::JitSafepointEntry> {
+    let payload = name.strip_prefix(JIT_SAFEPOINT_METADATA_SYMBOL_PREFIX)?;
+    let mut parts = payload.split("__");
+    let namespace_hex = parts.next()?;
+    let site_id_text = parts.next()?;
+    let slots_text = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let namespace = u64::from_str_radix(namespace_hex, 16).ok()?;
+    let site_id = site_id_text.parse().ok()?;
+    let slots = if slots_text == "none" {
+        Vec::new()
+    } else {
+        let mut out = Vec::new();
+        for slot in slots_text.split('_') {
+            if slot.starts_with('r') {
+                return None;
+            }
+            out.push(slot.parse().ok()?);
+        }
+        out
+    };
+    Some(nod_runtime::JitSafepointEntry {
+        namespace,
+        site_id,
+        slots,
+    })
+}
+
+fn collect_embedded_jit_safepoints<'ctx>(
+    module: &inkwell::module::Module<'ctx>,
+) -> Vec<nod_runtime::JitSafepointEntry> {
+    let mut out = Vec::new();
+    let mut maybe = module.get_first_global();
+    while let Some(global) = maybe {
+        let name = global.get_name().to_string_lossy().into_owned();
+        if let Some(entry) = parse_jit_safepoint_metadata_symbol(&name) {
+            out.push(entry);
+        }
+        maybe = global.get_next_global();
+    }
+    out
 }
 
 /// Sprint 38 — compute the current-process address for one
@@ -1267,6 +1356,8 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_DISPATCH_BINARY_SYMBOL, nod_runtime::nod_dispatch_binary as *const () as *mut std::ffi::c_void),
         (NOD_DISPATCH_SYMBOL, nod_runtime::nod_dispatch as *const () as *mut std::ffi::c_void),
         (NOD_CARD_MARK_SYMBOL, nod_runtime::nod_card_mark as *const () as *mut std::ffi::c_void),
+        (NOD_JIT_BEGIN_SAFEPOINT_SYMBOL, nod_runtime::nod_jit_begin_safepoint as *const () as *mut std::ffi::c_void),
+        (NOD_JIT_END_SAFEPOINT_SYMBOL, nod_runtime::nod_jit_end_safepoint as *const () as *mut std::ffi::c_void),
         (NOD_REGISTER_ROOT_SYMBOL, nod_runtime::nod_register_root as *const () as *mut std::ffi::c_void),
         (NOD_UNREGISTER_ROOT_SYMBOL, nod_runtime::nod_unregister_root as *const () as *mut std::ffi::c_void),
         (NOD_NEXT_METHOD_SYMBOL, nod_runtime::nod_next_method as *const () as *mut std::ffi::c_void),
@@ -1394,4 +1485,21 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         // / recent-files / basename shims — those are pure Dylan now.
     ]);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_embedded_jit_safepoint_metadata_symbols() {
+        let entry = parse_jit_safepoint_metadata_symbol(
+            "nod_jit_safepoint__00000000000000ff__7__0_3_5",
+        )
+        .expect("symbol should parse");
+
+        assert_eq!(entry.namespace, 0xff);
+        assert_eq!(entry.site_id, 7);
+        assert_eq!(entry.slots, vec![0, 3, 5]);
+    }
 }

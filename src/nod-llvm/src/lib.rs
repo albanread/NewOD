@@ -24,7 +24,10 @@ pub use cache::{
     record_miss, reset_stats, target_triple, write_cache_entry, write_cache_entry_with_manifest,
 };
 pub use codegen::{
-    CodegenError, CodegenOutput, FunctionMap, codegen_module, codegen_module_with_key,
+    CodeInstallSurface, CodegenError, CodegenOutput, FunctionMap, InstalledTextRegion,
+    InstalledTextRegionKind, SafepointInstallRecord, SafepointKind, SafepointPlan,
+    codegen_module, codegen_module_for_surface, codegen_module_with_key,
+    codegen_module_with_key_for_surface, plan_safepoints,
 };
 pub use jit::{Jit, JitError, bitcode_to_ir_text};
 

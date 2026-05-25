@@ -16,10 +16,11 @@ mod ir;
 mod liveness;
 mod verify;
 
+pub use nod_reader::{FileId, Span};
 pub use format::{format_dfm, format_dfm_module, format_for_cache_key};
 pub use ir::{
     Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp, SlotTypeKind,
-    Temporary, TempId, Terminator, TypeEstimate,
+    SafepointLocation, SafepointRootLocation, Temporary, TempId, Terminator, TypeEstimate,
 };
 pub use liveness::{SafepointError, populate_safepoint_roots, verify_safepoint_roots};
 pub use verify::{VerifyError, verify};

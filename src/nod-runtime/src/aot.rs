@@ -192,6 +192,273 @@ pub unsafe extern "C" fn nod_aot_set_generic(
     unsafe { *slot = *v };
 }
 
+/// Sprint 45c — one image-installed safepoint descriptor baked into an
+/// AOT-built EXE's private data section. Emitted by `nod-llvm::aot` and
+/// consumed at process startup by [`nod_aot_register_safepoints`].
+///
+/// This is intentionally pre-PC: the current AOT path carries stable
+/// codegen-owned site anchors and install-surface identity, but not yet
+/// the final relocated instruction address. Registering the descriptor
+/// here gives the runtime a canonical, executable-path-visible snapshot
+/// of the compiler's image safepoint plan before true PC-keyed stack-map
+/// installation lands.
+#[repr(C)]
+pub struct AotSafepointEntry {
+    pub site_id: u64,
+    pub kind_tag: u8,
+    pub computation_index: u64,
+    pub root_count: u64,
+    pub section_label_ptr: *const u8,
+    pub section_label_len: usize,
+    pub patchpoint_label_ptr: *const u8,
+    pub patchpoint_label_len: usize,
+    pub function_ptr: *const u8,
+    pub function_len: usize,
+    pub block_label_ptr: *const u8,
+    pub block_label_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegisteredAotSafepoint {
+    site_id: u64,
+    kind_tag: u8,
+    computation_index: u64,
+    root_count: u64,
+    section_label: String,
+    patchpoint_label: String,
+    function: String,
+    block_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveAotSafepoint {
+    site_id: u64,
+    expected_root_count: usize,
+    baseline_root_count: usize,
+}
+
+fn aot_safepoint_registry(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<u64, RegisteredAotSafepoint>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<u64, RegisteredAotSafepoint>>,
+    > =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+thread_local! {
+    static ACTIVE_AOT_SAFEPOINTS: std::cell::RefCell<Vec<ActiveAotSafepoint>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn decode_utf8_bytes(ptr: *const u8, len: usize) -> String {
+    if len == 0 {
+        return String::new();
+    }
+    // SAFETY: callers only pass UTF-8 byte slices baked by codegen.
+    unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }.to_string()
+}
+
+fn replace_registered_aot_safepoints(entries: &[AotSafepointEntry]) {
+    let mut decoded = std::collections::BTreeMap::new();
+    for entry in entries {
+        let site = RegisteredAotSafepoint {
+            site_id: entry.site_id,
+            kind_tag: entry.kind_tag,
+            computation_index: entry.computation_index,
+            root_count: entry.root_count,
+            section_label: decode_utf8_bytes(entry.section_label_ptr, entry.section_label_len),
+            patchpoint_label: decode_utf8_bytes(
+                entry.patchpoint_label_ptr,
+                entry.patchpoint_label_len,
+            ),
+            function: decode_utf8_bytes(entry.function_ptr, entry.function_len),
+            block_label: decode_utf8_bytes(entry.block_label_ptr, entry.block_label_len),
+        };
+        let old = decoded.insert(site.site_id, site);
+        assert!(old.is_none(), "duplicate AOT safepoint site id {}", entry.site_id);
+    }
+    *aot_safepoint_registry().lock().expect("aot safepoint registry poisoned") = decoded;
+}
+
+fn find_registered_aot_safepoint(site_id: u64) -> RegisteredAotSafepoint {
+    aot_safepoint_registry()
+        .lock()
+        .expect("aot safepoint registry poisoned")
+        .get(&site_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("unknown AOT safepoint site {site_id}"))
+}
+
+fn trace_exec_safepoints_enabled() -> bool {
+    std::env::var_os("NOD_AOT_TRACE_EXEC_SAFEPOINTS").is_some()
+}
+
+fn active_safepoint_top() -> ActiveAotSafepoint {
+    ACTIVE_AOT_SAFEPOINTS.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .cloned()
+            .expect("AOT safepoint stack empty")
+    })
+}
+
+fn with_active_safepoint_mut<F>(f: F)
+where
+    F: FnOnce(&mut Vec<ActiveAotSafepoint>),
+{
+    ACTIVE_AOT_SAFEPOINTS.with(|stack| f(&mut stack.borrow_mut()));
+}
+
+#[cfg(test)]
+fn registered_aot_safepoint_count() -> usize {
+    aot_safepoint_registry()
+        .lock()
+        .expect("aot safepoint registry poisoned")
+        .len()
+}
+
+#[cfg(test)]
+fn reset_aot_safepoints_for_tests() {
+    aot_safepoint_registry()
+        .lock()
+        .expect("aot safepoint registry poisoned")
+        .clear();
+    ACTIVE_AOT_SAFEPOINTS.with(|stack| stack.borrow_mut().clear());
+}
+
+/// Sprint 45c — ingest the codegen-emitted AOT safepoint table at EXE
+/// startup so the image path has a real runtime consumer for the
+/// installed-site descriptors.
+///
+/// The current consumer is intentionally small: it snapshots the image
+/// safepoint descriptors into a process-local registry for later runtime
+/// metadata wiring, and optionally traces the count to stderr when
+/// `NOD_AOT_TRACE_SAFEPOINTS` is set. That makes the hook observable in a
+/// real built EXE today while keeping the future PC-keyed integration
+/// local to this runtime surface.
+///
+/// # Safety
+///
+/// `entries` + `count` must describe a valid contiguous array of
+/// [`AotSafepointEntry`]. Every `(ptr, len)` pair inside each entry must
+/// describe a valid UTF-8 byte slice for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_register_safepoints(
+    entries: *const AotSafepointEntry,
+    count: usize,
+) {
+    let slice = if count == 0 {
+        &[]
+    } else {
+        // SAFETY: caller guarantees `entries` points to `count` valid rows.
+        unsafe { std::slice::from_raw_parts(entries, count) }
+    };
+    replace_registered_aot_safepoints(slice);
+    if std::env::var_os("NOD_AOT_TRACE_SAFEPOINTS").is_some() {
+        eprintln!("nod-aot: registered {} image safepoints", count);
+    }
+}
+
+fn begin_aot_safepoint(site_id: u64, expected_root_count: u64) {
+    let registered = find_registered_aot_safepoint(site_id);
+    let expected_root_count = usize::try_from(expected_root_count)
+        .unwrap_or_else(|_| panic!("AOT safepoint {site_id} root count does not fit usize"));
+    assert_eq!(
+        registered.root_count as usize,
+        expected_root_count,
+        "AOT safepoint {} ({}) expected {} roots but codegen emitted {}",
+        site_id,
+        registered.patchpoint_label,
+        registered.root_count,
+        expected_root_count
+    );
+    let baseline_root_count = crate::heap::root_count();
+    with_active_safepoint_mut(|stack| {
+        stack.push(ActiveAotSafepoint {
+            site_id,
+            expected_root_count,
+            baseline_root_count,
+        });
+    });
+    if trace_exec_safepoints_enabled() {
+        eprintln!(
+            "nod-aot: begin safepoint site {} roots {} baseline {}",
+            site_id, expected_root_count, baseline_root_count
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nod_aot_begin_safepoint(site_id: u64, expected_root_count: u64) {
+    begin_aot_safepoint(site_id, expected_root_count);
+}
+
+fn verify_aot_safepoint(site_id: u64) {
+    let active = active_safepoint_top();
+    assert_eq!(
+        active.site_id, site_id,
+        "AOT safepoint stack mismatch: top site {} but verify requested {}",
+        active.site_id, site_id
+    );
+    let current_root_count = crate::heap::root_count();
+    let expected_root_count = active.baseline_root_count + active.expected_root_count;
+    assert_eq!(
+        current_root_count, expected_root_count,
+        "AOT safepoint {} registered {} roots; expected {} (baseline {}, patchpoint {})",
+        site_id,
+        current_root_count.saturating_sub(active.baseline_root_count),
+        active.expected_root_count,
+        active.baseline_root_count,
+        find_registered_aot_safepoint(site_id).patchpoint_label
+    );
+    if trace_exec_safepoints_enabled() {
+        eprintln!(
+            "nod-aot: verified safepoint site {} roots {} current {}",
+            site_id, active.expected_root_count, current_root_count
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nod_aot_verify_safepoint(site_id: u64) {
+    verify_aot_safepoint(site_id);
+}
+
+fn end_aot_safepoint(site_id: u64) {
+    let active = active_safepoint_top();
+    assert_eq!(
+        active.site_id, site_id,
+        "AOT safepoint stack mismatch: top site {} but end requested {}",
+        active.site_id, site_id
+    );
+    let current_root_count = crate::heap::root_count();
+    assert_eq!(
+        current_root_count, active.baseline_root_count,
+        "AOT safepoint {} leaked roots: current {} baseline {} (patchpoint {})",
+        site_id,
+        current_root_count,
+        active.baseline_root_count,
+        find_registered_aot_safepoint(site_id).patchpoint_label
+    );
+    with_active_safepoint_mut(|stack| {
+        let popped = stack.pop().expect("AOT safepoint stack empty");
+        assert_eq!(popped.site_id, site_id, "AOT safepoint stack corrupted");
+    });
+    if trace_exec_safepoints_enabled() {
+        eprintln!(
+            "nod-aot: end safepoint site {} baseline {}",
+            site_id, active.baseline_root_count
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nod_aot_end_safepoint(site_id: u64) {
+    end_aot_safepoint(site_id);
+}
+
 // ─── Sprint 39c — startup registration helpers ───────────────────────────────
 //
 // In the JIT path, the post-codegen glue in `nod-sema` resolves
@@ -840,6 +1107,23 @@ pub extern "C-unwind" fn nod_aot_main_wrapper() -> i32 {
 mod tests {
     use super::*;
 
+    fn test_safepoint_entry(site_id: u64, label: &'static [u8]) -> AotSafepointEntry {
+        AotSafepointEntry {
+            site_id,
+            kind_tag: 1,
+            computation_index: 3,
+            root_count: 2,
+            section_label_ptr: b"image.code.text".as_ptr(),
+            section_label_len: b"image.code.text".len(),
+            patchpoint_label_ptr: b"gc.s7".as_ptr(),
+            patchpoint_label_len: b"gc.s7".len(),
+            function_ptr: b"main".as_ptr(),
+            function_len: b"main".len(),
+            block_label_ptr: label.as_ptr(),
+            block_label_len: label.len(),
+        }
+    }
+
     /// Double-call must be a no-op. The `LazyLock` guard collapses
     /// repeat calls to an atomic load; the individual `ensure_*`
     /// helpers each have their own idempotency story (covered by their
@@ -865,5 +1149,64 @@ mod tests {
     fn nod_aot_main_wrapper_returns_zero_via_stub() {
         let rc = nod_aot_main_wrapper();
         assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn nod_aot_register_safepoints_replaces_runtime_registry() {
+        reset_aot_safepoints_for_tests();
+        let entries = [test_safepoint_entry(7, b"entry"), test_safepoint_entry(8, b"dispatch")];
+
+        // SAFETY: `entries` is a live contiguous array for the call.
+        unsafe {
+            nod_aot_register_safepoints(entries.as_ptr(), entries.len());
+        }
+
+        assert_eq!(registered_aot_safepoint_count(), 2);
+
+        let replacement = [test_safepoint_entry(7, b"replacement")];
+        // SAFETY: `replacement` is a live contiguous array for the call.
+        unsafe {
+            nod_aot_register_safepoints(replacement.as_ptr(), replacement.len());
+        }
+
+        assert_eq!(registered_aot_safepoint_count(), 1);
+    }
+
+    #[test]
+    fn aot_exec_safepoint_hooks_verify_root_protocol() {
+        reset_aot_safepoints_for_tests();
+        let entries = [test_safepoint_entry(7, b"entry")];
+        unsafe {
+            nod_aot_register_safepoints(entries.as_ptr(), entries.len());
+        }
+
+        let root_a = crate::Word::from_raw(0);
+        let root_b = crate::Word::from_raw(0);
+
+        begin_aot_safepoint(7, 2);
+        crate::heap::register_root(&root_a);
+        crate::heap::register_root(&root_b);
+        verify_aot_safepoint(7);
+        crate::heap::unregister_root(&root_b);
+        crate::heap::unregister_root(&root_a);
+        end_aot_safepoint(7);
+
+        assert_eq!(crate::heap::root_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 2")]
+    fn aot_exec_safepoint_hooks_detect_missing_root() {
+        reset_aot_safepoints_for_tests();
+        let entries = [test_safepoint_entry(7, b"entry")];
+        unsafe {
+            nod_aot_register_safepoints(entries.as_ptr(), entries.len());
+        }
+
+        let root_a = crate::Word::from_raw(0);
+
+        begin_aot_safepoint(7, 2);
+        crate::heap::register_root(&root_a);
+        verify_aot_safepoint(7);
     }
 }

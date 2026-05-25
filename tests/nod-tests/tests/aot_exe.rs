@@ -74,6 +74,14 @@ fn make_temp_dir(test_name: &str) -> PathBuf {
 /// invokes `cargo run --bin nod-driver -- build ...`, spawns the resulting
 /// EXE, returns (stdout, stderr, exit_code).
 fn build_and_run(test_name: &str, source: &str) -> (String, String, i32) {
+    build_and_run_with_env(test_name, source, &[])
+}
+
+fn build_and_run_with_env(
+    test_name: &str,
+    source: &str,
+    envs: &[(&str, &str)],
+) -> (String, String, i32) {
     let dir = make_temp_dir(test_name);
     let src_path = dir.join("input.dylan");
     let exe_path = dir.join("output.exe");
@@ -125,7 +133,11 @@ fn build_and_run(test_name: &str, source: &str) -> (String, String, i32) {
     // from the cargo runtime. We do NOT set `current_dir` — the EXE
     // doesn't read any files, only writes stdout — so the working
     // directory is whatever cargo passed us; that's fine.
-    let exe = Command::new(&exe_path).output().expect("spawn user EXE");
+    let mut exe_cmd = Command::new(&exe_path);
+    for (key, value) in envs {
+        exe_cmd.env(key, value);
+    }
+    let exe = exe_cmd.output().expect("spawn user EXE");
     let stdout = String::from_utf8_lossy(&exe.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&exe.stderr).into_owned();
     let code = exe.status.code().unwrap_or(-1);
@@ -203,4 +215,59 @@ fn aot_dispatch() {
     let (stdout, stderr, code) = build_and_run("dispatch", source);
     assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
     assert_eq!(stdout, "6\n", "stdout mismatch; stderr=\n{stderr}");
+}
+
+/// Sprint 45c: prove the image safepoint table is consumed on the real
+/// AOT execution path. The EXE is built through `nod-driver build`, then
+/// run with `NOD_AOT_TRACE_SAFEPOINTS=1`; the runtime registration shim
+/// emits a trace line on stderr when the codegen-baked safepoint table is
+/// registered during startup, before Dylan `main` runs.
+#[test]
+#[ignore]
+#[serial]
+fn aot_startup_registers_image_safepoints() {
+    let source = "Module: traced\n\n\
+        define function alloc-a (x) => (y)\n  \
+            x;\n\
+        end function alloc-a;\n\
+        define function main () => ()\n  \
+            alloc-a(41);\n\
+            format-out(\"startup-ok\\n\");\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run_with_env(
+        "trace-safepoints",
+        source,
+        &[
+            ("NOD_AOT_TRACE_SAFEPOINTS", "1"),
+            ("NOD_AOT_TRACE_EXEC_SAFEPOINTS", "1"),
+        ],
+    );
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "startup-ok\n", "stdout mismatch; stderr=\n{stderr}");
+    let trace_line = stderr
+        .lines()
+        .find(|line| line.starts_with("nod-aot: registered "))
+        .unwrap_or_else(|| panic!("missing safepoint registration trace; stderr=\n{stderr}"));
+    let count_text = trace_line
+        .strip_prefix("nod-aot: registered ")
+        .and_then(|rest| rest.strip_suffix(" image safepoints"))
+        .unwrap_or_else(|| panic!("malformed safepoint registration trace: {trace_line}"));
+    let count: usize = count_text
+        .parse()
+        .unwrap_or_else(|_| panic!("non-numeric safepoint registration trace count: {trace_line}"));
+    assert!(count > 0, "expected positive safepoint count; trace={trace_line}");
+    assert!(
+        stderr.lines().any(|line| line.starts_with("nod-aot: begin safepoint site ")),
+        "missing executed safepoint begin trace; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("nod-aot: verified safepoint site ")),
+        "missing executed safepoint verify trace; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line.starts_with("nod-aot: end safepoint site ")),
+        "missing executed safepoint end trace; stderr=\n{stderr}"
+    );
 }

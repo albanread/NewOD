@@ -296,7 +296,12 @@ fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> Exi
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("dylan-module");
-    let out = match nod_llvm::codegen_module(&ctx, &lm.functions, module_name) {
+    let out = match nod_llvm::codegen_module_for_surface(
+        &ctx,
+        &lm.functions,
+        module_name,
+        nod_llvm::CodeInstallSurface::Image,
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("nod build: codegen: {e}");
@@ -305,6 +310,7 @@ fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> Exi
     };
     let module = out.module;
     let manifest = out.manifest;
+    let safepoint_installs = out.safepoint_installs;
 
     // Step 3 — AOT entry-stub injection + object-file emission.
     // We co-locate the `.obj` next to the output EXE so the file system
@@ -334,10 +340,11 @@ fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> Exi
     // generic method) resolve at AOT runtime.
     let registrations = nod_sema::build_aot_registrations(&lm);
 
-    if let Err(e) = nod_llvm::aot::emit_aot_object_with_registrations(
+    if let Err(e) = nod_llvm::aot::emit_aot_object_with_registrations_and_safepoints(
         &module,
         &manifest,
         &registrations,
+        &safepoint_installs,
         &obj_path,
         OptimizationLevel::Default,
     ) {

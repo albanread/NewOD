@@ -111,6 +111,20 @@ to-write. Headline arc:
   real lexing lands in 45b. New `nod-driver dump-dylan-tokens
   <path>` subcommand AOT-compiles the embedded lexer source and
   prints the dump.
+- **45c – e (planned)**: Windows-first GC hardening. 45c defines a
+  PC-keyed safepoint-map contract for JIT/AOT code using the existing
+  `nod-runtime/src/stack_map.rs` runtime shape, plus a debug dump of
+  emitted safepoint records. 45d teaches the Windows runtime/GC to
+  consult those maps when scanning JIT frames, reusing the existing
+  SEH registration already wired in `nod-llvm/src/jit_mm.rs`. 45e
+  removes the spill/register_root safepoint shim from ordinary JIT
+  callsites and adds loop/back-edge safepoint polls.
+- **45f – g (planned)**: dispatch-cache performance follow-through.
+  45f grows the current monomorphic `CacheSlot` into a bounded PIC
+  state machine (cold → mono → poly cap 3 → megamorphic shared),
+  keeping `nod_dispatch` as the semantic oracle. 45g is stabilization:
+  counters, regression expansion, IDE-shell/callback stress coverage,
+  and doc rewrites across `DEFERRED.md`, `GC.md`, and this file.
 
 Sprint 38c is the last entry with a long-form retro below. Sprints
 38d through 43c are best understood from the commit log and the

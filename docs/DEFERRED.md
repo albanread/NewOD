@@ -417,6 +417,14 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   site, (b) lift NCL's stack-map decoder, (c) add the safepoint-poll
   lowering pass to `nod-llvm::codegen`. Until then, the JIT-side
   parking story is "the GC only runs at Rust-side allocation sites".
+  **2026-05 Windows-first replan:** the immediate landing is no
+  longer blocked on the full LLVM intrinsic story. Sprint 45c defines
+  a Windows x64 PC-keyed safepoint-map contract using the dormant
+  `nod-runtime/src/stack_map.rs` shape; Sprint 45d wires GC
+  consumption of those maps for JIT/AOT on Windows; Sprint 45e retires
+  the spill/register_root shim from hot call paths. Full
+  `llvm.experimental.gc.statepoint` adoption remains desirable later,
+  but precise roots are no longer deferred on that single mechanism.
 - **:open: JIT safepoint poll emission** — Sprint 11 → Sprint 11b.
   Same root cause. Today's codegen emits plain `call`s; the brief's
   option (b) lets us defer the poll-and-park machinery. Concretely
@@ -424,6 +432,8 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   allocating never yields to the collector — but Sprint 11's stress
   test (Rust-side allocation loop) already exercises the path the
   Sprint 12+ Dylan-side loops will reach via primops that allocate.
+  **Current pickup:** loop/back-edge polls are folded into Sprint 45e
+  after the Windows-first safepoint-map runtime path is in place.
 - **:open: Multi-threaded mutator + per-thread TLABs** — Sprint 11 →
   Sprint 11b / 28. The `Heap` is mutex-guarded; allocation is single-
   threaded in practice. NCL's `mutator.rs` (TLAB design + cooperative
@@ -725,7 +735,13 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
   these with a single LLVM intrinsic at the safe point, and the
   collector decodes the stack map. The stack-map decoder is already
   lifted (`nod-runtime/src/stack_map.rs`); the compiler-side emission
-  is the remaining work.
+  is the remaining work. **Current plan:** treat this as a staged
+  Windows-first hardening arc instead of a monolithic "wait for full
+  statepoint" item. Sprint 45c defines the PC-and-location contract,
+  Sprint 45d wires Windows GC consumption, and Sprint 45e removes the
+  per-call register_root shim from ordinary JIT callsites. Cross-
+  platform unwind support and full LLVM intrinsic adoption stay
+  deferred beyond that first landing.
 - **:open: Single-threaded thread-confinement assertion deferred to
   Sprint 28** — Sprint 11c → Sprint 28. The brief asked for a
   `OnceLock<ThreadId>` debug-assert capturing the first runtime-init
@@ -768,12 +784,14 @@ Format per entry: `:status: title — owner-sprint → unblock-sprint. brief.`
 ### Opened by Sprint 13 (still deferred)
 
 - **:open: Polymorphic inline caches (PIC) for 2–4 receivers** —
-  Sprint 13 → Sprint 18+. The cache slot holds ONE receiver class.
+  Sprint 13 → Sprint 45f. The cache slot holds ONE receiver class.
   Calls that flip between 2–3 receiver classes hit the slow path
   every time. A polymorphic cache with a small bounded array (the
-  Self / Smalltalk / V8 design) is the right next step once the
-  Sprint 16 Richards subset is up; the cache-slot struct can grow
-  without breaking the IR shape.
+  Self / Smalltalk / V8 design) is the right next step. The 2026-05
+  plan is a bounded Windows-first state machine: cold → mono → poly
+  (cap 3) → megamorphic-shared. The cache-slot struct can grow
+  without breaking the IR shape, and the slow path remains
+  `nod_dispatch`-authoritative.
 - **:closed: Sealed-direct call lowering** — Sprint 13 → Sprint 15
   (landed). The Sprint 15 dispatch resolver rewrites
   `Computation::Dispatch` to `Computation::DirectCall` (single

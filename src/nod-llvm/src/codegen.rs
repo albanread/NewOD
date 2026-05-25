@@ -59,8 +59,8 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, GlobalValue, PhiValue,
 };
 use nod_dfm::{
-    BlockId, ClassCheck, Computation, ConstValue, Function as DfmFunction, PrimOp, SlotTypeKind,
-    TempId, Terminator, TypeEstimate,
+    BlockId, ClassCheck, Computation, ConstValue, Function as DfmFunction, PrimOp,
+    SafepointLocation, SafepointRootLocation, SlotTypeKind, TempId, Terminator, TypeEstimate,
 };
 use nod_runtime::ClassId;
 
@@ -93,6 +93,21 @@ pub const NOD_CARD_MARK_SYMBOL: &str = "nod_card_mark";
 pub const NOD_REGISTER_ROOT_SYMBOL: &str = "nod_register_root";
 /// Sprint 11b: companion to `NOD_REGISTER_ROOT_SYMBOL`.
 pub const NOD_UNREGISTER_ROOT_SYMBOL: &str = "nod_unregister_root";
+/// Sprint 45d: JIT runtime hook that marks one active safepoint frame
+/// so the collector can consume the codegen-emitted callsite map.
+pub const NOD_JIT_BEGIN_SAFEPOINT_SYMBOL: &str = "nod_jit_begin_safepoint";
+/// Sprint 45d: companion to `NOD_JIT_BEGIN_SAFEPOINT_SYMBOL`.
+pub const NOD_JIT_END_SAFEPOINT_SYMBOL: &str = "nod_jit_end_safepoint";
+/// Sprint 45c: image-only runtime hook that records the pre-safepoint
+/// root-stack baseline and checks the executing site against the
+/// registered AOT safepoint table.
+pub const NOD_AOT_BEGIN_SAFEPOINT_SYMBOL: &str = "nod_aot_begin_safepoint";
+/// Sprint 45c: image-only runtime hook that verifies the current root
+/// stack matches the static safepoint plan after registration.
+pub const NOD_AOT_VERIFY_SAFEPOINT_SYMBOL: &str = "nod_aot_verify_safepoint";
+/// Sprint 45c: image-only runtime hook that verifies safepoint cleanup
+/// restored the pre-call root-stack baseline.
+pub const NOD_AOT_END_SAFEPOINT_SYMBOL: &str = "nod_aot_end_safepoint";
 
 /// Sprint 14: invoke the next-most-specific applicable method on the
 /// current dispatch chain, forwarding the current method's args
@@ -585,6 +600,8 @@ pub type FunctionMap<'ctx> = HashMap<String, FunctionValue<'ctx>>;
 pub(crate) struct ModuleCodegenCtx {
     pub key: CacheKey,
     pub manifest: RefCell<ModuleManifest>,
+    safepoint_sites: RefCell<Vec<EmittedSafepointSite>>,
+    install_surface: SafepointInstallSurface,
     /// Sprint 38c — per-module content-keyed dedup table for string
     /// literals. The first time a given UTF-8 text is referenced, we
     /// assign it the next sequential index (used to namespace its
@@ -603,7 +620,7 @@ pub(crate) struct ModuleCodegenCtx {
     pub stub_entry_idx: RefCell<HashMap<(String, String), u32>>,
     /// Sprint 38e — per-module dedup record for inline-cache dispatch
     /// slots. Keyed by `site_id` (the codegen's stable per-MODULE
-    /// counter in `next_dispatch_site_id` below); the value is unit
+    /// counter in `next_safepoint_site_id` below); the value is unit
     /// because the external global's name already encodes the site_id
     /// directly (`@nod_cache_slot__<key>__<site_id>`). The set tracks
     /// which site_ids have already had their external global declared
@@ -618,8 +635,8 @@ pub(crate) struct ModuleCodegenCtx {
     /// identity (`@nod_generic__<key>__<sanitised-name>`); the set
     /// tracks first-seen.
     pub generic_function_seen: RefCell<HashSet<String>>,
-    /// Sprint 38e — module-wide monotonic counter for inline-cache
-    /// dispatch site IDs.
+    /// Sprint 38e / 45c — module-wide monotonic counter for
+    /// call-shaped safepoint site IDs.
     ///
     /// **Pre-Sprint-38e this counter lived per-function** (an `Emit`
     /// field), which was fine because the cache slot's address was
@@ -642,28 +659,31 @@ pub(crate) struct ModuleCodegenCtx {
     /// that no two sites share a `CacheSlot`. Cross-module collisions
     /// are already prevented by the per-module `<key>` prefix in the
     /// symbol name.
-    pub next_dispatch_site_id: RefCell<u64>,
+    pub next_safepoint_site_id: RefCell<u64>,
 }
 
 impl ModuleCodegenCtx {
-    fn new(key: CacheKey) -> Self {
+    fn new(key: CacheKey, install_surface: SafepointInstallSurface) -> Self {
         Self {
             key,
             manifest: RefCell::new(ModuleManifest::new(key)),
+            safepoint_sites: RefCell::new(Vec::new()),
+            install_surface,
             string_lit_idx: RefCell::new(HashMap::new()),
             symbol_lit_idx: RefCell::new(HashMap::new()),
             stub_entry_idx: RefCell::new(HashMap::new()),
             cache_slot_seen: RefCell::new(HashSet::new()),
             generic_function_seen: RefCell::new(HashSet::new()),
-            next_dispatch_site_id: RefCell::new(0),
+            next_safepoint_site_id: RefCell::new(0),
         }
     }
 
-    /// Sprint 38e — mint the next module-wide unique dispatch site id.
-    /// Replaces the per-function counter so cross-function site_ids
-    /// can't collide and accidentally share one `CacheSlot`.
-    pub fn next_dispatch_site_id(&self) -> u64 {
-        let mut id = self.next_dispatch_site_id.borrow_mut();
+    /// Sprint 38e / 45c — mint the next module-wide unique safepoint
+    /// site id. Dispatch consumes these ids for cache-slot identity;
+    /// other call-shaped safepoints currently use them only as stable
+    /// emitted/debug handles until runtime stack maps land.
+    pub fn next_safepoint_site_id(&self) -> u64 {
+        let mut id = self.next_safepoint_site_id.borrow_mut();
         let v = *id;
         *id += 1;
         v
@@ -955,11 +975,209 @@ fn get_or_add_generic_function_global<'ctx>(
 pub struct CodegenOutput<'ctx> {
     pub module: Module<'ctx>,
     pub function_map: FunctionMap<'ctx>,
+    pub safepoint_namespace: u64,
+    /// Sprint 45c — location-based safepoint planning surface.
+    ///
+    /// This is intentionally debug/introspection-first: it captures the
+    /// per-callsite root-location plan codegen will eventually lower
+    /// into installed-code safepoint maps, while leaving the active
+    /// GC behavior unchanged. The current runtime path still uses the
+    /// spill/register_root/unregister_root shim.
+    pub safepoint_plans: Vec<SafepointPlan>,
+    /// Canonical emitted-site descriptors for eventual install-time
+    /// safepoint metadata writers. Unlike [`SafepointPlan`], this
+    /// carries install-region identity so in-memory and image output
+    /// can be distinguished without rebuilding that context.
+    pub safepoint_installs: Vec<SafepointInstallRecord>,
     /// Sprint 38b — manifest of named-symbol → [`RelocKind`] rows for
     /// every external global this module references. Empty if no
     /// process-local addresses were materialised (e.g. a pure-arithmetic
     /// module with no booleans / nil / class-id reads).
     pub manifest: ModuleManifest,
+}
+
+pub(crate) const JIT_SAFEPOINT_METADATA_SYMBOL_PREFIX: &str = "nod_jit_safepoint__";
+
+/// Location-based description of one safepoint in one function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafepointPlan {
+    /// Module-order stable safepoint site id.
+    ///
+    /// Sprint 45c keeps this purely as a planning/debug identifier.
+    /// Unlike dispatch-site ids, it is not yet baked into installed
+    /// runtime metadata, but it gives tests and future codegen work a
+    /// stable handle for a safepoint independent of block labels.
+    pub site_id: u64,
+    /// Codegen-owned placeholder anchor for the eventual installed
+    /// safepoint/patchpoint identity. This is intentionally not a real
+    /// PC yet; Sprint 45c uses a stable string handle so downstream
+    /// metadata code can stop keying solely on block/computation pairs.
+    pub patchpoint_label: String,
+    pub kind: SafepointKind,
+    pub function: String,
+    pub block_label: String,
+    pub computation_index: usize,
+    pub roots: Vec<SafepointRootLocation>,
+}
+
+/// Where shared-codegen output is intended to be installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeInstallSurface {
+    InMemory,
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SafepointInstallKey {
+    install_surface: SafepointInstallSurface,
+    module_site_ordinal: u64,
+}
+
+impl SafepointInstallKey {
+    fn site_id(self) -> u64 {
+        self.module_site_ordinal
+    }
+
+    fn patchpoint_label(self) -> String {
+        match self.install_surface {
+            SafepointInstallSurface::InMemoryCodeText
+            | SafepointInstallSurface::ImageCodeText => {
+                safepoint_patchpoint_label(self.module_site_ordinal)
+            }
+        }
+    }
+}
+
+/// Installation surface for one emitted safepoint site.
+///
+/// NewOpenDylan has one code generator; the distinction here is where
+/// the resulting machine code is ultimately installed, not whether it
+/// came from separate "JIT" and "AOT" compiler pipelines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SafepointInstallSurface {
+    InMemoryCodeText,
+    ImageCodeText,
+}
+
+impl From<CodeInstallSurface> for SafepointInstallSurface {
+    fn from(value: CodeInstallSurface) -> Self {
+        match value {
+            CodeInstallSurface::InMemory => SafepointInstallSurface::InMemoryCodeText,
+            CodeInstallSurface::Image => SafepointInstallSurface::ImageCodeText,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstalledTextRegionKind {
+    InMemory,
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstalledTextRegion {
+    pub kind: InstalledTextRegionKind,
+    pub section_label: &'static str,
+}
+
+impl SafepointInstallSurface {
+    fn installed_text_region(self) -> InstalledTextRegion {
+        match self {
+            SafepointInstallSurface::InMemoryCodeText => InstalledTextRegion {
+                kind: InstalledTextRegionKind::InMemory,
+                section_label: "mem.code.text",
+            },
+            SafepointInstallSurface::ImageCodeText => InstalledTextRegion {
+                kind: InstalledTextRegionKind::Image,
+                section_label: "image.code.text",
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmittedSafepointSite {
+    namespace: u64,
+    install_key: SafepointInstallKey,
+    installed_text_region: InstalledTextRegion,
+    kind: SafepointKind,
+    function: String,
+    block_label: String,
+    computation_index: usize,
+    roots: Vec<SafepointRootLocation>,
+}
+
+fn emitted_safepoint_site(
+    namespace: u64,
+    install_key: SafepointInstallKey,
+    kind: SafepointKind,
+    function: String,
+    block_label: String,
+    computation_index: usize,
+    roots: Vec<SafepointRootLocation>,
+) -> EmittedSafepointSite {
+    EmittedSafepointSite {
+        namespace,
+        installed_text_region: install_key.install_surface.installed_text_region(),
+        install_key,
+        kind,
+        function,
+        block_label,
+        computation_index,
+        roots,
+    }
+}
+
+impl From<EmittedSafepointSite> for SafepointPlan {
+    fn from(site: EmittedSafepointSite) -> Self {
+        Self {
+            site_id: site.install_key.site_id(),
+            patchpoint_label: site.install_key.patchpoint_label(),
+            kind: site.kind,
+            function: site.function,
+            block_label: site.block_label,
+            computation_index: site.computation_index,
+            roots: site.roots,
+        }
+    }
+}
+
+/// Canonical install-time descriptor for one emitted safepoint site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafepointInstallRecord {
+    pub namespace: u64,
+    pub site_id: u64,
+    pub patchpoint_label: String,
+    pub installed_text_region: InstalledTextRegion,
+    pub kind: SafepointKind,
+    pub function: String,
+    pub block_label: String,
+    pub computation_index: usize,
+    pub roots: Vec<SafepointRootLocation>,
+}
+
+impl From<EmittedSafepointSite> for SafepointInstallRecord {
+    fn from(site: EmittedSafepointSite) -> Self {
+        Self {
+            namespace: site.namespace,
+            site_id: site.install_key.site_id(),
+            patchpoint_label: site.install_key.patchpoint_label(),
+            installed_text_region: site.installed_text_region,
+            kind: site.kind,
+            function: site.function,
+            block_label: site.block_label,
+            computation_index: site.computation_index,
+            roots: site.roots,
+        }
+    }
+}
+
+/// Normalized codegen-facing category for an emitted safepoint site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafepointKind {
+    DirectCall,
+    Dispatch,
+    SealedDirectCall,
 }
 
 #[derive(Debug)]
@@ -1000,6 +1218,15 @@ pub fn codegen_module<'ctx>(
     fns: &[DfmFunction],
     module_name: &str,
 ) -> Result<CodegenOutput<'ctx>, CodegenError> {
+    codegen_module_for_surface(ctx, fns, module_name, CodeInstallSurface::InMemory)
+}
+
+pub fn codegen_module_for_surface<'ctx>(
+    ctx: &'ctx Context,
+    fns: &[DfmFunction],
+    module_name: &str,
+    install_surface: CodeInstallSurface,
+) -> Result<CodegenOutput<'ctx>, CodegenError> {
     // Sprint 38b — synthesise a deterministic CacheKey from the module
     // name + a digest of the function names. Callers that already have a
     // real cache key (the eval pipeline) use
@@ -1009,7 +1236,13 @@ pub fn codegen_module<'ctx>(
     // requires a 16-char prefix; collision-resistance is satisfied as
     // long as distinct modules synthesize distinct keys.
     let synth_key = synth_cache_key_from_module(module_name, fns);
-    codegen_module_with_key(ctx, fns, module_name, synth_key)
+    codegen_module_with_key_for_surface(
+        ctx,
+        fns,
+        module_name,
+        synth_key,
+        install_surface,
+    )
 }
 
 /// Sprint 38b — the canonical codegen entry point. `key` namespaces
@@ -1022,9 +1255,19 @@ pub fn codegen_module_with_key<'ctx>(
     module_name: &str,
     key: CacheKey,
 ) -> Result<CodegenOutput<'ctx>, CodegenError> {
+    codegen_module_with_key_for_surface(ctx, fns, module_name, key, CodeInstallSurface::InMemory)
+}
+
+pub fn codegen_module_with_key_for_surface<'ctx>(
+    ctx: &'ctx Context,
+    fns: &[DfmFunction],
+    module_name: &str,
+    key: CacheKey,
+    install_surface: CodeInstallSurface,
+) -> Result<CodegenOutput<'ctx>, CodegenError> {
     let module = ctx.create_module(module_name);
     let builder = ctx.create_builder();
-    let mctx = ModuleCodegenCtx::new(key);
+    let mctx = ModuleCodegenCtx::new(key, install_surface.into());
 
     // Pass 1: forward-declare every function so direct calls can resolve
     // regardless of declaration order (handles mutual recursion).
@@ -1041,11 +1284,682 @@ pub fn codegen_module_with_key<'ctx>(
         emit_function(ctx, &module, &builder, &function_map, &mctx, f, fv)?;
     }
 
+    let safepoint_sites = mctx.safepoint_sites.into_inner();
+    if matches!(install_surface, CodeInstallSurface::InMemory) {
+        emit_jit_safepoint_metadata_globals(&module, &safepoint_sites);
+    }
+
     Ok(CodegenOutput {
         module,
         function_map,
+        safepoint_namespace: mctx.key.0[0],
+        safepoint_plans: safepoint_sites
+            .clone()
+            .into_iter()
+            .map(SafepointPlan::from)
+            .collect(),
+        safepoint_installs: safepoint_sites
+            .into_iter()
+            .map(SafepointInstallRecord::from)
+            .collect(),
         manifest: mctx.manifest.into_inner(),
     })
+}
+
+fn emit_jit_safepoint_metadata_globals<'ctx>(
+    module: &Module<'ctx>,
+    sites: &[EmittedSafepointSite],
+) {
+    let i8_ty = module.get_context().i8_type();
+    for site in sites {
+        let sym = jit_safepoint_metadata_symbol(
+            site.namespace,
+            site.install_key.site_id(),
+            &site.roots,
+        );
+        if module.get_global(&sym).is_some() {
+            continue;
+        }
+        let g = module.add_global(i8_ty, Some(inkwell::AddressSpace::default()), &sym);
+        g.set_linkage(Linkage::Internal);
+        g.set_initializer(&i8_ty.const_zero());
+        g.set_constant(true);
+    }
+}
+
+fn jit_safepoint_metadata_symbol(
+    namespace: u64,
+    site_id: u64,
+    roots: &[SafepointRootLocation],
+) -> String {
+    let slots = if roots.is_empty() {
+        "none".to_string()
+    } else {
+        roots
+            .iter()
+            .map(|root| match root.location {
+                SafepointLocation::FrameSlot(slot_idx) => slot_idx.to_string(),
+                SafepointLocation::SavedRegister(reg_idx) => format!("r{reg_idx}"),
+            })
+            .collect::<Vec<_>>()
+            .join("_")
+    };
+    format!(
+        "{JIT_SAFEPOINT_METADATA_SYMBOL_PREFIX}{namespace:016x}__{site_id}__{slots}"
+    )
+}
+
+/// Sprint 45c — compute a location-based safepoint plan for each
+/// call-shaped computation in `fns`.
+///
+/// This planner is intentionally narrow: it preserves today's
+/// `safepoint_roots` live-set computation and assigns future-facing
+/// frame-slot locations in root order. The active codegen path still
+/// lowers through `begin_safepoint` / `end_safepoint`; this function
+/// exists so tests and debug tooling can lock the new contract before
+/// runtime GC behavior changes.
+pub fn plan_safepoints(fns: &[DfmFunction]) -> Vec<SafepointPlan> {
+    let mut out = Vec::new();
+    let mut next_site_id = 0u64;
+    for f in fns {
+        for block in &f.blocks {
+            for (computation_index, computation) in block.computations.iter().enumerate() {
+                let Some(roots) = computation.safepoint_roots() else {
+                    continue;
+                };
+                let Some(kind) = planned_safepoint_kind(computation) else {
+                    continue;
+                };
+                let roots: Vec<SafepointRootLocation> = roots
+                    .iter()
+                    .enumerate()
+                    .map(|(slot_idx, temp)| SafepointRootLocation {
+                        temp: *temp,
+                        location: SafepointLocation::FrameSlot(slot_idx as u32),
+                    })
+                    .collect();
+                out.push(SafepointPlan::from(emitted_safepoint_site(
+                    0,
+                    SafepointInstallKey {
+                        install_surface: SafepointInstallSurface::InMemoryCodeText,
+                        module_site_ordinal: next_site_id,
+                    },
+                    kind,
+                    f.name.clone(),
+                    block.label.clone(),
+                    computation_index,
+                    roots,
+                )));
+                next_site_id += 1;
+            }
+        }
+    }
+    out
+}
+
+fn planned_safepoint_kind(computation: &Computation) -> Option<SafepointKind> {
+    match computation {
+        Computation::DirectCall { .. } => Some(SafepointKind::DirectCall),
+        Computation::Dispatch { .. } => Some(SafepointKind::Dispatch),
+        Computation::SealedDirectCall { .. } => Some(SafepointKind::SealedDirectCall),
+        Computation::Call { .. } => Some(SafepointKind::DirectCall),
+        _ => None,
+    }
+}
+
+fn safepoint_patchpoint_label(site_id: u64) -> String {
+    format!("gc.s{site_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        codegen_module, codegen_module_for_surface, emitted_safepoint_site,
+        plan_safepoints, CodeInstallSurface, InstalledTextRegion, InstalledTextRegionKind,
+        NOD_JIT_BEGIN_SAFEPOINT_SYMBOL, NOD_JIT_END_SAFEPOINT_SYMBOL,
+        NOD_AOT_BEGIN_SAFEPOINT_SYMBOL, NOD_AOT_END_SAFEPOINT_SYMBOL,
+        NOD_AOT_VERIFY_SAFEPOINT_SYMBOL, SafepointInstallKey, SafepointInstallRecord,
+        SafepointInstallSurface,
+    };
+    use inkwell::context::Context;
+    use nod_dfm::{
+        Block, BlockId, Computation, ConstValue, Function, FunctionId, SafepointLocation,
+        SafepointRootLocation, Temporary, TempId, Terminator, TypeEstimate, FileId, Span,
+    };
+    use crate::codegen::SafepointKind;
+
+    fn test_span() -> Span {
+        Span::new(FileId(0), 0, 0)
+    }
+
+    #[test]
+    fn plans_location_based_safepoints_per_callsite() {
+        let f = Function {
+            id: FunctionId(0),
+            name: "two_calls".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![
+                    Computation::Const {
+                        dst: TempId(1),
+                        value: ConstValue::Integer(7),
+                    },
+                    Computation::DirectCall {
+                        dst: TempId(2),
+                        callee: "alloc_a".to_string(),
+                        args: vec![TempId(0)],
+                        safepoint_roots: vec![TempId(0)],
+                    },
+                    Computation::DirectCall {
+                        dst: TempId(3),
+                        callee: "alloc_b".to_string(),
+                        args: vec![TempId(0), TempId(2)],
+                        safepoint_roots: vec![TempId(0), TempId(2)],
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Some(TempId(3)),
+                },
+            }],
+            temps: vec![
+                Temporary {
+                    id: TempId(0),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(1),
+                    type_estimate: TypeEstimate::Integer,
+                },
+                Temporary {
+                    id: TempId(2),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(3),
+                    type_estimate: TypeEstimate::String,
+                },
+            ],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+
+        let plans = plan_safepoints(&[f]);
+        assert_eq!(plans.len(), 2);
+
+        assert_eq!(plans[0].site_id, 0);
+        assert_eq!(plans[0].patchpoint_label, "gc.s0");
+        assert_eq!(plans[0].kind, SafepointKind::DirectCall);
+
+        assert_eq!(plans[0].function, "two_calls");
+        assert_eq!(plans[0].block_label, "entry");
+        assert_eq!(plans[0].computation_index, 1);
+        assert_eq!(plans[0].roots.len(), 1);
+        assert_eq!(plans[0].roots[0].temp, TempId(0));
+        assert_eq!(plans[0].roots[0].location, SafepointLocation::FrameSlot(0));
+
+        assert_eq!(plans[1].site_id, 1);
+        assert_eq!(plans[1].patchpoint_label, "gc.s1");
+        assert_eq!(plans[1].kind, SafepointKind::DirectCall);
+        assert_eq!(plans[1].computation_index, 2);
+        assert_eq!(plans[1].roots.len(), 2);
+        assert_eq!(plans[1].roots[0].temp, TempId(0));
+        assert_eq!(plans[1].roots[0].location, SafepointLocation::FrameSlot(0));
+        assert_eq!(plans[1].roots[1].temp, TempId(2));
+        assert_eq!(plans[1].roots[1].location, SafepointLocation::FrameSlot(1));
+    }
+
+    #[test]
+    fn plans_dispatch_safepoints_with_stable_site_ids() {
+        let f = Function {
+            id: FunctionId(1),
+            name: "dispatch_site".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![
+                    Computation::Dispatch {
+                        dst: TempId(1),
+                        generic_name: "g".to_string(),
+                        args: vec![TempId(0)],
+                        safepoint_roots: vec![TempId(0)],
+                    },
+                    Computation::DirectCall {
+                        dst: TempId(2),
+                        callee: "alloc_after_dispatch".to_string(),
+                        args: vec![TempId(1)],
+                        safepoint_roots: vec![TempId(0), TempId(1)],
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Some(TempId(2)),
+                },
+            }],
+            temps: vec![
+                Temporary {
+                    id: TempId(0),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(1),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(2),
+                    type_estimate: TypeEstimate::String,
+                },
+            ],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+
+        let plans = plan_safepoints(&[f]);
+        assert_eq!(plans.len(), 2);
+
+        assert_eq!(plans[0].site_id, 0);
+        assert_eq!(plans[0].patchpoint_label, "gc.s0");
+        assert_eq!(plans[0].kind, SafepointKind::Dispatch);
+        assert_eq!(plans[0].function, "dispatch_site");
+        assert_eq!(plans[0].computation_index, 0);
+        assert_eq!(plans[0].roots.len(), 1);
+        assert_eq!(plans[0].roots[0].temp, TempId(0));
+        assert_eq!(plans[0].roots[0].location, SafepointLocation::FrameSlot(0));
+
+        assert_eq!(plans[1].site_id, 1);
+        assert_eq!(plans[1].patchpoint_label, "gc.s1");
+        assert_eq!(plans[1].kind, SafepointKind::DirectCall);
+        assert_eq!(plans[1].computation_index, 1);
+        assert_eq!(plans[1].roots.len(), 2);
+        assert_eq!(plans[1].roots[0].temp, TempId(0));
+        assert_eq!(plans[1].roots[0].location, SafepointLocation::FrameSlot(0));
+        assert_eq!(plans[1].roots[1].temp, TempId(1));
+        assert_eq!(plans[1].roots[1].location, SafepointLocation::FrameSlot(1));
+    }
+
+    #[test]
+    fn emits_site_scoped_gc_markers_for_direct_and_dispatch_safepoints() {
+        let callee = Function {
+            id: FunctionId(1),
+            name: "alloc_a".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![],
+                terminator: Terminator::Return {
+                    value: Some(TempId(0)),
+                },
+            }],
+            temps: vec![Temporary {
+                id: TempId(0),
+                type_estimate: TypeEstimate::String,
+            }],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+        let caller = Function {
+            id: FunctionId(0),
+            name: "caller".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![
+                    Computation::DirectCall {
+                        dst: TempId(1),
+                        callee: "alloc_a".to_string(),
+                        args: vec![TempId(0)],
+                        safepoint_roots: vec![TempId(0)],
+                    },
+                    Computation::Dispatch {
+                        dst: TempId(2),
+                        generic_name: "g".to_string(),
+                        args: vec![TempId(1)],
+                        safepoint_roots: vec![TempId(0), TempId(1)],
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Some(TempId(2)),
+                },
+            }],
+            temps: vec![
+                Temporary {
+                    id: TempId(0),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(1),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(2),
+                    type_estimate: TypeEstimate::String,
+                },
+            ],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+
+        let ctx = Context::create();
+        let out = codegen_module(&ctx, &[caller, callee], "safepoint_sites").expect("codegen ok");
+        let ir = out.module.print_to_string().to_string();
+
+        assert!(ir.contains("gc.s0.reload.t0"), "missing direct-call reload marker: {ir}");
+        assert!(ir.contains("disp.s1.fast_call"), "missing dispatch site block label: {ir}");
+        assert!(ir.contains("gc.s1.reload.t1"), "missing dispatch reload marker: {ir}");
+    }
+
+    #[test]
+    fn codegen_output_reports_emitted_safepoint_plans() {
+        let callee = Function {
+            id: FunctionId(1),
+            name: "alloc_a".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![],
+                terminator: Terminator::Return {
+                    value: Some(TempId(0)),
+                },
+            }],
+            temps: vec![Temporary {
+                id: TempId(0),
+                type_estimate: TypeEstimate::String,
+            }],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+        let caller = Function {
+            id: FunctionId(0),
+            name: "caller".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![
+                    Computation::DirectCall {
+                        dst: TempId(1),
+                        callee: "alloc_a".to_string(),
+                        args: vec![TempId(0)],
+                        safepoint_roots: vec![TempId(0)],
+                    },
+                    Computation::Dispatch {
+                        dst: TempId(2),
+                        generic_name: "g".to_string(),
+                        args: vec![TempId(1)],
+                        safepoint_roots: vec![TempId(0), TempId(1)],
+                    },
+                ],
+                terminator: Terminator::Return {
+                    value: Some(TempId(2)),
+                },
+            }],
+            temps: vec![
+                Temporary {
+                    id: TempId(0),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(1),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(2),
+                    type_estimate: TypeEstimate::String,
+                },
+            ],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+
+        let ctx = Context::create();
+        let out = codegen_module(&ctx, &[caller, callee], "safepoint_sites").expect("codegen ok");
+
+        assert_eq!(out.safepoint_plans.len(), 2);
+        assert_eq!(out.safepoint_plans[0].site_id, 0);
+        assert_eq!(out.safepoint_plans[0].patchpoint_label, "gc.s0");
+        assert_eq!(out.safepoint_plans[0].kind, SafepointKind::DirectCall);
+        assert_eq!(out.safepoint_plans[0].function, "caller");
+        assert_eq!(out.safepoint_plans[0].block_label, "entry");
+        assert_eq!(out.safepoint_plans[0].computation_index, 0);
+        assert_eq!(out.safepoint_plans[0].roots.len(), 1);
+        assert_eq!(out.safepoint_plans[0].roots[0].temp, TempId(0));
+        assert_eq!(out.safepoint_plans[0].roots[0].location, SafepointLocation::FrameSlot(0));
+
+        assert_eq!(out.safepoint_plans[1].site_id, 1);
+        assert_eq!(out.safepoint_plans[1].patchpoint_label, "gc.s1");
+        assert_eq!(out.safepoint_plans[1].kind, SafepointKind::Dispatch);
+        assert_eq!(out.safepoint_plans[1].function, "caller");
+        assert_eq!(out.safepoint_plans[1].block_label, "entry");
+        assert_eq!(out.safepoint_plans[1].computation_index, 1);
+        assert_eq!(out.safepoint_plans[1].roots.len(), 2);
+        assert_eq!(out.safepoint_plans[1].roots[0].temp, TempId(0));
+        assert_eq!(out.safepoint_plans[1].roots[0].location, SafepointLocation::FrameSlot(0));
+        assert_eq!(out.safepoint_plans[1].roots[1].temp, TempId(1));
+        assert_eq!(out.safepoint_plans[1].roots[1].location, SafepointLocation::FrameSlot(1));
+    }
+
+    #[test]
+    fn codegen_output_reports_surface_specific_safepoint_installs() {
+        let callee = Function {
+            id: FunctionId(1),
+            name: "alloc_a".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![],
+                terminator: Terminator::Return {
+                    value: Some(TempId(0)),
+                },
+            }],
+            temps: vec![Temporary {
+                id: TempId(0),
+                type_estimate: TypeEstimate::String,
+            }],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+        let caller = Function {
+            id: FunctionId(0),
+            name: "caller".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![Computation::DirectCall {
+                    dst: TempId(1),
+                    callee: "alloc_a".to_string(),
+                    args: vec![TempId(0)],
+                    safepoint_roots: vec![TempId(0)],
+                }],
+                terminator: Terminator::Return {
+                    value: Some(TempId(1)),
+                },
+            }],
+            temps: vec![
+                Temporary {
+                    id: TempId(0),
+                    type_estimate: TypeEstimate::String,
+                },
+                Temporary {
+                    id: TempId(1),
+                    type_estimate: TypeEstimate::String,
+                },
+            ],
+            return_type: TypeEstimate::String,
+            span: test_span(),
+        };
+
+        let ctx = Context::create();
+        let mem_out = codegen_module_for_surface(
+            &ctx,
+            &[caller.clone(), callee.clone()],
+            "safepoint_sites_mem",
+            CodeInstallSurface::InMemory,
+        )
+        .expect("mem codegen ok");
+        let image_out = codegen_module_for_surface(
+            &ctx,
+            &[caller, callee],
+            "safepoint_sites_image",
+            CodeInstallSurface::Image,
+        )
+        .expect("image codegen ok");
+
+        assert_eq!(mem_out.safepoint_installs.len(), 1);
+        assert_eq!(image_out.safepoint_installs.len(), 1);
+
+        let mem_install: &SafepointInstallRecord = &mem_out.safepoint_installs[0];
+        let image_install: &SafepointInstallRecord = &image_out.safepoint_installs[0];
+
+        assert_eq!(mem_install.namespace, mem_out.safepoint_namespace);
+        assert_eq!(image_install.namespace, image_out.safepoint_namespace);
+        assert_eq!(mem_install.site_id, image_install.site_id);
+        assert_eq!(mem_install.patchpoint_label, image_install.patchpoint_label);
+        assert_eq!(mem_install.kind, image_install.kind);
+        assert_eq!(mem_install.function, image_install.function);
+        assert_eq!(mem_install.block_label, image_install.block_label);
+        assert_eq!(mem_install.computation_index, image_install.computation_index);
+        assert_eq!(mem_install.roots, image_install.roots);
+        assert_eq!(
+            mem_install.installed_text_region,
+            InstalledTextRegion {
+                kind: InstalledTextRegionKind::InMemory,
+                section_label: "mem.code.text",
+            }
+        );
+        assert_eq!(
+            image_install.installed_text_region,
+            InstalledTextRegion {
+                kind: InstalledTextRegionKind::Image,
+                section_label: "image.code.text",
+            }
+        );
+
+        let mem_ir = mem_out.module.print_to_string().to_string();
+        let image_ir = image_out.module.print_to_string().to_string();
+        assert!(
+            mem_ir.contains(NOD_JIT_BEGIN_SAFEPOINT_SYMBOL),
+            "in-memory surface missing JIT begin safepoint hook: {mem_ir}"
+        );
+        assert!(
+            mem_ir.contains(NOD_JIT_END_SAFEPOINT_SYMBOL),
+            "in-memory surface missing JIT end safepoint hook: {mem_ir}"
+        );
+        assert!(
+            !mem_ir.contains(super::NOD_REGISTER_ROOT_SYMBOL),
+            "in-memory surface should not emit legacy root registration hooks: {mem_ir}"
+        );
+        assert!(
+            !mem_ir.contains(super::NOD_UNREGISTER_ROOT_SYMBOL),
+            "in-memory surface should not emit legacy root unregister hooks: {mem_ir}"
+        );
+        assert!(
+            mem_ir.contains(super::JIT_SAFEPOINT_METADATA_SYMBOL_PREFIX),
+            "in-memory surface missing embedded JIT safepoint metadata: {mem_ir}"
+        );
+        assert!(
+            !mem_ir.contains(NOD_AOT_BEGIN_SAFEPOINT_SYMBOL),
+            "in-memory surface should not emit AOT runtime safepoint hooks: {mem_ir}"
+        );
+        assert!(
+            !image_ir.contains(super::JIT_SAFEPOINT_METADATA_SYMBOL_PREFIX),
+            "image surface should not emit JIT safepoint metadata globals: {image_ir}"
+        );
+        assert!(
+            image_ir.contains(NOD_AOT_BEGIN_SAFEPOINT_SYMBOL),
+            "image surface missing AOT begin safepoint hook: {image_ir}"
+        );
+        assert!(
+            image_ir.contains(super::NOD_REGISTER_ROOT_SYMBOL),
+            "image surface should retain legacy root registration hooks: {image_ir}"
+        );
+        assert!(
+            image_ir.contains(super::NOD_UNREGISTER_ROOT_SYMBOL),
+            "image surface should retain legacy root unregister hooks: {image_ir}"
+        );
+        assert!(
+            image_ir.contains(NOD_AOT_VERIFY_SAFEPOINT_SYMBOL),
+            "image surface missing AOT verify safepoint hook: {image_ir}"
+        );
+        assert!(
+            image_ir.contains(NOD_AOT_END_SAFEPOINT_SYMBOL),
+            "image surface missing AOT end safepoint hook: {image_ir}"
+        );
+    }
+
+    #[test]
+    fn emitted_safepoint_sites_track_install_surface_region() {
+        let roots = vec![SafepointRootLocation {
+            temp: TempId(0),
+            location: SafepointLocation::FrameSlot(0),
+        }];
+
+        let mem_site = emitted_safepoint_site(
+            0,
+            SafepointInstallKey {
+                install_surface: SafepointInstallSurface::InMemoryCodeText,
+                module_site_ordinal: 7,
+            },
+            SafepointKind::DirectCall,
+            "f".to_string(),
+            "entry".to_string(),
+            0,
+            roots.clone(),
+        );
+        let image_site = emitted_safepoint_site(
+            0,
+            SafepointInstallKey {
+                install_surface: SafepointInstallSurface::ImageCodeText,
+                module_site_ordinal: 7,
+            },
+            SafepointKind::DirectCall,
+            "f".to_string(),
+            "entry".to_string(),
+            0,
+            roots,
+        );
+
+        assert_eq!(mem_site.install_key.site_id(), image_site.install_key.site_id());
+        assert_eq!(
+            mem_site.install_key.patchpoint_label(),
+            image_site.install_key.patchpoint_label()
+        );
+        assert_eq!(
+            mem_site.installed_text_region,
+            InstalledTextRegion {
+                kind: InstalledTextRegionKind::InMemory,
+                section_label: "mem.code.text",
+            }
+        );
+        assert_eq!(
+            image_site.installed_text_region,
+            InstalledTextRegion {
+                kind: InstalledTextRegionKind::Image,
+                section_label: "image.code.text",
+            }
+        );
+    }
 }
 
 /// Sprint 38b — produce a deterministic [`CacheKey`] from a module name
@@ -1147,17 +2061,18 @@ struct Emit<'ctx, 'a> {
     /// function, breaking dominance and corrupting heap references.
     /// The value captured here flowed out of the actual predecessor.
     pending_incoming: Vec<(BlockId, BasicBlock<'ctx>, Vec<BasicValueEnum<'ctx>>)>,
-    /// Sprint 11b: a small pool of `i64` allocas in the entry block,
-    /// reused across multiple safepoints. Indexed by allocation order.
-    /// Each call's spill/reload sequence rents N slots starting at
-    /// `safepoint_slots_used`, then returns them when the call
-    /// finishes. Slots persist across calls; the pool grows as new
-    /// peaks are reached.
-    safepoint_slot_pool: Vec<inkwell::values::PointerValue<'ctx>>,
-    // Sprint 38e — `next_dispatch_site_id` was previously a per-function
-    // counter here. It now lives in `ModuleCodegenCtx::next_dispatch_site_id`
-    // so site_ids are module-wide unique; see the doc comment there for
-    // the cross-function-collision rationale.
+    /// Sprint 45d: one entry-block slab backing every safepoint slot in
+    /// the function. Slot indices in the emitted safepoint maps index
+    /// into this array directly.
+    safepoint_slot_capacity: usize,
+    safepoint_slot_slab: Option<inkwell::values::PointerValue<'ctx>>,
+    current_block_label: String,
+    current_computation_index: usize,
+    // Sprint 38e / 45c — site ids were previously dispatch-local. The
+    // module-wide allocator now lives in
+    // `ModuleCodegenCtx::next_safepoint_site_id` so site_ids are
+    // module-wide unique; see the doc comment there for the
+    // cross-function-collision rationale.
 }
 
 fn emit_function<'ctx, 'a>(
@@ -1169,6 +2084,7 @@ fn emit_function<'ctx, 'a>(
     func: &'a DfmFunction,
     llvm_fn: FunctionValue<'ctx>,
 ) -> Result<(), CodegenError> {
+    let safepoint_slot_capacity = max_safepoint_slots(func);
     let mut state = Emit {
         ctx,
         module,
@@ -1181,7 +2097,10 @@ fn emit_function<'ctx, 'a>(
         block_phis: HashMap::new(),
         temps: HashMap::new(),
         pending_incoming: Vec::new(),
-        safepoint_slot_pool: Vec::new(),
+        safepoint_slot_capacity,
+        safepoint_slot_slab: None,
+        current_block_label: String::new(),
+        current_computation_index: 0,
     };
 
     // Pre-create every LLVM basic block so terminators can branch
@@ -1190,6 +2109,8 @@ fn emit_function<'ctx, 'a>(
         let bb = ctx.append_basic_block(llvm_fn, &b.label);
         state.blocks.insert(b.id, bb);
     }
+
+    state.init_safepoint_slot_slab()?;
 
     // Bind function parameters to the entry block's SSA temps.
     for (i, p) in func.params.iter().enumerate() {
@@ -1224,7 +2145,9 @@ fn emit_function<'ctx, 'a>(
     for b in &func.blocks {
         let bb = state.blocks[&b.id];
         builder.position_at_end(bb);
-        for c in &b.computations {
+        state.current_block_label = b.label.clone();
+        for (computation_index, c) in b.computations.iter().enumerate() {
+            state.current_computation_index = computation_index;
             state.emit_computation(c)?;
         }
         state.emit_terminator(&b.terminator)?;
@@ -1245,8 +2168,52 @@ fn emit_function<'ctx, 'a>(
 
     Ok(())
 }
-
 impl<'ctx, 'a> Emit<'ctx, 'a> {
+    fn begin_emitted_safepoint(
+        &mut self,
+        kind: SafepointKind,
+        roots: &[TempId],
+    ) -> Result<EmittedSafepoint<'ctx>, CodegenError> {
+        let site_id = self.mctx.next_safepoint_site_id();
+        let rented = self.begin_safepoint(site_id, roots)?;
+        self.record_safepoint_plan(site_id, kind, &rented);
+        Ok(EmittedSafepoint { site_id, rented })
+    }
+
+    fn end_emitted_safepoint(
+        &mut self,
+        emitted: &EmittedSafepoint<'ctx>,
+    ) -> Result<(), CodegenError> {
+        self.end_safepoint(emitted.site_id, &emitted.rented)
+    }
+
+    fn record_safepoint_plan(
+        &self,
+        site_id: u64,
+        kind: SafepointKind,
+        rented: &[SafepointSlot<'ctx>],
+    ) {
+        let roots = rented
+            .iter()
+            .map(|slot_info| SafepointRootLocation {
+                temp: slot_info.temp,
+                location: slot_info.home.as_safepoint_location(),
+            })
+            .collect();
+        self.mctx.safepoint_sites.borrow_mut().push(emitted_safepoint_site(
+            self.mctx.key.0[0],
+            SafepointInstallKey {
+                install_surface: self.mctx.install_surface,
+                module_site_ordinal: site_id,
+            },
+            kind,
+            self.func.name.clone(),
+            self.current_block_label.clone(),
+            self.current_computation_index,
+            roots,
+        ));
+    }
+
     /// Sprint 38b — load the runtime `#t` Word from the external global
     /// declared (or reused) for this module. Replaces the Sprint 10
     /// pattern of baking `imm.true_.raw()` as an `i64` constant.
@@ -1259,7 +2226,6 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .map_err(map_err)?;
         Ok(v.into_int_value())
     }
-
     /// Sprint 38b — load the runtime `#f` Word from the external global.
     fn load_imm_false(&self) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
         let g = get_or_add_imm_global(self.ctx, self.module, self.mctx, RelocKind::ImmFalse);
@@ -1753,7 +2719,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
 
         // Now the direct call. Bracket with the safepoint pair so any
         // allocation inside the method body is observed by GC.
-        let rented = self.begin_safepoint(safepoint_roots)?;
+        let emitted = self.begin_emitted_safepoint(SafepointKind::SealedDirectCall, safepoint_roots)?;
         let arg_vals: Vec<BasicMetadataValueEnum<'ctx>> = args
             .iter()
             .map(|a| self.temp_val(*a).into())
@@ -1763,7 +2729,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .builder
             .build_call(callee_fn, &arg_vals, &name)
             .map_err(map_err)?;
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         let result = site.try_as_basic_value().basic();
 
         // Pop the chain frame on the success path. (Panic-unwind from
@@ -2382,12 +3348,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // direct calls have an empty `safepoint_roots` list (the
         // liveness pass produced no live pointer-shaped temps) and the
         // bracketing is a no-op.
-        let rented = self.begin_safepoint(safepoint_roots)?;
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(callee_fn, &arg_vals, &name)
             .map_err(|e| CodegenError::Builder(e.to_string()))?;
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         Ok(site.try_as_basic_value().basic())
     }
 
@@ -2453,12 +3419,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             }
         }
         let name = format!("call.t{}", dst.0);
-        let rented = self.begin_safepoint(safepoint_roots)?;
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(make_fn, &call_args, &name)
             .map_err(map_err)?;
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         Ok(site.try_as_basic_value().basic())
     }
 
@@ -2498,12 +3464,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             }
         }
         let name = format!("call.t{}", dst.0);
-        let rented = self.begin_safepoint(safepoint_roots)?;
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(fmt_fn, &call_args, &name)
             .map_err(map_err)?;
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         Ok(site.try_as_basic_value().basic())
     }
 
@@ -2530,12 +3496,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             }
         };
         let name = format!("call.t{}", dst.0);
-        let rented = self.begin_safepoint(safepoint_roots)?;
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(fn_, &[], &name)
             .map_err(map_err)?;
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         Ok(site.try_as_basic_value().basic())
     }
 
@@ -2574,12 +3540,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .map(|a| self.temp_val(*a).into())
             .collect();
         let name = format!("call.t{}", dst.0);
-        let rented = self.begin_safepoint(safepoint_roots)?;
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(fn_, &call_args, &name)
             .map_err(map_err)?;
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         Ok(site.try_as_basic_value().basic())
     }
 
@@ -2746,7 +3712,8 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // Sprint 38e — reserve a module-wide unique site id for this
         // call site (previously per-function; see
         // `ModuleCodegenCtx::next_dispatch_site_id` doc).
-        let site_id = self.mctx.next_dispatch_site_id();
+        let emitted = self.begin_emitted_safepoint(SafepointKind::Dispatch, safepoint_roots)?;
+        let site_id = emitted.site_id;
 
         // Sprint 38e — load the GenericFunction + CacheSlot pointers
         // through per-module external globals instead of baking them
@@ -2947,8 +3914,6 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .map_err(map_err)?;
 
         // ---- Begin safepoint for both branches. ----
-        let rented = self.begin_safepoint(safepoint_roots)?;
-
         // Create fast/slow/done blocks. Append AFTER the current end
         // (don't disturb pre-created DFM blocks).
         let fast_bb = self
@@ -3070,7 +4035,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .map_err(map_err)?;
         phi.add_incoming(&[(&fast_result, fast_pred), (&slow_result, slow_pred)]);
 
-        self.end_safepoint(&rented)?;
+        self.end_emitted_safepoint(&emitted)?;
         let _ = dst;
 
         Ok(Some(phi.as_basic_value()))
@@ -3131,65 +4096,217 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .unwrap_or_else(|| panic!("undefined TempId({})", t.0))
     }
 
-    /// Sprint 11b: emit the pre-call GC root bracketing — spill each
-    /// live pointer-shaped temp into an entry-block-resident `alloca`
-    /// slot and call `nod_register_root(slot)`. Returns the list of
-    /// `(temp_id, slot_ptr)` pairs the matching `end_safepoint` will
-    /// pop. Empty input → empty return → no IR emitted at all.
+    /// Spill each safepoint root temp into an entry-block-resident
+    /// `alloca` slot. The image surface still brackets those slots
+    /// with the legacy root shims; the in-memory JIT surface uses the
+    /// precise per-site safepoint map exclusively.
     fn begin_safepoint(
         &mut self,
+        site_id: u64,
         roots: &[TempId],
     ) -> Result<Vec<SafepointSlot<'ctx>>, CodegenError> {
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
         let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
-        let register_fn = self.get_or_declare_register_root();
         let mut rented: Vec<SafepointSlot<'ctx>> = Vec::with_capacity(roots.len());
-        for (i, t) in roots.iter().enumerate() {
-            // Snapshot the current LLVM value for the temp, then drop a
-            // slot in the entry block and spill it.
-            let cur = self.temp_val(*t);
-            let slot = self.rent_safepoint_slot(i)?;
-            self.builder.build_store(slot, cur).map_err(map_err)?;
+        if self.emits_image_safepoint_runtime_checks() {
             self.builder
-                .build_call(register_fn, &[slot.into()], "gc.reg")
+                .build_call(
+                    self.get_or_declare_aot_begin_safepoint(),
+                    &[
+                        self.ctx.i64_type().const_int(site_id, false).into(),
+                        self.ctx
+                            .i64_type()
+                            .const_int(roots.len() as u64, false)
+                            .into(),
+                    ],
+                    &format!("gc.s{site_id}.begin"),
+                )
                 .map_err(map_err)?;
-            rented.push(SafepointSlot { temp: *t, slot });
+        }
+        if !roots.is_empty() {
+            let register_fn = if self.emits_jit_precise_safepoints() {
+                None
+            } else {
+                Some(self.get_or_declare_register_root())
+            };
+            for (i, t) in roots.iter().enumerate() {
+                let cur = self.temp_val(*t);
+                let slot = self.rent_safepoint_slot(i)?;
+                self.builder.build_store(slot, cur).map_err(map_err)?;
+                if let Some(register_fn) = register_fn {
+                    self.builder
+                        .build_call(
+                            register_fn,
+                            &[slot.into()],
+                            &format!("gc.s{site_id}.reg.t{}", t.0),
+                        )
+                        .map_err(map_err)?;
+                }
+                rented.push(SafepointSlot {
+                    temp: *t,
+                    slot,
+                    home: FrameHome::SafepointPoolSlot(i),
+                });
+            }
+        }
+        if self.emits_jit_precise_safepoints() && !rented.is_empty() {
+            let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
+            let slot_base_ptr = self
+                .builder
+                .build_pointer_cast(
+                    self.safepoint_slot_base_ptr()?,
+                    ptr_ty,
+                    &format!("gc.s{site_id}.slot_base"),
+                )
+                .map_err(map_err)?;
+            self.builder
+                .build_call(
+                    self.get_or_declare_jit_begin_safepoint(),
+                    &[
+                        self.ctx.i64_type().const_int(self.mctx.key.0[0], false).into(),
+                        self.ctx.i64_type().const_int(site_id, false).into(),
+                        slot_base_ptr.into(),
+                    ],
+                    &format!("gc.s{site_id}.jit_begin"),
+                )
+                .map_err(map_err)?;
+        }
+        if self.emits_image_safepoint_runtime_checks() {
+            self.builder
+                .build_call(
+                    self.get_or_declare_aot_verify_safepoint(),
+                    &[self.ctx.i64_type().const_int(site_id, false).into()],
+                    &format!("gc.s{site_id}.verify"),
+                )
+                .map_err(map_err)?;
         }
         // Save current insert position for the caller — the caller
         // continues emitting the actual call into the same block.
         Ok(rented)
     }
 
-    /// Sprint 11b: emit the post-call GC root cleanup — for each
-    /// rented slot, call `nod_unregister_root(slot)`, reload the Word,
-    /// and rewire the temp's mapping to the reloaded SSA value.
-    fn end_safepoint(&mut self, rented: &[SafepointSlot<'ctx>]) -> Result<(), CodegenError> {
-        if rented.is_empty() {
+    /// Emit the post-call GC root cleanup. The image surface closes
+    /// the legacy root shims; the in-memory JIT surface only closes
+    /// the precise safepoint frame and reloads the potentially-
+    /// relocated Words from the slot slab.
+    fn end_safepoint(
+        &mut self,
+        site_id: u64,
+        rented: &[SafepointSlot<'ctx>],
+    ) -> Result<(), CodegenError> {
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let i64ty = self.ctx.i64_type();
+        if self.emits_jit_precise_safepoints() && !rented.is_empty() {
+            self.builder
+                .build_call(
+                    self.get_or_declare_jit_end_safepoint(),
+                    &[
+                        self.ctx.i64_type().const_int(self.mctx.key.0[0], false).into(),
+                        self.ctx.i64_type().const_int(site_id, false).into(),
+                    ],
+                    &format!("gc.s{site_id}.jit_end"),
+                )
+                .map_err(map_err)?;
+        }
+        if !rented.is_empty() {
+            let unregister_fn = if self.emits_jit_precise_safepoints() {
+                None
+            } else {
+                Some(self.get_or_declare_unregister_root())
+            };
+            for slot_info in rented.iter().rev() {
+                if let Some(unregister_fn) = unregister_fn {
+                    self.builder
+                        .build_call(
+                            unregister_fn,
+                            &[slot_info.slot.into()],
+                            &format!("gc.s{site_id}.unreg.t{}", slot_info.temp.0),
+                        )
+                        .map_err(map_err)?;
+                }
+            }
+        }
+        if self.emits_image_safepoint_runtime_checks() {
+            self.builder
+                .build_call(
+                    self.get_or_declare_aot_end_safepoint(),
+                    &[self.ctx.i64_type().const_int(site_id, false).into()],
+                    &format!("gc.s{site_id}.end"),
+                )
+                .map_err(map_err)?;
+        }
+        if !rented.is_empty() {
+            for slot_info in rented.iter() {
+                let reloaded = self
+                    .builder
+                    .build_load(
+                        i64ty,
+                        slot_info.slot,
+                        &format!("gc.s{site_id}.reload.t{}", slot_info.temp.0),
+                    )
+                    .map_err(map_err)?;
+                self.temps.insert(slot_info.temp, reloaded);
+            }
+        }
+        Ok(())
+    }
+
+    fn emits_image_safepoint_runtime_checks(&self) -> bool {
+        matches!(
+            self.mctx.install_surface,
+            SafepointInstallSurface::ImageCodeText
+        )
+    }
+
+    fn emits_jit_precise_safepoints(&self) -> bool {
+        matches!(
+            self.mctx.install_surface,
+            SafepointInstallSurface::InMemoryCodeText
+        )
+    }
+
+    fn init_safepoint_slot_slab(&mut self) -> Result<(), CodegenError> {
+        if self.safepoint_slot_capacity == 0 {
             return Ok(());
         }
         let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
         let i64ty = self.ctx.i64_type();
-        let unregister_fn = self.get_or_declare_unregister_root();
-        // Reverse order matches the "stack discipline" intent —
-        // register A,B then unregister B,A — even though the runtime
-        // tolerates any order. Determinism in IR shape simplifies
-        // tests.
-        for slot_info in rented.iter().rev() {
-            self.builder
-                .build_call(unregister_fn, &[slot_info.slot.into()], "gc.unreg")
-                .map_err(map_err)?;
+        let slab_ty = i64ty.array_type(self.safepoint_slot_capacity as u32);
+        let saved = self.builder.get_insert_block();
+        let entry_bb = self
+            .llvm_fn
+            .get_first_basic_block()
+            .expect("function has at least one block");
+        if let Some(first_inst) = entry_bb.get_first_instruction() {
+            self.builder.position_before(&first_inst);
+        } else {
+            self.builder.position_at_end(entry_bb);
         }
-        // Reload (in forward order) and rewire each temp's mapping.
-        for slot_info in rented.iter() {
-            let reloaded = self
-                .builder
-                .build_load(i64ty, slot_info.slot, &format!("gc.reload.t{}", slot_info.temp.0))
-                .map_err(map_err)?;
-            self.temps.insert(slot_info.temp, reloaded);
+        let slab = self
+            .builder
+            .build_alloca(slab_ty, "gc.root.slots")
+            .map_err(map_err)?;
+        self.safepoint_slot_slab = Some(slab);
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
         }
         Ok(())
+    }
+
+    fn safepoint_slot_base_ptr(&self) -> Result<inkwell::values::PointerValue<'ctx>, CodegenError> {
+        let slab = self
+            .safepoint_slot_slab
+            .expect("safepoint slot slab missing");
+        let i64ty = self.ctx.i64_type();
+        let slab_ty = i64ty.array_type(self.safepoint_slot_capacity as u32);
+        unsafe {
+            self.builder.build_gep(
+                slab_ty,
+                slab,
+                &[i64ty.const_zero(), i64ty.const_zero()],
+                "gc.root.slots.base",
+            )
+        }
+        .map_err(|e| CodegenError::Builder(e.to_string()))
     }
 
     /// Return the i-th alloca slot from the function's safepoint pool,
@@ -3200,36 +4317,21 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         &mut self,
         idx: usize,
     ) -> Result<inkwell::values::PointerValue<'ctx>, CodegenError> {
-        if idx < self.safepoint_slot_pool.len() {
-            return Ok(self.safepoint_slot_pool[idx]);
-        }
-        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        assert!(idx < self.safepoint_slot_capacity, "safepoint slot index out of range");
         let i64ty = self.ctx.i64_type();
-        // Stash the current insert position; insert allocas at the
-        // start of the entry block so LLVM treats them as standard
-        // mem2reg-eligible storage.
-        let saved = self.builder.get_insert_block();
-        let entry_bb = self
-            .llvm_fn
-            .get_first_basic_block()
-            .expect("function has at least one block");
-        // Position before the first non-alloca instruction in entry.
-        // For simplicity (and matching what the rest of the codebase
-        // assumes), we position at the start of entry's instruction
-        // list. Phi nodes appear at the very start of non-entry
-        // blocks but never in the entry block — so this is safe.
-        if let Some(first_inst) = entry_bb.get_first_instruction() {
-            self.builder.position_before(&first_inst);
-        } else {
-            self.builder.position_at_end(entry_bb);
+        let slab = self
+            .safepoint_slot_slab
+            .expect("safepoint slot slab missing");
+        let slab_ty = i64ty.array_type(self.safepoint_slot_capacity as u32);
+        unsafe {
+            self.builder.build_gep(
+                slab_ty,
+                slab,
+                &[i64ty.const_zero(), i64ty.const_int(idx as u64, false)],
+                &format!("gc.root.slot.{idx}"),
+            )
         }
-        let slot_name = format!("gc.root.slot.{idx}");
-        let slot = self.builder.build_alloca(i64ty, &slot_name).map_err(map_err)?;
-        self.safepoint_slot_pool.push(slot);
-        if let Some(bb) = saved {
-            self.builder.position_at_end(bb);
-        }
-        Ok(slot)
+        .map_err(|e| CodegenError::Builder(e.to_string()))
     }
 
     fn get_or_declare_register_root(&self) -> FunctionValue<'ctx> {
@@ -3249,6 +4351,66 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         let ty = self.ctx.void_type().fn_type(&[ptr_ty.into()], false);
         self.module.add_function(NOD_UNREGISTER_ROOT_SYMBOL, ty, None)
     }
+
+    fn get_or_declare_jit_begin_safepoint(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(NOD_JIT_BEGIN_SAFEPOINT_SYMBOL) {
+            return f;
+        }
+        let i64ty = self.ctx.i64_type();
+        let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
+        let ty = self
+            .ctx
+            .void_type()
+            .fn_type(&[i64ty.into(), i64ty.into(), ptr_ty.into()], false);
+        self.module
+            .add_function(NOD_JIT_BEGIN_SAFEPOINT_SYMBOL, ty, None)
+    }
+
+    fn get_or_declare_jit_end_safepoint(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(NOD_JIT_END_SAFEPOINT_SYMBOL) {
+            return f;
+        }
+        let i64ty = self.ctx.i64_type();
+        let ty = self
+            .ctx
+            .void_type()
+            .fn_type(&[i64ty.into(), i64ty.into()], false);
+        self.module
+            .add_function(NOD_JIT_END_SAFEPOINT_SYMBOL, ty, None)
+    }
+
+    fn get_or_declare_aot_begin_safepoint(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(NOD_AOT_BEGIN_SAFEPOINT_SYMBOL) {
+            return f;
+        }
+        let i64ty = self.ctx.i64_type();
+        let ty = self
+            .ctx
+            .void_type()
+            .fn_type(&[i64ty.into(), i64ty.into()], false);
+        self.module
+            .add_function(NOD_AOT_BEGIN_SAFEPOINT_SYMBOL, ty, None)
+    }
+
+    fn get_or_declare_aot_verify_safepoint(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(NOD_AOT_VERIFY_SAFEPOINT_SYMBOL) {
+            return f;
+        }
+        let i64ty = self.ctx.i64_type();
+        let ty = self.ctx.void_type().fn_type(&[i64ty.into()], false);
+        self.module
+            .add_function(NOD_AOT_VERIFY_SAFEPOINT_SYMBOL, ty, None)
+    }
+
+    fn get_or_declare_aot_end_safepoint(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(NOD_AOT_END_SAFEPOINT_SYMBOL) {
+            return f;
+        }
+        let i64ty = self.ctx.i64_type();
+        let ty = self.ctx.void_type().fn_type(&[i64ty.into()], false);
+        self.module
+            .add_function(NOD_AOT_END_SAFEPOINT_SYMBOL, ty, None)
+    }
 }
 
 /// One rented entry from the function's safepoint slot pool, used by
@@ -3256,6 +4418,40 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
 struct SafepointSlot<'ctx> {
     temp: TempId,
     slot: inkwell::values::PointerValue<'ctx>,
+    home: FrameHome,
+}
+
+struct EmittedSafepoint<'ctx> {
+    site_id: u64,
+    rented: Vec<SafepointSlot<'ctx>>,
+}
+
+/// Internal codegen notion of where a safepoint root lives.
+///
+/// Today every root is materialized in the entry-block alloca pool,
+/// but Windows stack-map lowering will need a stable place to grow
+/// other home kinds without exposing codegen pool details as the
+/// defining contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameHome {
+    SafepointPoolSlot(usize),
+}
+
+impl FrameHome {
+    fn as_safepoint_location(self) -> SafepointLocation {
+        match self {
+            FrameHome::SafepointPoolSlot(slot_idx) => SafepointLocation::FrameSlot(slot_idx as u32),
+        }
+    }
+}
+
+fn max_safepoint_slots(func: &DfmFunction) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|block| block.computations.iter())
+        .filter_map(|computation| computation.safepoint_roots().map(|roots| roots.len()))
+        .max()
+        .unwrap_or(0)
 }
 
 // ─── CacheSlot / GenericFunction field offsets ─────────────────────────────

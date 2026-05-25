@@ -42,6 +42,7 @@ use crate::classes::{
     ClassId, ClassMetadata, SlotDefault, SlotInfo, SlotType, class_metadata_for, is_subclass,
 };
 use crate::make::rust_make;
+use crate::stack_map::{active_jit_safepoint_depth, truncate_active_jit_safepoints};
 use crate::word::Word;
 
 // ─── Seed condition class IDs ──────────────────────────────────────────────
@@ -659,13 +660,20 @@ struct CleanupGuard {
     /// any frames added by us (and not yet popped) get trimmed if the
     /// body panics through.
     handler_stack_baseline: usize,
+    /// Active-JIT-safepoint depth at entry so that a re-raised unwind
+    /// (NLX to an outer block, or non-NLX panic) clears stale entries
+    /// from dead JIT stack frames before the cleanup thunk runs.
+    jit_safepoint_baseline: usize,
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        // Always restore the handler-stack baseline first; otherwise a
-        // re-raised panic could leave dangling frames pointing at this
-        // (defunct) block_id.
+        // Restore JIT safepoint depth first: the cleanup thunk may
+        // allocate, which can trigger GC.  At this point the JIT body
+        // frames are gone, so their safepoint entries are stale.
+        truncate_active_jit_safepoints(self.jit_safepoint_baseline);
+        // Restore the handler-stack baseline; a re-raised panic must not
+        // leave dangling frames pointing at this (defunct) block_id.
         truncate_handler_stack(self.handler_stack_baseline);
         if !self.done
             && let Some(cleanup) = self.cleanup
@@ -721,6 +729,7 @@ pub unsafe extern "C-unwind" fn nod_run_block(
 
     let captured = [c0, c1, c2, c3, c4, c5, c6, c7];
     let baseline = handler_stack_len();
+    let jit_safepoint_baseline = active_jit_safepoint_depth();
 
     // Make the captured locals visible to any `nod_signal` invoked
     // inside the body or a handler — they need the same locals to run
@@ -760,6 +769,7 @@ pub unsafe extern "C-unwind" fn nod_run_block(
         captured,
         done: false,
         handler_stack_baseline: baseline,
+        jit_safepoint_baseline,
     };
 
     let body: ThunkFn = unsafe { std::mem::transmute(fns.body) };
@@ -774,16 +784,20 @@ pub unsafe extern "C-unwind" fn nod_run_block(
         Ok(v) => v,
         Err(payload) => match downcast_nlx(payload) {
             Ok(nlx) if nlx.target_block_id == block_id => {
+                truncate_active_jit_safepoints(jit_safepoint_baseline);
                 // NLX into this block. The handler (if a signal drove
                 // us here) already produced `nlx.value` — return it.
                 nlx.value.raw()
             }
             Ok(nlx) => {
                 // NLX targeting an outer block. Re-raise.
+                // CleanupGuard::drop() restores jit_safepoint_baseline
+                // and runs the cleanup thunk as part of the unwind.
                 std::panic::resume_unwind(Box::new(nlx))
             }
             Err(other) => {
                 // Non-NLX panic. Re-raise. (Cleanup runs via Drop.)
+                // CleanupGuard::drop() restores jit_safepoint_baseline.
                 std::panic::resume_unwind(other)
             }
         },
@@ -1079,6 +1093,35 @@ pub unsafe extern "C-unwind" fn nod_condition_message(c_raw: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    thread_local! {
+        static TEST_INNER_SAFEPOINT_SLOT: std::cell::RefCell<[Word; 1]> =
+            std::cell::RefCell::new([Word::from_raw(0)]);
+    }
+
+    extern "C-unwind" fn body_pushes_inner_safepoint_and_nlx(
+        _c0: u64,
+        _c1: u64,
+        _c2: u64,
+        _c3: u64,
+        _c4: u64,
+        _c5: u64,
+        _c6: u64,
+        _c7: u64,
+    ) -> u64 {
+        TEST_INNER_SAFEPOINT_SLOT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            slot[0] = Word::from_fixnum(22).expect("test fixnum in range");
+            unsafe {
+                crate::stack_map::nod_jit_begin_safepoint(0xAA, 8, slot.as_mut_ptr());
+            }
+        });
+        std::panic::panic_any(NlxPayload {
+            target_block_id: 42,
+            value: Word::from_fixnum(77).expect("test fixnum in range"),
+        })
+    }
 
     #[test]
     fn condition_classes_register_with_expected_cpl() {
@@ -1142,5 +1185,177 @@ mod tests {
     fn exit_procedure_roundtrips_block_id() {
         let ep = make_exit_procedure(99);
         assert_eq!(exit_procedure_block_id(ep), Some(99));
+    }
+
+    #[test]
+    #[serial]
+    fn nod_run_block_restores_jit_safepoint_baseline_on_nlx() {
+        crate::stack_map::register_jit_safepoints(vec![
+            crate::stack_map::JitSafepointEntry {
+                namespace: 0xAA,
+                site_id: 7,
+                slots: vec![0],
+            },
+            crate::stack_map::JitSafepointEntry {
+                namespace: 0xAA,
+                site_id: 8,
+                slots: vec![0],
+            },
+        ]);
+        register_block_fns(
+            42,
+            BlockFns {
+                body: body_pushes_inner_safepoint_and_nlx as *const () as *const u8,
+                cleanup: None,
+                afterwards: None,
+                handlers: &[],
+            },
+        );
+
+        let mut outer_slots = [Word::from_fixnum(11).expect("test fixnum in range")];
+        unsafe {
+            crate::stack_map::nod_jit_begin_safepoint(0xAA, 7, outer_slots.as_mut_ptr());
+        }
+
+        let result = unsafe { nod_run_block(42, 0, 0, 0, 0, 0, 0, 0, 0) };
+        assert_eq!(Word::from_raw(result).as_fixnum(), Some(77));
+        assert_eq!(crate::stack_map::active_jit_safepoint_depth(), 1);
+
+        let roots = crate::stack_map::snapshot_active_jit_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(unsafe { (*roots[0]).as_fixnum() }, Some(11));
+
+        crate::stack_map::nod_jit_end_safepoint(0xAA, 7);
+        assert!(crate::stack_map::snapshot_active_jit_roots().is_empty());
+    }
+
+    // ── Signal-driven NLX test ────────────────────────────────────────────
+    //
+    // Exercises the full `nod_signal` → handler thunk → NLX path.  Unlike
+    // the test above (which uses a bare `panic_any`), here the unwind is
+    // initiated by `nod_signal`; the handler returns a value and
+    // `nod_signal_inner` drives the NLX.  The inner safepoint is opened
+    // inside the body but never explicitly closed (signal diverges before
+    // the matching `nod_jit_end_safepoint`).  After `nod_run_block`
+    // returns, the stale inner entry must be gone and the outer entry
+    // must survive intact.
+
+    thread_local! {
+        static TEST_SIGNAL_INNER_SLOT: std::cell::RefCell<[Word; 1]> =
+            std::cell::RefCell::new([Word::from_raw(0)]);
+    }
+
+    extern "C-unwind" fn signal_driven_body(
+        _c0: u64,
+        _c1: u64,
+        _c2: u64,
+        _c3: u64,
+        _c4: u64,
+        _c5: u64,
+        _c6: u64,
+        _c7: u64,
+    ) -> u64 {
+        // Open an inner safepoint that will be left dangling when
+        // nod_signal diverges.
+        TEST_SIGNAL_INNER_SLOT.with(|slot| {
+            let mut s = slot.borrow_mut();
+            s[0] = Word::from_fixnum(55).expect("fixnum 55");
+            let ptr = s.as_mut_ptr();
+            drop(s); // release borrow before raw-pointer hand-off
+            unsafe {
+                crate::stack_map::nod_jit_begin_safepoint(0xCC, 20, ptr);
+            }
+        });
+        let cond = make_simple_error("signal-driven safepoint test");
+        // nod_signal never returns — it raises an NlxPayload.
+        unsafe { nod_signal(cond.raw()) }
+    }
+
+    extern "C-unwind" fn signal_driven_handler(
+        _condition: u64,
+        _c0: u64,
+        _c1: u64,
+        _c2: u64,
+        _c3: u64,
+        _c4: u64,
+        _c5: u64,
+        _c6: u64,
+        _c7: u64,
+    ) -> u64 {
+        Word::from_fixnum(33).expect("fixnum 33").raw()
+    }
+
+    #[test]
+    #[serial]
+    fn nod_run_block_restores_safepoints_on_signal_driven_nlx() {
+        ensure_registered();
+        // Start from a known-clean active-safepoint stack on this thread.
+        crate::stack_map::truncate_active_jit_safepoints(0);
+        _reset_handler_stack_for_tests();
+
+        // Register the safepoint sites used by this test (distinct
+        // namespace 0xCC avoids collision with the test above).
+        crate::stack_map::register_jit_safepoints(vec![
+            crate::stack_map::JitSafepointEntry {
+                namespace: 0xCC,
+                site_id: 19, // outer, opened before nod_run_block
+                slots: vec![0],
+            },
+            crate::stack_map::JitSafepointEntry {
+                namespace: 0xCC,
+                site_id: 20, // inner, opened inside body and left dangling
+                slots: vec![0],
+            },
+        ]);
+
+        // Build the HandlerFn.  We need a &'static slice; Box::leak is
+        // sound here because the pointer lives for the process lifetime.
+        let handlers: &'static [HandlerFn] = Box::leak(Box::new([HandlerFn {
+            class_id: error_class_id(),
+            class_name_ptr: b"<error>".as_ptr(),
+            class_name_len: 7,
+            body: signal_driven_handler as *const () as *const u8,
+        }]));
+
+        register_block_fns(
+            55,
+            BlockFns {
+                body: signal_driven_body as *const () as *const u8,
+                cleanup: None,
+                afterwards: None,
+                handlers,
+            },
+        );
+
+        // Open the outer safepoint around the nod_run_block call.
+        let mut outer_slot = [Word::from_fixnum(77).expect("fixnum 77")];
+        unsafe {
+            crate::stack_map::nod_jit_begin_safepoint(0xCC, 19, outer_slot.as_mut_ptr());
+        }
+
+        let result = unsafe { nod_run_block(55, 0, 0, 0, 0, 0, 0, 0, 0) };
+        assert_eq!(
+            Word::from_raw(result).as_fixnum(),
+            Some(33),
+            "handler return value"
+        );
+
+        // The inner safepoint (site 20) was open when nod_signal fired;
+        // nod_run_block must have truncated it.
+        assert_eq!(
+            crate::stack_map::active_jit_safepoint_depth(),
+            1,
+            "inner stale safepoint must be truncated"
+        );
+        let roots = crate::stack_map::snapshot_active_jit_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            unsafe { (*roots[0]).as_fixnum() },
+            Some(77),
+            "outer root preserved"
+        );
+
+        crate::stack_map::nod_jit_end_safepoint(0xCC, 19);
+        assert!(crate::stack_map::snapshot_active_jit_roots().is_empty());
     }
 }

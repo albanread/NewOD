@@ -36,6 +36,7 @@ use inkwell::targets::{
 };
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, GlobalValue};
 
+use crate::codegen::{InstalledTextRegionKind, SafepointInstallRecord, SafepointKind};
 use crate::jit::JitError;
 use crate::symbols::{ModuleManifest, RelocKind};
 
@@ -280,10 +281,11 @@ pub fn emit_aot_entry_stubs<'ctx>(
     module: &Module<'ctx>,
     manifest: &ModuleManifest,
 ) -> Result<(), AotError> {
-    emit_aot_entry_stubs_with_registrations(
+    emit_aot_entry_stubs_with_registrations_and_safepoints(
         module,
         manifest,
         &AotRegistrations::default(),
+        &[],
     )
 }
 
@@ -296,6 +298,23 @@ pub fn emit_aot_entry_stubs_with_registrations<'ctx>(
     module: &Module<'ctx>,
     manifest: &ModuleManifest,
     registrations: &AotRegistrations,
+) -> Result<(), AotError> {
+    emit_aot_entry_stubs_with_registrations_and_safepoints(
+        module,
+        manifest,
+        registrations,
+        &[],
+    )
+}
+
+/// Variant of [`emit_aot_entry_stubs_with_registrations`] that also
+/// bakes the image-installed safepoint descriptors into private module
+/// globals for later AOT metadata consumption.
+pub fn emit_aot_entry_stubs_with_registrations_and_safepoints<'ctx>(
+    module: &Module<'ctx>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    safepoint_installs: &[SafepointInstallRecord],
 ) -> Result<(), AotError> {
     // Resist the temptation to rename `<eval-entry>` here — that name
     // is reserved for the JIT path. AOT users write `define function
@@ -337,7 +356,14 @@ pub fn emit_aot_entry_stubs_with_registrations<'ctx>(
     // first instruction of `main()` onward.
     convert_externals_to_defining_storage(module, manifest, &stub_entries)?;
 
-    // Step 4: emit the resolver function. It calls a per-RelocKind
+    // Step 4: bake the image safepoint descriptors as a private AOT
+    // table so the object file carries canonical installed-site
+    // metadata for later image readers. Reject non-image records here:
+    // the AOT pipeline should never be handed compile-to-memory
+    // descriptors.
+    emit_aot_image_safepoint_table(module, safepoint_installs)?;
+
+    // Step 4b: emit the resolver function. It calls a per-RelocKind
     // C-ABI helper for each manifest entry, passing the global's
     // address and any per-kind parameters. For StubEntry the resolver
     // stores `&<dllimport_symbol>` into each entry's `fn_ptr` field.
@@ -656,6 +682,7 @@ fn emit_resolve_relocs_function<'ctx>(
     );
     // `(slot, name_ptr, name_len)`.
     let helper_set_generic = helper_set_lit;
+    let helper_register_safepoints = void_ty.fn_type(&[ptr_ty.into(), isize_ty.into()], false);
 
     // Declare or recover each helper as an external.
     let get_or_add =
@@ -674,6 +701,10 @@ fn emit_resolve_relocs_function<'ctx>(
     let set_symlit = get_or_add("nod_aot_set_symlit", helper_set_lit);
     let set_cache_slot = get_or_add("nod_aot_set_cache_slot", helper_set_cache_slot);
     let set_generic = get_or_add("nod_aot_set_generic", helper_set_generic);
+    let register_safepoints = get_or_add(
+        "nod_aot_register_safepoints",
+        helper_register_safepoints,
+    );
 
     // Declare the `nod_runtime_init` extern. The resolver calls it
     // first so class metadata, condition classes, generics, etc., are
@@ -706,6 +737,34 @@ fn emit_resolve_relocs_function<'ctx>(
     builder
         .build_call(runtime_init, &[], "")
         .map_err(|e| AotError::Llvm(format!("call runtime_init: {e}")))?;
+
+    if let (Some(table), Some(count)) = (
+        module.get_global("__nod_aot_safepoints"),
+        module.get_global("__nod_aot_safepoint_count"),
+    ) {
+        let table_ptr = unsafe {
+            builder
+                .build_gep(
+                    table.get_value_type().into_array_type(),
+                    table.as_pointer_value(),
+                    &[i32_ty.const_zero(), i32_ty.const_zero()],
+                    "aot.safepoints.ptr",
+                )
+                .map_err(|e| AotError::Llvm(format!("gep aot safepoints: {e}")))?
+        };
+        let count_value = builder
+            .build_load(i64_ty, count.as_pointer_value(), "aot.safepoints.count")
+            .map_err(|e| AotError::Llvm(format!("load aot safepoint count: {e}")))?
+            .into_int_value();
+        let count_isize = builder
+            .build_int_cast(count_value, isize_ty, "aot.safepoints.count.isize")
+            .map_err(|e| AotError::Llvm(format!("cast aot safepoint count: {e}")))?;
+        let args: Vec<BasicMetadataValueEnum<'ctx>> =
+            vec![table_ptr.into(), count_isize.into()];
+        builder
+            .build_call(register_safepoints, &args, "")
+            .map_err(|e| AotError::Llvm(format!("call register_safepoints: {e}")))?;
+    }
 
     // Sprint 40a — register user classes BEFORE the manifest-entry
     // loop. `RelocKind::ClassMetadata { class_id }` slots in the
@@ -1560,6 +1619,141 @@ fn emit_byte_constant<'ctx>(
     Ok((ptr, bytes.len()))
 }
 
+fn emit_aot_image_safepoint_table<'ctx>(
+    module: &Module<'ctx>,
+    safepoint_installs: &[SafepointInstallRecord],
+) -> Result<(), AotError> {
+    if safepoint_installs.is_empty() {
+        return Ok(());
+    }
+    if module.get_global("__nod_aot_safepoints").is_some() {
+        return Err(AotError::Conflict(
+            "module already defines `__nod_aot_safepoints`".to_string(),
+        ));
+    }
+    if module.get_global("__nod_aot_safepoint_count").is_some() {
+        return Err(AotError::Conflict(
+            "module already defines `__nod_aot_safepoint_count`".to_string(),
+        ));
+    }
+
+    let ctx = module.get_context();
+    let i8_ty = ctx.i8_type();
+    let i64_ty = ctx.i64_type();
+    let isize_ty = ctx.ptr_sized_int_type(
+        &inkwell::targets::TargetData::create(""),
+        Some(AddressSpace::default()),
+    );
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    let record_ty = ctx.struct_type(
+        &[
+            i64_ty.into(),   // site_id
+            i8_ty.into(),    // kind_tag
+            i64_ty.into(),   // computation_index
+            i64_ty.into(),   // root_count
+            ptr_ty.into(),   // section_label_ptr
+            isize_ty.into(), // section_label_len
+            ptr_ty.into(),   // patchpoint_label_ptr
+            isize_ty.into(), // patchpoint_label_len
+            ptr_ty.into(),   // function_ptr
+            isize_ty.into(), // function_len
+            ptr_ty.into(),   // block_label_ptr
+            isize_ty.into(), // block_label_len
+        ],
+        false,
+    );
+
+    let mut row_inits = Vec::with_capacity(safepoint_installs.len());
+    for (idx, site) in safepoint_installs.iter().enumerate() {
+        if site.installed_text_region.kind != InstalledTextRegionKind::Image {
+            return Err(AotError::Conflict(format!(
+                "AOT received non-image safepoint install record for site {}",
+                site.site_id
+            )));
+        }
+
+        let section_label = emit_private_byte_global(
+            module,
+            &ctx,
+            &format!("__nod_aot_safepoint_{idx}_section"),
+            site.installed_text_region.section_label.as_bytes(),
+        );
+        let patchpoint_label = emit_private_byte_global(
+            module,
+            &ctx,
+            &format!("__nod_aot_safepoint_{idx}_patchpoint"),
+            site.patchpoint_label.as_bytes(),
+        );
+        let function_name = emit_private_byte_global(
+            module,
+            &ctx,
+            &format!("__nod_aot_safepoint_{idx}_function"),
+            site.function.as_bytes(),
+        );
+        let block_label = emit_private_byte_global(
+            module,
+            &ctx,
+            &format!("__nod_aot_safepoint_{idx}_block"),
+            site.block_label.as_bytes(),
+        );
+
+        let kind_tag = match site.kind {
+            SafepointKind::DirectCall => 0,
+            SafepointKind::Dispatch => 1,
+            SafepointKind::SealedDirectCall => 2,
+        };
+
+        row_inits.push(record_ty.const_named_struct(&[
+            i64_ty.const_int(site.site_id, false).into(),
+            i8_ty.const_int(kind_tag, false).into(),
+            i64_ty.const_int(site.computation_index as u64, false).into(),
+            i64_ty.const_int(site.roots.len() as u64, false).into(),
+            section_label.as_pointer_value().into(),
+            isize_ty
+                .const_int(site.installed_text_region.section_label.len() as u64, false)
+                .into(),
+            patchpoint_label.as_pointer_value().into(),
+            isize_ty.const_int(site.patchpoint_label.len() as u64, false).into(),
+            function_name.as_pointer_value().into(),
+            isize_ty.const_int(site.function.len() as u64, false).into(),
+            block_label.as_pointer_value().into(),
+            isize_ty.const_int(site.block_label.len() as u64, false).into(),
+        ]));
+    }
+
+    let arr_ty = record_ty.array_type(safepoint_installs.len() as u32);
+    let table = module.add_global(arr_ty, Some(AddressSpace::default()), "__nod_aot_safepoints");
+    table.set_linkage(Linkage::Private);
+    table.set_constant(true);
+    table.set_initializer(&record_ty.const_array(&row_inits));
+
+    let count = module.add_global(i64_ty, Some(AddressSpace::default()), "__nod_aot_safepoint_count");
+    count.set_linkage(Linkage::Private);
+    count.set_constant(true);
+    count.set_initializer(&i64_ty.const_int(safepoint_installs.len() as u64, false));
+    Ok(())
+}
+
+fn emit_private_byte_global<'ctx>(
+    module: &Module<'ctx>,
+    ctx: &inkwell::context::ContextRef<'ctx>,
+    name: &str,
+    bytes: &[u8],
+) -> GlobalValue<'ctx> {
+    let i8_ty = ctx.i8_type();
+    let arr_ty = i8_ty.array_type(bytes.len() as u32);
+    let g = module.add_global(arr_ty, Some(AddressSpace::default()), name);
+    g.set_linkage(Linkage::Private);
+    g.set_constant(true);
+    g.set_initializer(&i8_ty.const_array(
+        &bytes
+            .iter()
+            .map(|b| i8_ty.const_int(*b as u64, false))
+            .collect::<Vec<_>>(),
+    ));
+    g
+}
+
 /// Sprint 39a — write `module` to disk as a Windows COFF / ELF `.obj`
 /// file at `path`. Caller is `nod-driver`; the produced `.obj` is fed
 /// to `link.exe` alongside `nod_runtime.lib` to produce a Dylan EXE.
@@ -1650,7 +1844,31 @@ pub fn emit_aot_object_with_registrations(
     path: &Path,
     opt_level: OptimizationLevel,
 ) -> Result<(), AotError> {
-    emit_aot_entry_stubs_with_registrations(module, manifest, registrations)?;
+    emit_aot_object_with_registrations_and_safepoints(
+        module,
+        manifest,
+        registrations,
+        &[],
+        path,
+        opt_level,
+    )?;
+    Ok(())
+}
+
+pub fn emit_aot_object_with_registrations_and_safepoints(
+    module: &Module<'_>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    safepoint_installs: &[SafepointInstallRecord],
+    path: &Path,
+    opt_level: OptimizationLevel,
+) -> Result<(), AotError> {
+    emit_aot_entry_stubs_with_registrations_and_safepoints(
+        module,
+        manifest,
+        registrations,
+        safepoint_installs,
+    )?;
     emit_object_file(module, path, opt_level)?;
     Ok(())
 }
@@ -1668,6 +1886,23 @@ mod tests {
     use super::*;
     use inkwell::context::Context;
     use inkwell::values::AsValueRef;
+
+    fn image_safepoint(site_id: u64) -> SafepointInstallRecord {
+        SafepointInstallRecord {
+            namespace: 0,
+            site_id,
+            patchpoint_label: format!("gc.s{site_id}"),
+            installed_text_region: crate::codegen::InstalledTextRegion {
+                kind: InstalledTextRegionKind::Image,
+                section_label: "image.code.text",
+            },
+            kind: SafepointKind::DirectCall,
+            function: "main".to_string(),
+            block_label: "entry".to_string(),
+            computation_index: 0,
+            roots: Vec::new(),
+        }
+    }
 
     fn make_user_main_module<'ctx>(ctx: &'ctx Context) -> Module<'ctx> {
         let module = ctx.create_module("hello");
@@ -1734,5 +1969,66 @@ mod tests {
         // Best-effort cleanup; if removal fails we leave a stray temp
         // file but the test passes.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entry_stub_bakes_image_safepoint_table() {
+        let ctx = Context::create();
+        let module = make_user_main_module(&ctx);
+        let manifest = ModuleManifest::default();
+
+        emit_aot_entry_stubs_with_registrations_and_safepoints(
+            &module,
+            &manifest,
+            &AotRegistrations::default(),
+            &[image_safepoint(7)],
+        )
+        .expect("entry stub emission with safepoints");
+
+        let ir = module.print_to_string().to_string();
+        assert!(ir.contains("@__nod_aot_safepoints = private constant"), "missing safepoint table: {ir}");
+        assert!(ir.contains("@__nod_aot_safepoint_count = private constant i64 1"), "missing safepoint count: {ir}");
+        assert!(ir.contains("image.code.text"), "missing image section label: {ir}");
+        assert!(ir.contains("gc.s7"), "missing patchpoint label: {ir}");
+    }
+
+    #[test]
+    fn entry_stub_rejects_non_image_safepoint_table() {
+        let ctx = Context::create();
+        let module = make_user_main_module(&ctx);
+        let manifest = ModuleManifest::default();
+        let mut site = image_safepoint(1);
+        site.installed_text_region.kind = InstalledTextRegionKind::InMemory;
+        site.installed_text_region.section_label = "mem.code.text";
+
+        let err = emit_aot_entry_stubs_with_registrations_and_safepoints(
+            &module,
+            &manifest,
+            &AotRegistrations::default(),
+            &[site],
+        );
+
+        assert!(matches!(err, Err(AotError::Conflict(msg)) if msg.contains("non-image safepoint install record")));
+    }
+
+    #[test]
+    fn entry_stub_calls_runtime_safepoint_registration() {
+        let ctx = Context::create();
+        let module = make_user_main_module(&ctx);
+        let manifest = ModuleManifest::default();
+
+        emit_aot_entry_stubs_with_registrations_and_safepoints(
+            &module,
+            &manifest,
+            &AotRegistrations::default(),
+            &[image_safepoint(3)],
+        )
+        .expect("entry stub emission with safepoints");
+
+        let ir = module.print_to_string().to_string();
+        assert!(
+            ir.contains("call void @nod_aot_register_safepoints"),
+            "missing runtime safepoint registration call: {ir}"
+        );
     }
 }

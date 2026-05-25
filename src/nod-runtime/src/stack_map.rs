@@ -25,7 +25,10 @@
 //! 1-bit-tag scheme uses `Word::from_raw` where NCL uses
 //! `unsafe { Word::from_raw(…) }`).
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::word::Word;
 
 // -- LiveSlot ----------------------------------------------------------------
 
@@ -84,6 +87,131 @@ impl StackMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitSafepointEntry {
+    pub namespace: u64,
+    pub site_id: u64,
+    pub slots: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveJitSafepoint {
+    namespace: u64,
+    site_id: u64,
+    slot_base: *mut Word,
+}
+
+fn jit_safepoint_registry(
+) -> &'static std::sync::Mutex<BTreeMap<(u64, u64), JitSafepointEntry>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<(u64, u64), JitSafepointEntry>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+thread_local! {
+    static ACTIVE_JIT_SAFEPOINTS: RefCell<Vec<ActiveJitSafepoint>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub fn active_jit_safepoint_depth() -> usize {
+    ACTIVE_JIT_SAFEPOINTS.with(|stack| stack.borrow().len())
+}
+
+pub fn truncate_active_jit_safepoints(depth: usize) {
+    ACTIVE_JIT_SAFEPOINTS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.len() > depth {
+            stack.truncate(depth);
+        }
+    });
+}
+
+pub fn register_jit_safepoints(entries: Vec<JitSafepointEntry>) {
+    let mut registry = jit_safepoint_registry()
+        .lock()
+        .expect("jit safepoint registry poisoned");
+    for entry in entries {
+        registry.insert((entry.namespace, entry.site_id), entry);
+    }
+}
+
+fn lookup_jit_safepoint(namespace: u64, site_id: u64) -> Option<JitSafepointEntry> {
+    jit_safepoint_registry()
+        .lock()
+        .expect("jit safepoint registry poisoned")
+        .get(&(namespace, site_id))
+        .cloned()
+}
+
+fn require_jit_safepoint(namespace: u64, site_id: u64) -> JitSafepointEntry {
+    lookup_jit_safepoint(namespace, site_id).unwrap_or_else(|| {
+        panic!(
+            "missing JIT safepoint registration for namespace={namespace:#x} site_id={site_id}"
+        )
+    })
+}
+
+pub fn snapshot_active_jit_roots() -> Vec<*const Word> {
+    ACTIVE_JIT_SAFEPOINTS.with(|stack| {
+        let active = stack.borrow();
+        let mut roots = Vec::new();
+        for frame in active.iter() {
+            let Some(entry) = lookup_jit_safepoint(frame.namespace, frame.site_id) else {
+                continue;
+            };
+            for &slot_idx in &entry.slots {
+                // SAFETY: `slot_base` points at the first entry of the
+                // active safepoint slot slab; every recorded slot index is
+                // in-bounds for that slab while the safepoint is active.
+                let slot = unsafe { frame.slot_base.add(slot_idx as usize) };
+                roots.push(slot as *const Word);
+            }
+        }
+        roots
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_jit_begin_safepoint(
+    namespace: u64,
+    site_id: u64,
+    slot_base: *mut Word,
+) {
+    let _entry = require_jit_safepoint(namespace, site_id);
+    ACTIVE_JIT_SAFEPOINTS.with(|stack| {
+        stack.borrow_mut().push(ActiveJitSafepoint {
+            namespace,
+            site_id,
+            slot_base,
+        });
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nod_jit_end_safepoint(namespace: u64, site_id: u64) {
+    ACTIVE_JIT_SAFEPOINTS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(top) = stack.pop() else {
+            return;
+        };
+        assert_eq!(
+            (top.namespace, top.site_id),
+            (namespace, site_id),
+            "JIT safepoint stack mismatch"
+        );
+    });
+}
+
+#[cfg(test)]
+fn reset_jit_safepoints_for_tests() {
+    jit_safepoint_registry()
+        .lock()
+        .expect("jit safepoint registry poisoned")
+        .clear();
+    ACTIVE_JIT_SAFEPOINTS.with(|stack| stack.borrow_mut().clear());
 }
 
 // -- ParkedFrame -------------------------------------------------------------
@@ -158,7 +286,7 @@ pub unsafe fn walk_parked_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::word::Word;
+    use serial_test::serial;
 
     fn fixnum_word(n: i64) -> Word {
         Word::from_fixnum(n).expect("test fixnum in range")
@@ -344,5 +472,67 @@ mod tests {
         assert!(m.lookup(1).is_some());
         assert!(m.lookup(2).is_some());
         assert!(m.lookup(3).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn active_jit_safepoint_snapshot_uses_registered_slots() {
+        reset_jit_safepoints_for_tests();
+        register_jit_safepoints(vec![JitSafepointEntry {
+            namespace: 0xAA,
+            site_id: 7,
+            slots: vec![0, 2],
+        }]);
+        let mut slots = [fixnum_word(11), fixnum_word(22), fixnum_word(33)];
+        unsafe {
+            nod_jit_begin_safepoint(0xAA, 7, slots.as_mut_ptr());
+        }
+        let roots = snapshot_active_jit_roots();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(unsafe { (*roots[0]).as_fixnum() }, Some(11));
+        assert_eq!(unsafe { (*roots[1]).as_fixnum() }, Some(33));
+        nod_jit_end_safepoint(0xAA, 7);
+        assert!(snapshot_active_jit_roots().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn truncate_active_jit_safepoints_restores_checkpoint() {
+        reset_jit_safepoints_for_tests();
+        register_jit_safepoints(vec![
+            JitSafepointEntry {
+                namespace: 0xAA,
+                site_id: 7,
+                slots: vec![0],
+            },
+            JitSafepointEntry {
+                namespace: 0xAA,
+                site_id: 8,
+                slots: vec![0],
+            },
+        ]);
+        let mut outer_slots = [fixnum_word(11)];
+        let mut inner_slots = [fixnum_word(22)];
+        unsafe {
+            nod_jit_begin_safepoint(0xAA, 7, outer_slots.as_mut_ptr());
+        }
+        let baseline = active_jit_safepoint_depth();
+        unsafe {
+            nod_jit_begin_safepoint(0xAA, 8, inner_slots.as_mut_ptr());
+        }
+        truncate_active_jit_safepoints(baseline);
+        let roots = snapshot_active_jit_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(unsafe { (*roots[0]).as_fixnum() }, Some(11));
+        nod_jit_end_safepoint(0xAA, 7);
+        assert!(snapshot_active_jit_roots().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "missing JIT safepoint registration")]
+    fn begin_jit_safepoint_requires_registration() {
+        reset_jit_safepoints_for_tests();
+        let _ = require_jit_safepoint(0xAA, 7);
     }
 }

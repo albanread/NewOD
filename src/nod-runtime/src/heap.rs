@@ -439,7 +439,9 @@ pub fn root_count() -> usize {
 /// `*slot` for each slot in the snapshot, and the rewrites happen
 /// outside the `RefCell` borrow).
 fn snapshot_roots() -> Vec<*const Word> {
-    ROOT_STACK.with(|s| s.borrow().clone())
+    let mut roots = ROOT_STACK.with(|s| s.borrow().clone());
+    roots.extend(crate::stack_map::snapshot_active_jit_roots());
+    roots
 }
 
 /// Iterate every currently-registered root. The closure must NOT
