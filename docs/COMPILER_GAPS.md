@@ -169,7 +169,7 @@ Sort by ID. New gaps append. Don't renumber.
 * **Scope (actual)**: medium-large. ~600 lines across nod-runtime,
   nod-sema, nod-llvm. 7 commits worth of independently-verifiable
   steps merged here into one for atomicity.
-* **Status**: **fixed in SHA TBD** (this commit). GAP-002's regression
+* **Status**: **fixed in SHA `74e6221`** (this commit). GAP-002's regression
   test still passes — constants stay immutable, variables are the
   only writable kind.
 
