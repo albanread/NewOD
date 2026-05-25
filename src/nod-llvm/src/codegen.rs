@@ -1133,11 +1133,20 @@ struct Emit<'ctx, 'a> {
     blocks: HashMap<BlockId, BasicBlock<'ctx>>,
     block_phis: HashMap<BlockId, Vec<PhiValue<'ctx>>>,
     temps: HashMap<TempId, BasicValueEnum<'ctx>>,
-    /// (target block, source block, args) — recorded as we emit each
-    /// terminator. After all blocks are emitted, we walk this and call
-    /// `add_incoming` on each phi node. Done in two phases so all
-    /// predecessor SSA values are defined before phis read them.
-    pending_incoming: Vec<(BlockId, BasicBlock<'ctx>, Vec<TempId>)>,
+    /// (target block, source block, arg SSA values) — recorded as we
+    /// emit each terminator. After all blocks are emitted, we walk this
+    /// and call `add_incoming` on each phi node. Done in two phases so
+    /// every basic block exists before phis reference them.
+    ///
+    /// GAP-007 (docs/COMPILER_GAPS.md): we snapshot the resolved
+    /// `BasicValueEnum` at jump-emit time rather than the symbolic
+    /// `TempId`. `end_safepoint` rebinds `state.temps[t]` to a fresh
+    /// `gc.reload.tN` SSA value in whichever block currently owns the
+    /// reload — if phi-wiring resolved TempIds at end-of-function, every
+    /// loop-header phi would read the LAST reload across the entire
+    /// function, breaking dominance and corrupting heap references.
+    /// The value captured here flowed out of the actual predecessor.
+    pending_incoming: Vec<(BlockId, BasicBlock<'ctx>, Vec<BasicValueEnum<'ctx>>)>,
     /// Sprint 11b: a small pool of `i64` allocas in the entry block,
     /// reused across multiple safepoints. Indexed by allocation order.
     /// Each call's spill/reload sequence rents N slots starting at
@@ -1221,17 +1230,16 @@ fn emit_function<'ctx, 'a>(
         state.emit_terminator(&b.terminator)?;
     }
 
-    // Now that every block has been emitted (so every TempId is bound
-    // to an LLVM value), wire up phi incomings.
-    for (target_block, source_bb, args) in &state.pending_incoming {
-        let phis = state.block_phis.get(target_block);
-        let Some(phis) = phis else { continue };
-        for (phi, arg_temp) in phis.iter().zip(args.iter()) {
-            let v = *state
-                .temps
-                .get(arg_temp)
-                .expect("phi incoming temp defined");
-            phi.add_incoming(&[(&v, *source_bb)]);
+    // Now that every block has been emitted, wire up phi incomings.
+    // GAP-007: `arg_vals` are pre-resolved SSA values captured at
+    // jump-emit time, so we don't re-consult `state.temps` here (which
+    // safepoint reloads have since mutated).
+    for (target_block, source_bb, arg_vals) in &state.pending_incoming {
+        let Some(phis) = state.block_phis.get(target_block) else {
+            continue;
+        };
+        for (phi, v) in phis.iter().zip(arg_vals.iter()) {
+            phi.add_incoming(&[(v, *source_bb)]);
         }
     }
 
@@ -3091,6 +3099,14 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             }
             Terminator::Jump { target, args } => {
                 let target_bb = self.blocks[target];
+                // GAP-007: resolve TempIds to SSA values BEFORE branching
+                // so the phi captures the value that flowed out of THIS
+                // predecessor. If we deferred to end-of-function, a
+                // subsequent safepoint reload would clobber
+                // `self.temps[t]` and the phi would receive the wrong
+                // (likely body-block-local) reload SSA on every edge.
+                let arg_vals: Vec<BasicValueEnum<'ctx>> =
+                    args.iter().map(|t| self.temp_val(*t)).collect();
                 // Snapshot the actual source block at this exact insert
                 // point — phi nodes need that, not the logical DFM
                 // BlockId (which would resolve to its starting LLVM BB
@@ -3102,8 +3118,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 self.builder
                     .build_unconditional_branch(target_bb)
                     .map_err(map_err)?;
-                self.pending_incoming
-                    .push((*target, current, args.clone()));
+                self.pending_incoming.push((*target, current, arg_vals));
             }
         }
         Ok(())
