@@ -227,6 +227,90 @@ Sort by ID. New gaps append. Don't renumber.
 * **Scope**: small. ~15 lines of codegen.
 * **Status**: **fixed in SHA `8e153b2`** (this commit).
 
+## GAP-007 — Function-local heap references go stale across heavy allocation loops
+
+* **Discovered**: Sprint 45b,
+  `tests/nod-tests/fixtures/dylan-lexer.dylan` — the lex+dump path
+  for the Dylan-in-Dylan lexer.
+* **Symptom**: a function holds a heap-object reference in a `let`
+  local (a `<stretchy-vector>`, a `<string-stream>`, a `<byte-string>`)
+  and threads it through a loop that calls into other functions that
+  allocate. After ~92–650 iterations (depending on the per-iteration
+  allocation pressure) the local's word turns into garbage and the
+  next use trips one of:
+  - `stretchy_vector_push: not a <stretchy-vector>` in
+    `src/nod-runtime/src/collections.rs:989`
+  - `<no-applicable-methods-error>: no applicable method for
+    \`write-byte\` on (<unknown:NNN>, <integer>)` raised by sema's
+    method dispatch
+  Class id `NNN` in the second form is a different small integer on
+  every run — classic stale-pointer behaviour. Function parameters
+  show the same failure as `let` locals; passing the vector/stream
+  through a helper function's parameter slot does NOT save it.
+  Module-level `define variable` cells DO survive because they live
+  in cell-backed slots registered as GC roots (the Sprint 24 / GAP-004
+  machinery).
+* **Minimal reproducer**:
+  ```dylan
+  define class <tok> (<object>) end class;
+  define function dump (vec :: <stretchy-vector>) => ()
+    let stream = make-string-stream();
+    let n = %stretchy-vector-size(vec);
+    let i = 0;
+    until (i = n)
+      let t = %stretchy-vector-element(vec, i);
+      write-string(stream, "abcdef");
+      write-byte(stream, 10);
+      i := i + 1;
+    end;
+  end function;
+  ```
+  Run with `n > ~92`. `vec` and `stream` both become garbage between
+  iterations once `write-string` triggers enough allocations to grow
+  the stream's backing storage. The `lex_count2.dylan` variant on
+  this shape FAILS AT BUILD with a verifier error
+  `Instruction does not dominate all uses!` involving a `gc.reload`
+  PHI — same root cause surfacing as ill-formed LLVM IR instead of
+  runtime corruption.
+* **Workaround in tree**: the lexer fixture stashes its three
+  heaviest-trafficked heap roots as module variables:
+  - `*tokens* :: <object>` — the `<stretchy-vector>` accumulator
+  - `*dump-stream* :: <object>` — the dump-tokens output stream
+  - `print-token` writes through `*dump-stream*` directly (with
+    helpers `write-line-col-to-dump-stream` and
+    `write-escaped-source-text-to-dump-stream`)
+  This pushes the failure envelope from ~92 lines to ~650 lines of
+  the lexer's own source — enough for sprint 45b's working corpus
+  (hello.dylan, the Sprint 45-era tests) but NOT enough to dump the
+  lexer fixture on itself (~1265 lines, 38 KB). The workaround
+  surface is documented in-source where it lives.
+* **Planned fix**: a JIT GC-root-tracking sweep. Likely culprits:
+  - `nod-llvm`'s phi-node placement around loop join blocks. The
+    `gc.reload` from the `lex_count2.dylan` IR-verifier failure
+    suggests the codegen is generating a phi where one incoming
+    edge's value is not dominated. A small clean-room reproducer
+    EXE (the `lex_count2.dylan` build above) gives us a fast
+    iteration loop.
+  - Function-parameter slots are SUPPOSED to be tracked roots but
+    the empirical data says they aren't surviving past the first
+    minor GC. Audit `emit_call` / `emit_dispatch` in
+    `nod-llvm/src/codegen.rs` for missing `gc.relocate` reloads on
+    parameter temps.
+  - Cross-check against the Sprint 23 `RootGuard` machinery in
+    `nod-runtime/src/make.rs` — Rust-side allocations correctly
+    root locals across allocs; the same discipline needs to extend
+    to Dylan-side function frames.
+* **Regression test**: none yet. The minimal reproducer above
+  should land as `tests/nod-tests/tests/gap_007_stale_locals.rs`
+  once the fix is in flight, with the fixture saved at
+  `tests/nod-tests/fixtures/gap-007-repro.dylan`.
+* **Scope**: medium-large. Touches `nod-llvm` codegen + the JIT
+  GC-root-tracking schema. Own sprint, sequenced before Sprint 45d
+  (the oracle test) since the oracle will need the lexer to dump
+  bigger corpora than the workaround envelope.
+* **Status**: **open**. Workaround in tree at
+  `tests/nod-tests/fixtures/dylan-lexer.dylan` (Sprint 45b).
+
 ## GAP-003 — No multi-value return / no multi-binder `let`
 
 * **Discovered**: Sprint 45a, commit `29e1040`,
