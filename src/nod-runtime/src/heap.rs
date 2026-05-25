@@ -441,6 +441,7 @@ pub fn root_count() -> usize {
 fn snapshot_roots() -> Vec<*const Word> {
     let mut roots = ROOT_STACK.with(|s| s.borrow().clone());
     roots.extend(crate::stack_map::snapshot_active_jit_roots());
+    roots.extend(crate::aot::snapshot_active_aot_roots());
     roots
 }
 

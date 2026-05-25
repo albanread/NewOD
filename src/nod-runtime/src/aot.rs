@@ -235,6 +235,7 @@ struct ActiveAotSafepoint {
     site_id: u64,
     expected_root_count: usize,
     baseline_root_count: usize,
+    slot_base: *mut crate::word::Word,
 }
 
 fn aot_safepoint_registry(
@@ -304,6 +305,23 @@ fn active_safepoint_top() -> ActiveAotSafepoint {
     })
 }
 
+pub fn snapshot_active_aot_roots() -> Vec<*const crate::word::Word> {
+    ACTIVE_AOT_SAFEPOINTS.with(|stack| {
+        let stack = stack.borrow();
+        let mut roots = Vec::new();
+        for frame in stack.iter() {
+            for slot_idx in 0..frame.expected_root_count {
+                // SAFETY: `slot_base` points at the active safepoint slab
+                // passed by codegen; the first `expected_root_count` entries
+                // are the spilled root slots for this active frame.
+                let slot = unsafe { frame.slot_base.add(slot_idx) };
+                roots.push(slot as *const crate::word::Word);
+            }
+        }
+        roots
+    })
+}
+
 fn with_active_safepoint_mut<F>(f: F)
 where
     F: FnOnce(&mut Vec<ActiveAotSafepoint>),
@@ -361,7 +379,11 @@ pub unsafe extern "C" fn nod_aot_register_safepoints(
     }
 }
 
-fn begin_aot_safepoint(site_id: u64, expected_root_count: u64) {
+fn begin_aot_safepoint(
+    site_id: u64,
+    expected_root_count: u64,
+    slot_base: *mut crate::word::Word,
+) {
     let registered = find_registered_aot_safepoint(site_id);
     let expected_root_count = usize::try_from(expected_root_count)
         .unwrap_or_else(|_| panic!("AOT safepoint {site_id} root count does not fit usize"));
@@ -380,6 +402,7 @@ fn begin_aot_safepoint(site_id: u64, expected_root_count: u64) {
             site_id,
             expected_root_count,
             baseline_root_count,
+            slot_base,
         });
     });
     if trace_exec_safepoints_enabled() {
@@ -391,8 +414,12 @@ fn begin_aot_safepoint(site_id: u64, expected_root_count: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nod_aot_begin_safepoint(site_id: u64, expected_root_count: u64) {
-    begin_aot_safepoint(site_id, expected_root_count);
+pub extern "C" fn nod_aot_begin_safepoint(
+    site_id: u64,
+    expected_root_count: u64,
+    slot_base: *mut crate::word::Word,
+) {
+    begin_aot_safepoint(site_id, expected_root_count, slot_base);
 }
 
 fn verify_aot_safepoint(site_id: u64) {
@@ -1173,6 +1200,29 @@ mod tests {
     }
 
     #[test]
+    fn active_aot_safepoint_snapshot_uses_slot_slab() {
+        reset_aot_safepoints_for_tests();
+        let entries = [test_safepoint_entry(7, b"entry")];
+        unsafe {
+            nod_aot_register_safepoints(entries.as_ptr(), entries.len());
+        }
+
+        let mut roots = [
+            crate::Word::from_fixnum(11).expect("test fixnum in range"),
+            crate::Word::from_fixnum(22).expect("test fixnum in range"),
+        ];
+
+        begin_aot_safepoint(7, 2, roots.as_mut_ptr());
+        let snapshot = snapshot_active_aot_roots();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(unsafe { (*snapshot[0]).as_fixnum() }, Some(11));
+        assert_eq!(unsafe { (*snapshot[1]).as_fixnum() }, Some(22));
+
+        end_aot_safepoint(7);
+        assert!(snapshot_active_aot_roots().is_empty());
+    }
+
+    #[test]
     fn aot_exec_safepoint_hooks_verify_root_protocol() {
         reset_aot_safepoints_for_tests();
         let entries = [test_safepoint_entry(7, b"entry")];
@@ -1182,8 +1232,9 @@ mod tests {
 
         let root_a = crate::Word::from_raw(0);
         let root_b = crate::Word::from_raw(0);
+    let mut precise_roots = [root_a, root_b];
 
-        begin_aot_safepoint(7, 2);
+    begin_aot_safepoint(7, 2, precise_roots.as_mut_ptr());
         crate::heap::register_root(&root_a);
         crate::heap::register_root(&root_b);
         verify_aot_safepoint(7);
@@ -1204,8 +1255,9 @@ mod tests {
         }
 
         let root_a = crate::Word::from_raw(0);
+        let mut precise_roots = [root_a, crate::Word::from_raw(0)];
 
-        begin_aot_safepoint(7, 2);
+        begin_aot_safepoint(7, 2, precise_roots.as_mut_ptr());
         crate::heap::register_root(&root_a);
         verify_aot_safepoint(7);
     }

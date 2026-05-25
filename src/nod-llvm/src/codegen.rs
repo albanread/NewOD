@@ -4108,6 +4108,15 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
         let mut rented: Vec<SafepointSlot<'ctx>> = Vec::with_capacity(roots.len());
         if self.emits_image_safepoint_runtime_checks() {
+            let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
+            let slot_base_ptr = self
+                .builder
+                .build_pointer_cast(
+                    self.safepoint_slot_base_ptr()?,
+                    ptr_ty,
+                    &format!("gc.s{site_id}.aot_slot_base"),
+                )
+                .map_err(map_err)?;
             self.builder
                 .build_call(
                     self.get_or_declare_aot_begin_safepoint(),
@@ -4117,6 +4126,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                             .i64_type()
                             .const_int(roots.len() as u64, false)
                             .into(),
+                        slot_base_ptr.into(),
                     ],
                     &format!("gc.s{site_id}.begin"),
                 )
@@ -4384,10 +4394,11 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             return f;
         }
         let i64ty = self.ctx.i64_type();
+        let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
         let ty = self
             .ctx
             .void_type()
-            .fn_type(&[i64ty.into(), i64ty.into()], false);
+            .fn_type(&[i64ty.into(), i64ty.into(), ptr_ty.into()], false);
         self.module
             .add_function(NOD_AOT_BEGIN_SAFEPOINT_SYMBOL, ty, None)
     }
