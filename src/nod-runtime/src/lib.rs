@@ -80,7 +80,7 @@ mod wrapper;
 // Sprint 39a — AOT entry-point symbols. Re-exported so test code can
 // reference them (the `#[unsafe(no_mangle)]` extern surface is what the
 // linker sees; the `pub use` is just to give cargo-test callers a path).
-pub use aot::{nod_aot_main_wrapper, nod_runtime_init};
+pub use aot::{nod_aot_main_wrapper, nod_aot_register_variable, nod_runtime_init};
 pub use classes::{
     ClassId, ClassMetadata, ClassTable, LayoutFn, ScanFn, SizeFn, SlotDefault, SlotInfo,
     SlotType, _reset_user_classes_for_tests, allocate_user_class_id, class_metadata_for,
@@ -90,7 +90,8 @@ pub use classes::{
 pub use closures::{
     cell_class_id, ensure_registered as ensure_closures_registered, environment_class_id,
     is_cell, is_environment, make_cell, make_environment, nod_cell_get, nod_cell_set,
-    nod_env_cell, nod_make_cell, nod_make_environment,
+    nod_env_cell, nod_make_cell, nod_make_environment, nod_var_get_by_name,
+    nod_var_set_by_name,
 };
 pub use collections::{
     FipKind, IterStateSnapshot, OutOfRange, collection_class_id, collection_concatenate,
@@ -713,6 +714,101 @@ pub fn generic_function_slot_addr(name: &str) -> &'static u64 {
     let slot: &'static u64 = Box::leak(Box::new(generic_ptr_bits));
     guard.insert(name.to_string(), slot);
     slot
+}
+
+// ─── GAP-004 — per-`define variable` cell slot allocator ───────────────────
+//
+// Each module-level `define variable` is lowered as:
+//   * an `__init-<name>` zero-arg function returning the init expression;
+//   * a `<name>()` getter that loads the cell pointer from the variable's
+//     slot and calls `nod_cell_get`;
+//   * a `<name>-setter(v)` that loads the cell pointer and calls
+//     `nod_cell_set`.
+//
+// The runtime side here owns the **slot**: a process-global
+// `&'static u64` per variable name whose bits are the raw pointer of a
+// freshly-allocated `<cell>`. The slot starts at 0 (uninitialised) and
+// is filled in at startup by [`nod_aot_register_variable`] (AOT path)
+// or by the JIT-side init driver in `nod-sema` (JIT path), which
+// evaluates the user's init expression, allocates a cell holding the
+// result, and stores the cell pointer's raw bits in the slot.
+//
+// GC-trace note: the cell itself lives in the **moveable heap** (since
+// `<cell>` is a GC-traced class). When the GC relocates the cell, the
+// slot's bits must be updated to the new address. We achieve that by
+// registering the slot's address as a heap root the first time we
+// allocate a slot for a variable — the GC's existing pointer-rewriting
+// path then walks through the slot's address as if it were any other
+// stack-/static-tracked Word.
+//
+// The user-visible value INSIDE the cell is itself in the moveable
+// heap (for pointer values) and is reached via the cell's `value`
+// slot, which is already GC-traced by Sprint 24's `<cell>` class. So
+// any heap pointer stored in a `define variable` survives GC cycles
+// transitively through cell → value.
+//
+// Storage choice: we leak an `AtomicU64` per variable so atomic
+// init-store / load semantics are explicit. Reads from JIT-emitted
+// getter bodies use `Relaxed` (no synchronisation contract beyond
+// "see the post-init value at some point") since the init runs
+// before `nod_user_main` is entered.
+
+/// GAP-004 — per-`define variable`-name slot table mapping the
+/// variable's bareword name (as it appears in source) to the stable
+/// address of an `AtomicU64` holding the variable's `<cell>` pointer
+/// bits. Keyed on `name.to_string()`. Pointers are leaked for the
+/// process lifetime; the AtomicU64 starts at 0 and is set to the
+/// cell's raw Word bits when the variable is initialised.
+static VARIABLE_CELL_SLOTS: LazyLock<
+    Mutex<HashMap<String, &'static std::sync::atomic::AtomicU64>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// GAP-004 — return the stable address of the `AtomicU64` slot holding
+/// the cell pointer for `name`. Repeated calls with the same name
+/// return the SAME `&'static AtomicU64`.
+///
+/// First lookup allocates a fresh `AtomicU64` initialised to 0 (the
+/// "uninitialised" sentinel — `nod_var_get_by_name` panics if it reads
+/// 0), leaks it, registers its address as a GC root (so the collector
+/// rewrites the cell pointer when the cell is relocated), and memoises.
+///
+/// **GC root registration**: the slot's address is registered via
+/// [`heap_register_root`] so the GC rewrites the slot's bits when the
+/// referenced `<cell>` is evacuated. This call MUST happen on the
+/// thread that will later be running the GC's pointer-rewriting cycle
+/// — single-mutator deployments (current AOT + JIT) trivially satisfy
+/// this because allocation and the rewrite both run on the main
+/// thread. Multi-mutator support is deferred.
+pub fn variable_cell_slot_addr(name: &str) -> &'static std::sync::atomic::AtomicU64 {
+    let mut guard = VARIABLE_CELL_SLOTS
+        .lock()
+        .expect("variable cell slot table poisoned");
+    if let Some(&slot) = guard.get(name) {
+        return slot;
+    }
+    let slot: &'static std::sync::atomic::AtomicU64 =
+        Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    // Register the slot's address as a GC root. The slot's bits ARE
+    // a Word (cell pointer), so the collector walks through it during
+    // root scanning and rewrites the bits if the pointed-at cell is
+    // evacuated. AtomicU64 has the same layout as u64, so casting to
+    // `*const Word` is sound.
+    let slot_as_word: *const Word = slot as *const _ as *const Word;
+    heap_register_root(slot_as_word);
+    guard.insert(name.to_string(), slot);
+    slot
+}
+
+/// GAP-004 — clear the variable cell slot table. Used by tests that
+/// reset the runtime state between scenarios; the leaked `AtomicU64`s
+/// themselves stay alive (still GC roots), but the map is wiped so a
+/// fresh test sees fresh init paths.
+#[doc(hidden)]
+pub fn _reset_variable_cell_slots_for_tests() {
+    let mut guard = VARIABLE_CELL_SLOTS
+        .lock()
+        .expect("variable cell slot table poisoned");
+    guard.clear();
 }
 
 /// Description of a user class to be registered. Sprint 12 expects

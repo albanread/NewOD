@@ -121,19 +121,57 @@ Sort by ID. New gaps append. Don't renumber.
   to anything callable.
 * **Symptom**: `define variable foo = expr;` fails to lower at all
   — fails BEFORE the GAP-002 name-resolution path is even reached.
-* **Workaround**: avoid `define variable`. The lexer fixture uses
-  `define constant` exclusively. Mutable module-level state isn't
-  expressible in user Dylan today.
-* **Planned fix**: complete the `Item::DefineVariable` lowering.
-  The right shape is probably "zero-arg getter function + one-arg
-  setter function", same pattern as slot accessors — store the
-  current value in a process-global Word slot (similar to Sprint
-  38c's literal slots), getter loads it, setter stores it (with
-  write-barrier if heap pointer).
-* **Scope**: medium. Touches the lowering pass, the AOT
-  registration path (need a runtime slot per `define variable`),
-  and possibly the JIT path for cross-module refs.
-* **Status**: open.
+* **Workaround**: avoid `define variable`. The lexer fixture used
+  `define constant` exclusively. Retired with the fix.
+* **Fix**: full `<cell>`-backed read/write/init pipeline in 7 steps:
+  1. **Runtime storage** — `variable_cell_slot_addr(name) ->
+     &'static AtomicU64` slot-allocator pattern (Sprint 38c shape,
+     mutable variant) in `nod-runtime/src/lib.rs`. Slots hold the
+     cell-pointer Word, registered as GC roots on first allocation
+     so the cell itself stays reachable across GC cycles.
+  2. **Runtime API** — `nod_aot_register_variable(name, name_len,
+     init_fn_ptr)` (in `aot.rs`) calls the init function to compute
+     the initial value, allocates a fresh `<cell>` via `nod_make_cell`,
+     stores the cell pointer in the slot. `nod_var_get_by_name` /
+     `nod_var_set_by_name` (in `closures.rs`) read/write through the
+     slot lookup + cell deref.
+  3. **Lower `Item::DefineVariable`** — emits THREE bodies: a
+     `__init-<name>()` zero-arg function with the init expression,
+     a getter `<name>()` that calls `nod_var_get_by_name`, and a
+     setter `<name>-setter(v)` that calls `nod_var_set_by_name`.
+  4. **Setter wiring** — `lower_assign` (lower.rs:4798) gained a
+     module-variable branch: when the LHS resolves to a `define
+     variable`, emit a DirectCall to `nod_var_set_by_name` with the
+     interned variable name + RHS. `TopNames` split into separate
+     `constants` and `variables` sets so assignment to a `define
+     constant` correctly errors out.
+  5. **AOT registration** — `LoweredModule` gained a `variables:
+     Vec<VariableRegistration>` field; codegen emits one
+     `nod_aot_register_variable(name, len, &__init-name)` call per
+     variable inside `nod_aot_resolve_relocs` AFTER class/method/
+     block registration (variables can call any registered function
+     during init).
+  6. **JIT path** — the JIT-side initialisation mirror runs after
+     the engine materialises; calls each `__init-*` function and
+     stores the result via `nod_var_set_by_name`. Symmetric with
+     the AOT resolver.
+  7. **GC discipline** — the cell pointer in the slot is reachable
+     because the slot is registered as a heap root; the cell's
+     `value` slot is `SlotType::Object` so the contained Word is
+     traced via the existing Sprint 24 machinery.
+* **Regression tests**:
+  - `tests/nod-tests/tests/sema.rs::gap_004_define_variable_lowers_to_getter_and_init`
+    — lowering-side check.
+  - End-to-end smoke (manual): build `define variable *counter* = 41;`
+    program, run, observe `initial = 41` → `*counter* := *counter* + 1`
+    → `after-bump = 42` → `*counter* := 99` → `after-set = 99`.
+    Verified byte-exact through the AOT EXE pipeline.
+* **Scope (actual)**: medium-large. ~600 lines across nod-runtime,
+  nod-sema, nod-llvm. 7 commits worth of independently-verifiable
+  steps merged here into one for atomicity.
+* **Status**: **fixed in SHA TBD** (this commit). GAP-002's regression
+  test still passes — constants stay immutable, variables are the
+  only writable kind.
 
 ## GAP-003 — No multi-value return / no multi-binder `let`
 

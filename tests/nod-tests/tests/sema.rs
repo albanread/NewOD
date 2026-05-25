@@ -499,3 +499,70 @@ fn gap_002_define_constant_resolves_from_function_body() {
     assert!(names.contains(&"$magic"), "missing $magic: {names:?}");
     assert!(names.contains(&"call-magic"), "missing call-magic: {names:?}");
 }
+
+// ─── GAP-004 — `define variable` lowering + setter ───────────────────────
+
+/// Regression test for COMPILER_GAPS.md GAP-004 lowering. Before the
+/// fix, `Item::DefineVariable` emitted `LoweringError::Unsupported`
+/// ("define variable not lowered in Sprint 06"). The fix synthesises
+/// two functions per variable: a `<name>()` getter (zero-arg body that
+/// loads the cell via `nod_var_get_by_name`) and a corresponding
+/// `__init-<name>()` init thunk; a setter ISN'T a standalone function
+/// (`lower_assign` inlines the `nod_var_set_by_name` call at each
+/// assignment site).
+///
+/// This test asserts the lowering structure. End-to-end runtime
+/// round-trip lives in the `aot_dylan` family (separate file).
+#[test]
+fn gap_004_define_variable_lowers_to_getter_and_init() {
+    let src = "\
+        define variable *counter* = 41;\n\
+        define function bump-counter () => (n :: <integer>)\n  \
+            *counter* := *counter* + 1;\n  \
+            *counter*\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+    // Expect three lowered functions: the getter (`*counter*`), the
+    // init thunk (`__init-*counter*`), and the user function
+    // (`bump-counter`). The setter is inlined at the assignment site
+    // inside bump-counter, not emitted standalone.
+    assert!(names.contains(&"*counter*"),
+        "missing *counter* getter: {names:?}");
+    assert!(names.contains(&"__init-*counter*"),
+        "missing __init-*counter* thunk: {names:?}");
+    assert!(names.contains(&"bump-counter"),
+        "missing bump-counter: {names:?}");
+    assert_eq!(fns.len(), 3,
+        "expected 3 lowered functions, got: {names:?}");
+
+    // The user function's body should contain DirectCalls to both the
+    // getter (via the bareword `*counter*`) and the setter shim
+    // (via `:=`). Find bump-counter and check.
+    let bump = fns.iter().find(|f| f.name == "bump-counter")
+        .expect("bump-counter present");
+    let dump = format!("{bump:?}");
+    assert!(dump.contains("nod_var_set_by_name"),
+        "bump-counter body should call nod_var_set_by_name for `:=`: {dump}");
+    assert!(dump.contains("*counter*"),
+        "bump-counter body should reference *counter*: {dump}");
+}
+
+/// GAP-004 — assignment to a `define constant` (vs. variable) must be
+/// rejected by the lowerer. Pre-GAP-004 this fell through to
+/// "UndefinedIdent" because module-level names didn't reach
+/// lower_assign at all. Post-fix, the new branch surfaces a clear
+/// "cannot assign to constant" error.
+#[test]
+fn gap_004_assign_to_define_constant_is_error() {
+    let src = "\
+        define constant $magic = 42;\n\
+        define function clobber () => () $magic := 99 end function;\n";
+    let m = parse_src(src);
+    let err = nod_sema::lower_module(&m).expect_err("must reject constant-assign");
+    let combined = format!("{err:?}");
+    assert!(
+        combined.contains("cannot assign to") && combined.contains("$magic"),
+        "expected `cannot assign to $magic` diagnostic, got: {combined}"
+    );
+}

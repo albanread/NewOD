@@ -63,6 +63,25 @@ pub struct AotRegistrations {
     /// specialiser lookups against user-class IDs find live metadata
     /// by the time those later registrations run.
     pub user_classes: Vec<AotUserClassRegistration>,
+    /// GAP-004 — `define variable` registrations captured from
+    /// `LoweredModule::variables`. The EXE's resolver replays these
+    /// LAST (after classes / methods / blocks / functions), because a
+    /// variable's init expression can call any user / stdlib
+    /// function or dispatch on any user class. Each entry triggers
+    /// one `nod_aot_register_variable(name, init_fn_ptr)` call.
+    pub variables: Vec<AotVariableRegistration>,
+}
+
+/// GAP-004 — one `define variable` to initialise at startup. The
+/// codegen-emitted `__init-<name>` thunk lives in the same module as
+/// the variable's getter; the resolver takes its address and hands it
+/// + the variable's source name to the runtime shim, which evaluates
+/// the thunk and stores the resulting cell pointer in the variable's
+/// process-global slot.
+#[derive(Clone, Debug)]
+pub struct AotVariableRegistration {
+    pub name: String,
+    pub init_fn_name: String,
 }
 
 /// One method registration. Codegen emits one `nod_aot_register_method`
@@ -847,6 +866,11 @@ fn emit_resolve_relocs_function<'ctx>(
     emit_top_level_function_registrations(module, &builder, &ctx, registrations, isize_ty)?;
     emit_method_registrations(module, &builder, &ctx, registrations, isize_ty, i32_ty)?;
     emit_block_registrations(module, &builder, &ctx, registrations, isize_ty)?;
+    // GAP-004 — variable registrations come LAST in the resolver:
+    // a variable's `__init-<name>` thunk can call any user function /
+    // stdlib method / Win32 API, all of which must be live in the
+    // dispatch / function-ref / block registries before init runs.
+    emit_variable_registrations(module, &builder, &ctx, registrations, isize_ty)?;
 
     builder
         .build_return(None)
@@ -1440,6 +1464,63 @@ fn emit_block_registrations<'ctx>(
         builder
             .build_call(helper, &args, "")
             .map_err(|e| AotError::Llvm(format!("call register_block: {e}")))?;
+    }
+    Ok(())
+}
+
+/// GAP-004 — for each [`AotVariableRegistration`] emit a call to
+/// `nod_aot_register_variable(name_ptr, name_len, init_fn_ptr)`
+/// inside the resolver. The shim calls the init thunk to get the
+/// variable's initial Word, allocates a fresh `<cell>`, and stores
+/// the cell pointer in the variable's process-global slot.
+///
+/// The init thunk is a regular Dylan function the user-side codegen
+/// already emitted as `__init-<name>` (see the `Item::DefineVariable`
+/// arm of `lower_module_full`). We take its address by name; skip the
+/// variable if the function isn't in the module (codegen-DCE may have
+/// stripped it, though that shouldn't happen because the variable's
+/// getter also depends on it transitively).
+fn emit_variable_registrations<'ctx>(
+    module: &Module<'ctx>,
+    builder: &inkwell::builder::Builder<'ctx>,
+    ctx: &inkwell::context::ContextRef<'ctx>,
+    registrations: &AotRegistrations,
+    isize_ty: inkwell::types::IntType<'ctx>,
+) -> Result<(), AotError> {
+    if registrations.variables.is_empty() {
+        return Ok(());
+    }
+    let void_ty = ctx.void_type();
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    // `void nod_aot_register_variable(ptr name, isize name_len,
+    //                                 ptr init_fn)`.
+    let helper_ty =
+        void_ty.fn_type(&[ptr_ty.into(), isize_ty.into(), ptr_ty.into()], false);
+    let helper = module
+        .get_function("nod_aot_register_variable")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "nod_aot_register_variable",
+                helper_ty,
+                Some(Linkage::External),
+            )
+        });
+    for reg in &registrations.variables {
+        let Some(fv) = module.get_function(&reg.init_fn_name) else {
+            continue;
+        };
+        let (name_ptr, name_len) =
+            emit_byte_constant(module, builder, ctx, reg.name.as_bytes())?;
+        let init_ptr: BasicValueEnum<'ctx> =
+            fv.as_global_value().as_pointer_value().into();
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
+            name_ptr.into(),
+            isize_ty.const_int(name_len as u64, false).into(),
+            init_ptr.into(),
+        ];
+        builder
+            .build_call(helper, &args, "")
+            .map_err(|e| AotError::Llvm(format!("call register_variable: {e}")))?;
     }
     Ok(())
 }

@@ -50,4 +50,5 @@ pub use symbols::{
 pub use aot::{
     AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
     AotMethodRegistration, AotRegistrations, AotSlotRegistration, AotUserClassRegistration,
+    AotVariableRegistration,
 };

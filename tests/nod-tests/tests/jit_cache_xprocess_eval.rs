@@ -240,6 +240,7 @@ fn sprint38f_disk_replay_abi_mismatch_falls_through() {
         functions: vec![],
         methods: vec![],
         blocks: vec![],
+        variables: vec![],
     };
     bad_regs.write(&dir, key);
 
@@ -330,6 +331,7 @@ fn sprint38f_registrations_sidecar_round_trips() {
                 body_fn_name: "block-handler".into(),
             }],
         }],
+        variables: vec![],
     };
 
     s.write(&dir, key);

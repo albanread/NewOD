@@ -238,6 +238,10 @@ pub const NOD_ENV_CELL_SYMBOL: &str = "nod_env_cell";
 pub const NOD_MAKE_ENVIRONMENT_SYMBOL: &str = "nod_make_environment";
 pub const NOD_MAKE_CLOSURE_SYMBOL: &str = "nod_make_closure";
 
+// ─── GAP-004 — `define variable` getter/setter shims by name ──────────────
+pub const NOD_VAR_GET_BY_NAME_SYMBOL: &str = "nod_var_get_by_name";
+pub const NOD_VAR_SET_BY_NAME_SYMBOL: &str = "nod_var_set_by_name";
+
 // ─── Sprint 34 — <c-struct> field accessor primitives ─────────────────────
 //
 // Each (get, set) pair takes the struct Word and a byte offset and
@@ -437,6 +441,9 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_env_cell", NOD_ENV_CELL_SYMBOL, 2),
     ("nod_make_environment", NOD_MAKE_ENVIRONMENT_SYMBOL, 1),
     ("nod_make_closure", NOD_MAKE_CLOSURE_SYMBOL, 3),
+    // GAP-004 — `define variable` shims (name-by-byte-string).
+    ("nod_var_get_by_name", NOD_VAR_GET_BY_NAME_SYMBOL, 1),
+    ("nod_var_set_by_name", NOD_VAR_SET_BY_NAME_SYMBOL, 2),
     // Sprint 28 — Win64 FFI trampolines. Arity here is the trampoline's
     // C-ABI arity (entry-pointer + user args), so `nod_winffi_call_N`
     // entry takes `N + 1` Dylan-side args.

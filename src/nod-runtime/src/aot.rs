@@ -272,6 +272,52 @@ pub unsafe extern "C" fn nod_aot_register_method(
     }
 }
 
+/// GAP-004 — register a `define variable`'s cell. Evaluates the
+/// codegen-emitted `__init-<name>` thunk to get the variable's initial
+/// Word, allocates a fresh `<cell>` holding that Word, and stores the
+/// cell pointer's raw bits into the slot returned by
+/// [`crate::variable_cell_slot_addr`].
+///
+/// Idempotent only by accident — calling this twice for the same name
+/// would allocate two cells and the second one would win, orphaning
+/// the first (still GC-reachable through the slot). The AOT resolver
+/// calls it once per `LoweredModule::variables` entry in source order;
+/// don't call it from user code.
+///
+/// # Safety
+///
+/// `name_ptr` + `name_len` must describe a valid UTF-8 byte slice.
+/// `init_fn_ptr` must be a valid function pointer of signature
+/// `extern "C-unwind" fn() -> u64` (the codegen-emitted `__init-<name>`
+/// thunk).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_aot_register_variable(
+    name_ptr: *const u8,
+    name_len: usize,
+    init_fn_ptr: *const u8,
+) {
+    // SAFETY: caller asserts the byte slice is valid UTF-8.
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len))
+    };
+    // Reinterpret the init thunk's raw pointer as the expected
+    // signature and call it. Sema lowers `__init-<name>()` as a
+    // zero-arg function returning a Dylan Word.
+    type InitFn = unsafe extern "C-unwind" fn() -> u64;
+    // SAFETY: caller guarantees init_fn_ptr matches this signature.
+    let init: InitFn = unsafe { std::mem::transmute(init_fn_ptr) };
+    // SAFETY: init thunk is a normal Dylan function; calling it during
+    // the AOT resolver runs on the main thread before nod_user_main.
+    let initial_bits = unsafe { init() };
+    let initial = crate::Word::from_raw(initial_bits);
+    // Root the initial value across the cell allocation in case the
+    // allocator triggers a minor GC.
+    let _g = crate::make::RootGuard::new(&initial);
+    let cell_word = crate::make_cell(initial);
+    let slot = crate::variable_cell_slot_addr(name);
+    slot.store(cell_word.raw(), std::sync::atomic::Ordering::Release);
+}
+
 /// Sprint 39c — register a top-level Dylan function in the function-ref
 /// registry so `\name` resolves to its body address.
 ///

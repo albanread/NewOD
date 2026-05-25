@@ -499,3 +499,53 @@ fn aot_register_wndproc_smoke() {
     assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
     assert_eq!(stdout, "ok\n", "stdout mismatch; stderr=\n{stderr}");
 }
+
+// ─── GAP-004 — `define variable` end-to-end through AOT ──────────────────────
+//
+// The sema-side regression in `sema.rs::gap_004_define_variable_lowers_to_getter_and_init`
+// proves the lowering shape is correct. This test proves the FULL
+// pipeline works: lower → codegen → linker → EXE → runtime
+// `nod_aot_register_variable` resolver → `define variable` getter +
+// setter round-tripping at runtime. Without this end-to-end test, the
+// lowering test alone could pass while the runtime shims silently
+// bork.
+//
+// Coverage:
+//   * Initial value (41) flows through the getter on first read.
+//   * `<name> := <value>` writes are observed by subsequent reads.
+//   * Mutation across function-call boundaries holds (bump-counter
+//     called twice, prints intermediate + final).
+//   * Two independent variables don't cross-contaminate (sanity check
+//     for slot-table keying on name).
+
+/// **The GAP-004 headline.** Build an AOT EXE around two
+/// `define variable` declarations and exercise getter / setter /
+/// cross-call mutation. Without the GAP-004 fix the lowering step
+/// would emit `LoweringError::Unsupported` and `nod-driver` would
+/// fail before producing an EXE.
+#[test]
+#[ignore]
+#[serial]
+fn aot_gap_004_define_variable_round_trip() {
+    let source = "Module: var\n\n\
+        define variable *counter* = 41;\n\
+        define variable *other* = 7;\n\n\
+        define function bump-counter () => ()\n  \
+            *counter* := *counter* + 1;\n\
+        end function;\n\n\
+        define function main () => ()\n  \
+            format-out(\"%d\\n\", *counter*);\n  \
+            bump-counter();\n  \
+            format-out(\"%d\\n\", *counter*);\n  \
+            *counter* := 99;\n  \
+            format-out(\"%d\\n\", *counter*);\n  \
+            format-out(\"%d\\n\", *other*);\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("gap-004-var", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    // 41 (initial) → 42 (after bump-counter) → 99 (after direct
+    // assignment) → 7 (the OTHER variable, never touched, still at
+    // its init value — proves slot-table keying is per-name).
+    assert_eq!(stdout, "41\n42\n99\n7\n",
+        "round-trip mismatch; stderr=\n{stderr}");
+}

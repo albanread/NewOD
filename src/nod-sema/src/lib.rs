@@ -37,8 +37,8 @@ use nod_llvm::{Jit, codegen_module};
 pub use lower::{
     BindingSource, BlockHandlerRegistration, BlockRegistration, CFunctionBinding, ClosureInfo,
     ClosureRegistry, LoweredModule, LoweringError, LoweringWarning, MethodRegistration,
-    SealingViolation, UserClassRegistration, dump_classes, lower_function, lower_module,
-    lower_module_full,
+    SealingViolation, UserClassRegistration, VariableRegistration, dump_classes, lower_function,
+    lower_module, lower_module_full,
 };
 
 /// Sprint 17: parse + macro-expand + lower in one shot. Existing
@@ -310,6 +310,11 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     register_blocks(&jit_box, &lm.blocks)?;
     register_top_level_functions(&jit_box, &lm)?;
     initialize_module_winffi(&lm)?;
+    // GAP-004 — variable init MUST follow `register_top_level_functions`
+    // + winffi init: the init expression may call any user / stdlib
+    // function or Win32 API, and those need to be resolvable through
+    // the dispatch / function-ref registries first.
+    register_variables(&jit_box, &lm.variables)?;
 
     // SAFETY: see `eval_expr_to_string`.
     let ptr = unsafe { jit_box.get_function_ptr("<eval-entry>") }
@@ -443,6 +448,7 @@ fn try_on_disk_replay(cache_key: nod_llvm::CacheKey) -> Result<Option<String>, E
     replay_register_methods(&jit_box, &regs.methods)?;
     replay_register_blocks(&jit_box, &regs.blocks)?;
     replay_register_top_level_functions(&jit_box, &regs.functions)?;
+    replay_register_variables(&jit_box, &regs.variables)?;
 
     // SAFETY: see `eval_wrapped_source` for the lifetime rationale.
     let ptr = unsafe { jit_box.get_function_ptr("<eval-entry>") }
@@ -602,6 +608,34 @@ fn replay_register_top_level_functions(
         // closures: params.len()).
         unsafe {
             nod_runtime::register_jit_function(&f.name, f.source_arity as usize, ptr as *const u8);
+        }
+    }
+    Ok(())
+}
+
+/// GAP-004 — replay variable init from the on-disk sidecar. Mirrors
+/// `register_variables` but reads from [`sidecar::PersistedVariable`]
+/// (the data persisted on the cold path) instead of
+/// [`crate::lower::VariableRegistration`] (only available when we
+/// have a live `LoweredModule`).
+fn replay_register_variables(
+    jit: &Jit<'_>,
+    variables: &[sidecar::PersistedVariable],
+) -> Result<(), EvalError> {
+    for v in variables {
+        let ptr = unsafe { jit.get_function_ptr(&v.init_fn_name) }.ok_or_else(|| {
+            EvalError::NoEntry(format!(
+                "variable init `{}` not JIT'd (on-disk replay)",
+                v.init_fn_name
+            ))
+        })?;
+        // SAFETY: matches `extern "C-unwind" fn() -> u64`.
+        unsafe {
+            nod_runtime::nod_aot_register_variable(
+                v.name.as_ptr(),
+                v.name.len(),
+                ptr as *const u8,
+            );
         }
     }
     Ok(())
@@ -969,7 +1003,7 @@ pub fn build_aot_registrations(lm: &LoweredModule) -> nod_llvm::AotRegistrations
     use nod_llvm::{
         AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
         AotMethodRegistration, AotRegistrations, AotSlotRegistration,
-        AotUserClassRegistration,
+        AotUserClassRegistration, AotVariableRegistration,
     };
     use nod_runtime::{SlotDefault, SlotType};
     let mut out = AotRegistrations::default();
@@ -1072,6 +1106,15 @@ pub fn build_aot_registrations(lm: &LoweredModule) -> nod_llvm::AotRegistrations
             name: f.name.clone(),
             arity,
             body_fn_name: f.name.clone(),
+        });
+    }
+    // GAP-004 — variable registrations. The AOT resolver runs these
+    // last, AFTER classes / methods / blocks / functions, because an
+    // init expression can call any user / stdlib function.
+    for v in &lm.variables {
+        out.variables.push(AotVariableRegistration {
+            name: v.name.clone(),
+            init_fn_name: v.init_fn_name.clone(),
         });
     }
     out
@@ -1204,6 +1247,26 @@ pub(crate) fn merge_modules(into: &mut LoweredModule, from: &LoweredModule) {
         merged.extend(from.user_classes.iter().cloned());
         merged.append(&mut into.user_classes);
         into.user_classes = merged;
+    }
+    // GAP-004 — variables. Stdlib defines none today, but if it ever
+    // does, the same "from first, into second" ordering matters: a
+    // stdlib `define variable` should initialise before any user code
+    // (including user variables that might transitively read it via a
+    // function call from the init expression). Per-name dedup is by
+    // VariableRegistration.name; user wins on collision.
+    if !from.variables.is_empty() {
+        use std::collections::HashSet;
+        let existing_var_names: HashSet<String> =
+            into.variables.iter().map(|v| v.name.clone()).collect();
+        let mut merged: Vec<VariableRegistration> =
+            Vec::with_capacity(from.variables.len() + into.variables.len());
+        for v in &from.variables {
+            if !existing_var_names.contains(&v.name) {
+                merged.push(v.clone());
+            }
+        }
+        merged.append(&mut into.variables);
+        into.variables = merged;
     }
 }
 
@@ -1474,6 +1537,39 @@ pub fn register_blocks(
                 handlers: handlers_static,
             },
         );
+    }
+    Ok(())
+}
+
+/// GAP-004 — for each `define variable` in `lm`, look up its
+/// `__init-<name>` thunk in the JIT, call it to get the initial Word,
+/// allocate a fresh `<cell>` holding the Word, and store the cell
+/// pointer in the variable's process-global slot.
+///
+/// Runs AFTER `register_methods` / `register_blocks` /
+/// `register_top_level_functions` because init expressions may call
+/// any of those. Mirrors the AOT resolver's late-stage variable pass.
+pub fn register_variables(
+    jit: &Jit<'_>,
+    variables: &[crate::lower::VariableRegistration],
+) -> Result<(), EvalError> {
+    for v in variables {
+        // SAFETY: JIT engine outlives the registration. The init thunk
+        // is a zero-arg Dylan function returning a Word — codegen
+        // emitted it with that exact signature (see the
+        // `Item::DefineVariable` arm of `lower_module_full`).
+        let ptr = unsafe { jit.get_function_ptr(&v.init_fn_name) }.ok_or_else(|| {
+            EvalError::NoEntry(format!("variable init `{}` not JIT'd", v.init_fn_name))
+        })?;
+        // SAFETY: ptr matches `extern "C-unwind" fn() -> u64`. The
+        // runtime shim transmutes via the same signature.
+        unsafe {
+            nod_runtime::nod_aot_register_variable(
+                v.name.as_ptr(),
+                v.name.len(),
+                ptr as *const u8,
+            );
+        }
     }
     Ok(())
 }

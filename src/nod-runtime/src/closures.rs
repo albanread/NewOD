@@ -192,6 +192,94 @@ pub unsafe extern "C-unwind" fn nod_make_cell(value_raw: u64) -> u64 {
     make_cell(v).raw()
 }
 
+// ─── GAP-004 — `define variable` getter/setter shims by name ──────────────
+//
+// These are the runtime side of the variable-by-name lowering Option A
+// in the GAP-004 design: getter and setter call sites pass the
+// variable's source name as a Dylan `<byte-string>` Word. The runtime
+// decodes the name, looks up the variable's cell-slot in the process-
+// global table, loads the cell pointer, and delegates to nod_cell_get
+// / nod_cell_set. Optimisation (slot pointer per call site) is a
+// future sprint — see the GAP-004 design notes in COMPILER_GAPS.md.
+
+/// JIT-callable `%var-get(name) -> <object>`. The name Word must be a
+/// Dylan `<byte-string>` whose contents identify a previously-
+/// registered `define variable`. Panics if the variable is not yet
+/// initialised (cell slot still zero) — that indicates the AOT
+/// resolver or JIT-side init driver failed to call
+/// `nod_aot_register_variable` for this name before user code reached
+/// the getter.
+///
+/// # Safety
+///
+/// `name_raw` must be a pointer-tagged `<byte-string>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_var_get_by_name(name_raw: u64) -> u64 {
+    let name_w = Word::from_raw(name_raw);
+    // SAFETY: the sema layer enforces the byte-string type at the call
+    // site (it always passes an interned string literal).
+    let Some(bs) =
+        (unsafe { crate::try_byte_string(name_w, ClassId::BYTE_STRING) })
+    else {
+        panic!(
+            "nod_var_get_by_name: expected <byte-string> name, got raw Word {:#x}",
+            name_raw
+        );
+    };
+    // SAFETY: `bs` borrows the live byte-string payload.
+    let name = unsafe { std::str::from_utf8_unchecked(bs.bytes()) };
+    let slot = crate::variable_cell_slot_addr(name);
+    let cell_bits = slot.load(std::sync::atomic::Ordering::Acquire);
+    if cell_bits == 0 {
+        panic!(
+            "nod_var_get_by_name: variable `{name}` referenced before \
+             initialisation — the AOT resolver or JIT init driver did \
+             not call nod_aot_register_variable for it"
+        );
+    }
+    // Delegate to the cell-get path.
+    // SAFETY: `cell_bits` came from a successful `nod_make_cell` call
+    // at init time and the GC rewrites the slot when the cell moves,
+    // so the bits are always a live pointer-tagged `<cell>` Word.
+    unsafe { nod_cell_get(cell_bits) }
+}
+
+/// JIT-callable `%var-set!(value, name) -> value`. Stores `value`
+/// into the variable's underlying `<cell>` and returns the new value
+/// (Dylan setter convention). Panics if the variable is not yet
+/// initialised.
+///
+/// # Safety
+///
+/// `name_raw` must be a pointer-tagged `<byte-string>` Word; `value_raw`
+/// is any Dylan Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_var_set_by_name(
+    value_raw: u64,
+    name_raw: u64,
+) -> u64 {
+    let name_w = Word::from_raw(name_raw);
+    let Some(bs) =
+        (unsafe { crate::try_byte_string(name_w, ClassId::BYTE_STRING) })
+    else {
+        panic!(
+            "nod_var_set_by_name: expected <byte-string> name, got raw Word {:#x}",
+            name_raw
+        );
+    };
+    let name = unsafe { std::str::from_utf8_unchecked(bs.bytes()) };
+    let slot = crate::variable_cell_slot_addr(name);
+    let cell_bits = slot.load(std::sync::atomic::Ordering::Acquire);
+    if cell_bits == 0 {
+        panic!(
+            "nod_var_set_by_name: variable `{name}` written before \
+             initialisation"
+        );
+    }
+    // SAFETY: see nod_var_get_by_name.
+    unsafe { nod_cell_set(value_raw, cell_bits) }
+}
+
 // ─── <environment> builders + accessors ───────────────────────────────────
 
 /// Allocate a fresh `<environment>` whose `cells` slot holds a

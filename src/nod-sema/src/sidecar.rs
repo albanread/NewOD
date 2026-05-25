@@ -66,7 +66,11 @@ use crate::lower::{
 /// Current schema version for the registration sidecar. Bump on any
 /// breaking change to the JSON shape, the persisted registration
 /// fields, or the replay contract that consumes them.
-pub const REGISTRATIONS_ABI_VERSION: u32 = 1;
+///
+/// GAP-004 — bumped from 1 to 2 with the addition of the `variables`
+/// list. Old sidecars are treated as ABI-incompatible (a cache miss)
+/// and the cold path overwrites them.
+pub const REGISTRATIONS_ABI_VERSION: u32 = 2;
 
 /// One persisted top-level function registration. Carries the
 /// `(name, source-arity)` pair `register_top_level_functions` needs.
@@ -114,6 +118,14 @@ pub struct PersistedBlock {
     pub handlers: Vec<PersistedHandler>,
 }
 
+/// GAP-004 — one persisted `define variable` registration. Mirrors
+/// [`VariableRegistration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedVariable {
+    pub name: String,
+    pub init_fn_name: String,
+}
+
 /// The whole sidecar payload — everything `eval_wrapped_source` needs
 /// to call the four registration passes after `add_module_from_bitcode`
 /// returns, plus the return-type pair `call_and_format` consumes.
@@ -125,6 +137,10 @@ pub struct RegistrationSidecar {
     pub functions: Vec<PersistedFunction>,
     pub methods: Vec<PersistedMethod>,
     pub blocks: Vec<PersistedBlock>,
+    /// GAP-004 — `define variable` registrations to replay at JIT
+    /// disk-cache hit time. Each entry triggers a
+    /// `nod_aot_register_variable` call.
+    pub variables: Vec<PersistedVariable>,
 }
 
 impl RegistrationSidecar {
@@ -188,6 +204,14 @@ impl RegistrationSidecar {
             .map(persist_method)
             .collect();
         let blocks = lm.blocks.iter().map(persist_block).collect();
+        let variables = lm
+            .variables
+            .iter()
+            .map(|v| PersistedVariable {
+                name: v.name.clone(),
+                init_fn_name: v.init_fn_name.clone(),
+            })
+            .collect();
         Self {
             abi_version: REGISTRATIONS_ABI_VERSION,
             return_type_tag,
@@ -195,6 +219,7 @@ impl RegistrationSidecar {
             functions,
             methods,
             blocks,
+            variables,
         }
     }
 
@@ -287,6 +312,20 @@ impl RegistrationSidecar {
             }
             out.push_str("]}");
         }
+        out.push_str("],");
+        // variables (GAP-004)
+        out.push_str("\"variables\":[");
+        for (i, v) in self.variables.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{{\"name\":\"{}\",\"init\":\"{}\"}}",
+                escape_json(&v.name),
+                escape_json(&v.init_fn_name),
+            );
+        }
         out.push_str("]}");
         out
     }
@@ -303,6 +342,7 @@ impl RegistrationSidecar {
         let mut functions: Vec<PersistedFunction> = Vec::new();
         let mut methods: Vec<PersistedMethod> = Vec::new();
         let mut blocks: Vec<PersistedBlock> = Vec::new();
+        let mut variables: Vec<PersistedVariable> = Vec::new();
         let mut first = true;
         loop {
             p.skip_ws();
@@ -325,6 +365,7 @@ impl RegistrationSidecar {
                 "functions" => functions = p.array(parse_function)?,
                 "methods" => methods = p.array(parse_method)?,
                 "blocks" => blocks = p.array(parse_block)?,
+                "variables" => variables = p.array(parse_variable)?,
                 _ => return None,
             }
         }
@@ -335,6 +376,7 @@ impl RegistrationSidecar {
             functions,
             methods,
             blocks,
+            variables,
         })
     }
 
@@ -586,6 +628,34 @@ fn parse_function(p: &mut JsonParser<'_>) -> Option<PersistedFunction> {
     Some(PersistedFunction { name, arity, is_closure, source_arity })
 }
 
+fn parse_variable(p: &mut JsonParser<'_>) -> Option<PersistedVariable> {
+    p.expect('{')?;
+    let mut name = String::new();
+    let mut init_fn_name = String::new();
+    let mut first = true;
+    loop {
+        p.skip_ws();
+        if p.peek() == Some('}') {
+            p.bump();
+            break;
+        }
+        if !first {
+            p.expect(',')?;
+            p.skip_ws();
+        }
+        first = false;
+        let k = p.string()?;
+        p.expect(':')?;
+        p.skip_ws();
+        match k.as_str() {
+            "name" => name = p.string()?,
+            "init" => init_fn_name = p.string()?,
+            _ => return None,
+        }
+    }
+    Some(PersistedVariable { name, init_fn_name })
+}
+
 fn parse_method(p: &mut JsonParser<'_>) -> Option<PersistedMethod> {
     p.expect('{')?;
     let mut generic_name = String::new();
@@ -765,6 +835,10 @@ mod tests {
                     body_fn_name: "block-handler-7-0".into(),
                 }],
             }],
+            variables: vec![PersistedVariable {
+                name: "*counter*".into(),
+                init_fn_name: "__init-*counter*".into(),
+            }],
         }
     }
 
@@ -785,6 +859,7 @@ mod tests {
             functions: vec![],
             methods: vec![],
             blocks: vec![],
+            variables: vec![],
         };
         let j = s.to_json();
         let back = RegistrationSidecar::parse(&j).expect("parse");
@@ -820,6 +895,7 @@ mod tests {
             }],
             methods: vec![],
             blocks: vec![],
+            variables: vec![],
         };
         let j = s.to_json();
         let back = RegistrationSidecar::parse(&j).expect("parse");

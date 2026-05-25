@@ -563,6 +563,23 @@ pub struct LoweredModule {
     /// resolver. The JIT path ignores this field — it registers user
     /// classes inline as `register_class` runs in `lower_module_full`.
     pub user_classes: Vec<UserClassRegistration>,
+    /// GAP-004 — every `define variable` lowered by this module. The
+    /// AOT pipeline emits one `nod_aot_register_variable` call per
+    /// entry inside the EXE's startup resolver, AFTER class / method /
+    /// block / function registration (variable init expressions can
+    /// reference any of those). The JIT path drives the same set
+    /// through `register_variables` once the engine is materialised.
+    pub variables: Vec<VariableRegistration>,
+}
+
+/// GAP-004 — one `define variable` registration: the variable's source
+/// name and the symbol name of its codegen-emitted `__init-<name>`
+/// thunk (a zero-arg `extern "C-unwind" fn() -> u64` returning the
+/// initial Dylan Word).
+#[derive(Clone, Debug)]
+pub struct VariableRegistration {
+    pub name: String,
+    pub init_fn_name: String,
 }
 
 /// Sprint 27: information captured for a single `define c-function`
@@ -1434,6 +1451,11 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // Sprint 27: non-fatal diagnostics — currently just
     // `c-function not in windows_api database`.
     let mut warnings: Vec<LoweringWarning> = Vec::new();
+    // GAP-004: per-`define variable` registrations. The AOT pipeline
+    // emits one `nod_aot_register_variable` call per entry in source
+    // order; the JIT path drives the same set through
+    // `register_variables`.
+    let mut variable_registrations: Vec<VariableRegistration> = Vec::new();
     // Sprint 19: a single `LiftSink` carries the FunctionId counter and
     // any per-`block` lifted thunks the lowerer synthesises. Both the
     // Phase 3 slot accessors and the Phase 4 user-item lowering allocate
@@ -1908,11 +1930,78 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
             Item::DefineClass { .. } => {
                 // Already handled in Phase 1.
             }
-            Item::DefineVariable { span, .. } => {
-                errors.push(LoweringError::Unsupported {
-                    span: *span,
-                    message: "define variable not lowered in Sprint 06".to_string(),
+            Item::DefineVariable { name, value, span, .. } => {
+                // GAP-004: lower as two cooperating functions.
+                //
+                // 1. `<name>()` — the getter. Body emits a DirectCall
+                //    to `nod_var_get_by_name(<name-literal>)` which
+                //    loads the variable's `<cell>` via the per-name
+                //    slot and returns `nod_cell_get(cell)`. Bareword
+                //    references in expression position (`format-out(
+                //    "%d", foo)`) lower to a zero-arg DirectCall on
+                //    `<name>` (Sprint 02's TopNames bareword path,
+                //    seen by `Expr::Ident` in `lower_expr`), and that
+                //    DirectCall resolves to THIS function by name —
+                //    the runtime dispatcher then jumps to its body.
+                //
+                // 2. `__init-<name>()` — the init thunk. Body lowers
+                //    the user's init expression and returns the
+                //    result. The AOT resolver / JIT-side init driver
+                //    calls this once at startup to obtain the initial
+                //    Word, allocates a fresh `<cell>` holding that
+                //    Word, and stores the cell pointer in the slot.
+                //
+                // The setter (`nod_var_set_by_name(value, name)`) is
+                // not emitted as a standalone function; `lower_assign`
+                // inlines a DirectCall at each `<name> := value` site.
+                // This saves a function-call indirection and avoids
+                // needing to register `<name>-setter` in the dispatch
+                // table just to forward to the shim.
+                let ctx = LowerCtx {
+                    top_names: &top_names,
+                    generics: &generics,
+                    user_classes: &user_classes_snapshot,
+                    closures: Some(&closure_registry),
+                    c_functions: Some(&c_function_call_map),
+                };
+
+                // Getter: `<name>() => <object>`.
+                let mut getter =
+                    FunctionBuilder::new(alloc_id(&mut lift_sink), name.clone(), *span);
+                let name_t = getter.fresh_temp(TypeEstimate::String);
+                getter.push(Computation::Const {
+                    dst: name_t,
+                    value: ConstValue::String(name.clone()),
                 });
+                let value_t = getter.fresh_temp(TypeEstimate::Top);
+                getter.push(Computation::DirectCall {
+                    dst: value_t,
+                    callee: "nod_var_get_by_name".to_string(),
+                    args: vec![name_t],
+                    safepoint_roots: Vec::new(),
+                });
+                getter.func.return_type = TypeEstimate::Top;
+                getter.terminate_current(Terminator::Return { value: Some(value_t) });
+                out.push(getter.finish());
+
+                // Init thunk: `__init-<name>() => <object>`.
+                let init_name = format!("__init-{name}");
+                let mut init =
+                    FunctionBuilder::new(alloc_id(&mut lift_sink), init_name.clone(), *span);
+                let mut env = LocalEnv::new();
+                match init.lower_expr(value, &mut env, &ctx) {
+                    Ok(t) => {
+                        let ty = init.func.temp_type(t);
+                        init.func.return_type = ty;
+                        init.terminate_current(Terminator::Return { value: Some(t) });
+                        out.push(init.finish());
+                        variable_registrations.push(VariableRegistration {
+                            name: name.clone(),
+                            init_fn_name: init_name,
+                        });
+                    }
+                    Err(e) => errors.push(e),
+                }
             }
             Item::DefineMacro { .. } => {
                 // WHY: Sprint 17 — macro definitions are collected and
@@ -2144,6 +2233,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         c_function_stub_table: c_function_stub_table_entries,
         warnings,
         user_classes: user_class_registrations,
+        variables: variable_registrations,
     })
 }
 
@@ -3156,14 +3246,25 @@ pub struct TopNames {
     /// setters (`<C>-setter-x`) arity 2; user `define function`s
     /// follow their param count.
     fn_arity: HashMap<String, usize>,
-    /// GAP-002 fix: names introduced by `define constant` /
-    /// `define variable`. These ARE lowered as zero-arg functions
-    /// (see the `Item::DefineConstant` arm of the per-item lowering
-    /// loop), but a bareword reference to one in expression position
-    /// should EVALUATE it (zero-arg DirectCall returning its value),
-    /// not produce a function-reference. We track them separately so
-    /// the `Expr::Ident` lowering can pick the right shape.
-    constants_and_variables: HashSet<String>,
+    /// GAP-002 fix: names introduced by `define constant`. These ARE
+    /// lowered as zero-arg functions (see the `Item::DefineConstant`
+    /// arm of the per-item lowering loop), but a bareword reference to
+    /// one in expression position should EVALUATE it (zero-arg
+    /// DirectCall returning its value), not produce a function-
+    /// reference. We track them separately so the `Expr::Ident`
+    /// lowering can pick the right shape.
+    constants: HashSet<String>,
+    /// GAP-004: names introduced by `define variable`. Tracked
+    /// separately from `constants` because:
+    ///   1. Bareword references evaluate via `<name>()` (the getter
+    ///      function, which loads the cell and returns its value) —
+    ///      same as constants.
+    ///   2. Assignment via `<name> := <expr>` is permitted (constants
+    ///      reject it).
+    /// The `is_constant_or_variable` accessor unions both sets to
+    /// preserve the GAP-002 bareword path; `is_variable` differentiates
+    /// for `lower_assign`.
+    variables: HashSet<String>,
 }
 
 impl TopNames {
@@ -3171,7 +3272,8 @@ impl TopNames {
         Self {
             fns: HashMap::new(),
             fn_arity: HashMap::new(),
-            constants_and_variables: HashSet::new(),
+            constants: HashSet::new(),
+            variables: HashSet::new(),
         }
     }
     pub fn contains(&self, name: &str) -> bool {
@@ -3189,7 +3291,14 @@ impl TopNames {
     /// to such a name in expression position should be lowered as a
     /// zero-arg DirectCall, not as `nod_make_function_ref`.
     pub fn is_constant_or_variable(&self, name: &str) -> bool {
-        self.constants_and_variables.contains(name)
+        self.constants.contains(name) || self.variables.contains(name)
+    }
+    /// GAP-004: true iff this name was introduced by `define variable`
+    /// (mutable). Used by `lower_assign` to route `<name> := <expr>`
+    /// through the cell-set path; assignment to a `define constant`
+    /// name is an error.
+    pub fn is_variable(&self, name: &str) -> bool {
+        self.variables.contains(name)
     }
 }
 
@@ -3889,7 +3998,8 @@ fn check_free_vars_in_stmt(
 fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) -> TopNames {
     let mut fns = HashMap::new();
     let mut fn_arity: HashMap<String, usize> = HashMap::new();
-    let mut constants_and_variables: HashSet<String> = HashSet::new();
+    let mut constants: HashSet<String> = HashSet::new();
+    let mut variables: HashSet<String> = HashSet::new();
     for item in &m.items {
         match item {
             Item::DefineFunction { name, params, return_, .. } => {
@@ -3901,25 +4011,26 @@ fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) 
                 fns.insert(name.clone(), ret);
                 fn_arity.insert(name.clone(), params.len());
             }
-            // GAP-002 fix: `define constant` and `define variable` are
-            // lowered as zero-arg functions whose body returns the
-            // initial value (see the `Item::DefineConstant` arm of the
-            // per-item loop in `lower_module_full`). Register them in
-            // `top_names` with arity 0 AND in the constants_and_variables
-            // set so the bareword-ident lowering path emits a zero-arg
-            // DirectCall (evaluates the constant) instead of a
-            // function-reference (which would be wrong — constants are
-            // values, not callable refs).
-            Item::DefineConstant { name, .. }
-            | Item::DefineVariable { name, .. } => {
-                // Return type defaults to Top. Constants/variables don't
-                // carry a declared return type today; type-inferring the
-                // value expression is possible but deferred (the type
-                // estimate is a hint for dispatch / unbox optimization,
-                // and the constant call site won't be hot).
+            // GAP-002 fix + GAP-004: `define constant` and
+            // `define variable` are both lowered as zero-arg "getter"
+            // functions whose body returns the initial / current value.
+            // We register both in `top_names` with arity 0 so bareword
+            // references in expression position emit a zero-arg
+            // DirectCall (evaluates the constant / loads the cell).
+            //
+            // We separate the two sets here because `lower_assign`
+            // needs to tell them apart: assigning to a variable goes
+            // through the cell-set path; assigning to a constant is an
+            // error.
+            Item::DefineConstant { name, .. } => {
                 fns.insert(name.clone(), TypeEstimate::Top);
                 fn_arity.insert(name.clone(), 0);
-                constants_and_variables.insert(name.clone());
+                constants.insert(name.clone());
+            }
+            Item::DefineVariable { name, .. } => {
+                fns.insert(name.clone(), TypeEstimate::Top);
+                fn_arity.insert(name.clone(), 0);
+                variables.insert(name.clone());
             }
             _ => {}
         }
@@ -3984,7 +4095,8 @@ fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) 
     TopNames {
         fns,
         fn_arity,
-        constants_and_variables,
+        constants,
+        variables,
     }
 }
 
@@ -4821,6 +4933,47 @@ impl FunctionBuilder {
                 let t = self.lower_expr(rhs, env, ctx)?;
                 env.insert(name.clone(), t);
                 return Ok(t);
+            }
+            // GAP-004: module-level `define variable` assignment.
+            // Routes through `nod_var_set_by_name(value, name)` which
+            // looks up the variable's cell via the per-name slot and
+            // writes through `nod_cell_set` (write-barriered). The
+            // setter shim returns the new value (Dylan setter
+            // convention), so we propagate its result as the
+            // assignment's value.
+            //
+            // We check `is_variable` rather than the wider
+            // `is_constant_or_variable` so that assigning to a
+            // `define constant` falls through to UndefinedIdent
+            // territory below — we surface a dedicated "cannot assign
+            // to constant" error there.
+            if ctx.top_names.is_variable(name) {
+                let v = self.lower_expr(rhs, env, ctx)?;
+                let name_t = self.fresh_temp(TypeEstimate::String);
+                self.push(Computation::Const {
+                    dst: name_t,
+                    value: ConstValue::String(name.clone()),
+                });
+                let dst = self.fresh_temp(TypeEstimate::Top);
+                self.push(Computation::DirectCall {
+                    dst,
+                    callee: "nod_var_set_by_name".to_string(),
+                    args: vec![v, name_t],
+                    safepoint_roots: Vec::new(),
+                });
+                return Ok(dst);
+            }
+            // Assignment to a `define constant` is an error.
+            if ctx.top_names.is_constant_or_variable(name) {
+                // (is_variable was false above, so this must be a
+                // constant.)
+                return Err(LoweringError::Unsupported {
+                    span,
+                    message: format!(
+                        "cannot assign to `{name}` — it is a `define constant` \
+                         (use `define variable` if you need a mutable binding)"
+                    ),
+                });
             }
             return Err(LoweringError::UndefinedIdent {
                 span,
