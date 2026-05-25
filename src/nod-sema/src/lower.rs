@@ -3156,6 +3156,14 @@ pub struct TopNames {
     /// setters (`<C>-setter-x`) arity 2; user `define function`s
     /// follow their param count.
     fn_arity: HashMap<String, usize>,
+    /// GAP-002 fix: names introduced by `define constant` /
+    /// `define variable`. These ARE lowered as zero-arg functions
+    /// (see the `Item::DefineConstant` arm of the per-item lowering
+    /// loop), but a bareword reference to one in expression position
+    /// should EVALUATE it (zero-arg DirectCall returning its value),
+    /// not produce a function-reference. We track them separately so
+    /// the `Expr::Ident` lowering can pick the right shape.
+    constants_and_variables: HashSet<String>,
 }
 
 impl TopNames {
@@ -3163,6 +3171,7 @@ impl TopNames {
         Self {
             fns: HashMap::new(),
             fn_arity: HashMap::new(),
+            constants_and_variables: HashSet::new(),
         }
     }
     pub fn contains(&self, name: &str) -> bool {
@@ -3174,6 +3183,13 @@ impl TopNames {
     /// Sprint 21: arity for a registered top-level function, if known.
     pub fn arity(&self, name: &str) -> Option<usize> {
         self.fn_arity.get(name).copied()
+    }
+    /// GAP-002 fix: true iff this name was introduced by
+    /// `define constant` or `define variable`. A bareword reference
+    /// to such a name in expression position should be lowered as a
+    /// zero-arg DirectCall, not as `nod_make_function_ref`.
+    pub fn is_constant_or_variable(&self, name: &str) -> bool {
+        self.constants_and_variables.contains(name)
     }
 }
 
@@ -3873,15 +3889,39 @@ fn check_free_vars_in_stmt(
 fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) -> TopNames {
     let mut fns = HashMap::new();
     let mut fn_arity: HashMap<String, usize> = HashMap::new();
+    let mut constants_and_variables: HashSet<String> = HashSet::new();
     for item in &m.items {
-        if let Item::DefineFunction { name, params, return_, .. } = item {
-            let ret = return_
-                .as_ref()
-                .and_then(|r| r.values.first().and_then(|v| v.type_.as_ref()))
-                .map(|e| type_from_expr(Some(e)))
-                .unwrap_or(TypeEstimate::Top);
-            fns.insert(name.clone(), ret);
-            fn_arity.insert(name.clone(), params.len());
+        match item {
+            Item::DefineFunction { name, params, return_, .. } => {
+                let ret = return_
+                    .as_ref()
+                    .and_then(|r| r.values.first().and_then(|v| v.type_.as_ref()))
+                    .map(|e| type_from_expr(Some(e)))
+                    .unwrap_or(TypeEstimate::Top);
+                fns.insert(name.clone(), ret);
+                fn_arity.insert(name.clone(), params.len());
+            }
+            // GAP-002 fix: `define constant` and `define variable` are
+            // lowered as zero-arg functions whose body returns the
+            // initial value (see the `Item::DefineConstant` arm of the
+            // per-item loop in `lower_module_full`). Register them in
+            // `top_names` with arity 0 AND in the constants_and_variables
+            // set so the bareword-ident lowering path emits a zero-arg
+            // DirectCall (evaluates the constant) instead of a
+            // function-reference (which would be wrong — constants are
+            // values, not callable refs).
+            Item::DefineConstant { name, .. }
+            | Item::DefineVariable { name, .. } => {
+                // Return type defaults to Top. Constants/variables don't
+                // carry a declared return type today; type-inferring the
+                // value expression is possible but deferred (the type
+                // estimate is a hint for dispatch / unbox optimization,
+                // and the constant call site won't be hot).
+                fns.insert(name.clone(), TypeEstimate::Top);
+                fn_arity.insert(name.clone(), 0);
+                constants_and_variables.insert(name.clone());
+            }
+            _ => {}
         }
     }
     // Slot accessors are emitted as top-level functions too; record
@@ -3941,7 +3981,11 @@ fn collect_top_level_names(m: &Module, user_classes: &HashMap<String, ClassId>) 
             }
         }
     }
-    TopNames { fns, fn_arity }
+    TopNames {
+        fns,
+        fn_arity,
+        constants_and_variables,
+    }
 }
 
 fn collect_generic_names(m: &Module) -> HashSet<String> {
@@ -4302,6 +4346,29 @@ impl FunctionBuilder {
                         captured_cells.push(cell_t);
                     }
                     return Ok(self.emit_make_closure(name, info.arity, &captured_cells));
+                }
+                // GAP-002 fix: a bareword reference to a `define
+                // constant` or `define variable` name should EVALUATE
+                // it (call the zero-arg function body that returns the
+                // constant's value), not produce a function-reference.
+                // Dylan constants/variables are *values*, not callable
+                // refs — `format-out("%d", $magic)` must pass the
+                // integer value, not the function-ref Word.
+                //
+                // We check this BEFORE the make-function-ref paths
+                // because both `top_names.arity()` and `top_names
+                // .contains()` would otherwise match (the constant
+                // IS registered as a zero-arg function for codegen
+                // purposes) and emit the wrong shape.
+                if ctx.top_names.is_constant_or_variable(name) {
+                    let dst = self.fresh_temp(TypeEstimate::Top);
+                    self.push(Computation::DirectCall {
+                        dst,
+                        callee: name.clone(),
+                        args: Vec::new(),
+                        safepoint_roots: Vec::new(),
+                    });
+                    return Ok(dst);
                 }
                 // Sprint 21: first-class function references.
                 //

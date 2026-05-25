@@ -59,27 +59,62 @@ Sort by ID. New gaps append. Don't renumber.
 
 * **Discovered**: Sprint 45a, commit `29e1040`,
   `tests/nod-tests/fixtures/dylan-lexer.dylan` (the literal
-  `1000000` appears at three sites with comments).
+  `1000000` appeared at three sites with comments).
 * **Symptom**: a module-level `define constant $line-multiplier =
-  1000000;` declaration is correctly parsed and accepted, but
-  references to `$line-multiplier` from inside a `define function`
-  body (in the same module / same file) fail to resolve. Workaround
-  was to substitute the literal integer at every call site with a
-  comment marker.
-* **Workaround**: the literal `1000000` is repeated at three sites
-  in `offset-to-line-col-packed` / `unpack-line` / `unpack-col`,
-  each with a `// SPRINT 45a COMPILER-GAP-002` comment.
-* **Planned fix**: investigate sema's handling of `Item::DefineConstant`.
-  Likely either:
-  (a) constants are parsed but never lowered into the global name
-      resolution table, OR
-  (b) they are, but function-body name resolution doesn't consult
-      that table.
-  Either way the fix is bounded — a few lines of sema. Comes with
-  a unit test that defines a constant and uses it from a function.
-* **Scope**: small. Probably a one-evening fix once the sema
-  control flow is understood.
-* **Status**: in-progress (investigation starting now).
+  1000000;` declaration is correctly parsed and lowered (as a
+  zero-arg function returning the value), but `collect_top_level_names`
+  in `nod-sema/src/lower.rs` only looked at `Item::DefineFunction`
+  entries — never registered the constant in the name-resolution
+  table. So bareword references from inside a `define function`
+  body raised `LoweringError::UndefinedIdent` even though the
+  constant was right there in scope.
+* **Workaround**: the literal `1000000` was repeated at three sites
+  in `offset-to-line-col-packed` / `unpack-line` / `unpack-col`.
+  Retired with the fix.
+* **Fix**: two changes in `nod-sema/src/lower.rs`:
+  1. `collect_top_level_names` now also walks `Item::DefineConstant`
+     and `Item::DefineVariable`, registering them with arity 0 and
+     adding them to a new `TopNames::constants_and_variables` set.
+  2. The `Expr::Ident` arm of `lower_expr` checks
+     `is_constant_or_variable(name)` BEFORE the existing
+     make-function-ref paths. When true, it emits a zero-arg
+     `Computation::DirectCall` that evaluates the constant's body
+     and returns its value — the right Dylan semantics (constants
+     are values, not callable refs).
+* **Regression test**: `tests/nod-tests/tests/sema.rs::
+  gap_002_define_constant_resolves_from_function_body`.
+* **Scope**: small. ~30 lines of sema.
+* **Status**: **fixed in SHA TBD** (this commit). `define variable`
+  is a separate, deeper gap — see GAP-004.
+
+## GAP-004 — `define variable` not lowered
+
+* **Discovered**: Sprint 45a follow-up while fixing GAP-002 (this
+  commit). The repro
+  ```
+  define variable *counter* = 41;
+  define function main () => () *counter* := *counter* + 1; ... end;
+  ```
+  surfaces `unsupported [Span ...]: define variable not lowered in
+  Sprint 06`. The `Item::DefineVariable` arm of the per-item
+  lowering loop emits an `Unsupported` lowering error rather than
+  generating a function body, so the variable's name is never bound
+  to anything callable.
+* **Symptom**: `define variable foo = expr;` fails to lower at all
+  — fails BEFORE the GAP-002 name-resolution path is even reached.
+* **Workaround**: avoid `define variable`. The lexer fixture uses
+  `define constant` exclusively. Mutable module-level state isn't
+  expressible in user Dylan today.
+* **Planned fix**: complete the `Item::DefineVariable` lowering.
+  The right shape is probably "zero-arg getter function + one-arg
+  setter function", same pattern as slot accessors — store the
+  current value in a process-global Word slot (similar to Sprint
+  38c's literal slots), getter loads it, setter stores it (with
+  write-barrier if heap pointer).
+* **Scope**: medium. Touches the lowering pass, the AOT
+  registration path (need a runtime slot per `define variable`),
+  and possibly the JIT path for cross-module refs.
+* **Status**: open.
 
 ## GAP-003 — No multi-value return / no multi-binder `let`
 

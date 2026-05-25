@@ -425,3 +425,32 @@ fn verify_missing_entry() {
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
+
+// ─── GAP-002 — `define constant` resolves from function bodies ───────────
+
+/// Regression test for COMPILER_GAPS.md GAP-002. Before the fix,
+/// `collect_top_level_names` only registered `Item::DefineFunction`
+/// entries — constants were lowered as zero-arg functions but never
+/// added to the name-resolution table, so a bareword reference to a
+/// constant from inside a `define function` body raised
+/// `LoweringError::UndefinedIdent` even though the constant was
+/// declared in the same file at module scope. Surfaced by Sprint 45a's
+/// `dylan-lexer.dylan` (the `$line-col-shift` use); fix landed in the
+/// same commit as this test. Don't remove without retiring the gap.
+#[test]
+fn gap_002_define_constant_resolves_from_function_body() {
+    let src = "\
+        define constant $magic = 42;\n\
+        define function call-magic () => (n :: <integer>)\n  \
+            $magic\n\
+        end function;\n";
+    let fns = lower_src(src);
+    // Expect both `$magic` (zero-arg constant body) and `call-magic`
+    // (the function that references it) to lower cleanly. Pre-fix the
+    // lower_src call panicked with "undefined ident `$magic`".
+    assert_eq!(fns.len(), 2, "expected 2 lowered functions, got: {:?}",
+        fns.iter().map(|f| f.name.as_str()).collect::<Vec<_>>());
+    let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"$magic"), "missing $magic: {names:?}");
+    assert!(names.contains(&"call-magic"), "missing call-magic: {names:?}");
+}

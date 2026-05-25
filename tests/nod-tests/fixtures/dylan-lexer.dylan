@@ -362,12 +362,12 @@ end function;
 // >= 1_000_000 would collide, but no source file we'll ever lex has
 // a single line that long.
 
-// Packing scale: line * 1_000_000 + col. The literal is repeated
-// (rather than `define constant $line-col-shift`) because the Sprint
-// 06 sema kernel doesn't resolve user `define constant` names from
-// within `define function` bodies yet — a kernel limitation the
-// `*answer*` test in `kernel-arith.dylan` exercises at top-level
-// only. Three sites use the literal; if it ever changes, grep for it.
+// Packing scale: line * $line-col-shift + col. GAP-002 is fixed —
+// `define constant` names now resolve from inside function bodies,
+// so we use the named constant at all three sites. (Until GAP-003
+// lands proper multi-value return, the packing trick stays.)
+
+define constant $line-col-shift = 1000000;
 
 define function offset-to-line-col-packed
     (source :: <byte-string>, offset :: <integer>) => (packed :: <integer>)
@@ -391,15 +391,15 @@ define function offset-to-line-col-packed
     end;
     i := i + 1;
   end;
-  line * 1000000 + col
+  line * $line-col-shift + col
 end function;
 
 define function unpack-line (packed :: <integer>) => (line :: <integer>)
-  packed / 1000000
+  packed / $line-col-shift
 end function;
 
 define function unpack-col (packed :: <integer>) => (col :: <integer>)
-  packed - (packed / 1000000) * 1000000
+  packed - (packed / $line-col-shift) * $line-col-shift
 end function;
 
 // ─── escape-source-text ───────────────────────────────────────────────────
