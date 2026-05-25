@@ -98,6 +98,20 @@ enum Command {
         /// Dylan expression source.
         expr: String,
     },
+    /// Sprint 45a — run the Dylan-in-Dylan lexer over the input file and
+    /// print the canonical token dump to stdout.
+    ///
+    /// The lexer source itself lives at
+    /// `tests/nod-tests/fixtures/dylan-lexer.dylan` and is baked into
+    /// the driver via `include_str!` so this subcommand works from
+    /// anywhere on disk, not just inside the repo. The 45a stub `lex`
+    /// returns one `<eof-token>`; the canonical dump for any input is
+    /// therefore exactly `1:1-1:1  EOF\n` until 45b lands the real
+    /// implementation.
+    DumpDylanTokens {
+        /// Path to a `.dylan` source file.
+        input: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -135,6 +149,7 @@ fn main() -> ExitCode {
         Some(Command::DumpDfm { input }) => run_dump_dfm(&input),
         Some(Command::DumpLlvm { input }) => run_dump_llvm(&input),
         Some(Command::Eval { expr }) => run_eval(&expr),
+        Some(Command::DumpDylanTokens { input }) => run_dump_dylan_tokens(&input),
     }
 }
 
@@ -569,6 +584,129 @@ fn run_dump_ast(input: &std::path::Path) -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+// ─── Sprint 45a `dump-dylan-tokens` subcommand ────────────────────────────
+//
+// Embed the Dylan-in-Dylan lexer source into the driver via
+// `include_str!`. On invocation:
+//   1. Materialise the source to a temp file (path: tempdir/dylan-lexer.dylan).
+//   2. Materialise it to an EXE at tempdir/dylan-lexer.exe via run_build.
+//   3. Spawn the EXE with the user's input path as argv[1].
+//   4. Forward the EXE's stdout to our stdout, byte-for-byte.
+//
+// The EXE is cached by a hash of the lexer source plus the driver's
+// own version so re-runs reuse the same artifact. The cache lives in
+// the OS tempdir as `nod-dylan-lexer-<hash>/`. This keeps the
+// interactive experience sub-second on warm runs (the compile takes
+// a few seconds; the lex step is a couple of milliseconds).
+//
+// Stub lex (Sprint 45a) → for any input the EXE prints exactly
+// `1:1-1:1  EOF\n`. Sprint 45b's real lex fills out the dump; the
+// driver path is unchanged.
+
+/// Lexer source baked into the driver. Lives in the repo at
+/// `tests/nod-tests/fixtures/dylan-lexer.dylan`; build.rs (none yet)
+/// or `include_str!` keeps it pinned to the matching version at
+/// driver-compile time.
+const DYLAN_LEXER_SOURCE: &str =
+    include_str!("../../../tests/nod-tests/fixtures/dylan-lexer.dylan");
+
+fn dylan_lexer_cache_dir() -> Result<PathBuf, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    DYLAN_LEXER_SOURCE.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    let digest = h.finish();
+    let dir = std::env::temp_dir().join(format!("nod-dylan-lexer-{digest:016x}"));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create cache dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+fn ensure_dylan_lexer_exe() -> Result<PathBuf, String> {
+    let dir = dylan_lexer_cache_dir()?;
+    let src = dir.join("dylan-lexer.dylan");
+    let exe = dir.join("dylan-lexer.exe");
+    // Always (re-)write the source — cheap, ensures source-tree
+    // consistency with the EXE if the hash collided or the source
+    // file was deleted out from under us.
+    std::fs::write(&src, DYLAN_LEXER_SOURCE)
+        .map_err(|e| format!("write {}: {e}", src.display()))?;
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    // Compile via the existing AOT pipeline. `run_build` prints
+    // `compiled: …` to stdout on success — we redirect by capturing
+    // it manually since `run_build` writes directly. Easiest: route
+    // through `nod_sema::compile_files_for_aot` + the same codegen
+    // dance. But that's a lot of duplication; instead we just call
+    // `run_build` and accept the one-line trailer on first build —
+    // then suppress the trailing line by detecting it before we
+    // print the lex output. Simpler still: shell out to ourselves.
+    //
+    // Since `run_build` is in this same binary and uses println!, the
+    // cleanest pattern is to call ourselves as a subprocess so the
+    // `compiled: ...` line goes to the child's stdout instead of
+    // mingling with ours.
+    let driver = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+    let out = std::process::Command::new(&driver)
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .map_err(|e| format!("spawn nod-driver build: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "dylan-lexer build failed: {}\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    if !exe.is_file() {
+        return Err(format!(
+            "dylan-lexer build claimed success but {} is missing",
+            exe.display()
+        ));
+    }
+    Ok(exe)
+}
+
+fn run_dump_dylan_tokens(input: &std::path::Path) -> ExitCode {
+    let exe = match ensure_dylan_lexer_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-tokens: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Pass the absolute input path so the EXE's %read-file resolves
+    // it independent of the working directory the EXE inherits.
+    let input_abs = match std::fs::canonicalize(input) {
+        Ok(p) => p,
+        Err(_) => input.to_path_buf(),
+    };
+    let out = match std::process::Command::new(&exe).arg(&input_abs).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-tokens: spawn {}: {e}", exe.display());
+            return ExitCode::from(1);
+        }
+    };
+    // Forward stdout byte-for-byte so the canonical dump (sprint 45d
+    // oracle contract) survives any console transcoding.
+    use std::io::Write;
+    std::io::stdout().write_all(&out.stdout).ok();
+    std::io::stderr().write_all(&out.stderr).ok();
+    if out.status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(out.status.code().unwrap_or(1) as u8)
     }
 }
 

@@ -102,6 +102,15 @@ to-write. Headline arc:
   Dylan, 24 self-tests pass under AOT including a 200-op random-
   edit walk that stresses NewGC with thousands of small
   allocations.
+- **45a**: types + dump infrastructure landed (Dylan lexer in Dylan).
+  `tests/nod-tests/fixtures/dylan-lexer.dylan` defines the full
+  `<token>` class hierarchy (16 concrete subclasses), `<span>`,
+  `colour-of` / `token-kind-name` / `print-token` generics per
+  class, and a `dump-tokens` formatter producing the canonical
+  text-diff oracle format. Stub `lex` returns `[<eof-token>]` only;
+  real lexing lands in 45b. New `nod-driver dump-dylan-tokens
+  <path>` subcommand AOT-compiles the embedded lexer source and
+  prints the dump.
 
 Sprint 38c is the last entry with a long-form retro below. Sprints
 38d through 43c are best understood from the commit log and the
