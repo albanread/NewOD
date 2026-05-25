@@ -307,24 +307,27 @@ end method;
 // GAP-001 (`a689fcd`) lit up the stream surface; this method is the
 // first real consumer.
 
+// GAP-007 workaround: this method ignores the `stream` parameter and
+// writes to the module-variable `*dump-stream*` instead. The variable
+// lives in a cell-backed slot registered as a GC root, so it survives
+// the many allocations that happen inside `nod-int-to-string`,
+// `write-string`, and `write-escaped-source-text`. (The function-arg
+// form clobbers around the 92nd iteration of `dump-tokens`.) Callers
+// MUST set `*dump-stream*` to a fresh string-stream before calling.
 define method print-token
     (t :: <token>, source :: <byte-string>, stream :: <string-stream>)
  => ()
   let span = token-span(t);
   let start-packed = offset-to-line-col-packed(source, span-start(span));
   let end-packed   = offset-to-line-col-packed(source, span-end(span));
-  write-line-col(stream, unpack-line(start-packed), unpack-col(start-packed));
-  write-byte(stream, 45);  // '-'
-  write-line-col(stream, unpack-line(end-packed),   unpack-col(end-packed));
-  write-string(stream, "  ");
-  write-string(stream, token-kind-name(t));
-  // GAP-005 + GAP-006 both fixed: else-less if lowers cleanly AND
-  // codegen tolerates void-returning calls in if-arms by binding
-  // their dst to the nil singleton. The natural side-effect-only
-  // form just works now.
+  write-line-col-to-dump-stream(unpack-line(start-packed), unpack-col(start-packed));
+  write-byte(*dump-stream*, 45);  // '-'
+  write-line-col-to-dump-stream(unpack-line(end-packed),   unpack-col(end-packed));
+  write-string(*dump-stream*, "  ");
+  write-string(*dump-stream*, token-kind-name(t));
   if (~instance?(t, <eof-token>))
-    write-string(stream, "  ");
-    write-escaped-source-text(stream, token-source-text(t, source));
+    write-string(*dump-stream*, "  ");
+    write-escaped-source-text-to-dump-stream(token-source-text(t, source));
   end;
 end method;
 
@@ -335,6 +338,16 @@ define function write-line-col
   write-string(stream, nod-int-to-string(line));
   write-byte(stream, 58);  // ':'
   write-string(stream, nod-int-to-string(col));
+end function;
+
+// GAP-007 workaround variant: writes to `*dump-stream*` so the stream
+// reference lives in a GC-root cell, not a function-arg slot that can
+// go stale across the int-to-string allocation.
+define function write-line-col-to-dump-stream
+    (line :: <integer>, col :: <integer>) => ()
+  write-string(*dump-stream*, nod-int-to-string(line));
+  write-byte(*dump-stream*, 58);  // ':'
+  write-string(*dump-stream*, nod-int-to-string(col));
 end function;
 
 // ─── nod-int-to-string — local digit formatter ────────────────────────────
@@ -470,6 +483,30 @@ define function write-escaped-source-text
   end;
 end function;
 
+// GAP-007 workaround variant: writes to `*dump-stream*` directly.
+define function write-escaped-source-text-to-dump-stream
+    (s :: <byte-string>) => ()
+  let n = %byte-string-size(s);
+  let i = 0;
+  until (i = n)
+    let b = %byte-string-element(s, i);
+    if (b = 10)
+      write-string(*dump-stream*, "\\n");
+    elseif (b = 9)
+      write-string(*dump-stream*, "\\t");
+    elseif (b = 92)
+      write-string(*dump-stream*, "\\\\");
+    elseif (b = 34)
+      write-string(*dump-stream*, "\\\"");
+    elseif (b = 32)
+      write-string(*dump-stream*, "\\s");
+    else
+      write-byte(*dump-stream*, b);
+    end;
+    i := i + 1;
+  end;
+end function;
+
 // ─── dump-tokens ──────────────────────────────────────────────────────────
 //
 // Build the whole-buffer dump. Allocates ONE `<string-stream>` accumulator,
@@ -483,34 +520,802 @@ end function;
 // only allocations are (a) the stream's own stretchy-vector growth and
 // (b) the final `as-byte-string` materialisation.
 
-define function dump-tokens
-    (tokens, source :: <byte-string>) => (text :: <byte-string>)
-  let stream = make-string-stream();
-  let n = %stretchy-vector-size(tokens);
-  let i = 0;
-  until (i = n)
-    let t = %stretchy-vector-element(tokens, i);
-    print-token(t, source, stream);
-    write-byte(stream, 10);  // '\n' — every line ends in LF, even the last.
-    i := i + 1;
-  end;
-  as-byte-string(stream)
+// Per-token line build — returns the canonical dump line for ONE
+// token as a freshly-allocated byte-string, with no trailing newline.
+// Allocates a fresh stream into the *dump-stream* module variable so
+// the GC's root-tracking of the variable cell keeps the stream live
+// across the many allocations that happen inside `print-token` itself.
+// See GAP-007.
+define function print-token-to-string
+    (t :: <token>, source :: <byte-string>) => (line :: <byte-string>)
+  *dump-stream* := make-string-stream();
+  print-token(t, source, *dump-stream*);
+  as-byte-string(*dump-stream*)
 end function;
 
-// ─── lex — Sprint 45a STUB ────────────────────────────────────────────────
+// Dump the token vector. Concatenate per-token lines using
+// `acc := concatenate(acc, …)` — the IDE syntax fixture's
+// `build-line-numbers-block` uses the same shape and works through
+// thousands of tokens. See GAP-007 for the stream-local clobber that
+// pushed us off the stream-streaming form.
 //
-// Real implementation lands in 45b. Returns a one-element stretchy
-// vector holding a single `<eof-token>` at byte offset 0, so the dump
-// path is fully exercisable end-to-end. The driver's
-// `dump-dylan-tokens` subcommand pipes its argv[1] file through this
-// stub today; the same call shape lights up the real lexer in 45b
-// without any driver changes.
+// GAP-007 workaround: reads from the `*tokens*` module variable rather
+// than the `tokens` parameter so the vector stays reachable through
+// the heavy per-iteration allocation in `print-token-to-string`. The
+// caller MUST set `*tokens*` before calling (the `lex` function does
+// this on every invocation).
+define function dump-tokens
+    (tokens, source :: <byte-string>) => (text :: <byte-string>)
+  *tokens* := tokens;
+  let n = %stretchy-vector-size(*tokens*);
+  let acc = "";
+  let i = 0;
+  until (i = n)
+    let t = %stretchy-vector-element(*tokens*, i);
+    let line = print-token-to-string(t, source);
+    acc := concatenate(acc, line);
+    acc := concatenate(acc, "\n");
+    i := i + 1;
+  end;
+  acc
+end function;
+
+// ─── lex — Sprint 45b real implementation ─────────────────────────────────
+//
+// Strategy:
+//   * Module-level `*src*` + `*pos*` variables hold the immutable source
+//     buffer and the moving byte cursor. GAP-004 (define variable) is
+//     fixed, so the cursor can be a true mutable scalar.
+//   * `lex(source)` resets the variables, then loops calling
+//     `next-token()` until an `<eof-token>` is appended.
+//   * Each scanner consumes ≥ 1 byte even on malformed input (the
+//     `<error-token>` recovery path) so the loop is guaranteed to
+//     terminate after at most `size(source) + 1` iterations.
+//   * Lossless: whitespace and comments come back as first-class
+//     tokens, one per run. The parser will use `non-trivia-tokens` to
+//     skip them (a sprint-46 helper).
+//
+// Open questions from §9 of SPRINT_45_DYLAN_LEXER.md, settled here:
+//   * Negative integers lex as `-` + digits (two tokens). Parser folds.
+//   * `/* … */` block comments DO NOT nest. First `*/` closes them.
+//   * `<error-token>` always carries an explanatory `error-message` and
+//     advances pos by at least 1 byte.
+//
+// Things deliberately NOT covered in 45b (queued for follow-ups):
+//   * Float literals (`3.14`, `1.0e-3`). The token class exists but
+//     `lex` does not produce it yet; SPRINT_45_DYLAN_LEXER.md §3 marks
+//     floats as nice-to-have.
+//   * Header preambles (`Module: foo`, `Author: bar`). The Rust lexer
+//     skips them before scanning; we lex them as ordinary identifiers
+//     plus a trailing `:` (`<keyword-name-token>`). The 45d oracle
+//     will document any disagreement.
+//   * Triple-quoted strings, raw-string `#r"..."`, ratio numerics,
+//     hex `\<HHHH>` char escapes, leading-dot floats — all deferred to
+//     follow-up sprints with their own tests.
+
+define variable *src* :: <byte-string> = "";
+define variable *pos* :: <integer> = 0;
+// GAP-007 workaround: also stash the in-progress token vector as a
+// module variable so it lives in a `<cell>` slot (registered as a GC
+// root). The function-local form clobbers around the 1000th token under
+// heavy allocation pressure.
+define variable *tokens* :: <object> = #f;
+// Same GAP-007 workaround on the dump side. The dump-token stream
+// is the only one we ever materialise in this file; stashing it in
+// a module-variable cell keeps it reachable across the many
+// allocations inside `print-token`.
+define variable *dump-stream* :: <object> = #f;
+
+// ─── tiny cursor helpers ──────────────────────────────────────────────────
+
+define function at-end? () => (yes? :: <boolean>)
+  *pos* >= %byte-string-size(*src*)
+end function;
+
+// `peek-at(off)` returns the byte at `*pos* + off` or -1 when past end.
+// Using -1 as the EOF sentinel keeps every classification predicate
+// pure-integer; no token-stream code ever pattern-matches on it.
+
+define function peek-at (off :: <integer>) => (b :: <integer>)
+  let i = *pos* + off;
+  if (i >= 0 & i < %byte-string-size(*src*))
+    %byte-string-element(*src*, i)
+  else
+    -1
+  end
+end function;
+
+define function current-byte () => (b :: <integer>)
+  peek-at(0)
+end function;
+
+define function advance (n :: <integer>) => ()
+  *pos* := *pos* + n;
+end function;
+
+// ─── character classification ─────────────────────────────────────────────
+//
+// Dylan identifier alphabet (mirrors `is_ident_start` /
+// `is_ident_continue` in `src/nod-reader/src/lexer.rs`). For 45c these
+// lift into stdlib character predicates; the inline form is fine for
+// 45b and lets the lexer stay self-contained.
+
+define function is-ascii-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 48 & b <= 57           // '0'..'9'
+end function;
+
+define function is-ascii-alpha? (b :: <integer>) => (yes? :: <boolean>)
+  (b >= 65 & b <= 90) | (b >= 97 & b <= 122)   // A..Z | a..z
+end function;
+
+define function is-bin-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b = 48 | b = 49             // '0' | '1'
+end function;
+
+define function is-oct-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 48 & b <= 55           // '0'..'7'
+end function;
+
+define function is-hex-digit? (b :: <integer>) => (yes? :: <boolean>)
+  is-ascii-digit?(b)
+    | (b >= 65 & b <= 70)     // 'A'..'F'
+    | (b >= 97 & b <= 102)    // 'a'..'f'
+end function;
+
+// Dylan's "name-start" alphabet: letters plus the punctuation graphics
+// allowed at the head of an identifier. Note `-` is NOT in the start
+// set (so `-7` lexes as `-` + `7`).
+define function is-name-start? (b :: <integer>) => (yes? :: <boolean>)
+  is-ascii-alpha?(b)
+    | b = 95   // '_'
+    | b = 33   // '!'
+    | b = 36   // '$'
+    | b = 37   // '%'
+    | b = 38   // '&'
+    | b = 42   // '*'
+    | b = 60   // '<'
+    | b = 62   // '>'
+    | b = 94   // '^'
+    | b = 124  // '|'
+    | b = 126  // '~'
+end function;
+
+// Name-continuation also accepts digits, `?`, `-`, `+`, `=`, `/`.
+define function is-name-cont? (b :: <integer>) => (yes? :: <boolean>)
+  is-name-start?(b)
+    | is-ascii-digit?(b)
+    | b = 45   // '-'
+    | b = 43   // '+'
+    | b = 61   // '='
+    | b = 47   // '/'
+    | b = 63   // '?'
+end function;
+
+// Whitespace bytes treated as a single run. Newline (10) is included;
+// the line/col packing in `offset-to-line-col-packed` separately tracks
+// line breaks.
+define function is-whitespace-byte? (b :: <integer>) => (yes? :: <boolean>)
+  b = 32 | b = 9 | b = 10 | b = 13 | b = 12  // ' ' \t \n \r \f
+end function;
+
+// ─── identifier classification: keyword vs ordinary ───────────────────────
+//
+// Dylan has a fairly long keyword list. Rather than allocating a hash
+// table at lex-time we just compare against the literal strings via the
+// stdlib `=` method on `<byte-string>` (Sprint 42a). One comparison per
+// candidate keyword; for the typical token-stream this is a few hundred
+// nanoseconds total per identifier. If profiling ever flags this hot,
+// a perfect-hash table is a follow-up sprint.
+
+define function classify-keyword (name :: <byte-string>)
+ => (kw :: <object>)   // either a <symbol> on match or #f on miss
+  if (name = "define") #"define"
+  elseif (name = "end") #"end"
+  elseif (name = "let") #"let"
+  elseif (name = "local") #"local"
+  elseif (name = "if") #"if"
+  elseif (name = "else") #"else"
+  elseif (name = "elseif") #"elseif"
+  elseif (name = "then") #"then"
+  elseif (name = "begin") #"begin"
+  elseif (name = "method") #"method"
+  elseif (name = "function") #"function"
+  elseif (name = "class") #"class"
+  elseif (name = "module") #"module"
+  elseif (name = "library") #"library"
+  elseif (name = "use") #"use"
+  elseif (name = "export") #"export"
+  elseif (name = "import") #"import"
+  elseif (name = "constant") #"constant"
+  elseif (name = "variable") #"variable"
+  elseif (name = "slot") #"slot"
+  elseif (name = "make") #"make"
+  elseif (name = "instance?") #"instance?"
+  elseif (name = "singleton") #"singleton"
+  elseif (name = "inherited") #"inherited"
+  elseif (name = "next") #"next"
+  elseif (name = "signal") #"signal"
+  elseif (name = "condition") #"condition"
+  elseif (name = "block") #"block"
+  elseif (name = "cleanup") #"cleanup"
+  elseif (name = "exception") #"exception"
+  elseif (name = "select") #"select"
+  elseif (name = "case") #"case"
+  elseif (name = "cond") #"cond"
+  elseif (name = "unless") #"unless"
+  elseif (name = "while") #"while"
+  elseif (name = "until") #"until"
+  elseif (name = "for") #"for"
+  elseif (name = "from") #"from"
+  elseif (name = "to") #"to"
+  elseif (name = "by") #"by"
+  elseif (name = "in") #"in"
+  elseif (name = "handler") #"handler"
+  elseif (name = "generic") #"generic"
+  elseif (name = "domain") #"domain"
+  elseif (name = "sealed") #"sealed"
+  elseif (name = "open") #"open"
+  elseif (name = "abstract") #"abstract"
+  elseif (name = "concrete") #"concrete"
+  elseif (name = "primary") #"primary"
+  elseif (name = "free") #"free"
+  elseif (name = "virtual") #"virtual"
+  elseif (name = "each-subclass") #"each-subclass"
+  elseif (name = "required-init-keyword") #"required-init-keyword"
+  elseif (name = "init-keyword") #"init-keyword"
+  elseif (name = "init-value") #"init-value"
+  elseif (name = "init-function") #"init-function"
+  elseif (name = "setter") #"setter"
+  elseif (name = "getter") #"getter"
+  elseif (name = "type") #"type"
+  elseif (name = "subclass") #"subclass"
+  elseif (name = "super") #"super"
+  elseif (name = "next-method") #"next-method"
+  else
+    #f
+  end
+end function;
+
+// ─── span construction + small wrappers ───────────────────────────────────
+
+define function span-here (lo :: <integer>) => (s :: <span>)
+  make(<span>, start: lo, end: *pos*)
+end function;
+
+// Materialise the bytes between `lo` and `*pos*` as a fresh
+// `<byte-string>`. Used by scanners that capture token text (idents,
+// numbers, comments).
+define function slice-from (lo :: <integer>) => (s :: <byte-string>)
+  copy-sequence(*src*, lo, *pos*)
+end function;
+
+// ─── individual scanners ──────────────────────────────────────────────────
+//
+// Every scanner is called with `*pos*` pointing at the first byte of the
+// token. Each one advances `*pos*` to the byte after the last consumed
+// byte and returns a fully-built token.
+
+// Run of whitespace bytes — one token per maximal run.
+define function scan-whitespace (lo :: <integer>) => (t :: <whitespace-token>)
+  until (at-end?() | ~ is-whitespace-byte?(current-byte()))
+    advance(1);
+  end;
+  make(<whitespace-token>, span: span-here(lo))
+end function;
+
+// `// …` to end of line. Newline byte is NOT consumed (it becomes a
+// whitespace token on the next iteration).
+define function scan-line-comment (lo :: <integer>) => (t :: <comment-token>)
+  until (at-end?() | current-byte() = 10)
+    advance(1);
+  end;
+  make(<comment-token>,
+       span: span-here(lo),
+       text: slice-from(lo),
+       is-block?: #f)
+end function;
+
+// `/* … */` — does NOT nest. The first `*/` closes the comment. EOF
+// inside an unterminated block comment produces an `<error-token>` so
+// callers can flag it visually.
+define function scan-block-comment (lo :: <integer>) => (t :: <token>)
+  advance(2);  // consume the opening "/*"
+  let closed = #f;
+  until (at-end?() | closed)
+    if (current-byte() = 42 & peek-at(1) = 47)  // '*' '/'
+      advance(2);
+      closed := #t;
+    else
+      advance(1);
+    end;
+  end;
+  if (closed)
+    make(<comment-token>,
+         span: span-here(lo),
+         text: slice-from(lo),
+         is-block?: #t)
+  else
+    make(<error-token>,
+         span: span-here(lo),
+         message: "unterminated block comment")
+  end
+end function;
+
+// String literal `"…"` with escapes `\n \t \\ \" \r`. Returns either a
+// `<string-literal-token>` (raw + decoded text) or an `<error-token>`
+// for unterminated/invalid forms.
+define function scan-string (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume opening quote
+  // Build the decoded value into a stretchy-vector of bytes; the raw
+  // text comes from a slice of the source. Two allocations per string,
+  // which is fine for an editor-shaped workload.
+  let decoded-bytes = %make-stretchy-vector(16);
+  let done = #f;
+  let result = #f;
+  until (done)
+    if (at-end?())
+      result := make(<error-token>,
+                     span: span-here(lo),
+                     message: "unterminated string literal");
+      done := #t;
+    else
+      let b = current-byte();
+      if (b = 34)  // closing '"'
+        advance(1);
+        let n = %stretchy-vector-size(decoded-bytes);
+        let decoded = %byte-string-allocate(n);
+        let i = 0;
+        until (i = n)
+          %byte-string-element-setter(%stretchy-vector-element(decoded-bytes, i),
+                                      decoded, i);
+          i := i + 1;
+        end;
+        result := make(<string-literal-token>,
+                       span: span-here(lo),
+                       raw-text: slice-from(lo),
+                       decoded: decoded);
+        done := #t;
+      elseif (b = 10)  // bare newline — unterminated
+        result := make(<error-token>,
+                       span: span-here(lo),
+                       message: "newline inside string literal");
+        done := #t;
+      elseif (b = 92)  // backslash escape
+        advance(1);
+        if (at-end?())
+          result := make(<error-token>,
+                         span: span-here(lo),
+                         message: "trailing backslash in string literal");
+          done := #t;
+        else
+          let esc = current-byte();
+          let decoded-byte =
+            if (esc = 110) 10        // \n
+            elseif (esc = 116) 9     // \t
+            elseif (esc = 114) 13    // \r
+            elseif (esc = 92) 92     // \\
+            elseif (esc = 34) 34     // \"
+            elseif (esc = 39) 39     // \'
+            elseif (esc = 48) 0      // \0
+            else
+              esc                    // unknown escape — pass-through
+            end;
+          %stretchy-vector-push(decoded-bytes, decoded-byte);
+          advance(1);
+        end;
+      else
+        %stretchy-vector-push(decoded-bytes, b);
+        advance(1);
+      end;
+    end;
+  end;
+  result
+end function;
+
+// Character literal `'a'` or `'\n'` — same escape vocabulary as strings
+// but exactly one codepoint. Sprint 45b ASCII-only; Unicode characters
+// in the source produce an error token (Dylan source IS UTF-8 but
+// `<character>` design waits for a later sprint).
+define function scan-character (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume opening quote
+  if (at-end?())
+    make(<error-token>,
+         span: span-here(lo),
+         message: "unterminated character literal")
+  else
+    let codepoint = -1;
+    let b = current-byte();
+    if (b = 39)  // empty '' — invalid
+      advance(1);
+      make(<error-token>,
+           span: span-here(lo),
+           message: "empty character literal")
+    elseif (b = 92)  // escape
+      advance(1);
+      if (at-end?())
+        make(<error-token>,
+             span: span-here(lo),
+             message: "trailing backslash in character literal")
+      else
+        let esc = current-byte();
+        codepoint :=
+          if (esc = 110) 10
+          elseif (esc = 116) 9
+          elseif (esc = 114) 13
+          elseif (esc = 92) 92
+          elseif (esc = 34) 34
+          elseif (esc = 39) 39
+          elseif (esc = 48) 0
+          else esc
+          end;
+        advance(1);
+        scan-character-close(lo, codepoint)
+      end
+    else
+      codepoint := b;
+      advance(1);
+      scan-character-close(lo, codepoint)
+    end
+  end
+end function;
+
+// After the character body has been consumed, check for the closing
+// quote and emit either a character-literal or an error token. Kept
+// separate so both the escaped and bare branches share the logic.
+define function scan-character-close
+    (lo :: <integer>, codepoint :: <integer>) => (t :: <token>)
+  if (at-end?() | current-byte() ~= 39)
+    make(<error-token>,
+         span: span-here(lo),
+         message: "expected closing quote in character literal")
+  else
+    advance(1);
+    make(<character-literal-token>,
+         span: span-here(lo),
+         codepoint: codepoint)
+  end
+end function;
+
+// Decimal integer literal. Caller has verified the first byte is a
+// digit. NB: negative numbers are lexed as `-` + digits — this scanner
+// never sees a leading sign.
+define function scan-integer (lo :: <integer>) => (t :: <integer-token>)
+  let value = 0;
+  until (at-end?() | ~ is-ascii-digit?(current-byte()))
+    value := value * 10 + (current-byte() - 48);
+    advance(1);
+  end;
+  make(<integer-token>,
+       span: span-here(lo),
+       value: value,
+       radix: 10)
+end function;
+
+// Radix-prefixed integer. Caller has consumed `#` and the letter (`b`,
+// `o`, or `x`); `radix` plus the matching digit predicate are passed
+// in. Empty digit run produces an error token.
+define function scan-radix-integer
+    (lo :: <integer>, radix :: <integer>) => (t :: <token>)
+  let value = 0;
+  let any-digit? = #f;
+  let done = #f;
+  until (done)
+    if (at-end?())
+      done := #t;
+    else
+      let b = current-byte();
+      let digit-value =
+        if (is-ascii-digit?(b)) b - 48
+        elseif (b >= 97 & b <= 102) b - 87   // a..f → 10..15
+        elseif (b >= 65 & b <= 70) b - 55    // A..F → 10..15
+        else -1
+        end;
+      if (digit-value < 0 | digit-value >= radix)
+        done := #t;
+      else
+        value := value * radix + digit-value;
+        any-digit? := #t;
+        advance(1);
+      end;
+    end;
+  end;
+  if (any-digit?)
+    make(<integer-token>,
+         span: span-here(lo),
+         value: value,
+         radix: radix)
+  else
+    make(<error-token>,
+         span: span-here(lo),
+         message: "radix literal with no digits")
+  end
+end function;
+
+// Identifier (or identifier-shaped keyword). Trailing `:` (NOT part of
+// `::` / `:=`) folds in as a `<keyword-name-token>`. Recognised
+// keyword bodies map to `<keyword-token>` via `classify-keyword`.
+define function scan-identifier (lo :: <integer>) => (t :: <token>)
+  until (at-end?() | ~ is-name-cont?(current-byte()))
+    advance(1);
+  end;
+  // Check for trailing keyword-name colon: a `:` that is not part of
+  // `::` (type ann) or `:=` (assignment). Peek both bytes.
+  if (~ at-end?() & current-byte() = 58
+        & peek-at(1) ~= 58 & peek-at(1) ~= 61)
+    advance(1);
+    let name = copy-sequence(*src*, lo, *pos* - 1);
+    make(<keyword-name-token>,
+         span: span-here(lo),
+         name: name)
+  else
+    let name = slice-from(lo);
+    let kw = classify-keyword(name);
+    if (kw)
+      make(<keyword-token>,
+           span: span-here(lo),
+           keyword: kw)
+    else
+      make(<identifier-token>,
+           span: span-here(lo),
+           name: name)
+    end
+  end
+end function;
+
+// Hash-prefixed forms — `#t`, `#f`, `#(`, `#[`, `#"…"`, `#x…`, `#b…`,
+// `#o…`. The caller has NOT yet consumed the `#`. Falls through to
+// `<error-token>` for unrecognised follow-up bytes.
+define function scan-hash (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume '#'
+  if (at-end?())
+    make(<error-token>,
+         span: span-here(lo),
+         message: "lone `#` at end of input")
+  else
+    let b = current-byte();
+    if (b = 116 | b = 84)  // 't' | 'T'
+      advance(1);
+      make(<boolean-literal-token>, span: span-here(lo), value: #t)
+    elseif (b = 102 | b = 70)  // 'f' | 'F'
+      advance(1);
+      make(<boolean-literal-token>, span: span-here(lo), value: #f)
+    elseif (b = 40)  // '('
+      advance(1);
+      make(<literal-vector-open>, span: span-here(lo))
+    elseif (b = 91)  // '['
+      advance(1);
+      make(<literal-sequence-open>, span: span-here(lo))
+    elseif (b = 120 | b = 88)  // 'x' | 'X'
+      advance(1);
+      scan-radix-integer(lo, 16)
+    elseif (b = 98 | b = 66)   // 'b' | 'B'
+      advance(1);
+      scan-radix-integer(lo, 2)
+    elseif (b = 111 | b = 79)  // 'o' | 'O'
+      advance(1);
+      scan-radix-integer(lo, 8)
+    elseif (b = 34)  // '"' — symbol literal #"foo"
+      scan-hash-symbol(lo)
+    else
+      // Unrecognised: consume one byte so we make progress.
+      advance(1);
+      make(<error-token>,
+           span: span-here(lo),
+           message: "unrecognised `#` form")
+    end
+  end
+end function;
+
+// Body of `#"foo"`. The `#` is already consumed; the `"` is at *pos*.
+// Uses the same escape vocabulary as string literals.
+define function scan-hash-symbol (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume opening '"'
+  let name-bytes = %make-stretchy-vector(8);
+  let done = #f;
+  let result = #f;
+  until (done)
+    if (at-end?())
+      result := make(<error-token>,
+                     span: span-here(lo),
+                     message: "unterminated symbol literal");
+      done := #t;
+    else
+      let b = current-byte();
+      if (b = 34)
+        advance(1);
+        let n = %stretchy-vector-size(name-bytes);
+        let name = %byte-string-allocate(n);
+        let i = 0;
+        until (i = n)
+          %byte-string-element-setter(%stretchy-vector-element(name-bytes, i),
+                                      name, i);
+          i := i + 1;
+        end;
+        result := make(<symbol-literal-token>,
+                       span: span-here(lo),
+                       name: name);
+        done := #t;
+      elseif (b = 10)
+        result := make(<error-token>,
+                       span: span-here(lo),
+                       message: "newline inside symbol literal");
+        done := #t;
+      elseif (b = 92)
+        advance(1);
+        if (~ at-end?())
+          %stretchy-vector-push(name-bytes, current-byte());
+          advance(1);
+        end;
+      else
+        %stretchy-vector-push(name-bytes, b);
+        advance(1);
+      end;
+    end;
+  end;
+  result
+end function;
+
+// Punctuation dispatch — single-byte operators plus the multi-char
+// combinations `==`, `=>`, `::`, `:=`, `...`, `??`, `?=`. The form
+// slot uses canonical short symbols so the parser can dispatch with a
+// single `select` on the punctuation symbol later.
+define function scan-punctuation (lo :: <integer>) => (t :: <token>)
+  let b = current-byte();
+  if (b = 40)        // '('
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"lparen")
+  elseif (b = 41)    // ')'
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"rparen")
+  elseif (b = 91)    // '['
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"lbracket")
+  elseif (b = 93)    // ']'
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"rbracket")
+  elseif (b = 123)   // '{'
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"lbrace")
+  elseif (b = 125)   // '}'
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"rbrace")
+  elseif (b = 59)    // ';'
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"semicolon")
+  elseif (b = 44)    // ','
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"comma")
+  elseif (b = 46)    // '.'  -- check for "..."
+    if (peek-at(1) = 46 & peek-at(2) = 46)
+      advance(3);
+      make(<punctuation-token>, span: span-here(lo), form: #"ellipsis")
+    else
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"dot")
+    end
+  elseif (b = 58)    // ':' -- check for "::" then ":="
+    if (peek-at(1) = 58)
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"colon-colon")
+    elseif (peek-at(1) = 61)
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"assign")
+    else
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"colon")
+    end
+  elseif (b = 61)    // '=' -- check for "==", "=>"
+    if (peek-at(1) = 61)
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"equal-equal")
+    elseif (peek-at(1) = 62)
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"arrow")
+    else
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"equal")
+    end
+  elseif (b = 63)    // '?' -- check for "??" "?="
+    if (peek-at(1) = 63)
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"query-query")
+    elseif (peek-at(1) = 61)
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"query-equal")
+    else
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"query")
+    end
+  else
+    // Unknown punctuation — make progress, emit error.
+    advance(1);
+    make(<error-token>,
+         span: span-here(lo),
+         message: "unrecognised character")
+  end
+end function;
+
+// ─── next-token dispatcher ────────────────────────────────────────────────
+//
+// Single point of dispatch: peek the first byte and route to the right
+// scanner. Each scanner is responsible for advancing `*pos*` past the
+// token it consumes (and for advancing at least one byte even on
+// error). The dispatcher never decides "skip this" — every input byte
+// ends up in exactly one token.
+//
+// The `else` arm is the catch-all `<error-token>` producer for bytes
+// that no scanner accepted (e.g. a stray `@` outside an identifier).
+
+define function next-token () => (t :: <token>)
+  let lo = *pos*;
+  if (at-end?())
+    make(<eof-token>, span: span-here(lo))
+  else
+    let b = current-byte();
+    if (is-whitespace-byte?(b))
+      scan-whitespace(lo)
+    elseif (b = 47 & peek-at(1) = 47)  // "//"
+      advance(2);
+      scan-line-comment(lo)
+    elseif (b = 47 & peek-at(1) = 42)  // "/*"
+      scan-block-comment(lo)
+    elseif (b = 34)  // '"'
+      scan-string(lo)
+    elseif (b = 39)  // '\''
+      scan-character(lo)
+    elseif (b = 35)  // '#'
+      scan-hash(lo)
+    elseif (is-ascii-digit?(b))
+      scan-integer(lo)
+    elseif (is-name-start?(b))
+      scan-identifier(lo)
+    elseif (b = 40 | b = 41 | b = 91 | b = 93 | b = 123 | b = 125
+              | b = 59 | b = 44 | b = 46 | b = 58 | b = 61 | b = 63)
+      scan-punctuation(lo)
+    elseif (b = 45)  // '-' — bare minus (signs are NOT folded; §9 #2)
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"minus")
+    elseif (b = 43)  // '+'
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"plus")
+    else
+      // Catch-all: unrecognised byte. Advance one byte and emit an
+      // error-token so the loop terminates.
+      advance(1);
+      make(<error-token>,
+           span: span-here(lo),
+           message: "unrecognised byte")
+    end
+  end
+end function;
+
+// ─── lex — public entry point ─────────────────────────────────────────────
+//
+// Reset the cursor, walk through the source one token at a time, append
+// each to a stretchy vector, stop after pushing the EOF token. Always
+// produces at least one token (the EOF).
+
+// Inner accumulation loop. Reads `*tokens*` from the cell-backed module
+// variable each iteration so the stretchy vector stays reachable even
+// when local roots go stale under sustained allocation pressure.
+// See GAP-007.
+define function lex-into () => ()
+  let done = #f;
+  until (done)
+    let t = next-token();
+    %stretchy-vector-push(*tokens*, t);
+    if (instance?(t, <eof-token>))
+      done := #t;
+    end;
+  end;
+end function;
 
 define function lex (source :: <byte-string>) => (tokens)
-  let tokens = %make-stretchy-vector(1);
-  let eof-span = make(<span>, start: 0, end: 0);
-  %stretchy-vector-push(tokens, make(<eof-token>, span: eof-span));
-  tokens
+  *src* := source;
+  *pos* := 0;
+  *tokens* := %make-stretchy-vector(64);
+  lex-into();
+  *tokens*
 end function;
 
 // ─── main — driver entry for `dump-dylan-tokens` ──────────────────────────
