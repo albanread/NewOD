@@ -312,16 +312,35 @@ sealing-vs-open performance trajectory.
 
 ## Sibling-compiler portfolio
 
-NewOpenDylan is the sixth in a family of from-scratch Rust + LLVM compilers we maintain together. We share runtime, GC, JIT-MM, and conventions; we do not share AST/IR/sema across languages.
+All projects listed here are under active development. None are
+finished or production-ready.
 
-| Project | Language | Workspace |
+This is a family of from-scratch language implementations — mostly
+Rust + LLVM JITs, plus one native-assembly Forth — maintained in
+parallel by the same developer. They share GC design, runtime
+conventions, calling-convention rules, and JIT infrastructure, but
+not AST, IR, or semantic analysis.
+
+**How the portfolio works in practice:** focus shifts between projects
+freely, driven by what's interesting, what's blocked, and frankly by
+boredom with any one stream. That turns out to be a feature: each
+language exercises the shared GC and runtime from a different angle.
+A GC bug found while stress-testing the Dylan rope allocator gets
+fixed once and benefits every runtime. A Forth word that tickles a
+stack-scanning edge case becomes a regression fixture for the Lisp
+collector. Running eight languages through the same collector means
+there's rarely a shortage of workloads to find the next crash.
+
+| Project | Language / notes | Implementation |
 |---|---|---|
-| NewM2 | Modula-2 (PIM 4 + ISO 10514-1) | `E:\NewM2` |
-| NewCP | Component Pascal | `E:\NewCP\NewCP` |
-| NewCormanLisp | Common Lisp | `E:\CL\NewCormanLisp` |
-| NewBCPL | BCPL | `E:\NewBCPL` |
-| NewFB | FreeBASIC | `E:\NewFB` |
-| **NewOpenDylan** | **Dylan** | `E:\NewOpenDylan\NewOpenDylan` |
+| NewM2 | Modula-2 (PIM 4 + ISO 10514-1) | Rust + LLVM JIT/AOT |
+| NewCP | Component Pascal | Rust + LLVM JIT/AOT |
+| NewCormanLisp | Common Lisp — page-heap GC, Win64 GUI | Rust + LLVM JIT |
+| NewBCPL | BCPL | Rust + LLVM JIT |
+| NewFB | FasterBASIC | Rust + LLVM JIT/AOT |
+| WF64 | 64-bit subroutine-threaded Forth, Win64 native | Hand-written x64 asm |
+| FactorForth | Factor-style concatenative / ANS Forth research | Rust + LLVM |
+| **NewOpenDylan** | **Dylan — JIT + AOT + Win64 IDE written in Dylan** | **Rust + LLVM JIT/AOT** |
 
 ## Licence
 
