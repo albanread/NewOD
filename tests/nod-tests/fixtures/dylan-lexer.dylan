@@ -294,21 +294,56 @@ end method;
 
 // ─── print-token — write one canonical dump line for a token ──────────────
 //
-// Generic so future stream-shaped consumers (Sprint 45d's oracle test,
-// the IDE inspector, etc.) can stream a token rather than concatenate.
-// Sprint 45a uses string concatenation inside `dump-tokens` directly
-// for now — Dylan has no `<stream>` class yet (DEFERRED.md: streams).
-// These methods exist so the API surface is in place; they're called
-// only via `print-token-to-string` below, which the dumper uses.
+// One canonical line per token; fields separated by EXACTLY two spaces:
+//
+//   <start-line>:<start-col>-<end-line>:<end-col>  <KIND>  <escaped-text>
+//
+// EOF tokens stop after the KIND tag (no source text to show). The
+// trailing newline is added by `dump-tokens`, not here.
+//
+// Stream-based: writes directly into the caller's `<string-stream>`
+// accumulator rather than returning a freshly-allocated byte-string per
+// token (the GAP-001-pre shape was O(N²) on the whole-buffer dump).
+// GAP-001 (`a689fcd`) lit up the stream surface; this method is the
+// first real consumer.
 
-define method print-token (t :: <token>, source :: <byte-string>, stream)
+define method print-token
+    (t :: <token>, source :: <byte-string>, stream :: <string-stream>)
  => ()
-  // Sprint 45a stub — see comment above. Future sprints route this
-  // through a `<stream>`-typed argument.
-  // SPRINT 45a DESIGN-QUESTION: no <stream> class exists yet; the
-  // `stream` parameter is untyped. When streams land we type it.
-  #f
+  let span = token-span(t);
+  let start-packed = offset-to-line-col-packed(source, span-start(span));
+  let end-packed   = offset-to-line-col-packed(source, span-end(span));
+  write-line-col(stream, unpack-line(start-packed), unpack-col(start-packed));
+  write-byte(stream, 45);  // '-'
+  write-line-col(stream, unpack-line(end-packed),   unpack-col(end-packed));
+  write-string(stream, "  ");
+  write-string(stream, token-kind-name(t));
+  // Both arms end in `#f` (a <boolean>) so the join's phi sees two
+  // temps of the same type — without this, codegen panics with
+  // `phi incoming temp defined` because the else-arm's last expr is
+  // a void-returning `write-escaped-source-text` and the then-arm's
+  // is `#f`. The else-arm's `write-*` calls are evaluated for their
+  // side effects; the trailing `#f` is just a sentinel.
+  //
+  // Worth a follow-up gap: lower_if should join an arm-returning-unit
+  // with an arm-returning-boolean as Top, not panic on type mismatch.
+  if (instance?(t, <eof-token>))
+    #f
+  else
+    write-string(stream, "  ");
+    write-escaped-source-text(stream, token-source-text(t, source));
+    #f
+  end;
 end method;
+
+// ─── write-line-col — small helper: `<line>:<col>` into a stream ─────────
+
+define function write-line-col
+    (stream :: <string-stream>, line :: <integer>, col :: <integer>) => ()
+  write-string(stream, nod-int-to-string(line));
+  write-byte(stream, 58);  // ':'
+  write-string(stream, nod-int-to-string(col));
+end function;
 
 // ─── nod-int-to-string — local digit formatter ────────────────────────────
 //
@@ -402,113 +437,72 @@ define function unpack-col (packed :: <integer>) => (col :: <integer>)
   packed - (packed / $line-col-shift) * $line-col-shift
 end function;
 
-// ─── escape-source-text ───────────────────────────────────────────────────
+// ─── write-escaped-source-text — escape control bytes into a stream ──────
 //
-// Replace control bytes and the quote / backslash with their canonical
-// dump escapes. Output bytes follow these rules:
+// Replace control bytes and quote/backslash with their canonical dump
+// escapes, writing directly into the caller's stream:
 //   * byte 10  (LF)  → `\n`   (two characters: backslash + 'n')
 //   * byte 9   (TAB) → `\t`
 //   * byte 92  (`\`) → `\\`
 //   * byte 34  (`"`) → `\"`
 //   * byte 32  (` `) → `\s`   (so whitespace runs are visible)
-//   * other printable bytes pass through unchanged
-//   * other control bytes pass through unchanged — Sprint 45a doesn't
-//     bother with hex escapes yet; the corpus we care about is LF-only.
+//   * other bytes pass through unchanged — Sprint 45a doesn't bother
+//     with hex escapes; the corpus we care about is LF-only.
 //
-// Concatenate-as-you-go shape: O(N²) on long strings but the lines we
-// hand to it are token-sized (rarely > 80 bytes) so the cost is
-// negligible. A two-pass sizing+writing variant tripped Sprint 42-pre's
-// lower_if env-merge bug — too many SSA join points in the `elseif`
-// chain for the current narrowing pass to model. Once 45c lifts these
-// to stdlib character predicates we revisit.
+// Pre-GAP-001 this allocated a fresh byte-string per byte (concatenate-
+// as-you-go to dodge Sprint 42-pre's `lower_if` SSA-join bug). The
+// stream-flavour writes single bytes via `write-byte` and 2-byte
+// escapes via `write-string` of a literal — no `acc := concatenate(...)`
+// chain, no O(N²) blow-up, no SSA-join trip-wire.
 
-define function escape-byte (b :: <integer>) => (out :: <byte-string>)
-  if (b = 10)
-    "\\n"
-  elseif (b = 9)
-    "\\t"
-  elseif (b = 92)
-    "\\\\"
-  elseif (b = 34)
-    "\\\""
-  elseif (b = 32)
-    "\\s"
-  else
-    let one = %byte-string-allocate(1);
-    %byte-string-element-setter(b, one, 0);
-    one
-  end
-end function;
-
-define function escape-source-text (s :: <byte-string>) => (out :: <byte-string>)
+define function write-escaped-source-text
+    (stream :: <string-stream>, s :: <byte-string>) => ()
   let n = %byte-string-size(s);
-  let acc = "";
   let i = 0;
   until (i = n)
     let b = %byte-string-element(s, i);
-    acc := concatenate(acc, escape-byte(b));
+    if (b = 10)
+      write-string(stream, "\\n");
+    elseif (b = 9)
+      write-string(stream, "\\t");
+    elseif (b = 92)
+      write-string(stream, "\\\\");
+    elseif (b = 34)
+      write-string(stream, "\\\"");
+    elseif (b = 32)
+      write-string(stream, "\\s");
+    else
+      write-byte(stream, b);
+    end;
     i := i + 1;
   end;
-  acc
-end function;
-
-// ─── print-token-to-string ────────────────────────────────────────────────
-//
-// Build one canonical dump line for a token. Returns the line WITHOUT
-// the trailing newline (the caller adds it). Format:
-//
-//   <start-line>:<start-col>-<end-line>:<end-col>  <KIND>  <escaped-text>
-//
-// Fields separated by EXACTLY two spaces. EOF tokens emit just the
-// position + KIND (no trailing escaped-text, no trailing two spaces).
-// This locks in the oracle-test contract for sprint 45d.
-
-define function print-token-to-string
-    (t :: <token>, source :: <byte-string>) => (line :: <byte-string>)
-  let span = token-span(t);
-  let start-packed = offset-to-line-col-packed(source, span-start(span));
-  let end-packed   = offset-to-line-col-packed(source, span-end(span));
-  let sl = unpack-line(start-packed);
-  let sc = unpack-col(start-packed);
-  let el = unpack-line(end-packed);
-  let ec = unpack-col(end-packed);
-  let pos = concatenate(
-              concatenate(
-                concatenate(nod-int-to-string(sl), ":"),
-                concatenate(nod-int-to-string(sc), "-")),
-              concatenate(
-                concatenate(nod-int-to-string(el), ":"),
-                nod-int-to-string(ec)));
-  let kind = token-kind-name(t);
-  let head = concatenate(pos, concatenate("  ", kind));
-  // EOF lines stop after the kind tag — there's no source text to show.
-  if (instance?(t, <eof-token>))
-    head
-  else
-    let txt = escape-source-text(token-source-text(t, source));
-    concatenate(head, concatenate("  ", txt))
-  end
 end function;
 
 // ─── dump-tokens ──────────────────────────────────────────────────────────
 //
-// Build the whole-buffer dump. Walks the stretchy-vector, calls
-// `print-token-to-string` per token, joins with '\n', and appends a
-// trailing newline so the dump is line-oriented (every token line ends
-// in '\n', including the last).
+// Build the whole-buffer dump. Allocates ONE `<string-stream>` accumulator,
+// walks the token vector calling `print-token` on each (which writes the
+// canonical line into the stream), then materialises the stream as a
+// `<byte-string>` once at the end.
+//
+// Pre-GAP-001 this was the O(N²) site — every token allocated a fresh
+// dump-line byte-string, every iteration concatenated it onto a growing
+// accumulator (allocating a fresh result). With the stream surface, the
+// only allocations are (a) the stream's own stretchy-vector growth and
+// (b) the final `as-byte-string` materialisation.
 
 define function dump-tokens
     (tokens, source :: <byte-string>) => (text :: <byte-string>)
+  let stream = make-string-stream();
   let n = %stretchy-vector-size(tokens);
-  let acc = "";
   let i = 0;
   until (i = n)
     let t = %stretchy-vector-element(tokens, i);
-    let line = print-token-to-string(t, source);
-    acc := concatenate(acc, concatenate(line, "\n"));
+    print-token(t, source, stream);
+    write-byte(stream, 10);  // '\n' — every line ends in LF, even the last.
     i := i + 1;
   end;
-  acc
+  as-byte-string(stream)
 end function;
 
 // ─── lex — Sprint 45a STUB ────────────────────────────────────────────────

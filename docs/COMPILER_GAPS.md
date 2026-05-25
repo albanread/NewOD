@@ -173,6 +173,65 @@ Sort by ID. New gaps append. Don't renumber.
   test still passes — constants stay immutable, variables are the
   only writable kind.
 
+## GAP-005 — `if` without `else` arm refuses to lower
+
+* **Discovered**: Sprint 45a rework (this commit while reworking
+  `print-token` to write into a `<string-stream>`),
+  `tests/nod-tests/fixtures/dylan-lexer.dylan` print-token method.
+* **Symptom**: writing `if (cond) write-string(stream, "  ") end;`
+  (an if-statement form used purely for side effects, no else) raises
+  `unsupported [Span ...]: Sprint 06 lowers only if-expressions with an else arm`
+  at lower time. Dylan supports the else-less form; the compiler
+  rejects it.
+* **Workaround**: explicit `else #f` arm: `if (cond) ... else #f end;`.
+  See the GAP-006 wrinkle: even with an else, the two arms must
+  produce compatible types or codegen panics.
+* **Planned fix**: lower the else-less form by synthesising an
+  `else #f` arm (semantically: missing else returns `#f`). One-line
+  change in `lower_if` (or whatever handles `Item`/`Expr` if without
+  else). Comes with a unit test using the else-less idiom.
+* **Scope**: small. Probably 10 lines of sema.
+* **Status**: open.
+
+## GAP-006 — `if` arm-type mismatch panics codegen instead of joining as Top
+
+* **Discovered**: Sprint 45a rework (same commit as GAP-005),
+  also in the print-token method.
+* **Symptom**: writing
+  ```dylan
+  if (cond)
+    #f
+  else
+    write-string(stream, "  ")      // returns void
+    write-escaped-source-text(...)  // also void
+  end
+  ```
+  panics codegen with `phi incoming temp defined` at
+  `src/nod-llvm/src/codegen.rs:1233`. The then-arm produces a
+  `<boolean>` Word; the else-arm's last expression is a
+  void-returning generic call. The join phi sees two temps with
+  incompatible types and the codegen narrowing pass panics rather
+  than joining as `TypeEstimate::Top`.
+* **Workaround**: ensure both arms produce the same shape. In the
+  print-token method, the else-arm got a trailing `#f` after the
+  void writes so both arms end with a `<boolean>` value:
+  ```dylan
+  if (instance?(t, <eof-token>))
+    #f
+  else
+    write-string(stream, "  ")
+    write-escaped-source-text(stream, ...)
+    #f          // sentinel — both arms now produce <boolean>
+  end
+  ```
+* **Planned fix**: `lower_if`'s join-block phi should accept a
+  type mismatch and produce a Top-typed result. Codegen's narrowing
+  shouldn't panic on `phi incoming temp defined` — that error
+  message indicates a real bug in the upstream check.
+* **Scope**: small-medium. Touches sema's type-estimate join logic
+  and codegen's phi-typing assertion.
+* **Status**: open.
+
 ## GAP-003 — No multi-value return / no multi-binder `let`
 
 * **Discovered**: Sprint 45a, commit `29e1040`,
