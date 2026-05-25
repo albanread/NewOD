@@ -175,62 +175,57 @@ Sort by ID. New gaps append. Don't renumber.
 
 ## GAP-005 — `if` without `else` arm refuses to lower
 
-* **Discovered**: Sprint 45a rework (this commit while reworking
-  `print-token` to write into a `<string-stream>`),
+* **Discovered**: Sprint 45a rework (commit `1d32575`),
   `tests/nod-tests/fixtures/dylan-lexer.dylan` print-token method.
 * **Symptom**: writing `if (cond) write-string(stream, "  ") end;`
-  (an if-statement form used purely for side effects, no else) raises
-  `unsupported [Span ...]: Sprint 06 lowers only if-expressions with an else arm`
-  at lower time. Dylan supports the else-less form; the compiler
-  rejects it.
-* **Workaround**: explicit `else #f` arm: `if (cond) ... else #f end;`.
-  See the GAP-006 wrinkle: even with an else, the two arms must
-  produce compatible types or codegen panics.
-* **Planned fix**: lower the else-less form by synthesising an
-  `else #f` arm (semantically: missing else returns `#f`). One-line
-  change in `lower_if` (or whatever handles `Item`/`Expr` if without
-  else). Comes with a unit test using the else-less idiom.
-* **Scope**: small. Probably 10 lines of sema.
-* **Status**: open.
+  raised `unsupported [Span ...]: Sprint 06 lowers only
+  if-expressions with an else arm`. Dylan supports the else-less
+  form; the compiler rejected it.
+* **Workaround**: explicit `else #f` arm. Retired with the fix.
+* **Fix**: in `Expr::If` lowering, when `else_` is `None` synthesise
+  an `Expr::Bool(span, false)` and pass it to `lower_if`. Semantically
+  correct (Dylan: missing else returns `#f`). Same 3-block CFG, no
+  special-case in lower_if.
+* **Regression test**: `tests/nod-tests/tests/sema.rs::
+  gap_005_if_without_else_lowers`.
+* **Scope**: small. ~10 lines of sema.
+* **Status**: **fixed in SHA TBD** (this commit). Note GAP-006 still
+  applies if the synthesised else's `#f` doesn't shape-match the
+  then-arm's last-expression type — see below.
 
-## GAP-006 — `if` arm-type mismatch panics codegen instead of joining as Top
+## GAP-006 — void-returning calls in if-arms panic codegen
 
-* **Discovered**: Sprint 45a rework (same commit as GAP-005),
-  also in the print-token method.
-* **Symptom**: writing
-  ```dylan
-  if (cond)
-    #f
-  else
-    write-string(stream, "  ")      // returns void
-    write-escaped-source-text(...)  // also void
-  end
-  ```
-  panics codegen with `phi incoming temp defined` at
-  `src/nod-llvm/src/codegen.rs:1233`. The then-arm produces a
-  `<boolean>` Word; the else-arm's last expression is a
-  void-returning generic call. The join phi sees two temps with
-  incompatible types and the codegen narrowing pass panics rather
-  than joining as `TypeEstimate::Top`.
-* **Workaround**: ensure both arms produce the same shape. In the
-  print-token method, the else-arm got a trailing `#f` after the
-  void writes so both arms end with a `<boolean>` value:
-  ```dylan
-  if (instance?(t, <eof-token>))
-    #f
-  else
-    write-string(stream, "  ")
-    write-escaped-source-text(stream, ...)
-    #f          // sentinel — both arms now produce <boolean>
-  end
-  ```
-* **Planned fix**: `lower_if`'s join-block phi should accept a
-  type mismatch and produce a Top-typed result. Codegen's narrowing
-  shouldn't panic on `phi incoming temp defined` — that error
-  message indicates a real bug in the upstream check.
-* **Scope**: small-medium. Touches sema's type-estimate join logic
-  and codegen's phi-typing assertion.
-* **Status**: open.
+* **Discovered**: Sprint 45a rework (commit `1d32575`), print-token
+  method using `if (cond) write-string(stream, "  ") end`.
+* **Symptom**: codegen panics with `phi incoming temp defined` at
+  `src/nod-llvm/src/codegen.rs:1233` when an if-arm's last
+  expression is a void-returning generic call (return type `()`)
+  AND the if's value flows into a join-block phi.
+* **Root cause**: the `Computation::DirectCall` / `Dispatch` /
+  `SealedDirectCall` codegen arms in `nod-llvm/src/codegen.rs`
+  guarded `self.temps.insert(*dst, v)` behind `if let Some(v) = v`.
+  When the called function returned void (`v == None`), the dst
+  TempId was NEVER inserted into `state.temps`. But the lowering
+  pass allocates a dst TempId regardless of the call's return
+  arity. When that orphan TempId then appeared as a Jump arg into
+  a join block, the phi-incoming wiring step at codegen.rs:1233
+  panicked because `state.temps.get(arg_temp)` returned None.
+  Not a type-system issue — a missing-binding issue.
+* **Workaround**: ensure both arms produce a same-shape value,
+  e.g. add a trailing `#f` sentinel after void calls. Retired
+  with the fix.
+* **Fix**: all three call-flavour Computation arms now insert
+  `load_imm_nil()?.into()` for the dst TempId when the underlying
+  emit returns None. Phi joins get a real i64 LLVM value (Dylan's
+  canonical "no meaningful value" — `nil`). Consumers that ever
+  use the value see `nil`, which is the right semantics for a void
+  call's "result".
+* **Regression test**: `tests/nod-tests/tests/sema.rs::
+  gap_006_void_call_in_if_arm_does_not_panic`, plus the end-to-end
+  smoke that the Sprint 45a `print-token` method now uses the bare
+  `if (~instance?(...)) ... end` shape without any sentinel `#f`.
+* **Scope**: small. ~15 lines of codegen.
+* **Status**: **fixed in SHA TBD** (this commit).
 
 ## GAP-003 — No multi-value return / no multi-binder `let`
 

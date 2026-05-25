@@ -1493,9 +1493,22 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 safepoint_roots,
             } => {
                 let v = self.emit_direct_call(callee, args, *dst, safepoint_roots)?;
-                if let Some(v) = v {
-                    self.temps.insert(*dst, v);
-                }
+                // GAP-006 fix: even when the called function returns
+                // void (`v == None`), we must bind `dst` to SOMETHING in
+                // `self.temps`. If a downstream Jump arg references this
+                // temp (e.g. when the void call is the last expression
+                // of an `if`-arm whose join phi takes a value param),
+                // the phi-wiring step at the end of the function panics
+                // with `phi incoming temp defined`. Sentinel: load the
+                // runtime `nil` Word — Dylan's canonical "no meaningful
+                // value" — so phi joins get a real i64. Consumers that
+                // actually USE the value see `nil` (no use case relies
+                // on the void call's "result" being anything else).
+                let v = match v {
+                    Some(v) => v,
+                    None => self.load_imm_nil()?.into(),
+                };
+                self.temps.insert(*dst, v);
             }
             Computation::Call { .. } => {
                 return Err(CodegenError::IndirectCallNotSupported {
@@ -1530,9 +1543,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 safepoint_roots,
             } => {
                 let v = self.emit_dispatch(generic_name, args, *dst, safepoint_roots)?;
-                if let Some(v) = v {
-                    self.temps.insert(*dst, v);
-                }
+                // GAP-006 fix — see DirectCall arm above for rationale.
+                let v = match v {
+                    Some(v) => v,
+                    None => self.load_imm_nil()?.into(),
+                };
+                self.temps.insert(*dst, v);
             }
             Computation::SealedDirectCall {
                 dst,
@@ -1550,9 +1566,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                     *dst,
                     safepoint_roots,
                 )?;
-                if let Some(v) = v {
-                    self.temps.insert(*dst, v);
-                }
+                // GAP-006 fix — see DirectCall arm above for rationale.
+                let v = match v {
+                    Some(v) => v,
+                    None => self.load_imm_nil()?.into(),
+                };
+                self.temps.insert(*dst, v);
             }
         }
         Ok(())

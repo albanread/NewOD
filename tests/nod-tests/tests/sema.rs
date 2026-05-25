@@ -426,6 +426,84 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+// ─── GAP-005 — `if` without `else` arm lowers cleanly ───────────────────
+
+/// Regression test for COMPILER_GAPS.md GAP-005. Before the fix
+/// `lower_expr`'s `Expr::If` arm rejected an else-less if with
+/// `LoweringError::Unsupported("Sprint 06 lowers only if-expressions
+/// with an else arm")`. Surfaced by Sprint 45a's `print-token`
+/// rework — the natural shape for a side-effect-only conditional
+/// (`if (cond) write-string(...) end;`) tripped the check
+/// immediately. Fix synthesises `Expr::Bool(span, false)` as the
+/// missing else; runtime semantics: an `if` without else returns `#f`.
+#[test]
+fn gap_005_if_without_else_lowers() {
+    let src = "\
+        define function classify (n :: <integer>) => (n :: <integer>)\n  \
+            if (n > 0) n end\n\
+        end function;\n";
+    // Pre-fix: lower_src panics with the Unsupported error.
+    let fns = lower_src(src);
+    assert_eq!(fns.len(), 1);
+    let f = &fns[0];
+    assert_eq!(f.name, "classify");
+    // The if's two arms produce different types (then = <integer>,
+    // else = <boolean> for the synthesised #f), so the join phi's
+    // return-type estimate widens to Top. That's correct Dylan
+    // semantics — the caller can't statically assume any particular
+    // shape.
+    verify(f).expect("verify");
+}
+
+// ─── GAP-006 — if arms with mismatched types don't panic codegen ────────
+
+/// Regression test for COMPILER_GAPS.md GAP-006. Before the fix the
+/// `Computation::DirectCall` / `Dispatch` / `SealedDirectCall` codegen
+/// arms in `nod-llvm/src/codegen.rs` only inserted the dst TempId
+/// into `state.temps` when the call returned Some(v). Void-returning
+/// calls (return type `()`) skipped the insert — but lowering still
+/// allocates a dst TempId regardless. When that TempId then appeared
+/// as a Jump arg into a join block (e.g. void call as the last
+/// expression of an `if`-arm), the phi-incoming wiring step at
+/// codegen.rs:1233 panicked with `phi incoming temp defined` because
+/// `state.temps.get(arg_temp)` returned None.
+///
+/// Fix: all three call-flavour Computation arms now insert
+/// `load_imm_nil()` (Dylan's canonical "no meaningful value") for the
+/// dst TempId when the underlying emit returns None. Phi joins get a
+/// real i64 LLVM value. Consumers that actually USE the value see
+/// `nil` — there's no Dylan use-case where a void call's "result" is
+/// supposed to be anything else.
+///
+/// The smoke that surfaced this was Sprint 45a's `print-token` after
+/// the GAP-001 stream rework — `if (cond) write-string(s, "  ") end`
+/// (post-GAP-005 = `if (cond) ... else #f end`) had a void-returning
+/// `write-string` as the then-arm's last expr and `#f` as the
+/// synthesised else, hitting the missing-temp panic on the phi join.
+#[test]
+fn gap_006_void_call_in_if_arm_does_not_panic() {
+    let src = "\
+        define function notice (n :: <integer>) => (out :: <boolean>)\n  \
+            if (n > 0)\n    \
+                format-out(\"positive\\n\")\n  \
+            else\n    \
+                #f\n  \
+            end\n\
+        end function;\n";
+    // Pre-fix: lower OK, then codegen would panic. lower_src only
+    // exercises the lowering pass, not codegen. The real test is the
+    // smoke test that builds + runs an EXE — see
+    // `tests/nod-tests/fixtures/hello.dylan` via the dump-dylan-tokens
+    // path; the lexer's print-token method now uses the bare
+    // `if (~instance?(...)) ... end` shape with a void write-* call
+    // as the last expression. If that build succeeds, GAP-006 is fixed.
+    let fns = lower_src(src);
+    assert_eq!(fns.len(), 1);
+    let f = &fns[0];
+    assert_eq!(f.name, "notice");
+    verify(f).expect("verify");
+}
+
 // ─── GAP-001 — <string-stream> round-trips bytes via stdlib generics ────
 
 /// Regression test for COMPILER_GAPS.md GAP-001. Before this gap landed,

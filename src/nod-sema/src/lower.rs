@@ -4604,12 +4604,21 @@ impl FunctionBuilder {
                 Ok(dst)
             }
             Expr::If { cond, then_, else_, span } => {
-                let Some(else_) = else_ else {
-                    return Err(LoweringError::Unsupported {
-                        span: *span,
-                        message: "Sprint 06 lowers only `if`-expressions with an `else` arm"
-                            .to_string(),
-                    });
+                // GAP-005 fix: an `if` without an `else` arm returns
+                // `#f` per Dylan semantics. Synthesise the missing arm
+                // here so `lower_if` doesn't need to know the two
+                // shapes apart — both compile to the same 3-block
+                // CFG, with the else-arm just yielding the boolean
+                // false singleton. Lets users write
+                // `if (cond) side-effect end;` for statement-flavour
+                // branches without the explicit `else #f` ceremony.
+                let synthesized_else;
+                let else_ = match else_ {
+                    Some(e) => e.as_ref(),
+                    None => {
+                        synthesized_else = Expr::Bool(*span, false);
+                        &synthesized_else
+                    }
                 };
                 self.lower_if(cond, then_, else_, env, ctx)
             }

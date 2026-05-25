@@ -318,21 +318,13 @@ define method print-token
   write-line-col(stream, unpack-line(end-packed),   unpack-col(end-packed));
   write-string(stream, "  ");
   write-string(stream, token-kind-name(t));
-  // Both arms end in `#f` (a <boolean>) so the join's phi sees two
-  // temps of the same type — without this, codegen panics with
-  // `phi incoming temp defined` because the else-arm's last expr is
-  // a void-returning `write-escaped-source-text` and the then-arm's
-  // is `#f`. The else-arm's `write-*` calls are evaluated for their
-  // side effects; the trailing `#f` is just a sentinel.
-  //
-  // Worth a follow-up gap: lower_if should join an arm-returning-unit
-  // with an arm-returning-boolean as Top, not panic on type mismatch.
-  if (instance?(t, <eof-token>))
-    #f
-  else
+  // GAP-005 + GAP-006 both fixed: else-less if lowers cleanly AND
+  // codegen tolerates void-returning calls in if-arms by binding
+  // their dst to the nil singleton. The natural side-effect-only
+  // form just works now.
+  if (~instance?(t, <eof-token>))
     write-string(stream, "  ");
     write-escaped-source-text(stream, token-source-text(t, source));
-    #f
   end;
 end method;
 
