@@ -389,9 +389,17 @@ Sort by ID. New gaps append. Don't renumber.
   no errors (currently impossible — see §"Workaround in tree"
   above).
 
-* **Status**: **open, diagnosis pinned**. Fix is a ~10-line patch
-  in `src/nod-llvm/src/codegen.rs`. Workaround in tree at
-  `tests/nod-tests/fixtures/dylan-lexer.dylan` (Sprint 45b).
+* **Status**: **fixed in SHA `f1d71c4`** (this commit). Regression
+  tests landed alongside in
+  `tests/nod-tests/tests/gap_007_stale_locals.rs` with fixtures
+  `gap-007-repro.dylan` (JIT + AOT runtime) and
+  `gap-007-repro-ir.dylan` (LLVM-IR shape assertion). The Sprint 45b
+  workaround in `tests/nod-tests/fixtures/dylan-lexer.dylan`
+  (`*tokens*` / `*dump-stream*` module-variable stash) remains in
+  tree pending its own retirement commit — the natural acceptance
+  gate for that retirement is the self-dump
+  (`nod-driver dump-dylan-tokens tests/nod-tests/fixtures/dylan-lexer.dylan`)
+  succeeding end-to-end on the lexer's own source.
 
 ## GAP-003 — No multi-value return / no multi-binder `let`
 
