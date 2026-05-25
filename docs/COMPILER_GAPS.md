@@ -284,31 +284,113 @@ Sort by ID. New gaps append. Don't renumber.
   (hello.dylan, the Sprint 45-era tests) but NOT enough to dump the
   lexer fixture on itself (~1265 lines, 38 KB). The workaround
   surface is documented in-source where it lives.
-* **Planned fix**: a JIT GC-root-tracking sweep. Likely culprits:
-  - `nod-llvm`'s phi-node placement around loop join blocks. The
-    `gc.reload` from the `lex_count2.dylan` IR-verifier failure
-    suggests the codegen is generating a phi where one incoming
-    edge's value is not dominated. A small clean-room reproducer
-    EXE (the `lex_count2.dylan` build above) gives us a fast
-    iteration loop.
-  - Function-parameter slots are SUPPOSED to be tracked roots but
-    the empirical data says they aren't surviving past the first
-    minor GC. Audit `emit_call` / `emit_dispatch` in
-    `nod-llvm/src/codegen.rs` for missing `gc.relocate` reloads on
-    parameter temps.
-  - Cross-check against the Sprint 23 `RootGuard` machinery in
-    `nod-runtime/src/make.rs` — Rust-side allocations correctly
-    root locals across allocs; the same discipline needs to extend
-    to Dylan-side function frames.
-* **Regression test**: none yet. The minimal reproducer above
-  should land as `tests/nod-tests/tests/gap_007_stale_locals.rs`
-  once the fix is in flight, with the fixture saved at
-  `tests/nod-tests/fixtures/gap-007-repro.dylan`.
-* **Scope**: medium-large. Touches `nod-llvm` codegen + the JIT
-  GC-root-tracking schema. Own sprint, sequenced before Sprint 45d
-  (the oracle test) since the oracle will need the lexer to dump
-  bigger corpora than the workaround envelope.
-* **Status**: **open**. Workaround in tree at
+* **Root cause (verified by reading codegen + liveness)**: the bug is
+  NOT in the GC liveness pass and NOT in the safepoint runtime — both
+  are correct. The bug is in **phi-incoming wiring in
+  `src/nod-llvm/src/codegen.rs`**:
+
+  - `pending_incoming` (line 1140) is typed as
+    `Vec<(BlockId, BasicBlock, Vec<TempId>)>` — it records the
+    symbolic TempIds of jump args, not the resolved SSA values.
+  - `emit_terminator` for `Terminator::Jump` (line 3092-3107) pushes
+    the TempIds onto `pending_incoming` and moves on.
+  - At end-of-function (line 1226-1236), the phi-wiring loop calls
+    `state.temps.get(arg_temp)` to resolve each TempId → SSA value.
+  - **But `end_safepoint` (line 3175) MUTATES `state.temps` every
+    time it runs**:
+    ```rust
+    self.temps.insert(slot_info.temp, reloaded);
+    ```
+    Every safepoint reload overwrites `temps[t]` with a fresh
+    `%gc.reload.tN` SSA value defined IN the current block.
+
+  By the time phi-wiring runs at the end, `state.temps[t]` holds the
+  **last** reload SSA value across the entire function — typically
+  defined deep inside the loop body. The phi for `t` at the loop
+  header ends up taking that same body-block SSA value on BOTH
+  incoming edges. The entry-edge then can't possibly dominate it.
+
+  This matches the GAP-007 IR-verifier error pattern exactly: the
+  phi name `phi.t{}` (line 1206) and the gc.reload name `gc.reload.t{}`
+  (line 3173) appear together in the failure message as the same
+  TempId. Both incomings use the same value.
+
+* **Symptom matrix explained by the root cause**:
+  - **Build-time `Instruction does not dominate all uses!`** — both
+    phi incomings reference `%gc.reload.tN` defined inside the body
+    block. Entry-edge dominance violated.
+  - **Runtime stale-pointer "after N iterations"** — when LLVM block
+    layout happens to satisfy dominance, the IR is valid but
+    semantically wrong: entry edge reads from a slot that wasn't
+    initialised this call. Different `<unknown:NNN>` per run because
+    the alloca slot pool is per-function-instance and the residual
+    bits drift across runs.
+  - **Function parameters fail identically to `let`-locals** —
+    params skip entry-block phi creation but, once threaded into a
+    downstream phi, go through the same `temps[p]` lookup that
+    `end_safepoint` clobbered.
+  - **Module-level `define variable` cells survive** — they bypass
+    phi-wiring entirely. Each read calls `nod_var_get_by_name`
+    against a registered cell slot.
+  - **Workaround "envelope" of ~650 lines** — only because the most
+    heavily allocating temp was hoisted into a module slot; the
+    bug still bites every other `let`-local that's loop-carried.
+
+* **The fix (small, surgical, three locations in `codegen.rs`)**:
+  Snapshot SSA values at jump-emit time instead of resolving at
+  phi-wiring time.
+
+  1. Change `pending_incoming` type (line 1140) from
+     `Vec<(BlockId, BasicBlock, Vec<TempId>)>` to
+     `Vec<(BlockId, BasicBlock, Vec<BasicValueEnum<'ctx>>)>`.
+  2. In `Terminator::Jump` (line 3092-3107), resolve `args` to SSA
+     values BEFORE the branch, then push them:
+     ```rust
+     let arg_vals: Vec<BasicValueEnum<'ctx>> =
+         args.iter().map(|t| self.temp_val(*t)).collect();
+     ```
+  3. In the wiring loop (line 1226-1236), iterate over the
+     pre-resolved values directly — drop the `state.temps.get`
+     lookup.
+
+  Net ~10 lines. Snapshotting at emit-time captures the SSA value
+  as it flowed out of the actual predecessor — which is exactly
+  what a phi-incoming wants.
+
+* **Related-bug bonus**: Sprint 11d's WNDPROC callback hang chase
+  (Tasks #239 / #243 / #244 / §10.1 closure-graph tenuring) is the
+  same root cause in a different shape — the callback frame's
+  closure cells were threading through dispatch loops with
+  loop-carried phis. The §10.1 tenuring hack worked around the
+  symptom by pinning the cells in old-gen so reloads stopped
+  mattering. If this fix lands cleanly, Sprint 11d Step F (#245)
+  should be retire-able without the tenuring hack.
+
+* **Regression test**: minimal reproducer above lands as
+  `tests/nod-tests/tests/gap_007_stale_locals.rs` with fixture
+  `tests/nod-tests/fixtures/gap-007-repro.dylan`. Add a focused
+  unit test in `src/nod-llvm/src/codegen.rs::tests` that builds
+  a 2-block function with a Jump-args phi-incoming, runs a fake
+  safepoint between them, and asserts the resulting LLVM IR's
+  phi incomings reference the pre-safepoint SSA value (NOT the
+  reload).
+
+* **Scope** (revised): SMALL — ~10 lines of code change + 2-3
+  regression tests. Hot path though: this code runs for every
+  Dylan function with a Jump terminator carrying args, so the
+  full `cargo test` sweep IS required (one of the exceptions to
+  the "Dylan-only changes skip the sweep" rule). One-day sprint.
+
+* **Workaround retirement**: once the fix is in, revert the
+  `*tokens*` / `*dump-stream*` module-var stash in
+  `tests/nod-tests/fixtures/dylan-lexer.dylan` (Sprint 45b
+  workaround) back to natural `let`-locals; add a sanity test
+  that `dump-dylan-tokens` on the lexer fixture itself produces
+  no errors (currently impossible — see §"Workaround in tree"
+  above).
+
+* **Status**: **open, diagnosis pinned**. Fix is a ~10-line patch
+  in `src/nod-llvm/src/codegen.rs`. Workaround in tree at
   `tests/nod-tests/fixtures/dylan-lexer.dylan` (Sprint 45b).
 
 ## GAP-003 — No multi-value return / no multi-binder `let`
