@@ -189,7 +189,7 @@ Sort by ID. New gaps append. Don't renumber.
 * **Regression test**: `tests/nod-tests/tests/sema.rs::
   gap_005_if_without_else_lowers`.
 * **Scope**: small. ~10 lines of sema.
-* **Status**: **fixed in SHA TBD** (this commit). Note GAP-006 still
+* **Status**: **fixed in SHA `8e153b2`** (this commit). Note GAP-006 still
   applies if the synthesised else's `#f` doesn't shape-match the
   then-arm's last-expression type — see below.
 
@@ -225,7 +225,7 @@ Sort by ID. New gaps append. Don't renumber.
   smoke that the Sprint 45a `print-token` method now uses the bare
   `if (~instance?(...)) ... end` shape without any sentinel `#f`.
 * **Scope**: small. ~15 lines of codegen.
-* **Status**: **fixed in SHA TBD** (this commit).
+* **Status**: **fixed in SHA `8e153b2`** (this commit).
 
 ## GAP-003 — No multi-value return / no multi-binder `let`
 
