@@ -314,6 +314,18 @@ pub(crate) struct HeapStats {
     pub young_bytes_allocated: u64,
     pub last_minor_pause_ns: u64,
     pub last_major_pause_ns: u64,
+    /// Cumulative pause time across all minor collections.
+    pub total_minor_pause_ns: u64,
+    /// Cumulative pause time across all major collections.
+    pub total_major_pause_ns: u64,
+    /// Root-slot count snapshotted at the most recent minor GC.
+    pub roots_at_last_minor: u64,
+    /// Root-slot count snapshotted at the most recent major GC.
+    pub roots_at_last_major: u64,
+    /// Cumulative bytes promoted from young to old across all minor GCs.
+    /// (Semispace: all surviving young bytes; NewGC: approximated as
+    /// young_bytes_allocated drained per minor cycle.)
+    pub bytes_promoted: u64,
     /// Conservative-pin scanner stat. Sprint 11b's pinner populated
     /// this; Sprint 23's NewGC backend is a precise-roots client and
     /// always reports 0. Kept in the struct (and surfaced via
@@ -333,6 +345,11 @@ pub(crate) struct HeapStatsSnapshot {
     pub old_bytes_live: u64,
     pub last_minor_pause_ns: u64,
     pub last_major_pause_ns: u64,
+    pub total_minor_pause_ns: u64,
+    pub total_major_pause_ns: u64,
+    pub roots_at_last_minor: u64,
+    pub roots_at_last_major: u64,
+    pub bytes_promoted: u64,
     pub last_pinned_objects: u64,
 }
 
@@ -701,6 +718,11 @@ impl Heap {
             old_bytes_live: inner.old.live.used_bytes() as u64,
             last_minor_pause_ns: inner.stats.last_minor_pause_ns,
             last_major_pause_ns: inner.stats.last_major_pause_ns,
+            total_minor_pause_ns: inner.stats.total_minor_pause_ns,
+            total_major_pause_ns: inner.stats.total_major_pause_ns,
+            roots_at_last_minor: inner.stats.roots_at_last_minor,
+            roots_at_last_major: inner.stats.roots_at_last_major,
+            bytes_promoted: inner.stats.bytes_promoted,
             last_pinned_objects: inner.stats.last_pinned_objects,
         }
     }
@@ -728,12 +750,19 @@ impl Heap {
     /// young is reset.
     pub fn collect_minor(&self) {
         let start = std::time::Instant::now();
+        // Capture young-gen occupancy before collection so we can
+        // report bytes_promoted (all young survivors tenure in one step).
+        let young_before_bytes = {
+            let inner = self.inner.lock().expect("heap mutex poisoned");
+            inner.young.used_bytes() as u64
+        };
         // Sprint 11c: snapshot the thread-local root stack BEFORE
         // taking the heap mutex. The snapshot is what the collector
         // walks; evacuation rewrites `*slot` on each entry, but never
         // mutates the root stack itself, so we don't need a `RefCell`
         // borrow live across the GC.
         let roots = snapshot_roots();
+        let root_count = roots.len() as u64;
         let pinned_count;
         {
             let mut inner = self.inner.lock().expect("heap mutex poisoned");
@@ -745,7 +774,20 @@ impl Heap {
         let mut inner = self.inner.lock().expect("heap mutex poisoned");
         inner.stats.minor_collections += 1;
         inner.stats.last_minor_pause_ns = elapsed_ns;
+        inner.stats.total_minor_pause_ns += elapsed_ns;
+        inner.stats.roots_at_last_minor = root_count;
+        inner.stats.bytes_promoted += young_before_bytes;
         inner.stats.last_pinned_objects = pinned_count as u64;
+        if crate::gc_trace_enabled() {
+            eprintln!(
+                "[GC minor #{}] roots={} promoted={}B pause={}µs (total {}µs)",
+                inner.stats.minor_collections,
+                root_count,
+                young_before_bytes,
+                elapsed_ns / 1_000,
+                inner.stats.total_minor_pause_ns / 1_000,
+            );
+        }
     }
 
     /// Full collection: young + old.live → old.scratch, swap old,
@@ -755,6 +797,7 @@ impl Heap {
         // Sprint 11c: see `collect_minor` — snapshot first, no
         // RefCell borrow across the heap mutex.
         let roots = snapshot_roots();
+        let root_count = roots.len() as u64;
         {
             let mut inner = self.inner.lock().expect("heap mutex poisoned");
             // SAFETY: heap mutex held; collector is sole mutator.
@@ -764,6 +807,17 @@ impl Heap {
         let mut inner = self.inner.lock().expect("heap mutex poisoned");
         inner.stats.major_collections += 1;
         inner.stats.last_major_pause_ns = elapsed_ns;
+        inner.stats.total_major_pause_ns += elapsed_ns;
+        inner.stats.roots_at_last_major = root_count;
+        if crate::gc_trace_enabled() {
+            eprintln!(
+                "[GC major #{}] roots={} pause={}µs (total {}µs)",
+                inner.stats.major_collections,
+                root_count,
+                elapsed_ns / 1_000,
+                inner.stats.total_major_pause_ns / 1_000,
+            );
+        }
     }
 }
 
@@ -1478,6 +1532,11 @@ mod newgc_backend {
                 old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
                 last_minor_pause_ns: inner.stats.last_minor_pause_ns,
                 last_major_pause_ns: inner.stats.last_major_pause_ns,
+                total_minor_pause_ns: inner.stats.total_minor_pause_ns,
+                total_major_pause_ns: inner.stats.total_major_pause_ns,
+                roots_at_last_minor: inner.stats.roots_at_last_minor,
+                roots_at_last_major: inner.stats.roots_at_last_major,
+                bytes_promoted: inner.stats.bytes_promoted,
                 last_pinned_objects: 0,
             }
         }
@@ -1485,6 +1544,13 @@ mod newgc_backend {
         pub(super) fn collect_minor(&self) {
             let start = Instant::now();
             let roots = snapshot_roots();
+            let root_count = roots.len() as u64;
+            // Capture G0 occupancy before the cycle to approximate
+            // bytes_promoted (G0 objects that survive move to G1/Tenured).
+            let g0_before = {
+                let inner = self.inner.lock().expect("heap mutex poisoned");
+                inner.heap.stats().g0_used_bytes as u64
+            };
             {
                 let mut inner = self.inner.lock().expect("heap mutex poisoned");
                 inner.heap.collect_minor(|evac| visit_roots(evac, &roots));
@@ -1493,6 +1559,19 @@ mod newgc_backend {
             let mut inner = self.inner.lock().expect("heap mutex poisoned");
             inner.stats.minor_collections += 1;
             inner.stats.last_minor_pause_ns = elapsed_ns;
+            inner.stats.total_minor_pause_ns += elapsed_ns;
+            inner.stats.roots_at_last_minor = root_count;
+            inner.stats.bytes_promoted += g0_before;
+            if crate::gc_trace_enabled() {
+                eprintln!(
+                    "[GC minor #{}] roots={} promoted={}B pause={}µs (total {}µs)",
+                    inner.stats.minor_collections,
+                    root_count,
+                    g0_before,
+                    elapsed_ns / 1_000,
+                    inner.stats.total_minor_pause_ns / 1_000,
+                );
+            }
         }
 
         pub(super) fn collect_full(&self) {
@@ -1504,6 +1583,7 @@ mod newgc_backend {
             // never reclaimed Tenured residents; we replaced it.
             let start = Instant::now();
             let roots = snapshot_roots();
+            let root_count = roots.len() as u64;
             {
                 let mut inner = self.inner.lock().expect("heap mutex poisoned");
                 let _result = inner.heap.collect_full(|evac| visit_roots(evac, &roots));
@@ -1515,6 +1595,17 @@ mod newgc_backend {
             let mut inner = self.inner.lock().expect("heap mutex poisoned");
             inner.stats.major_collections += 1;
             inner.stats.last_major_pause_ns = elapsed_ns;
+            inner.stats.total_major_pause_ns += elapsed_ns;
+            inner.stats.roots_at_last_major = root_count;
+            if crate::gc_trace_enabled() {
+                eprintln!(
+                    "[GC major #{}] roots={} pause={}µs (total {}µs)",
+                    inner.stats.major_collections,
+                    root_count,
+                    elapsed_ns / 1_000,
+                    inner.stats.total_major_pause_ns / 1_000,
+                );
+            }
         }
 
         /// Sprint 11 conservative-pin façade. NewGC is compiled

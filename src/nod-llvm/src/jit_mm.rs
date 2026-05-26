@@ -420,7 +420,7 @@ fn register_seh_for_module(sections: &[Section]) {
                 "[jit_mm] RtlAddFunctionTable failed for {live} entries at \
                  base={base:#x}; panics through JIT frames will abort"
             );
-        } else if std::env::var_os("NM2_TRACE_SEH").is_some() {
+        } else if std::env::var_os("NOD_TRACE_SEH").is_some() {
             let last = &live_entries[live - 1];
             eprintln!(
                 "[jit_mm] registered {live} live SEH entries (of {raw_count} slots) \

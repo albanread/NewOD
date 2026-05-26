@@ -35,6 +35,36 @@ pub extern "C" fn nod_safepoint_poll() {
     safepoint_park_slow();
 }
 
+/// Request that all mutator threads stop at their next safepoint poll.
+///
+/// The caller MUST call [`safepoint_resume`] after root scanning is
+/// complete, or all mutator threads will spin-park indefinitely.
+/// Intended for future stop-the-world multi-threaded GC; single-
+/// threaded code drives GC directly via `nod_make` and does not use
+/// this path.
+pub fn safepoint_request_stop() {
+    SAFEPOINT_PARK_REQUESTED.store(1, Ordering::SeqCst);
+}
+
+/// Release all threads parked at safepoint polls.  Must be called
+/// after [`safepoint_request_stop`] once root scanning is complete.
+pub fn safepoint_resume() {
+    SAFEPOINT_PARK_REQUESTED.store(0, Ordering::SeqCst);
+}
+
+/// C-ABI wrapper for `safepoint_request_stop` — callable from
+/// AOT-compiled Dylan code or external runtime coordinators.
+#[unsafe(no_mangle)]
+pub extern "C" fn nod_safepoint_request_stop() {
+    safepoint_request_stop();
+}
+
+/// C-ABI wrapper for `safepoint_resume`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nod_safepoint_resume() {
+    safepoint_resume();
+}
+
 #[cold]
 fn safepoint_park_slow() {
     while SAFEPOINT_PARK_REQUESTED.load(Ordering::Acquire) != 0 {

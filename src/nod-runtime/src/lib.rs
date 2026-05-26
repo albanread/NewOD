@@ -217,7 +217,11 @@ pub use lists::{
     nod_pair_alloc, nod_pair_head, nod_pair_tail, try_pair,
 };
 pub use roots::RootSet;
-pub use safepoint_poll::{SAFEPOINT_PARK_REQUESTED, nod_safepoint_poll};
+pub use safepoint_poll::{
+    SAFEPOINT_PARK_REQUESTED, nod_safepoint_poll,
+    safepoint_request_stop, safepoint_resume,
+    nod_safepoint_request_stop, nod_safepoint_resume,
+};
 pub use stack_map::{
     JitSafepointEntry, LiveSlot, ParkedFrame, StackMap, StackMapEntry,
     nod_jit_begin_safepoint, nod_jit_end_safepoint, register_jit_safepoints,
@@ -1052,6 +1056,16 @@ pub struct GcStats {
     pub old_bytes_live: u64,
     pub last_minor_pause_ns: u64,
     pub last_major_pause_ns: u64,
+    /// Cumulative wall-clock pause time across all minor collections.
+    pub total_minor_pause_ns: u64,
+    /// Cumulative wall-clock pause time across all major collections.
+    pub total_major_pause_ns: u64,
+    /// Root-slot count at the most recent minor GC.
+    pub roots_at_last_minor: u64,
+    /// Root-slot count at the most recent major GC.
+    pub roots_at_last_major: u64,
+    /// Cumulative bytes promoted from young generation to old.
+    pub bytes_promoted: u64,
     pub last_pinned_objects: u64,
     pub heap_backend: &'static str,
 }
@@ -1068,6 +1082,11 @@ pub fn gc_stats() -> GcStats {
             old_bytes_live: s.old_bytes_live,
             last_minor_pause_ns: s.last_minor_pause_ns,
             last_major_pause_ns: s.last_major_pause_ns,
+            total_minor_pause_ns: s.total_minor_pause_ns,
+            total_major_pause_ns: s.total_major_pause_ns,
+            roots_at_last_minor: s.roots_at_last_minor,
+            roots_at_last_major: s.roots_at_last_major,
+            bytes_promoted: s.bytes_promoted,
             last_pinned_objects: s.last_pinned_objects,
             heap_backend: HEAP_BACKEND_NAME,
         }
@@ -1107,6 +1126,11 @@ pub fn gc_stats_report() -> String {
          old live          : {} bytes\n  \
          last minor pause  : {} ns\n  \
          last major pause  : {} ns\n  \
+         total minor pause : {} ns\n  \
+         total major pause : {} ns\n  \
+         roots last minor  : {}\n  \
+         roots last major  : {}\n  \
+         bytes promoted    : {} bytes\n  \
          last pinned objs  : {}\n",
         s.heap_backend,
         s.minor_collections,
@@ -1116,6 +1140,11 @@ pub fn gc_stats_report() -> String {
         s.old_bytes_live,
         s.last_minor_pause_ns,
         s.last_major_pause_ns,
+        s.total_minor_pause_ns,
+        s.total_major_pause_ns,
+        s.roots_at_last_minor,
+        s.roots_at_last_major,
+        s.bytes_promoted,
         s.last_pinned_objects,
     )
 }
