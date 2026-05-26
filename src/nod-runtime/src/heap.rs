@@ -77,28 +77,26 @@ use crate::wrapper::{GcBit, Wrapper};
 #[cfg(feature = "newgc-backend")]
 use crate::wrapper::Wrapper;
 
-/// Default young-generation capacity (64 MB).
+/// Default young-generation capacity (4 MB).
 ///
-/// Sprint 43d hotfix: the original 4 MB was sized for benchmark-scale
-/// workloads (Richards, the GC stress tests). The IDE (Sprint 41+)
-/// allocates much more aggressively — every keystroke creates a few
-/// rope-node cells, every Open / Save re-serialises the buffer, and
-/// stdlib load + class metadata + COM handle registry all live for
-/// the lifetime of the EXE. A user reported
-/// `GcStallError::mid_evac_oom` on first `F:\scratch\nod-ide.exe`
-/// launch because the destination generation couldn't absorb the
-/// initial-paint live set with the old defaults.
+/// Sprint 43d bumped this to 64 MB as a crash-resistance workaround
+/// because the GC lacked precise roots and safepoint polls — giving
+/// the heap more room meant collections fired less often and the
+/// still-conservative scanner had fewer chances to corrupt live data.
 ///
-/// We're not bumping this for performance reasons. We're bumping it
-/// because the GC is still pre-Sprint-11d (no `gc.statepoint`
-/// precise roots, no safepoint polls) and the only knob we have
-/// to soften that is "give it more room". Trade RAM for crash
-/// resistance until Sprint 11d lands. Modern machines have
-/// gigabytes; 256 MB total Dylan heap is unremarkable.
-pub const DEFAULT_YOUNG_BYTES: usize = 64 * 1024 * 1024;
-/// Default old-generation capacity, per semispace (192 MB).
-/// Same Sprint 43d rationale as `DEFAULT_YOUNG_BYTES`.
-pub const DEFAULT_OLD_BYTES: usize = 192 * 1024 * 1024;
+/// Sprint 45 restored correct GC behaviour:
+///   - Sprint 45c: JIT precise safepoints (gc.statepoint-style slots)
+///   - Sprint 45d: AOT precise slot-slab roots
+///   - Sprint 45e: safepoint polls at function entry + loop headers
+///
+/// With precise roots the GC can safely collect on every minor cycle.
+/// 4 MB is a normal nursery size; the heap grows via the page pool as
+/// needed. The IDE live set at startup (class table, symbol table,
+/// COM handles, stdlib metadata) comfortably fits in 4 MB.
+pub const DEFAULT_YOUNG_BYTES: usize = 4 * 1024 * 1024;
+/// Default old-generation capacity (12 MB — 3× the young gen).
+/// Sprint 43d workaround retired; see `DEFAULT_YOUNG_BYTES`.
+pub const DEFAULT_OLD_BYTES: usize = 12 * 1024 * 1024;
 /// Legacy alias preserved for any external callers. Sprint 09's name
 /// for the bump-heap reservation; Sprint 11 keeps it as the sum of
 /// young + old.

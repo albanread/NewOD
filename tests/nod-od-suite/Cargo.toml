@@ -19,5 +19,6 @@ newgc-backend = ["nod-sema/newgc-backend"]
 semispace-backend = ["nod-sema/semispace-backend"]
 
 [dev-dependencies]
-nod-sema = { path = "../../src/nod-sema", default-features = false }
+nod-sema    = { path = "../../src/nod-sema",    default-features = false }
+nod-runtime = { path = "../../src/nod-runtime", default-features = false }
 serial_test = "3"

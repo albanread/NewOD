@@ -2153,6 +2153,22 @@ fn emit_function<'ctx, 'a>(
         let bb = state.blocks[&b.id];
         builder.position_at_end(bb);
         state.current_block_label = b.label.clone();
+        // Safepoint reloads intentionally rebind `state.temps[temp]` to a
+        // fresh SSA value, but that rebind is only valid within the block
+        // that performed the reload. When we move on to a sibling block,
+        // restore canonical block-entry bindings so later uses do not pick
+        // up a reload defined in a non-dominating predecessor.
+        for (i, p) in func.params.iter().enumerate() {
+            let pv = llvm_fn
+                .get_nth_param(i as u32)
+                .expect("parameter index in range");
+            state.temps.insert(*p, pv);
+        }
+        if let Some(phis) = state.block_phis.get(&b.id) {
+            for (&param, phi) in b.params.iter().zip(phis.iter()) {
+                state.temps.insert(param, phi.as_basic_value());
+            }
+        }
         // Safepoint poll at function entry and at every loop-header
         // block (back-edge target) so the GC can stop-the-world even
         // in non-allocating tight loops.

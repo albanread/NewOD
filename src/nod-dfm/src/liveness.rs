@@ -70,16 +70,23 @@ pub fn populate_safepoint_roots(f: &mut Function) {
         let computations_len = f.blocks[block_idx].computations.len();
 
         // Pass 1: collect def_index for each temp DEFINED in this block.
-        // Parameters of THIS block (and function params for the entry
-        // block) get def_index = -1 ("defined before any computation").
+        // Block params get def_index = -1 ("defined before any computation").
+        // Function params also get def_index = -1 in EVERY block, not only
+        // the entry block. The DFM lowering sometimes references function-
+        // param TempIds directly from non-entry blocks (e.g. join blocks
+        // produced by `lower_if`) without threading them through block args
+        // because the param was never reassigned in either arm. Restricting
+        // function-param tracking to the entry block meant those params were
+        // invisible to the safepoint-roots computation in the join block,
+        // so GC evacuation would update the slot but the JIT's live register
+        // copy went stale — leading to %byte-string-copy! receiving a
+        // pointer to a reclaimed page.
         let mut def_index: HashMap<TempId, isize> = HashMap::new();
         for bp in &f.blocks[block_idx].params {
             def_index.insert(*bp, -1);
         }
-        if f.blocks[block_idx].id == f.entry {
-            for p in &param_set {
-                def_index.insert(*p, -1);
-            }
+        for p in &param_set {
+            def_index.insert(*p, -1);
         }
         for (i, c) in f.blocks[block_idx].computations.iter().enumerate() {
             def_index.insert(c.dst(), i as isize);
@@ -119,16 +126,16 @@ pub fn populate_safepoint_roots(f: &mut Function) {
                 }
             }
         }
-        // Function parameters live-out by escapes_block too: a param
-        // defined "before -1" used in another block is live across
-        // every call in the entry block.
-        if f.blocks[block_idx].id == f.entry {
-            for &p in &param_set {
-                if escapes_block.contains(&p) {
-                    let entry = last_use_index.entry(p).or_insert(-1);
-                    if block_live_out_idx > *entry {
-                        *entry = block_live_out_idx;
-                    }
+        // Function parameters live-out by escapes_block: a param used in
+        // another block is live to the end of every block in which it
+        // appears (it may need to stay alive across a call to reach the
+        // successor block that consumes it). Apply to all blocks now that
+        // function params are tracked in every block's def_index.
+        for &p in &param_set {
+            if escapes_block.contains(&p) {
+                let entry = last_use_index.entry(p).or_insert(-1);
+                if block_live_out_idx > *entry {
+                    *entry = block_live_out_idx;
                 }
             }
         }

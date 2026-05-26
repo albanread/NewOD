@@ -419,6 +419,7 @@ dependencies = [
 name = "nod-od-suite"
 version = "0.0.1"
 dependencies = [
+ "nod-runtime",
  "nod-sema",
  "serial_test",
 ]

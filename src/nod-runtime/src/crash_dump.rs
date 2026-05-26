@@ -87,6 +87,48 @@ pub(crate) fn update_gc_metrics(s: &crate::heap::HeapStatsSnapshot) {
 }
 
 // ──────────────────────────────────────────────────────────────────── //
+// Public snapshot API                                                  //
+// ──────────────────────────────────────────────────────────────────── //
+
+/// Point-in-time snapshot of the GC metrics shadow copy.
+/// Readable from any thread; lock-free.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct GcMetricsSnapshot {
+    pub minor_collections:     u64,
+    pub major_collections:     u64,
+    pub young_bytes_allocated: u64,
+    pub young_bytes_live:      u64,
+    pub old_bytes_live:        u64,
+    pub last_minor_pause_ns:   u64,
+    pub last_major_pause_ns:   u64,
+    pub total_minor_pause_ns:  u64,
+    pub total_major_pause_ns:  u64,
+    pub roots_at_last_minor:   u64,
+    pub roots_at_last_major:   u64,
+    pub bytes_promoted:        u64,
+}
+
+/// Read the current GC metrics shadow.  Lock-free; `Relaxed` loads —
+/// may lag behind by at most one GC cycle (sufficient for post-test
+/// reporting).
+pub fn gc_metrics_snapshot() -> GcMetricsSnapshot {
+    GcMetricsSnapshot {
+        minor_collections:     SHADOW_MINOR_COLLECTIONS.load(Ordering::Relaxed),
+        major_collections:     SHADOW_MAJOR_COLLECTIONS.load(Ordering::Relaxed),
+        young_bytes_allocated: SHADOW_YOUNG_BYTES_ALLOCATED.load(Ordering::Relaxed),
+        young_bytes_live:      SHADOW_YOUNG_BYTES_LIVE.load(Ordering::Relaxed),
+        old_bytes_live:        SHADOW_OLD_BYTES_LIVE.load(Ordering::Relaxed),
+        last_minor_pause_ns:   SHADOW_LAST_MINOR_PAUSE_NS.load(Ordering::Relaxed),
+        last_major_pause_ns:   SHADOW_LAST_MAJOR_PAUSE_NS.load(Ordering::Relaxed),
+        total_minor_pause_ns:  SHADOW_TOTAL_MINOR_PAUSE_NS.load(Ordering::Relaxed),
+        total_major_pause_ns:  SHADOW_TOTAL_MAJOR_PAUSE_NS.load(Ordering::Relaxed),
+        roots_at_last_minor:   SHADOW_ROOTS_AT_LAST_MINOR.load(Ordering::Relaxed),
+        roots_at_last_major:   SHADOW_ROOTS_AT_LAST_MAJOR.load(Ordering::Relaxed),
+        bytes_promoted:        SHADOW_BYTES_PROMOTED.load(Ordering::Relaxed),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────── //
 // No-alloc stack formatter                                             //
 // ──────────────────────────────────────────────────────────────────── //
 
@@ -191,10 +233,10 @@ fn write_crash_dump(exception_info: &str) {
           young allocated      : {} bytes\n\
           young live           : {} bytes\n\
           old live             : {} bytes\n\
-          last minor pause     : {} ns  ({} µs)\n\
-          last major pause     : {} ns  ({} µs)\n\
-          total minor pause    : {} ns  ({} µs)\n\
-          total major pause    : {} ns  ({} µs)\n\
+          last minor pause     : {} ns  ({} us)\n\
+          last major pause     : {} ns  ({} us)\n\
+          total minor pause    : {} ns  ({} us)\n\
+          total major pause    : {} ns  ({} us)\n\
           roots at last minor  : {}\n\
           roots at last major  : {}\n\
           bytes promoted       : {} bytes\n\
