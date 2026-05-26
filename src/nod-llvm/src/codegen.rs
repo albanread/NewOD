@@ -980,9 +980,8 @@ pub struct CodegenOutput<'ctx> {
     ///
     /// This is intentionally debug/introspection-first: it captures the
     /// per-callsite root-location plan codegen will eventually lower
-    /// into installed-code safepoint maps, while leaving the active
-    /// GC behavior unchanged. The current runtime path still uses the
-    /// spill/register_root/unregister_root shim.
+    /// into installed-code safepoint maps. The active GC behaviour uses
+    /// the precise slot-slab path (JIT or AOT) for both surfaces.
     pub safepoint_plans: Vec<SafepointPlan>,
     /// Canonical emitted-site descriptors for eventual install-time
     /// safepoint metadata writers. Unlike [`SafepointPlan`], this
@@ -1891,12 +1890,12 @@ mod tests {
             "image surface missing AOT begin safepoint hook: {image_ir}"
         );
         assert!(
-            image_ir.contains(super::NOD_REGISTER_ROOT_SYMBOL),
-            "image surface should retain legacy root registration hooks: {image_ir}"
+            !image_ir.contains(super::NOD_REGISTER_ROOT_SYMBOL),
+            "image surface should not emit legacy root registration hooks: {image_ir}"
         );
         assert!(
-            image_ir.contains(super::NOD_UNREGISTER_ROOT_SYMBOL),
-            "image surface should retain legacy root unregister hooks: {image_ir}"
+            !image_ir.contains(super::NOD_UNREGISTER_ROOT_SYMBOL),
+            "image surface should not emit legacy root unregister hooks: {image_ir}"
         );
         assert!(
             image_ir.contains(NOD_AOT_VERIFY_SAFEPOINT_SYMBOL),
@@ -4097,9 +4096,10 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
     }
 
     /// Spill each safepoint root temp into an entry-block-resident
-    /// `alloca` slot. The image surface still brackets those slots
-    /// with the legacy root shims; the in-memory JIT surface uses the
-    /// precise per-site safepoint map exclusively.
+    /// `alloca` slot. Both surfaces use the precise per-site safepoint
+    /// map exclusively (JIT via `nod_jit_begin_safepoint`, AOT via
+    /// `nod_aot_begin_safepoint` + slot_base); no per-slot
+    /// `nod_register_root` calls are emitted.
     fn begin_safepoint(
         &mut self,
         site_id: u64,
@@ -4132,31 +4132,15 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 )
                 .map_err(map_err)?;
         }
-        if !roots.is_empty() {
-            let register_fn = if self.emits_jit_precise_safepoints() {
-                None
-            } else {
-                Some(self.get_or_declare_register_root())
-            };
-            for (i, t) in roots.iter().enumerate() {
-                let cur = self.temp_val(*t);
-                let slot = self.rent_safepoint_slot(i)?;
-                self.builder.build_store(slot, cur).map_err(map_err)?;
-                if let Some(register_fn) = register_fn {
-                    self.builder
-                        .build_call(
-                            register_fn,
-                            &[slot.into()],
-                            &format!("gc.s{site_id}.reg.t{}", t.0),
-                        )
-                        .map_err(map_err)?;
-                }
-                rented.push(SafepointSlot {
-                    temp: *t,
-                    slot,
-                    home: FrameHome::SafepointPoolSlot(i),
-                });
-            }
+        for (i, t) in roots.iter().enumerate() {
+            let cur = self.temp_val(*t);
+            let slot = self.rent_safepoint_slot(i)?;
+            self.builder.build_store(slot, cur).map_err(map_err)?;
+            rented.push(SafepointSlot {
+                temp: *t,
+                slot,
+                home: FrameHome::SafepointPoolSlot(i),
+            });
         }
         if self.emits_jit_precise_safepoints() && !rented.is_empty() {
             let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
@@ -4194,10 +4178,10 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         Ok(rented)
     }
 
-    /// Emit the post-call GC root cleanup. The image surface closes
-    /// the legacy root shims; the in-memory JIT surface only closes
-    /// the precise safepoint frame and reloads the potentially-
-    /// relocated Words from the slot slab.
+    /// Emit the post-call GC root cleanup. Both surfaces close the
+    /// precise safepoint frame (JIT via `nod_jit_end_safepoint`, AOT
+    /// via `nod_aot_end_safepoint`) and reload potentially-relocated
+    /// Words from the slot slab.
     fn end_safepoint(
         &mut self,
         site_id: u64,
@@ -4217,24 +4201,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 )
                 .map_err(map_err)?;
         }
-        if !rented.is_empty() {
-            let unregister_fn = if self.emits_jit_precise_safepoints() {
-                None
-            } else {
-                Some(self.get_or_declare_unregister_root())
-            };
-            for slot_info in rented.iter().rev() {
-                if let Some(unregister_fn) = unregister_fn {
-                    self.builder
-                        .build_call(
-                            unregister_fn,
-                            &[slot_info.slot.into()],
-                            &format!("gc.s{site_id}.unreg.t{}", slot_info.temp.0),
-                        )
-                        .map_err(map_err)?;
-                }
-            }
-        }
+
         if self.emits_image_safepoint_runtime_checks() {
             self.builder
                 .build_call(
