@@ -467,9 +467,13 @@ fn end_aot_safepoint(site_id: u64) {
         active.site_id, site_id
     );
     let current_root_count = crate::heap::total_root_count();
-    assert_eq!(
-        current_root_count,
-        active.baseline_root_count + active.expected_root_count,
+    // Allow `current > baseline + expected`: permanent roots (e.g. Win32
+    // callback-cell GC roots registered on first touch by
+    // `install_gc_roots_for_this_thread`) may be added inside the call.
+    // What we must NOT see is fewer roots than expected — that would mean
+    // our own safepoint slots were somehow removed prematurely.
+    assert!(
+        current_root_count >= active.baseline_root_count + active.expected_root_count,
         "AOT safepoint {} lost active roots before end: current {} baseline {} expected {} (patchpoint {})",
         site_id,
         current_root_count,
@@ -482,8 +486,9 @@ fn end_aot_safepoint(site_id: u64) {
         assert_eq!(popped.site_id, site_id, "AOT safepoint stack corrupted");
     });
     let post_pop_root_count = crate::heap::total_root_count();
-    assert_eq!(
-        post_pop_root_count, active.baseline_root_count,
+    // Same rationale: permanent roots added during the call remain after pop.
+    assert!(
+        post_pop_root_count >= active.baseline_root_count,
         "AOT safepoint {} leaked roots after end: current {} baseline {} (patchpoint {})",
         site_id,
         post_pop_root_count,

@@ -5917,6 +5917,10 @@ impl FunctionBuilder {
         for (n, p) in merge_names.iter().zip(join_var_params.iter()) {
             env.insert(n.clone(), *p);
         }
+        // GAP-011: evict any names introduced inside the rhs expression
+        // (e.g. by a nested `begin let x = …; x end`). They are
+        // lexically out of scope after the short-circuit join.
+        env.retain(|name, _| pre_rhs_env.contains_key(name));
         Ok(join_value_param)
     }
 
@@ -6049,6 +6053,14 @@ impl FunctionBuilder {
         for (n, p) in merge_names.iter().zip(join_var_params.iter()) {
             env.insert(n.clone(), *p);
         }
+        // GAP-011: evict any names that were introduced by `let`
+        // bindings inside one of the arms. Arms execute in a scope
+        // lexically nested under the `if`; those names are not visible
+        // after the join. Without this, post-if code (another `if`,
+        // a dispatch, etc.) finds an arm-local SSA temp in env and
+        // conservatively includes it as a GC root, violating LLVM
+        // dominance when the temp is used outside its defining block.
+        env.retain(|name, _| pre_env.contains_key(name));
         Ok(join_value_param)
     }
 
@@ -6175,6 +6187,13 @@ impl FunctionBuilder {
 
         // ─── loop_body ─── lower each body stmt, then jump back to
         // header with the post-body temps.
+        // GAP-011: snapshot env keys before body lowering so we can
+        // evict loop-body-local `let` bindings at loop exit. Loop-body
+        // `let`s (e.g. `let b = element(path, i)`) are lexically scoped
+        // to the body; leaving them in env after the loop causes a
+        // post-loop `lower_if` to include a body-local SSA temp as a GC
+        // root, violating LLVM dominance for any use outside the loop.
+        let pre_body_env_names: HashSet<String> = env.keys().cloned().collect();
         self.switch_to(body_b);
         for s in body {
             self.lower_loop_body_stmt(s, env, ctx)?;
@@ -6196,6 +6215,15 @@ impl FunctionBuilder {
         for (n, phi) in loop_var_order.iter().zip(header_params.iter()) {
             env.insert(n.clone(), *phi);
         }
+        // GAP-011: evict loop-body-local `let` bindings from env.
+        // Only names that existed before the loop body was entered are
+        // in scope after the loop exits. Without this, any name
+        // introduced by a `let` inside the body (e.g. `let b =
+        // element(path, i)`) survives in env pointing at a body-local
+        // SSA value. A post-loop `lower_if` would then conservatively
+        // add that name to its GC-root merge, producing a store of a
+        // non-dominating temp — rejected by the LLVM verifier.
+        env.retain(|name, _| pre_body_env_names.contains(name));
         self.switch_to(exit_b);
         Ok(())
     }

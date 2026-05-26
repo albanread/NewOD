@@ -553,6 +553,117 @@ Sort by ID. New gaps append. Don't renumber.
   and `src/nod-runtime/src/aot.rs`, plus focused AOT protocol test updates.
 * **Status**: **fixed** (same commit that adds this gap entry).
 
+## GAP-012 — Loop-body `let` bindings leak into post-loop GC root merges
+
+* **Discovered**: Sprint 46/47 five-file IDE build
+  (`tests/nod-tests/fixtures/ide_helpers.dylan` — `nod-basename`
+  function) surfaced after GAP-007/008/009/010/011 were all fixed.
+* **Symptom**: AOT build fails at the LLVM verifier with four
+  `Instruction does not dominate all uses!` errors, all pointing at
+  `%phi.t24` / `%phi.t23` (the phi parameter for a loop-body `let`
+  binding `b`) being stored into GC root slots in `else15` (a
+  post-loop if-arm block). `b` is defined at `join13` — an if-join
+  block inside the loop body — which does NOT dominate `else15`.
+  Minimal Dylan shape that triggers it:
+  ```dylan
+  let sep-pos = -1;
+  let i = 0;
+  until (i = n)
+    let b = element(path, i);   // ← `b` is a loop-body let
+    if (b = 92 | b = 47)
+      sep-pos := i;
+    end;
+    i := i + 1;
+  end;
+  if (sep-pos < 0)              // ← post-loop if
+    path
+  else
+    copy-sequence(path, sep-pos + 1, n)  // safepoint sees `b`!
+  end
+  ```
+* **Root cause**: `lower_while_like` restored only *loop-carrier*
+  variables (names in `loop_var_order`) in `env` after the loop
+  exits. Names introduced by `let` inside the loop body — such as
+  `b` — remained in `env` pointing at loop-body-local SSA temps
+  (in this case the `join13` phi parameter for `b` after the inner
+  short-circuit/if lowering). The conservative GC merge in the
+  subsequent `lower_if` for the post-loop `if (sep-pos < 0)` saw
+  `env["b"]` as a live GC-managed binding and included `phi.t24`
+  in the join's phi params and safepoint roots, producing an LLVM
+  SSA value used outside its defining block.
+
+  The same scope leak is present in `lower_if` (arm-local `let`
+  names survive in `env` after the join) and `lower_short_circuit`
+  (rhs-local names survive after the `sc_join`). In practice, the
+  `lower_if` arm leak is low-risk because:
+  - The then-arm env is reset to `pre_env` before the else-arm,
+    so then-arm `let` names don't propagate.
+  - Else-arm `let` names do stay, but only surface as a problem
+    if a NESTED outer `if` (or loop) conservatively GC-merges them
+    when they resolve to non-dominating temps. `lower_while_like`
+    is the only currently-confirmed site where this mis-merge
+    actually violates LLVM dominance.
+
+* **Fix**: three one-liner `env.retain(...)` additions:
+  1. **`lower_while_like`** — before body lowering, snapshot
+     `pre_body_env_names: HashSet<String> = env.keys().cloned()
+     .collect()`. After the loop-var restoration and before
+     `self.switch_to(exit_b)`, call
+     `env.retain(|name, _| pre_body_env_names.contains(name))`.
+     This evicts all loop-body `let` names on loop exit.
+  2. **`lower_if`** — after inserting join params into `env`, call
+     `env.retain(|name, _| pre_env.contains_key(name))`. Evicts
+     arm-local `let` names (those not in the pre-if env) after the
+     join.
+  3. **`lower_short_circuit`** — after inserting sc_join params, call
+     `env.retain(|name, _| pre_rhs_env.contains_key(name))`.
+     Evicts rhs-local `let` names after the sc_join.
+
+  All three `pre_*_env` / `pre_*_env_names` snapshots were already
+  computed by these functions for other purposes; no new clones needed.
+
+* **Scope**: small — 3 lines of `env.retain(...)` in
+  `src/nod-sema/src/lower.rs`, plus a snapshot declaration in
+  `lower_while_like`.
+* **Status**: **fixed** (this commit). Five-file IDE AOT build now
+  succeeds (`compiled: target/nod-ide.exe`) with no LLVM verifier
+  errors.
+
+## GAP-013 — AOT end-safepoint assertion too strict for permanent GC roots
+
+* **Discovered**: Sprint 46/47 five-file IDE runtime (after GAP-012
+  fixed the LLVM dominance errors and the IDE binary could be
+  generated and executed).
+* **Symptom**: `target/nod-ide.exe` panicked at
+  `src/nod-runtime/src/aot.rs:470` with
+  `AOT safepoint 1458 lost active roots before end: current 39 baseline 7 expected 0 (patchpoint gc.s1458)`.
+  `current (39) ≠ baseline + expected (7 + 0 = 7)`.
+* **Root cause**: the Win32 callback layer
+  (`install_gc_roots_for_this_thread`) registers 32 permanent
+  `ROOT_STACK` entries on the first call from a thread (one per
+  registered window-procedure callback cell). This first-touch
+  registration happens INSIDE the body of a call that is bracketed
+  by `nod_aot_begin_safepoint` / `nod_aot_end_safepoint`. After the
+  call returns, `total_root_count()` is `baseline + 32` rather than
+  `baseline + 0`. The `end_safepoint` assertion used `assert_eq!`,
+  which treats any INCREASE as an error. The same issue exists in the
+  post-pop assertion ("leaked roots after end").
+* **Why `assert_eq!` is wrong here**: the contract the assertion
+  should enforce is "none of OUR safepoint slots were removed before
+  end" (i.e., `current >= baseline + expected`). Permanent roots
+  being ADDED during the call are legitimate — they are intended to
+  outlive the call and must not be treated as a leak.
+* **Fix**: change both `assert_eq!` calls in `end_aot_safepoint` to
+  `assert!(current_root_count >= ...)` and
+  `assert!(post_pop_root_count >= ...)`. The "too few roots" check
+  (a callee removing roots it shouldn't) is preserved; the "too many
+  roots" rejection is removed.
+* **Scope**: small — 2-line change in
+  `src/nod-runtime/src/aot.rs::end_aot_safepoint`.
+* **Status**: **fixed** (this commit). IDE binary runs without
+  immediate safepoint assertion failure; GUI window opens and enters
+  the Win32 message loop normally.
+
 ---
 
 ## Notes
