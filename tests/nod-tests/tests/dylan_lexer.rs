@@ -54,6 +54,13 @@ fn snippet_dir() -> PathBuf {
     dir
 }
 
+fn gc_stats_dir() -> PathBuf {
+    let workspace = workspace_root();
+    let dir = workspace.join("target").join("gc-stats");
+    std::fs::create_dir_all(&dir).expect("create gc stats dir");
+    dir
+}
+
 /// Write a snippet to a temp file and return its absolute path.
 fn write_snippet(name: &str, contents: &str) -> PathBuf {
     let path = snippet_dir().join(format!("{name}.dylan"));
@@ -75,6 +82,10 @@ fn prebuild_driver(workspace: &Path) {
         build.status,
         String::from_utf8_lossy(&build.stderr)
     );
+}
+
+fn driver_exe(workspace: &Path) -> PathBuf {
+    workspace.join("target").join("debug").join("nod-driver.exe")
 }
 
 /// Lex one snippet through the cached lexer EXE; return stdout as
@@ -106,6 +117,48 @@ fn lex_snippet(snippet: &Path) -> String {
         stderr
     );
     stdout
+}
+
+fn lex_snippet_with_gc_stats(snippet: &Path, stats_file_name: &str) -> (String, String) {
+    let workspace = workspace_root();
+    prebuild_driver(&workspace);
+    let driver = driver_exe(&workspace);
+    assert!(driver.is_file(), "driver exe missing: {}", driver.display());
+    let out = Command::new(&driver)
+        .args([
+            "dump-dylan-tokens",
+            snippet.to_str().unwrap(),
+            "--gc-stats",
+        ])
+        .output()
+        .expect("spawn nod-driver dump-dylan-tokens --gc-stats");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    std::fs::write(gc_stats_dir().join(stats_file_name), &stderr)
+        .expect("write lexer gc stats report");
+    assert!(
+        out.status.success(),
+        "dump-dylan-tokens --gc-stats on {} failed: {}\nstdout:\n{}\nstderr:\n{}",
+        snippet.display(),
+        out.status,
+        stdout,
+        stderr
+    );
+    (stdout, stderr)
+}
+
+fn parse_gc_counter(report: &str, label: &str) -> u64 {
+    report
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            let (lhs, rhs) = trimmed.split_once(':')?;
+            if lhs.trim() != label {
+                return None;
+            }
+            rhs.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .unwrap_or_else(|| panic!("missing GC counter `{label}` in report:\n{report}"))
 }
 
 /// Build assertion helper: lex a snippet and assert the dump contains
@@ -192,6 +245,29 @@ fn dump_dylan_tokens_for_hello_produces_full_token_stream() {
             "hello.dylan dump missing {expected:?}\nfull dump:\n{stdout}"
         );
     }
+}
+
+#[test]
+#[ignore]
+#[serial]
+fn dump_dylan_tokens_gc_stats_for_repeated_hello_workload() {
+    let hello = std::fs::read_to_string(
+        workspace_root().join("tests/nod-tests/fixtures/hello.dylan"),
+    )
+    .expect("read hello.dylan");
+    let source = (0..32)
+        .map(|_| hello.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let snippet = write_snippet("hello-gc-workload", &source);
+    let (_stdout, stderr) = lex_snippet_with_gc_stats(
+        &snippet,
+        "dylan-lexer-repeated-hello.stats.txt",
+    );
+    assert!(stderr.contains("GC stats (backend ="), "missing GC stats:\n{stderr}");
+    let minor = parse_gc_counter(&stderr, "minor collections");
+    let major = parse_gc_counter(&stderr, "major collections");
+    assert!(minor > 0 || major > 0, "GC was not exercised:\n{stderr}");
 }
 
 // ─── integer literals ─────────────────────────────────────────────────────

@@ -2179,6 +2179,31 @@ pub unsafe extern "C-unwind" fn nod_get_argv1() -> u64 {
     }
 }
 
+/// JIT-callable: return `argv[2]` as a Dylan `<byte-string>` Word.
+/// Returns `nil` if the process was launched without a second user
+/// argument.
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_get_argv2() -> u64 {
+    match std::env::args().nth(2) {
+        Some(s) => crate::intern_string_literal(&s).raw(),
+        None => crate::literal_pool_immediates().nil.raw(),
+    }
+}
+
+/// JIT-callable: print the process-global GC stats report to stderr.
+/// Returns Dylan `#f` so callers can use it in statement position.
+///
+/// # Safety
+/// No unsafe operations beyond the FFI boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_print_gc_stats() -> u64 {
+    eprint!("{}", crate::gc_stats_report());
+    crate::literal_pool_immediates().false_.raw()
+}
+
 // Sprint 41c's `nod_count_newlines` and Sprint 41d's `nod_max_line_chars`
 // shims were retired in Sprint 42a Phase E — both are now pure Dylan in
 // `tests/nod-tests/fixtures/nod-ide.dylan` (`nod-count-newlines` /

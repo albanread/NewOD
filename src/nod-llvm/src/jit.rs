@@ -95,6 +95,8 @@ use crate::codegen::{
     // Sprint 41b — IDE source-viewer primitives.
     NOD_READ_FILE_TO_STRING_SYMBOL,
     NOD_GET_ARGV1_SYMBOL,
+    NOD_GET_ARGV2_SYMBOL,
+    NOD_PRINT_GC_STATS_SYMBOL,
     NOD_LO_WORD_SYMBOL,
     NOD_HI_WORD_SYMBOL,
     // Sprint 41c — scrollbar primitives.
@@ -658,6 +660,10 @@ impl<'ctx> Jit<'ctx> {
              nod_runtime::nod_read_file_to_string as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_GET_ARGV1_SYMBOL),
              nod_runtime::nod_get_argv1 as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_GET_ARGV2_SYMBOL),
+             nod_runtime::nod_get_argv2 as *const () as *mut std::ffi::c_void),
+            (module.get_function(NOD_PRINT_GC_STATS_SYMBOL),
+             nod_runtime::nod_print_gc_stats as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_LO_WORD_SYMBOL),
              nod_runtime::nod_lo_word as *const () as *mut std::ffi::c_void),
             (module.get_function(NOD_HI_WORD_SYMBOL),
@@ -1454,6 +1460,8 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         // hit doesn't lose the binding.
         (NOD_READ_FILE_TO_STRING_SYMBOL, nod_runtime::nod_read_file_to_string as *const () as *mut std::ffi::c_void),
         (NOD_GET_ARGV1_SYMBOL, nod_runtime::nod_get_argv1 as *const () as *mut std::ffi::c_void),
+        (NOD_GET_ARGV2_SYMBOL, nod_runtime::nod_get_argv2 as *const () as *mut std::ffi::c_void),
+        (NOD_PRINT_GC_STATS_SYMBOL, nod_runtime::nod_print_gc_stats as *const () as *mut std::ffi::c_void),
         (NOD_LO_WORD_SYMBOL, nod_runtime::nod_lo_word as *const () as *mut std::ffi::c_void),
         (NOD_HI_WORD_SYMBOL, nod_runtime::nod_hi_word as *const () as *mut std::ffi::c_void),
         // Sprint 41c — scrollbar primitives, also surfaced through the

@@ -111,6 +111,9 @@ enum Command {
     DumpDylanTokens {
         /// Path to a `.dylan` source file.
         input: PathBuf,
+        /// Ask the lexer process to print GC stats to stderr after dumping tokens.
+        #[arg(long = "gc-stats")]
+        gc_stats: bool,
     },
 }
 
@@ -149,7 +152,7 @@ fn main() -> ExitCode {
         Some(Command::DumpDfm { input }) => run_dump_dfm(&input),
         Some(Command::DumpLlvm { input }) => run_dump_llvm(&input),
         Some(Command::Eval { expr }) => run_eval(&expr),
-        Some(Command::DumpDylanTokens { input }) => run_dump_dylan_tokens(&input),
+        Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
     }
 }
 
@@ -626,6 +629,14 @@ fn dylan_lexer_cache_dir() -> Result<PathBuf, String> {
     let mut h = DefaultHasher::new();
     DYLAN_LEXER_SOURCE.hash(&mut h);
     env!("CARGO_PKG_VERSION").hash(&mut h);
+    let driver = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let meta = std::fs::metadata(&driver)
+        .map_err(|e| format!("metadata {}: {e}", driver.display()))?;
+    driver.hash(&mut h);
+    meta.len().hash(&mut h);
+    meta.modified()
+        .map_err(|e| format!("modified {}: {e}", driver.display()))?
+        .hash(&mut h);
     let digest = h.finish();
     let dir = std::env::temp_dir().join(format!("nod-dylan-lexer-{digest:016x}"));
     std::fs::create_dir_all(&dir)
@@ -684,7 +695,7 @@ fn ensure_dylan_lexer_exe() -> Result<PathBuf, String> {
     Ok(exe)
 }
 
-fn run_dump_dylan_tokens(input: &std::path::Path) -> ExitCode {
+fn run_dump_dylan_tokens(input: &std::path::Path, gc_stats: bool) -> ExitCode {
     let exe = match ensure_dylan_lexer_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -698,7 +709,12 @@ fn run_dump_dylan_tokens(input: &std::path::Path) -> ExitCode {
         Ok(p) => p,
         Err(_) => input.to_path_buf(),
     };
-    let out = match std::process::Command::new(&exe).arg(&input_abs).output() {
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg(&input_abs);
+    if gc_stats {
+        cmd.arg("--gc-stats");
+    }
+    let out = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("nod-driver dump-dylan-tokens: spawn {}: {e}", exe.display());

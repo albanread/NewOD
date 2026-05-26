@@ -402,7 +402,7 @@ fn begin_aot_safepoint(
         registered.root_count,
         expected_root_count
     );
-    let baseline_root_count = crate::heap::root_count();
+    let baseline_root_count = crate::heap::total_root_count();
     with_active_safepoint_mut(|stack| {
         stack.push(ActiveAotSafepoint {
             site_id,
@@ -435,7 +435,7 @@ fn verify_aot_safepoint(site_id: u64) {
         "AOT safepoint stack mismatch: top site {} but verify requested {}",
         active.site_id, site_id
     );
-    let current_root_count = crate::heap::root_count();
+    let current_root_count = crate::heap::total_root_count();
     let expected_root_count = active.baseline_root_count + active.expected_root_count;
     assert_eq!(
         current_root_count, expected_root_count,
@@ -466,19 +466,30 @@ fn end_aot_safepoint(site_id: u64) {
         "AOT safepoint stack mismatch: top site {} but end requested {}",
         active.site_id, site_id
     );
-    let current_root_count = crate::heap::root_count();
+    let current_root_count = crate::heap::total_root_count();
     assert_eq!(
-        current_root_count, active.baseline_root_count,
-        "AOT safepoint {} leaked roots: current {} baseline {} (patchpoint {})",
+        current_root_count,
+        active.baseline_root_count + active.expected_root_count,
+        "AOT safepoint {} lost active roots before end: current {} baseline {} expected {} (patchpoint {})",
         site_id,
         current_root_count,
         active.baseline_root_count,
+        active.expected_root_count,
         find_registered_aot_safepoint(site_id).patchpoint_label
     );
     with_active_safepoint_mut(|stack| {
         let popped = stack.pop().expect("AOT safepoint stack empty");
         assert_eq!(popped.site_id, site_id, "AOT safepoint stack corrupted");
     });
+    let post_pop_root_count = crate::heap::total_root_count();
+    assert_eq!(
+        post_pop_root_count, active.baseline_root_count,
+        "AOT safepoint {} leaked roots after end: current {} baseline {} (patchpoint {})",
+        site_id,
+        post_pop_root_count,
+        active.baseline_root_count,
+        find_registered_aot_safepoint(site_id).patchpoint_label
+    );
     if trace_exec_safepoints_enabled() {
         eprintln!(
             "nod-aot: end safepoint site {} baseline {}",
@@ -1241,16 +1252,12 @@ mod tests {
             nod_aot_register_safepoints(entries.as_ptr(), entries.len());
         }
 
-        let root_a = crate::Word::from_raw(0);
-        let root_b = crate::Word::from_raw(0);
-    let mut precise_roots = [root_a, root_b];
+        let root_a = crate::Word::from_fixnum(11).expect("test fixnum in range");
+        let root_b = crate::Word::from_fixnum(22).expect("test fixnum in range");
+        let mut precise_roots = [root_a, root_b];
 
-    begin_aot_safepoint(7, 2, precise_roots.as_mut_ptr());
-        crate::heap::register_root(&root_a);
-        crate::heap::register_root(&root_b);
+        begin_aot_safepoint(7, 2, precise_roots.as_mut_ptr());
         verify_aot_safepoint(7);
-        crate::heap::unregister_root(&root_b);
-        crate::heap::unregister_root(&root_a);
         end_aot_safepoint(7);
 
         assert_eq!(crate::heap::root_count(), 0);
@@ -1265,11 +1272,10 @@ mod tests {
             nod_aot_register_safepoints(entries.as_ptr(), entries.len());
         }
 
-        let root_a = crate::Word::from_raw(0);
+        let root_a = crate::Word::from_fixnum(11).expect("test fixnum in range");
         let mut precise_roots = [root_a, crate::Word::from_raw(0)];
 
         begin_aot_safepoint(7, 2, precise_roots.as_mut_ptr());
-        crate::heap::register_root(&root_a);
         verify_aot_safepoint(7);
     }
 }

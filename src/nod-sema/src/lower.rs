@@ -398,6 +398,8 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // `result = nil` to surface "no file" / "no arg" cases.
     ("%read-file", "nod_read_file_to_string", 1, TypeEstimate::Top),
     ("%argv1", "nod_get_argv1", 0, TypeEstimate::Top),
+    ("%argv2", "nod_get_argv2", 0, TypeEstimate::Top),
+    ("%print-gc-stats", "nod_print_gc_stats", 0, TypeEstimate::Top),
     // Sprint 41b — LOWORD/HIWORD extraction for WM_SIZE `lparam` unpack.
     // Both take a fixnum value and return a fixnum. Future sprints
     // should replace with general bitwise primitives.
@@ -5795,9 +5797,28 @@ impl FunctionBuilder {
         // Step 2: walk rhs upfront to find every name it would rebind,
         // so we know what phi params the join block needs. Same
         // discipline as `lower_if`'s `assigned_in_arms` collection.
+        //
+        // GAP-008: conservatively add ALL GC-managed env bindings to
+        // the sc_join params, not just names assigned in the rhs. The
+        // rhs block may contain dispatch safepoints that reload a
+        // GC-managed temp.  Since `sc_edge` is a sibling predecessor
+        // of `sc_join`, those reloads only dominate `sc_rhs` — they do
+        // NOT dominate `sc_join` or any block reachable from it.
+        // Without explicit phi params, the reload leaks through
+        // `block_entry_temps` into downstream if-arm blocks where LLVM
+        // correctly rejects it as a non-dominating SSA use.
+        // Mirroring `lower_if`'s conservative merge ensures every
+        // GC-managed pointer is properly phi'd at the join, giving
+        // downstream code a dominating value.
         let mut assigned_in_rhs: HashSet<String> = HashSet::new();
         collect_assigned_in_expr(rhs, env, &mut assigned_in_rhs);
-        let mut merge_names: Vec<String> = assigned_in_rhs.into_iter().collect();
+        let mut merge_name_set = assigned_in_rhs;
+        for (name, &temp) in env.iter() {
+            if self.func.temp_type(temp).needs_gc_protection() {
+                merge_name_set.insert(name.clone());
+            }
+        }
+        let mut merge_names: Vec<String> = merge_name_set.into_iter().collect();
         merge_names.sort(); // deterministic param order
         merge_names.retain(|n| env.contains_key(n));
         let pre_rhs_env = env.clone();
@@ -5807,10 +5828,8 @@ impl FunctionBuilder {
         // where the right operand runs; `join_b` is the merge point.
         let sc_idx = self.next_block;
         let rhs_idx = self.next_block + 1;
-        let join_idx = self.next_block + 2;
         let sc_edge = self.new_block(format!("sc_edge{sc_idx}"));
         let rhs_b = self.new_block(format!("sc_rhs{rhs_idx}"));
-        let join_b = self.new_block(format!("sc_join{join_idx}"));
 
         // Step 4: terminate cur with `If`, routing by op:
         //   Or:  truthy → sc_edge (return l), falsy → rhs_b
@@ -5835,11 +5854,6 @@ impl FunctionBuilder {
         let mut sc_args: Vec<TempId> = Vec::with_capacity(1 + sc_merge_temps.len());
         sc_args.push(l);
         sc_args.extend(sc_merge_temps.iter().copied());
-        self.switch_to(sc_edge);
-        self.terminate_current(Terminator::Jump {
-            target: join_b,
-            args: sc_args,
-        });
 
         // Step 6: emit rhs_b — lower the right operand against a fresh
         // copy of the pre-rhs env (mutations on this path don't leak
@@ -5851,6 +5865,7 @@ impl FunctionBuilder {
         *env = pre_rhs_env.clone();
         self.switch_to(rhs_b);
         let r = self.lower_expr(rhs, env, ctx)?;
+        let rhs_end_b = self.func.blocks[self.current].id;
         let r_ty = self.func.temp_type(r);
         let rhs_merge_temps: Vec<TempId> = merge_names
             .iter()
@@ -5859,6 +5874,23 @@ impl FunctionBuilder {
         let mut rhs_args: Vec<TempId> = Vec::with_capacity(1 + rhs_merge_temps.len());
         rhs_args.push(r);
         rhs_args.extend(rhs_merge_temps.iter().copied());
+
+        // GAP-010: delay `sc_join` creation until after rhs lowering so
+        // any nested control-flow blocks inside the rhs appear before the
+        // outer join in `func.blocks`. Codegen still walks that order when
+        // seeding block-entry temps, so an early outer join can observe a
+        // predecessor before its nested join has run and leak a
+        // non-dominating SSA value downstream.
+        let join_idx = self.next_block;
+        let join_b = self.new_block(format!("sc_join{join_idx}"));
+
+        self.switch_to(sc_edge);
+        self.terminate_current(Terminator::Jump {
+            target: join_b,
+            args: sc_args,
+        });
+
+        self.switch_to(rhs_end_b);
         self.terminate_current(Terminator::Jump {
             target: join_b,
             args: rhs_args,
@@ -5900,10 +5932,8 @@ impl FunctionBuilder {
 
         let then_idx = self.next_block;
         let else_idx = self.next_block + 1;
-        let join_idx = self.next_block + 2;
         let then_b = self.new_block(format!("then{then_idx}"));
         let else_b = self.new_block(format!("else{else_idx}"));
-        let join_b = self.new_block(format!("join{join_idx}"));
 
         self.terminate_current(Terminator::If {
             cond: cond_t,
@@ -5930,7 +5960,15 @@ impl FunctionBuilder {
             std::collections::HashSet::new();
         collect_assigned_in_expr(then_, env, &mut assigned_in_arms);
         collect_assigned_in_expr(else_, env, &mut assigned_in_arms);
-        let mut merge_names: Vec<String> = assigned_in_arms.into_iter().collect();
+
+        let mut merge_name_set = assigned_in_arms;
+        for (name, &temp) in env.iter() {
+            if self.func.temp_type(temp).needs_gc_protection() {
+                merge_name_set.insert(name.clone());
+            }
+        }
+
+        let mut merge_names: Vec<String> = merge_name_set.into_iter().collect();
         merge_names.sort(); // deterministic param order
         // Filter to names actually bound in env (collect_assigned_in_expr
         // already gates on env.contains_key, but be defensive).
@@ -5942,8 +5980,17 @@ impl FunctionBuilder {
         // nested join block, not `then_b`); `terminate_current` uses
         // that, which is what we want — we terminate the *last* block
         // of the arm with the jump to the outer join.
+        //
+        // GAP-010: create the outer join block only AFTER both arms are
+        // lowered. `new_block()` appends to `func.blocks`, and codegen
+        // still emits blocks in that order. If the outer join were
+        // appended before an arm's nested `if` / short-circuit join,
+        // codegen could visit the outer join before its real
+        // predecessors had populated `block_entry_temps`, reintroducing
+        // the same stale-SSA dominance bug as GAP-009 on branch joins.
         self.switch_to(then_b);
         let then_v = self.lower_expr(then_, env, ctx)?;
+        let then_end_b = self.func.blocks[self.current].id;
         let then_ty = self.func.temp_type(then_v);
         let then_merge_temps: Vec<TempId> = merge_names
             .iter()
@@ -5952,15 +5999,12 @@ impl FunctionBuilder {
         let mut then_args: Vec<TempId> = Vec::with_capacity(1 + then_merge_temps.len());
         then_args.push(then_v);
         then_args.extend(then_merge_temps.iter().copied());
-        self.terminate_current(Terminator::Jump {
-            target: join_b,
-            args: then_args,
-        });
 
         // Reset env to pre-if state, then lower the else arm.
         *env = pre_env.clone();
         self.switch_to(else_b);
         let else_v = self.lower_expr(else_, env, ctx)?;
+        let else_end_b = self.func.blocks[self.current].id;
         let else_ty = self.func.temp_type(else_v);
         let else_merge_temps: Vec<TempId> = merge_names
             .iter()
@@ -5969,6 +6013,17 @@ impl FunctionBuilder {
         let mut else_args: Vec<TempId> = Vec::with_capacity(1 + else_merge_temps.len());
         else_args.push(else_v);
         else_args.extend(else_merge_temps.iter().copied());
+
+        let join_idx = self.next_block;
+        let join_b = self.new_block(format!("join{join_idx}"));
+
+        self.switch_to(then_end_b);
+        self.terminate_current(Terminator::Jump {
+            target: join_b,
+            args: then_args,
+        });
+
+        self.switch_to(else_end_b);
         self.terminate_current(Terminator::Jump {
             target: join_b,
             args: else_args,
@@ -6028,23 +6083,44 @@ impl FunctionBuilder {
         env: &mut LocalEnv,
         ctx: &LowerCtx,
     ) -> Result<(), LoweringError> {
+        // GAP-009: `loop_body` and `loop_exit` are created AFTER
+        // `lower_expr(cond)` (see below) so that any blocks emitted by
+        // the condition — e.g. `sc_edge`/`sc_rhs`/`sc_join` from a
+        // short-circuit operator — appear before them in `func.blocks`.
+        // Codegen iterates `func.blocks` in creation order; if
+        // `loop_exit` preceded `sc_join`, codegen would process
+        // `loop_exit` before its only CFG predecessor (`sc_join`) had
+        // run, leaving `block_entry_temps[loop_exit]` empty and causing
+        // stale GC-managed values to propagate into post-loop code.
         let header_idx = self.next_block;
-        let body_idx = self.next_block + 1;
-        let exit_idx = self.next_block + 2;
         let header_b = self.new_block(format!("loop_header{header_idx}"));
-        let body_b = self.new_block(format!("loop_body{body_idx}"));
-        let exit_b = self.new_block(format!("loop_exit{exit_idx}"));
 
-        // Pre-scan: which names get assigned inside the body? Each one
-        // becomes a header block-param so the back-edge can re-supply
-        // the updated value.
+        // Pre-scan: which names must be carried around the loop header?
+        // Assigned names obviously need header params so the back-edge can
+        // re-supply the updated value. For GC-managed values we have to be
+        // more conservative: any live binding in env may be relocated by a
+        // safepoint in the loop body, even if the source loop never mentions
+        // that name directly. If post-loop code still reads the binding, the
+        // exit path must see a header phi, not a body-local reload/join temp.
         let assigned_names = collect_assigned_names_in_stmts(body, env);
+        let mut carried_names = assigned_names.clone();
+        let mut used_names = collect_used_bound_names_in_expr(cond, env);
+        used_names.extend(collect_used_bound_names_in_stmts(body, env));
+        for (name, &temp) in env.iter() {
+            if self.func.temp_type(temp).needs_gc_protection() {
+                carried_names.insert(name.clone());
+                continue;
+            }
+            if used_names.contains(name) {
+                carried_names.insert(name.clone());
+            }
+        }
 
         // Snapshot pre-loop temps for each assigned name. Create block
         // params on `header` for them; the entry-side jump carries the
         // pre-loop temps as args, the back-edge carries the post-body
         // temps.
-        let mut loop_var_order: Vec<String> = assigned_names.into_iter().collect();
+        let mut loop_var_order: Vec<String> = carried_names.into_iter().collect();
         loop_var_order.sort(); // deterministic param ordering
         let mut pre_loop_temps: Vec<TempId> = Vec::with_capacity(loop_var_order.len());
         let mut header_params: Vec<TempId> = Vec::with_capacity(loop_var_order.len());
@@ -6077,8 +6153,15 @@ impl FunctionBuilder {
         }
 
         // ─── header ─── evaluate cond, branch.
+        // body_b and exit_b are created HERE, after lower_expr(cond),
+        // so that any sc_edge/sc_rhs/sc_join blocks from a short-circuit
+        // condition appear before body_b/exit_b in func.blocks (GAP-009).
         self.switch_to(header_b);
         let cond_t = self.lower_expr(cond, env, ctx)?;
+        let body_idx = self.next_block;
+        let exit_idx = self.next_block + 1;
+        let body_b = self.new_block(format!("loop_body{body_idx}"));
+        let exit_b = self.new_block(format!("loop_exit{exit_idx}"));
         let (then_block, else_block) = if invert_cond {
             (exit_b, body_b)
         } else {
@@ -6244,6 +6327,82 @@ fn collect_assigned_names_in_stmts(
         collect_assigned_in_stmt(s, env, &mut out);
     }
     out
+}
+
+fn collect_used_bound_names_in_stmts(body: &[Statement], env: &LocalEnv) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for s in body {
+        collect_used_bound_names_in_stmt(s, env, &mut out);
+    }
+    out
+}
+
+fn collect_used_bound_names_in_stmt(s: &Statement, env: &LocalEnv, out: &mut HashSet<String>) {
+    match s {
+        Statement::Expr(e) => collect_used_bound_names_in_expr_into(e, env, out),
+        Statement::Let { value, .. } => collect_used_bound_names_in_expr_into(value, env, out),
+        Statement::While { cond, body, .. } | Statement::Until { cond, body, .. } => {
+            collect_used_bound_names_in_expr_into(cond, env, out);
+            for s2 in body {
+                collect_used_bound_names_in_stmt(s2, env, out);
+            }
+        }
+        Statement::For { .. } | Statement::Block { .. } | Statement::Local { .. } => {}
+    }
+}
+
+fn collect_used_bound_names_in_expr(e: &Expr, env: &LocalEnv) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_used_bound_names_in_expr_into(e, env, &mut out);
+    out
+}
+
+fn collect_used_bound_names_in_expr_into(e: &Expr, env: &LocalEnv, out: &mut HashSet<String>) {
+    match e {
+        Expr::Ident(_, name) => {
+            if env.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            collect_used_bound_names_in_expr_into(lhs, env, out);
+            collect_used_bound_names_in_expr_into(rhs, env, out);
+        }
+        Expr::UnOp { operand, .. } => collect_used_bound_names_in_expr_into(operand, env, out),
+        Expr::Paren { inner, .. } => collect_used_bound_names_in_expr_into(inner, env, out),
+        Expr::Call { callee, args, .. } => {
+            collect_used_bound_names_in_expr_into(callee, env, out);
+            for a in args {
+                collect_used_bound_names_in_expr_into(a, env, out);
+            }
+        }
+        Expr::If { cond, then_, else_, .. } => {
+            collect_used_bound_names_in_expr_into(cond, env, out);
+            collect_used_bound_names_in_expr_into(then_, env, out);
+            if let Some(b) = else_ {
+                collect_used_bound_names_in_expr_into(b, env, out);
+            }
+        }
+        Expr::Begin { body, .. } => {
+            for b in body {
+                collect_used_bound_names_in_expr_into(b, env, out);
+            }
+        }
+        Expr::Let { value, .. } => collect_used_bound_names_in_expr_into(value, env, out),
+        Expr::Stmt(s) => collect_used_bound_names_in_stmt(s, env, out),
+        Expr::Case { arms, otherwise, .. } => {
+            for a in arms {
+                collect_used_bound_names_in_expr_into(&a.cond, env, out);
+                for b in &a.body {
+                    collect_used_bound_names_in_expr_into(b, env, out);
+                }
+            }
+            if let Some(o) = otherwise {
+                collect_used_bound_names_in_expr_into(o, env, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_assigned_in_stmt(s: &Statement, env: &LocalEnv, out: &mut HashSet<String>) {

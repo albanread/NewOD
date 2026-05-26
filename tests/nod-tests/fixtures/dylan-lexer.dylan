@@ -1318,12 +1318,126 @@ define function lex (source :: <byte-string>) => (tokens)
   *tokens*
 end function;
 
+// ─── Minimal rope load path for lexer input ──────────────────────────────
+//
+// Retry after GAP-010: load source into a Dylan rope, then flatten it
+// back to a byte-string before lexing. This keeps the public lexer API
+// stable (`lex(<byte-string>)`) while exercising real rope-backed file
+// ingestion inside Dylan.
+
+define class <rope> (<object>) end class;
+
+define class <rope-leaf> (<rope>)
+  slot rope-leaf-bytes :: <byte-string>, init-keyword: bytes:;
+  slot rope-leaf-len   :: <integer>,     init-keyword: len:;
+end class;
+
+define class <rope-node> (<rope>)
+  slot rope-node-left   :: <rope>,    init-keyword: left:;
+  slot rope-node-right  :: <rope>,    init-keyword: right:;
+  slot rope-node-weight :: <integer>, init-keyword: weight:;
+  slot rope-node-total  :: <integer>, init-keyword: total:;
+end class;
+
+define method rope-size (r :: <rope-leaf>) => (n :: <integer>)
+  rope-leaf-len(r)
+end method;
+
+define method rope-size (r :: <rope-node>) => (n :: <integer>)
+  rope-node-total(r)
+end method;
+
+define method rope-concatenate (a :: <rope>, b :: <rope>) => (r :: <rope>)
+  let asize = rope-size(a);
+  let bsize = rope-size(b);
+  if (asize = 0)
+    b
+  elseif (bsize = 0)
+    a
+  else
+    make(<rope-node>,
+         left: a,
+         right: b,
+         weight: asize,
+         total: asize + bsize)
+  end
+end method;
+
+define method rope-copy-into
+    (r :: <rope-leaf>, lo :: <integer>, hi :: <integer>,
+     dst :: <byte-string>, dst-off :: <integer>)
+ => (n :: <integer>)
+  let leaf-len = rope-leaf-len(r);
+  let a = if (lo > 0) lo else 0 end;
+  let b = if (hi < leaf-len) hi else leaf-len end;
+  if (a < b)
+    %byte-string-copy!(dst, dst-off, rope-leaf-bytes(r), a, b - a);
+    b - a
+  else
+    0
+  end
+end method;
+
+define method rope-copy-into
+    (r :: <rope-node>, lo :: <integer>, hi :: <integer>,
+     dst :: <byte-string>, dst-off :: <integer>)
+ => (n :: <integer>)
+  let w = rope-node-weight(r);
+  let from-left =
+    if (lo < w)
+      let left-hi = if (hi < w) hi else w end;
+      rope-copy-into(rope-node-left(r), lo, left-hi, dst, dst-off)
+    else
+      0
+    end;
+  let from-right =
+    if (hi > w)
+      let right-lo = if (lo > w) lo - w else 0 end;
+      let right-hi = hi - w;
+      rope-copy-into(rope-node-right(r), right-lo, right-hi,
+                     dst, dst-off + from-left)
+    else
+      0
+    end;
+  from-left + from-right
+end method;
+
+define function rope-substring
+    (r :: <rope>, lo :: <integer>, hi :: <integer>) => (s :: <byte-string>)
+  let n = hi - lo;
+  let result = %byte-string-allocate(n);
+  rope-copy-into(r, lo, hi, result, 0);
+  result
+end function;
+
+define function rope->string (r :: <rope>) => (s :: <byte-string>)
+  rope-substring(r, 0, rope-size(r))
+end function;
+
+define function make-rope-from-string (s :: <byte-string>) => (r :: <rope>)
+  let n = size(s);
+  if (n <= 1024)
+    make(<rope-leaf>, bytes: s, len: n)
+  else
+    let mid = n / 2;
+    let left = make-rope-from-string(copy-sequence(s, 0, mid));
+    let right = make-rope-from-string(copy-sequence(s, mid, n));
+    rope-concatenate(left, right)
+  end
+end function;
+
+define function load-source-via-rope (path :: <byte-string>) => (source :: <byte-string>)
+  rope->string(make-rope-from-string(%read-file(path)))
+end function;
+
 // ─── main — driver entry for `dump-dylan-tokens` ──────────────────────────
 //
 // The nod-driver subcommand bakes this file + a thin wrapper into an
 // AOT EXE, runs the EXE with the user's path as argv[1], and forwards
 // the stdout. Keeping `main` here means the subcommand's wrapper is
 // effectively zero code; the wrapper module just re-exports `main`.
+// This block also intentionally changes when the embedded lexer EXE
+// cache needs to be invalidated for runtime debugging.
 //
 // Empty argv[1] → print a usage line to stderr-style stdout and exit
 // cleanly. Sprint 45a doesn't have a process-exit primitive that
@@ -1332,15 +1446,19 @@ end function;
 
 define function main () => ()
   let path = %argv1();
+  let mode = %argv2();
   if (empty?(path))
     format-out("dylan-lexer: missing input path\n");
   else
-    let source = %read-file(path);
+    let source = load-source-via-rope(path);
     if (empty?(source))
       format-out("dylan-lexer: could not read %s\n", path);
     else
       let tokens = lex(source);
       format-out("%s", dump-tokens(tokens, source));
+      if (mode = "--gc-stats")
+        %print-gc-stats();
+      end;
     end;
   end;
 end function main;

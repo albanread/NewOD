@@ -258,6 +258,36 @@ this is currently always a no-op — the GC runs synchronously inside
 `nod_make`, not via external park request.  The polls are the infrastructure
 for future stop-the-world multi-threaded collection.
 
+### 8b. Lessons Learned and Key Points
+
+Sprint 45e's `gc-rope-file-load` verifier failures exposed three practical
+rules for the current single-threaded safepoint implementation:
+
+1. **Lowering block creation order matters because codegen still seeds
+  `block_entry_temps` in linear `func.blocks` order.**  If an outer join or
+  loop-exit block is appended before the nested block that actually feeds it,
+  codegen can snapshot stale SSA state and later reuse a non-dominating
+  reload.
+
+2. **Outer merge blocks must be created after nested control flow is lowered.**
+  This now applies to both `lower_if` and `lower_short_circuit`: the outer
+  `join` / `sc_join` block has to come after any arm-local / rhs-local nested
+  joins, otherwise the merge point can be emitted before its real
+  predecessors have populated entry temps.
+
+3. **Loop headers must carry all GC-managed env bindings, not just syntactically
+  assigned or used names.**  A body safepoint may relocate a root that the
+  source loop never mentions directly but post-loop code still reads.  If that
+  binding is not threaded through the loop-header phi set, loop-exit code can
+  inherit a body-local join temp instead of a dominating header value.
+
+4. **The deciding regression surface was Dylan, not a Rust-only harness.**
+  The concrete failing shape was `rope-line-to-offset` inside
+  `gc-rope-file-load.dylan`, where an inner `if` in a loop body plus a
+  safepoint-emitting call left a post-loop `if` reading a non-dominating temp.
+  The fix is therefore only considered validated when the Dylan workload goes
+  green end-to-end.
+
 ---
 
 ## 9. What Is NOT Yet Done

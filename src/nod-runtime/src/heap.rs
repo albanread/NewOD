@@ -331,6 +331,10 @@ pub(crate) struct HeapStats {
     /// identical across backends.
     #[allow(dead_code)]
     pub last_pinned_objects: u64,
+    /// Peak young live bytes observed over this process lifetime.
+    pub peak_young_bytes_live: u64,
+    /// Peak old live bytes observed over this process lifetime.
+    pub peak_old_bytes_live: u64,
 }
 
 /// Public-facing snapshot of GC counters.
@@ -349,6 +353,14 @@ pub(crate) struct HeapStatsSnapshot {
     pub roots_at_last_major: u64,
     pub bytes_promoted: u64,
     pub last_pinned_objects: u64,
+    pub peak_young_bytes_live: u64,
+    pub peak_old_bytes_live: u64,
+}
+
+#[inline]
+fn update_peak_live(stats: &mut HeapStats, young_live: u64, old_live: u64) {
+    stats.peak_young_bytes_live = stats.peak_young_bytes_live.max(young_live);
+    stats.peak_old_bytes_live = stats.peak_old_bytes_live.max(old_live);
 }
 
 #[cfg(feature = "semispace-backend")]
@@ -448,6 +460,10 @@ pub fn root_count() -> usize {
     ROOT_STACK.with(|s| s.borrow().len())
 }
 
+pub(crate) fn total_root_count() -> usize {
+    snapshot_roots().len()
+}
+
 /// Snapshot the current root stack into a freshly-allocated `Vec`.
 /// The collector calls this once at the start of each cycle so the
 /// borrow is released before evacuation begins (evacuation rewrites
@@ -532,6 +548,11 @@ impl Heap {
             if let Some(addr) = inner.young.try_alloc_bytes(total_bytes) {
                 inner.cumulative_objects += 1;
                 inner.stats.young_bytes_allocated += total_bytes as u64;
+                update_peak_live(
+                    &mut inner.stats,
+                    inner.young.used_bytes() as u64,
+                    inner.old.live.used_bytes() as u64,
+                );
                 return addr;
             }
         }
@@ -542,10 +563,20 @@ impl Heap {
             if let Some(addr) = inner.young.try_alloc_bytes(total_bytes) {
                 inner.cumulative_objects += 1;
                 inner.stats.young_bytes_allocated += total_bytes as u64;
+                update_peak_live(
+                    &mut inner.stats,
+                    inner.young.used_bytes() as u64,
+                    inner.old.live.used_bytes() as u64,
+                );
                 return addr;
             }
             if let Some(addr) = inner.old.live.try_alloc_bytes(total_bytes) {
                 inner.cumulative_objects += 1;
+                update_peak_live(
+                    &mut inner.stats,
+                    inner.young.used_bytes() as u64,
+                    inner.old.live.used_bytes() as u64,
+                );
                 return addr;
             }
         }
@@ -555,10 +586,20 @@ impl Heap {
         if let Some(addr) = inner.young.try_alloc_bytes(total_bytes) {
             inner.cumulative_objects += 1;
             inner.stats.young_bytes_allocated += total_bytes as u64;
+            update_peak_live(
+                &mut inner.stats,
+                inner.young.used_bytes() as u64,
+                inner.old.live.used_bytes() as u64,
+            );
             return addr;
         }
         if let Some(addr) = inner.old.live.try_alloc_bytes(total_bytes) {
             inner.cumulative_objects += 1;
+            update_peak_live(
+                &mut inner.stats,
+                inner.young.used_bytes() as u64,
+                inner.old.live.used_bytes() as u64,
+            );
             return addr;
         }
         panic!(
@@ -707,13 +748,16 @@ impl Heap {
     }
 
     pub(crate) fn stats_snapshot(&self) -> HeapStatsSnapshot {
-        let inner = self.inner.lock().expect("heap mutex poisoned");
+        let mut inner = self.inner.lock().expect("heap mutex poisoned");
+        let young_live = inner.young.used_bytes() as u64;
+        let old_live = inner.old.live.used_bytes() as u64;
+        update_peak_live(&mut inner.stats, young_live, old_live);
         HeapStatsSnapshot {
             minor_collections: inner.stats.minor_collections,
             major_collections: inner.stats.major_collections,
             young_bytes_allocated: inner.stats.young_bytes_allocated,
-            young_bytes_live: inner.young.used_bytes() as u64,
-            old_bytes_live: inner.old.live.used_bytes() as u64,
+            young_bytes_live: young_live,
+            old_bytes_live: old_live,
             last_minor_pause_ns: inner.stats.last_minor_pause_ns,
             last_major_pause_ns: inner.stats.last_major_pause_ns,
             total_minor_pause_ns: inner.stats.total_minor_pause_ns,
@@ -722,6 +766,8 @@ impl Heap {
             roots_at_last_major: inner.stats.roots_at_last_major,
             bytes_promoted: inner.stats.bytes_promoted,
             last_pinned_objects: inner.stats.last_pinned_objects,
+            peak_young_bytes_live: inner.stats.peak_young_bytes_live,
+            peak_old_bytes_live: inner.stats.peak_old_bytes_live,
         }
     }
 }
@@ -777,14 +823,17 @@ impl Heap {
         inner.stats.roots_at_last_minor = root_count;
         inner.stats.bytes_promoted += young_before_bytes;
         inner.stats.last_pinned_objects = pinned_count as u64;
+        let young_live = inner.young.used_bytes() as u64;
+        let old_live = inner.old.live.used_bytes() as u64;
+        update_peak_live(&mut inner.stats, young_live, old_live);
         // Publish to crash-dump shadow before clearing the phase flag
         // so the handler always sees consistent metrics.
         let snap = HeapStatsSnapshot {
             minor_collections: inner.stats.minor_collections,
             major_collections: inner.stats.major_collections,
             young_bytes_allocated: inner.stats.young_bytes_allocated,
-            young_bytes_live: inner.young.used_bytes() as u64,
-            old_bytes_live: inner.old.live.used_bytes() as u64,
+            young_bytes_live: young_live,
+            old_bytes_live: old_live,
             last_minor_pause_ns: elapsed_ns,
             last_major_pause_ns: inner.stats.last_major_pause_ns,
             total_minor_pause_ns: inner.stats.total_minor_pause_ns,
@@ -793,6 +842,8 @@ impl Heap {
             roots_at_last_major: inner.stats.roots_at_last_major,
             bytes_promoted: inner.stats.bytes_promoted,
             last_pinned_objects: inner.stats.last_pinned_objects,
+            peak_young_bytes_live: inner.stats.peak_young_bytes_live,
+            peak_old_bytes_live: inner.stats.peak_old_bytes_live,
         };
         crate::crash_dump::update_gc_metrics(&snap);
         crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
@@ -828,12 +879,15 @@ impl Heap {
         inner.stats.last_major_pause_ns = elapsed_ns;
         inner.stats.total_major_pause_ns += elapsed_ns;
         inner.stats.roots_at_last_major = root_count;
+        let young_live = inner.young.used_bytes() as u64;
+        let old_live = inner.old.live.used_bytes() as u64;
+        update_peak_live(&mut inner.stats, young_live, old_live);
         let snap = HeapStatsSnapshot {
             minor_collections: inner.stats.minor_collections,
             major_collections: inner.stats.major_collections,
             young_bytes_allocated: inner.stats.young_bytes_allocated,
-            young_bytes_live: inner.young.used_bytes() as u64,
-            old_bytes_live: inner.old.live.used_bytes() as u64,
+            young_bytes_live: young_live,
+            old_bytes_live: old_live,
             last_minor_pause_ns: inner.stats.last_minor_pause_ns,
             last_major_pause_ns: elapsed_ns,
             total_minor_pause_ns: inner.stats.total_minor_pause_ns,
@@ -842,6 +896,8 @@ impl Heap {
             roots_at_last_major: root_count,
             bytes_promoted: inner.stats.bytes_promoted,
             last_pinned_objects: inner.stats.last_pinned_objects,
+            peak_young_bytes_live: inner.stats.peak_young_bytes_live,
+            peak_old_bytes_live: inner.stats.peak_old_bytes_live,
         };
         crate::crash_dump::update_gc_metrics(&snap);
         crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
@@ -1365,7 +1421,8 @@ mod newgc_backend {
     use crate::wrapper::Wrapper;
 
     use super::{
-        GcConfig, HeapRanges, HeapStats, HeapStatsSnapshot, snapshot_roots, HEAP_ALIGN,
+        GcConfig, HeapRanges, HeapStats, HeapStatsSnapshot, snapshot_roots, update_peak_live,
+        HEAP_ALIGN,
     };
 
     /// Inner state for the NewGC backend.
@@ -1558,14 +1615,17 @@ mod newgc_backend {
         }
 
         pub(super) fn stats_snapshot(&self) -> HeapStatsSnapshot {
-            let inner = self.inner.lock().expect("heap mutex poisoned");
+            let mut inner = self.inner.lock().expect("heap mutex poisoned");
             let gs = inner.heap.stats();
+            let young_live = gs.g0_used_bytes as u64;
+            let old_live = (gs.g1_used_bytes + gs.tenured_used_bytes) as u64;
+            update_peak_live(&mut inner.stats, young_live, old_live);
             HeapStatsSnapshot {
                 minor_collections: inner.stats.minor_collections,
                 major_collections: inner.stats.major_collections,
                 young_bytes_allocated: inner.stats.young_bytes_allocated,
-                young_bytes_live: gs.g0_used_bytes as u64,
-                old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
+                young_bytes_live: young_live,
+                old_bytes_live: old_live,
                 last_minor_pause_ns: inner.stats.last_minor_pause_ns,
                 last_major_pause_ns: inner.stats.last_major_pause_ns,
                 total_minor_pause_ns: inner.stats.total_minor_pause_ns,
@@ -1574,6 +1634,8 @@ mod newgc_backend {
                 roots_at_last_major: inner.stats.roots_at_last_major,
                 bytes_promoted: inner.stats.bytes_promoted,
                 last_pinned_objects: 0,
+                peak_young_bytes_live: inner.stats.peak_young_bytes_live,
+                peak_old_bytes_live: inner.stats.peak_old_bytes_live,
             }
         }
 
@@ -1600,12 +1662,15 @@ mod newgc_backend {
             inner.stats.roots_at_last_minor = root_count;
             inner.stats.bytes_promoted += g0_before;
             let gs = inner.heap.stats();
+            let young_live = gs.g0_used_bytes as u64;
+            let old_live = (gs.g1_used_bytes + gs.tenured_used_bytes) as u64;
+            update_peak_live(&mut inner.stats, young_live, old_live);
             let snap = HeapStatsSnapshot {
                 minor_collections: inner.stats.minor_collections,
                 major_collections: inner.stats.major_collections,
                 young_bytes_allocated: inner.stats.young_bytes_allocated,
-                young_bytes_live: gs.g0_used_bytes as u64,
-                old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
+                young_bytes_live: young_live,
+                old_bytes_live: old_live,
                 last_minor_pause_ns: elapsed_ns,
                 last_major_pause_ns: inner.stats.last_major_pause_ns,
                 total_minor_pause_ns: inner.stats.total_minor_pause_ns,
@@ -1614,6 +1679,8 @@ mod newgc_backend {
                 roots_at_last_major: inner.stats.roots_at_last_major,
                 bytes_promoted: inner.stats.bytes_promoted,
                 last_pinned_objects: 0,
+                peak_young_bytes_live: inner.stats.peak_young_bytes_live,
+                peak_old_bytes_live: inner.stats.peak_old_bytes_live,
             };
             crate::crash_dump::update_gc_metrics(&snap);
             crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
@@ -1654,12 +1721,15 @@ mod newgc_backend {
             inner.stats.total_major_pause_ns += elapsed_ns;
             inner.stats.roots_at_last_major = root_count;
             let gs = inner.heap.stats();
+            let young_live = gs.g0_used_bytes as u64;
+            let old_live = (gs.g1_used_bytes + gs.tenured_used_bytes) as u64;
+            update_peak_live(&mut inner.stats, young_live, old_live);
             let snap = HeapStatsSnapshot {
                 minor_collections: inner.stats.minor_collections,
                 major_collections: inner.stats.major_collections,
                 young_bytes_allocated: inner.stats.young_bytes_allocated,
-                young_bytes_live: gs.g0_used_bytes as u64,
-                old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
+                young_bytes_live: young_live,
+                old_bytes_live: old_live,
                 last_minor_pause_ns: inner.stats.last_minor_pause_ns,
                 last_major_pause_ns: elapsed_ns,
                 total_minor_pause_ns: inner.stats.total_minor_pause_ns,
@@ -1668,6 +1738,8 @@ mod newgc_backend {
                 roots_at_last_major: root_count,
                 bytes_promoted: inner.stats.bytes_promoted,
                 last_pinned_objects: 0,
+                peak_young_bytes_live: inner.stats.peak_young_bytes_live,
+                peak_old_bytes_live: inner.stats.peak_old_bytes_live,
             };
             crate::crash_dump::update_gc_metrics(&snap);
             crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);

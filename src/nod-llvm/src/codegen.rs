@@ -196,6 +196,8 @@ pub const NOD_FIP_CURRENT_ELEMENT_SYMBOL: &str = "nod_fip_current_element";
 pub const NOD_FIP_ADVANCE_SYMBOL: &str = "nod_fip_advance";
 pub const NOD_MAKE_RANGE_SYMBOL: &str = "nod_make_range";
 pub const NOD_MAKE_STRETCHY_VECTOR_SYMBOL: &str = "nod_make_stretchy_vector";
+pub const NOD_GET_ARGV2_SYMBOL: &str = "nod_get_argv2";
+pub const NOD_PRINT_GC_STATS_SYMBOL: &str = "nod_print_gc_stats";
 
 // ─── Sprint 21 — first-class function values ──────────────────────────────
 //
@@ -562,6 +564,8 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     // takes no args and returns a Word.
     ("nod_read_file_to_string", NOD_READ_FILE_TO_STRING_SYMBOL, 1),
     ("nod_get_argv1", NOD_GET_ARGV1_SYMBOL, 0),
+    ("nod_get_argv2", NOD_GET_ARGV2_SYMBOL, 0),
+    ("nod_print_gc_stats", NOD_PRINT_GC_STATS_SYMBOL, 0),
     ("nod_lo_word", NOD_LO_WORD_SYMBOL, 1),
     ("nod_hi_word", NOD_HI_WORD_SYMBOL, 1),
     // Sprint 41c — scrollbar primitives. Arity matches the Rust shim:
@@ -1912,6 +1916,82 @@ mod tests {
     }
 
     #[test]
+    fn image_surface_zero_root_safepoint_uses_null_slot_base() {
+        let callee = Function {
+            id: FunctionId(1),
+            name: "alloc_no_roots".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![],
+                terminator: Terminator::Return {
+                    value: Some(TempId(0)),
+                },
+            }],
+            temps: vec![Temporary {
+                id: TempId(0),
+                type_estimate: TypeEstimate::Integer,
+            }],
+            return_type: TypeEstimate::Integer,
+            span: test_span(),
+        };
+        let caller = Function {
+            id: FunctionId(0),
+            name: "caller_zero_roots".to_string(),
+            params: vec![TempId(0)],
+            entry: BlockId(0),
+            blocks: vec![Block {
+                id: BlockId(0),
+                label: "entry".to_string(),
+                params: vec![],
+                computations: vec![Computation::DirectCall {
+                    dst: TempId(1),
+                    callee: "alloc_no_roots".to_string(),
+                    args: vec![TempId(0)],
+                    safepoint_roots: vec![],
+                }],
+                terminator: Terminator::Return {
+                    value: Some(TempId(1)),
+                },
+            }],
+            temps: vec![
+                Temporary {
+                    id: TempId(0),
+                    type_estimate: TypeEstimate::Integer,
+                },
+                Temporary {
+                    id: TempId(1),
+                    type_estimate: TypeEstimate::Integer,
+                },
+            ],
+            return_type: TypeEstimate::Integer,
+            span: test_span(),
+        };
+
+        let ctx = Context::create();
+        let out = codegen_module_for_surface(
+            &ctx,
+            &[caller, callee],
+            "safepoint_zero_roots_image",
+            CodeInstallSurface::Image,
+        )
+        .expect("image codegen ok");
+
+        let image_ir = out.module.print_to_string().to_string();
+        assert!(
+            image_ir.contains(NOD_AOT_BEGIN_SAFEPOINT_SYMBOL),
+            "image surface missing AOT begin safepoint hook: {image_ir}"
+        );
+        assert!(
+            image_ir.contains("ptr null"),
+            "zero-root image safepoint should pass null slot base: {image_ir}"
+        );
+    }
+
+    #[test]
     fn emitted_safepoint_sites_track_install_surface_region() {
         let roots = vec![SafepointRootLocation {
             temp: TempId(0),
@@ -2049,6 +2129,7 @@ struct Emit<'ctx, 'a> {
     llvm_fn: FunctionValue<'ctx>,
     blocks: HashMap<BlockId, BasicBlock<'ctx>>,
     block_phis: HashMap<BlockId, Vec<PhiValue<'ctx>>>,
+    block_entry_temps: HashMap<BlockId, HashMap<TempId, BasicValueEnum<'ctx>>>,
     temps: HashMap<TempId, BasicValueEnum<'ctx>>,
     /// (target block, source block, arg SSA values) — recorded as we
     /// emit each terminator. After all blocks are emitted, we walk this
@@ -2098,6 +2179,7 @@ fn emit_function<'ctx, 'a>(
         llvm_fn,
         blocks: HashMap::new(),
         block_phis: HashMap::new(),
+        block_entry_temps: HashMap::new(),
         temps: HashMap::new(),
         pending_incoming: Vec::new(),
         safepoint_slot_capacity,
@@ -2126,6 +2208,9 @@ fn emit_function<'ctx, 'a>(
             .expect("parameter index in range");
         state.temps.insert(*p, pv);
     }
+    state
+        .block_entry_temps
+        .insert(func.entry, state.temps.clone());
 
     // For each non-entry block with `params`, create phi nodes at the
     // block's start. Phi values feed the block-arg temps.
@@ -2153,6 +2238,11 @@ fn emit_function<'ctx, 'a>(
         let bb = state.blocks[&b.id];
         builder.position_at_end(bb);
         state.current_block_label = b.label.clone();
+        if let Some(entry_temps) = state.block_entry_temps.get(&b.id).cloned() {
+            for (temp, value) in entry_temps {
+                state.temps.insert(temp, value);
+            }
+        }
         // Safepoint reloads intentionally rebind `state.temps[temp]` to a
         // fresh SSA value, but that rebind is only valid within the block
         // that performed the reload. When we move on to a sibling block,
@@ -2198,6 +2288,16 @@ fn emit_function<'ctx, 'a>(
     Ok(())
 }
 impl<'ctx, 'a> Emit<'ctx, 'a> {
+    fn note_successor_entry_temps(&mut self, target: BlockId) {
+        let entry = self
+            .block_entry_temps
+            .entry(target)
+            .or_default();
+        for (&temp, &value) in &self.temps {
+            entry.entry(temp).or_insert(value);
+        }
+    }
+
     fn begin_emitted_safepoint(
         &mut self,
         kind: SafepointKind,
@@ -4087,6 +4187,8 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 let c1 = self.untag_bool_to_i1(c64)?;
                 let then_bb = self.blocks[then_block];
                 let else_bb = self.blocks[else_block];
+                self.note_successor_entry_temps(*then_block);
+                self.note_successor_entry_temps(*else_block);
                 self.builder
                     .build_conditional_branch(c1, then_bb, else_bb)
                     .map_err(map_err)?;
@@ -4109,6 +4211,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                     .builder
                     .get_insert_block()
                     .expect("builder positioned");
+                self.note_successor_entry_temps(*target);
                 self.builder
                     .build_unconditional_branch(target_bb)
                     .map_err(map_err)?;
@@ -4139,14 +4242,17 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         let mut rented: Vec<SafepointSlot<'ctx>> = Vec::with_capacity(roots.len());
         if self.emits_image_safepoint_runtime_checks() {
             let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
-            let slot_base_ptr = self
-                .builder
-                .build_pointer_cast(
-                    self.safepoint_slot_base_ptr()?,
-                    ptr_ty,
-                    &format!("gc.s{site_id}.aot_slot_base"),
-                )
-                .map_err(map_err)?;
+            let slot_base_ptr = if roots.is_empty() {
+                ptr_ty.const_null()
+            } else {
+                self.builder
+                    .build_pointer_cast(
+                        self.safepoint_slot_base_ptr()?,
+                        ptr_ty,
+                        &format!("gc.s{site_id}.aot_slot_base"),
+                    )
+                    .map_err(map_err)?
+            };
             self.builder
                 .build_call(
                     self.get_or_declare_aot_begin_safepoint(),

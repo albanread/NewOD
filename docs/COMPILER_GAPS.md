@@ -401,6 +401,79 @@ Sort by ID. New gaps append. Don't renumber.
   (`nod-driver dump-dylan-tokens tests/nod-tests/fixtures/dylan-lexer.dylan`)
   succeeding end-to-end on the lexer's own source.
 
+## GAP-008 — Short-circuit (`&`/`|`) `sc_join` missing conservative GC-binding phi params
+
+* **Discovered**: Sprint 45e GC integration test (`gc-rope-file-load`)
+  during T16 mirror-writing workload.
+* **Symptom**: LLVM verifier "Instruction does not dominate all uses"
+  for GC-managed temps in if-arm blocks following a compound Boolean
+  condition that contains a safepoint-emitting call in the right-hand
+  side. Minimal repro shape:
+  ```dylan
+  let s :: <byte-string> = ...;
+  if (element(s, i) >= 97 & element(s, i) <= 122)
+    // ... uses s ...
+  end if;
+  ```
+  `lower_short_circuit` created an `sc_join` block with params only
+  for names *assigned* inside the rhs expression.  When the rhs
+  evaluation (`element` dispatch) fired a GC safepoint that reloaded
+  `s` → `%gc.sN.reload.s`, that reload was propagated via
+  `note_successor_entry_temps` into `sc_join`'s entry-temp snapshot.
+  From there it was copied into `block_entry_temps[then]` and
+  `block_entry_temps[else]` when the outer if's `Terminator::If`
+  fired. Because `sc_rhs` has `sc_edge` as a sibling predecessor of
+  `sc_join`, the reload defined in `sc_rhs` does **not** dominate the
+  `then`/`else` arm blocks. Both arms' Jump args resolved to the same
+  non-dominating reload, producing an invalid phi.
+* **Workaround**: none (breaks stdlib.dylan compilation).
+* **Planned fix**: apply the same conservative GC-binding merge to
+  `lower_short_circuit` as is already applied to `lower_if`: add all
+  GC-managed env bindings (not just rhs-assigned names) to the
+  `sc_join` block's params. This makes `sc_join` the proper merge
+  point for every GC-managed pointer, so its phi value dominates all
+  successors.
+* **Scope**: small — 5 lines in `nod-sema/src/lower.rs`
+  (`lower_short_circuit`).
+* **Status**: **fixed** (same commit that adds this gap entry).
+
+## GAP-009 — Loop body/exit blocks created before short-circuit condition blocks, causing stale `block_entry_temps`
+
+* **Discovered**: Sprint 45e GC integration test (`gc-rope-file-load`),
+  surfaced after GAP-008 fix.
+* **Symptom**: LLVM verifier "Instruction does not dominate all uses" for
+  GC-managed temps in blocks AFTER a while/until loop whose condition is
+  a short-circuit `&`/`|` expression. Minimal shape:
+  ```dylan
+  while (some-call() & other-call())
+    ...inner if using gc-managed bindings...
+  end;
+  if (some-comparison)   // ← phi uses loop-body value in violation of SSA
+    ...
+  end
+  ```
+  `lower_while_like` created `loop_body` and `loop_exit` blocks
+  **before** calling `lower_expr(cond)`. `lower_expr(cond)` for a
+  short-circuit condition creates `sc_edge`, `sc_rhs`, `sc_join` which
+  therefore appear **after** `loop_exit` in `func.blocks`. Codegen
+  iterates `func.blocks` in creation order, so it processes `loop_exit`
+  before `sc_join` (its only CFG predecessor). `block_entry_temps[loop_exit]`
+  is empty at that point, and `loop_exit` processes with stale state from
+  whatever block preceded it — picking up a GC-managed phi value from inside
+  the loop body (e.g. `phi.t41` from the loop-body inner-if join). That
+  stale value propagates via `note_successor_entry_temps` to the if-arm
+  blocks after the loop, which don't dominate the loop-body block where the
+  phi was defined.
+* **Workaround**: none (breaks functions with `while (a & b)` + post-loop if).
+* **Planned fix**: create `loop_body` and `loop_exit` blocks *after*
+  `lower_expr(cond)` returns. The condition blocks (`sc_edge`, `sc_rhs`,
+  `sc_join`) are then earlier in `func.blocks`, so codegen processes
+  `sc_join` before `loop_exit` and `block_entry_temps[loop_exit]` is
+  correctly seeded.
+* **Scope**: small — 6-line reorder in `nod-sema/src/lower.rs`
+  (`lower_while_like`).
+* **Status**: **fixed** (same commit that adds this gap entry).
+
 ## GAP-003 — No multi-value return / no multi-binder `let`
 
 * **Discovered**: Sprint 45a, commit `29e1040`,
@@ -430,6 +503,55 @@ Sort by ID. New gaps append. Don't renumber.
   caller-spilled slots).
 * **Scope**: large. Plan it as its own sprint. Not blocking.
 * **Status**: open.
+
+## GAP-010 — AOT zero-root safepoints panic in codegen when no slot slab exists
+
+* **Discovered**: Sprint 46 rope-backed lexer experiment, when trying to
+  route `tests/nod-tests/fixtures/dylan-lexer.dylan` through a Dylan-side
+  rope load path before lexing.
+* **Symptom**: AOT codegen panicked at
+  `src/nod-llvm/src/codegen.rs:4328` with
+  `safepoint slot slab missing` while compiling a function that emitted an
+  image safepoint with **zero** GC roots. `Emit::init_safepoint_slot_slab`
+  intentionally skipped slab allocation when `max_safepoint_slots(func) = 0`,
+  but `begin_safepoint` still unconditionally called
+  `safepoint_slot_base_ptr()` on the AOT path before `nod_aot_begin_safepoint`.
+  The runtime contract in `src/nod-runtime/src/aot.rs` only dereferences
+  `slot_base` when `expected_root_count > 0`, so zero-root frames do not need
+  a real slab pointer.
+* **Workaround**: none inside Dylan source; any attempt to introduce an
+  extra zero-root safepoint in the AOT-built lexer fixture crashed the build.
+* **Planned fix**: for image safepoints, pass `ptr null` as `slot_base` when
+  `roots.is_empty()` instead of demanding a safepoint slab. Keep the existing
+  slab path for non-empty root sets.
+* **Scope**: small — one conditional in
+  `src/nod-llvm/src/codegen.rs::begin_safepoint` plus a focused codegen test.
+* **Status**: **fixed** (same commit that adds this gap entry).
+
+## GAP-011 — AOT safepoint verification counted only legacy registered roots
+
+* **Discovered**: Sprint 46 rope-backed lexer retry, after GAP-010 was fixed
+  and `tests/nod-tests/fixtures/dylan-lexer.dylan` could again build through
+  the AOT pipeline with Dylan-side rope loading enabled.
+* **Symptom**: runtime execution panicked at `src/nod-runtime/src/aot.rs:440`
+  with errors like
+  `AOT safepoint 464 registered 0 roots; expected 1 (baseline 4, patchpoint gc.s464)`.
+  The codegen metadata and slot slab agreed that one precise root was live, but
+  `verify_aot_safepoint` asked `crate::heap::root_count()`, and that helper only
+  counted the legacy thread-local `register_root` stack. Active AOT safepoint
+  roots lived in `snapshot_active_aot_roots()` and were therefore invisible to
+  the verification and end-of-safepoint checks.
+* **Workaround**: temporarily fall back to plain `%read-file(path)` in the lexer
+  fixture, or manually rebuild the cached lexer EXE after runtime changes while
+  debugging. Neither was a real fix.
+* **Planned fix**: keep `root_count()` as the legacy registered-root count for
+  its existing callers, add a total-root helper that includes active JIT and AOT
+  precise safepoint roots, and use that helper in AOT begin/verify/end protocol
+  checks. Update the runtime unit test to validate the precise slot-slab path
+  directly instead of manually mirroring roots through `register_root`.
+* **Scope**: small-medium — runtime accounting in `src/nod-runtime/src/heap.rs`
+  and `src/nod-runtime/src/aot.rs`, plus focused AOT protocol test updates.
+* **Status**: **fixed** (same commit that adds this gap entry).
 
 ---
 

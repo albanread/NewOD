@@ -61,6 +61,8 @@ static SHADOW_TOTAL_MAJOR_PAUSE_NS: AtomicU64 = AtomicU64::new(0);
 static SHADOW_ROOTS_AT_LAST_MINOR: AtomicU64 = AtomicU64::new(0);
 static SHADOW_ROOTS_AT_LAST_MAJOR: AtomicU64 = AtomicU64::new(0);
 static SHADOW_BYTES_PROMOTED: AtomicU64 = AtomicU64::new(0);
+static SHADOW_PEAK_YOUNG_BYTES_LIVE: AtomicU64 = AtomicU64::new(0);
+static SHADOW_PEAK_OLD_BYTES_LIVE: AtomicU64 = AtomicU64::new(0);
 
 /// Publish a fresh snapshot of GC counters into the signal-safe
 /// shadow.  Called by both GC backends after every
@@ -84,6 +86,8 @@ pub(crate) fn update_gc_metrics(s: &crate::heap::HeapStatsSnapshot) {
     SHADOW_ROOTS_AT_LAST_MINOR.store(s.roots_at_last_minor, Ordering::SeqCst);
     SHADOW_ROOTS_AT_LAST_MAJOR.store(s.roots_at_last_major, Ordering::SeqCst);
     SHADOW_BYTES_PROMOTED.store(s.bytes_promoted, Ordering::SeqCst);
+    SHADOW_PEAK_YOUNG_BYTES_LIVE.store(s.peak_young_bytes_live, Ordering::SeqCst);
+    SHADOW_PEAK_OLD_BYTES_LIVE.store(s.peak_old_bytes_live, Ordering::SeqCst);
 }
 
 // ──────────────────────────────────────────────────────────────────── //
@@ -106,6 +110,8 @@ pub struct GcMetricsSnapshot {
     pub roots_at_last_minor:   u64,
     pub roots_at_last_major:   u64,
     pub bytes_promoted:        u64,
+    pub peak_young_bytes_live: u64,
+    pub peak_old_bytes_live:   u64,
 }
 
 /// Read the current GC metrics shadow.  Lock-free; `Relaxed` loads —
@@ -125,6 +131,8 @@ pub fn gc_metrics_snapshot() -> GcMetricsSnapshot {
         roots_at_last_minor:   SHADOW_ROOTS_AT_LAST_MINOR.load(Ordering::Relaxed),
         roots_at_last_major:   SHADOW_ROOTS_AT_LAST_MAJOR.load(Ordering::Relaxed),
         bytes_promoted:        SHADOW_BYTES_PROMOTED.load(Ordering::Relaxed),
+        peak_young_bytes_live: SHADOW_PEAK_YOUNG_BYTES_LIVE.load(Ordering::Relaxed),
+        peak_old_bytes_live:   SHADOW_PEAK_OLD_BYTES_LIVE.load(Ordering::Relaxed),
     }
 }
 
@@ -203,6 +211,8 @@ fn write_crash_dump(exception_info: &str) {
     let rlmin   = SHADOW_ROOTS_AT_LAST_MINOR.load(Ordering::Relaxed);
     let rlmaj   = SHADOW_ROOTS_AT_LAST_MAJOR.load(Ordering::Relaxed);
     let prom    = SHADOW_BYTES_PROMOTED.load(Ordering::Relaxed);
+    let pylive  = SHADOW_PEAK_YOUNG_BYTES_LIVE.load(Ordering::Relaxed);
+    let polive  = SHADOW_PEAK_OLD_BYTES_LIVE.load(Ordering::Relaxed);
 
     // Thread-local safepoint depths.  Safe to read from the SEH
     // handler because it runs on the faulting thread.
@@ -240,6 +250,8 @@ fn write_crash_dump(exception_info: &str) {
           roots at last minor  : {}\n\
           roots at last major  : {}\n\
           bytes promoted       : {} bytes\n\
+                    peak young live      : {} bytes\n\
+                    peak old live        : {} bytes\n\
         ------------------------------------------------------------\n\
         SAFEPOINT STATE  (faulting thread)\n\
           JIT active frames    : {}\n\
@@ -257,6 +269,8 @@ fn write_crash_dump(exception_info: &str) {
         rlmin,
         rlmaj,
         prom,
+        pylive,
+        polive,
         jit_depth,
         aot_depth,
     );
@@ -341,7 +355,7 @@ fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Build a one-line summary from panic location.
-        let mut context = StackBuf::<512>::new();
+        let mut context = StackBuf::<1024>::new();
         use core::fmt::Write as _;
         if let Some(loc) = info.location() {
             let _ = write!(
@@ -353,6 +367,33 @@ fn install_panic_hook() {
             );
         } else {
             let _ = write!(context, "Rust panic (no location)");
+        }
+        #[cfg(feature = "newgc-backend")]
+        if let Some(stall) = info
+            .payload()
+            .downcast_ref::<newgc_core::page_heap::evac::GcStallError>()
+        {
+            let _ = write!(
+                context,
+                " | gc-stall reason={:?} from={:?} dest={:?} attempted-kind={:?} attempted-cells={} pages(free/g0/g1/tenured)={}/{}/{}/{} pin-set={} reserve-pages={} copied(objects/cells)={}/{} mark(live-bytes/live-pages/zero-live-released)={}/{}/{} recycled-mid-evac={}",
+                stall.reason,
+                stall.from_gen,
+                stall.dest_gen,
+                stall.attempted_kind,
+                stall.attempted_cells,
+                stall.free_pages,
+                stall.g0_pages,
+                stall.g1_pages,
+                stall.tenured_pages,
+                stall.pin_set_size,
+                stall.reserve_pages,
+                stall.objects_copied_before_failure,
+                stall.cells_copied_before_failure,
+                stall.mark_live_bytes,
+                stall.mark_live_pages,
+                stall.zero_live_pages_released,
+                stall.pages_recycled_mid_evac,
+            );
         }
         write_crash_dump(context.as_str());
         prev(info);

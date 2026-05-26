@@ -72,15 +72,13 @@ pub fn populate_safepoint_roots(f: &mut Function) {
         // Pass 1: collect def_index for each temp DEFINED in this block.
         // Block params get def_index = -1 ("defined before any computation").
         // Function params also get def_index = -1 in EVERY block, not only
-        // the entry block. The DFM lowering sometimes references function-
-        // param TempIds directly from non-entry blocks (e.g. join blocks
-        // produced by `lower_if`) without threading them through block args
-        // because the param was never reassigned in either arm. Restricting
-        // function-param tracking to the entry block meant those params were
-        // invisible to the safepoint-roots computation in the join block,
-        // so GC evacuation would update the slot but the JIT's live register
-        // copy went stale — leading to %byte-string-copy! receiving a
-        // pointer to a reclaimed page.
+        // the entry block. More generally, if a temp is USED in this block
+        // but not defined here, it must be treated as live-in with def_index
+        // = -1 as well. Dylan lowering can reference outer-scope temps
+        // directly from nested loop / branch / join blocks without threading
+        // them through block params when they are only read. If those temps
+        // are absent from def_index, they disappear from safepoint root sets
+        // exactly when GC pressure is highest.
         let mut def_index: HashMap<TempId, isize> = HashMap::new();
         for bp in &f.blocks[block_idx].params {
             def_index.insert(*bp, -1);
@@ -113,36 +111,20 @@ pub fn populate_safepoint_roots(f: &mut Function) {
                 *entry = term_idx;
             }
         }
+        // Any temp used in this block but not defined here is a live-in from
+        // an outer scope or predecessor block. Treat it as pre-existing at
+        // block entry so across-call liveness can protect it.
+        for &t in last_use_index.keys() {
+            def_index.entry(t).or_insert(-1);
+        }
         // Live-out via escapes_block: any temp defined here that's
         // used in another block is considered live for the rest of
         // THIS block (last_use_index >= every call index in this
         // block).
         let block_live_out_idx = (computations_len + 1) as isize;
-        for (t, &di) in &def_index {
-            if di >= 0 && escapes_block.contains(t) {
+        for t in def_index.keys() {
+            if escapes_block.contains(t) {
                 let entry = last_use_index.entry(*t).or_insert(-1);
-                if block_live_out_idx > *entry {
-                    *entry = block_live_out_idx;
-                }
-            }
-        }
-        // Function parameters live-out by escapes_block: a param used in
-        // another block is live to the end of every block in which it
-        // appears (it may need to stay alive across a call to reach the
-        // successor block that consumes it). Apply to all blocks now that
-        // function params are tracked in every block's def_index.
-        for &p in &param_set {
-            if escapes_block.contains(&p) {
-                let entry = last_use_index.entry(p).or_insert(-1);
-                if block_live_out_idx > *entry {
-                    *entry = block_live_out_idx;
-                }
-            }
-        }
-        // Block params propagate the same way.
-        for bp in &f.blocks[block_idx].params {
-            if escapes_block.contains(bp) {
-                let entry = last_use_index.entry(*bp).or_insert(-1);
                 if block_live_out_idx > *entry {
                     *entry = block_live_out_idx;
                 }

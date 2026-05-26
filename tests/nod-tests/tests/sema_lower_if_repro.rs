@@ -154,3 +154,37 @@ fn nested_if_with_then_arm_rebind_composes() {
         .expect("eval should succeed after lower_if env-merge fix");
     assert_eq!(s, "12");
 }
+
+/// Sprint 45e follow-up: a GC-managed binding that is only used AFTER a
+/// loop still has to be threaded through the loop-header phi set. Before the
+/// fix, the body's inner `if` could leave the loop-exit path reading a
+/// body-local join temp for `survivor`, and LLVM rejected the JIT IR with
+/// `Instruction does not dominate all uses!`.
+#[test]
+#[serial]
+fn post_loop_live_gc_root_is_carried_through_loop_header() {
+    nod_runtime::_reset_handler_stack_for_tests();
+    nod_runtime::ensure_collections_registered();
+
+    let src = r#"
+        begin
+          let survivor = copy-sequence("abc");
+          let seen = -1;
+          let i = 0;
+          until (i = 2)
+            if (i = 0)
+              seen := i + 10;
+            else
+              #f
+            end;
+            copy-sequence("z");
+            i := i + 1;
+          end;
+          if (size(survivor) = 3) 1 else 0 end
+        end
+    "#;
+
+    let s = nod_sema::eval_expr_to_string(src)
+        .expect("eval should succeed after loop-header GC-root carry fix");
+    assert_eq!(s, "1");
+}

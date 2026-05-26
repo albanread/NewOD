@@ -144,8 +144,9 @@ pub use com_shim::{
     nod_dxgi_create_factory, nod_dxgi_create_surface_from_texture,
     nod_dxgi_create_swap_chain_for_hwnd, nod_dxgi_device_from_d3d_device,
     nod_dxgi_factory_from_d3d_device, nod_dxgi_swap_chain_present,
-    nod_dxgi_swap_chain_resize_buffers, nod_get_argv1, nod_get_scroll_pos, nod_hi_word, nod_lo_word,
-    nod_post_message, nod_pump_one_message, nod_read_file_to_string,
+    nod_dxgi_swap_chain_resize_buffers, nod_get_argv1, nod_get_argv2, nod_get_scroll_pos,
+    nod_hi_word, nod_lo_word, nod_post_message, nod_print_gc_stats, nod_pump_one_message,
+    nod_read_file_to_string,
     nod_register_window_class, nod_run_message_loop, nod_set_scroll_info,
     // Sprint 41e — Win32 file-open common dialog shim (wraps
     // GetOpenFileNameW + the 88-byte OPENFILENAMEW struct).
@@ -1070,6 +1071,8 @@ pub struct GcStats {
     /// Cumulative bytes promoted from young generation to old.
     pub bytes_promoted: u64,
     pub last_pinned_objects: u64,
+    pub peak_young_bytes_live: u64,
+    pub peak_old_bytes_live: u64,
     pub heap_backend: &'static str,
 }
 
@@ -1091,6 +1094,8 @@ pub fn gc_stats() -> GcStats {
             roots_at_last_major: s.roots_at_last_major,
             bytes_promoted: s.bytes_promoted,
             last_pinned_objects: s.last_pinned_objects,
+            peak_young_bytes_live: s.peak_young_bytes_live,
+            peak_old_bytes_live: s.peak_old_bytes_live,
             heap_backend: HEAP_BACKEND_NAME,
         }
     })
@@ -1134,7 +1139,9 @@ pub fn gc_stats_report() -> String {
          roots last minor  : {}\n  \
          roots last major  : {}\n  \
          bytes promoted    : {} bytes\n  \
-         last pinned objs  : {}\n",
+         last pinned objs  : {}\n  \
+         peak young live   : {} bytes\n  \
+         peak old live     : {} bytes\n",
         s.heap_backend,
         s.minor_collections,
         s.major_collections,
@@ -1149,6 +1156,8 @@ pub fn gc_stats_report() -> String {
         s.roots_at_last_major,
         s.bytes_promoted,
         s.last_pinned_objects,
+        s.peak_young_bytes_live,
+        s.peak_old_bytes_live,
     )
 }
 

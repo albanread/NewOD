@@ -7,6 +7,15 @@ collector** written in pure Rust, inheriting from
 [`E:\CL\NewCormanLisp\docs\GC.md`](../../CL/NewCormanLisp/docs/GC.md). Headlines
 (per [MANIFESTO.md](../MANIFESTO.md) §The garbage collector):
 
+## Validation policy
+
+When the goal is to validate the NewOpenDylan compiler, JIT, or GC, the
+workload under test must execute in Dylan. Rust test code may launch the Dylan
+program, gather counters, and print reports, but it must not replace the Dylan
+allocation or transformation workload with a Rust-side surrogate. Otherwise we
+would only be testing the Rust harness, not the Dylan compiler/runtime path the
+project exists to build.
+
 - Precise root finding via LLVM `gc.statepoint` (no conservative scanning past
   bring-up).
 - Generational copying: young + old + pinned static area for compiled code,

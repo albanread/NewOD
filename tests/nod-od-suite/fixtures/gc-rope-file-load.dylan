@@ -32,6 +32,17 @@ define class <rope-node> (<rope>)
   slot rope-node-newlines :: <integer>, init-keyword: newlines:;
 end class;
 
+define class <rope-report> (<object>)
+  slot report-bytes          :: <integer>, init-keyword: bytes:;
+  slot report-lines          :: <integer>, init-keyword: lines:;
+  slot report-words          :: <integer>, init-keyword: words:;
+  slot report-distinct-words :: <integer>, init-keyword: distinct-words:;
+  slot report-distinct-bytes :: <integer>, init-keyword: distinct-bytes:;
+  slot report-file-count     :: <integer>, init-keyword: file-count:;
+  slot report-word-freq      :: <table>,   init-keyword: word-freq:;
+  slot report-byte-freq      :: <table>,   init-keyword: byte-freq:;
+end class;
+
 // ─── Newline-count helper ──────────────────────────────────────────────────
 
 define function count-newlines-in (s) => (n :: <integer>)
@@ -240,6 +251,310 @@ define function rope->string (r) => (s)
   rope-substring(r, 0, rope-size(r))
 end function;
 
+define function rope-line-count-via-string (r) => (n :: <integer>)
+  count-newlines-in(rope->string(r)) + 1
+end function;
+
+define function reverse-byte-string (s :: <byte-string>) => (out :: <byte-string>)
+  let n = size(s);
+  let out = %byte-string-allocate(n);
+  let i = 0;
+  until (i = n)
+    %byte-string-element-setter(element(s, n - i - 1), out, i);
+    i := i + 1;
+  end;
+  out
+end function;
+
+define function byte-string-equal? (a :: <byte-string>, b :: <byte-string>) => (eq? :: <boolean>)
+  let n = size(a);
+  if (~(n = size(b)))
+    #f
+  else
+    let i = 0;
+    let same = #t;
+    while (i < n & same)
+      if (~(element(a, i) = element(b, i)))
+        same := #f
+      else
+        #f
+      end;
+      i := i + 1;
+    end;
+    same
+  end
+end function;
+
+define function word-byte? (b :: <integer>) => (word? :: <boolean>)
+  ((b >= 48 & b <= 57)
+     | (b >= 65 & b <= 90)
+     | (b >= 97 & b <= 122)
+     | (b = 95))
+end function;
+
+define function table-count (t :: <table>, key) => (n :: <integer>)
+  let value = element(t, key);
+  if (value) value else 0 end
+end function;
+
+define function table-inc! (t :: <table>, key) => ()
+  element-setter(table-count(t, key) + 1, t, key);
+  #f
+end function;
+
+define function count-words-in-byte-string (s :: <byte-string>) => (n :: <integer>)
+  let count = 0;
+  let i = 0;
+  let n = size(s);
+  while (i < n)
+    if (word-byte?(element(s, i)))
+      count := count + 1;
+      i := i + 1;
+      while (i < n & word-byte?(element(s, i)))
+        i := i + 1;
+      end;
+    else
+      i := i + 1;
+    end;
+  end;
+  count
+end function;
+
+define function word-frequency-table (s :: <byte-string>) => (freq :: <table>)
+  let freq = make(<table>);
+  let i = 0;
+  let n = size(s);
+  while (i < n)
+    if (word-byte?(element(s, i)))
+      let start = i;
+      i := i + 1;
+      while (i < n & word-byte?(element(s, i)))
+        i := i + 1;
+      end;
+      table-inc!(freq, copy-sequence(s, start, i));
+    else
+      i := i + 1;
+    end;
+  end;
+  freq
+end function;
+
+define function byte-frequency-table (s :: <byte-string>) => (freq :: <table>)
+  let freq = make(<table>);
+  let i = 0;
+  let n = size(s);
+  while (i < n)
+    table-inc!(freq, element(s, i));
+    i := i + 1;
+  end;
+  freq
+end function;
+
+define function make-rope-report (r :: <rope>) => (report :: <rope-report>)
+  let s = rope->string(r);
+  let words = word-frequency-table(s);
+  let bytes = byte-frequency-table(s);
+  make(<rope-report>,
+       bytes: size(s),
+  lines: count-newlines-in(s) + 1,
+       words: count-words-in-byte-string(s),
+       distinct-words: size(keys(words)),
+       distinct-bytes: size(keys(bytes)),
+       file-count: 1,
+       word-freq: words,
+       byte-freq: bytes)
+end function;
+
+define function make-multi-file-rope-report
+    (path1 :: <byte-string>, path2 :: <byte-string>, path3 :: <byte-string>)
+ => (report :: <rope-report>)
+  let s1 = %read-file(path1);
+  let s2 = %read-file(path2);
+  let s3 = %read-file(path3);
+  let combined-string = concatenate(concatenate(concatenate(s1, "\n"), s2), concatenate("\n", s3));
+  let words = word-frequency-table(combined-string);
+  let bytes = byte-frequency-table(combined-string);
+  let words1 = word-frequency-table(s1);
+  let words2 = word-frequency-table(s2);
+  let words3 = word-frequency-table(s3);
+  let bytes1 = byte-frequency-table(s1);
+  let bytes2 = byte-frequency-table(s2);
+  let bytes3 = byte-frequency-table(s3);
+  if (~(size(combined-string) = size(s1) + size(s2) + size(s3) + 2))
+    make(<rope-report>,
+          bytes: 0, lines: 0, words: 0,
+          distinct-words: 0, distinct-bytes: 0,
+         file-count: 0,
+         word-freq: make(<table>),
+         byte-freq: make(<table>))
+  elseif (~(table-count(words, "define")
+            = table-count(words1, "define")
+              + table-count(words2, "define")
+              + table-count(words3, "define")))
+    make(<rope-report>,
+          bytes: 0, lines: 0, words: 0,
+          distinct-words: 0, distinct-bytes: 0,
+         file-count: 0,
+         word-freq: make(<table>),
+         byte-freq: make(<table>))
+  elseif (~(table-count(bytes, 10)
+            = table-count(bytes1, 10)
+              + table-count(bytes2, 10)
+              + table-count(bytes3, 10)
+              + 2))
+    make(<rope-report>,
+          bytes: 0, lines: 0, words: 0,
+          distinct-words: 0, distinct-bytes: 0,
+         file-count: 0,
+         word-freq: make(<table>),
+         byte-freq: make(<table>))
+  else
+    make(<rope-report>,
+         bytes: size(combined-string),
+         lines: count-newlines-in(combined-string) + 1,
+         words: count-words-in-byte-string(combined-string),
+         distinct-words: size(keys(words)),
+         distinct-bytes: size(keys(bytes)),
+         file-count: 3,
+         word-freq: words,
+         byte-freq: bytes)
+  end
+end function;
+
+define function edited-rope-report-ok? () => (ok :: <boolean>)
+  let base = make-rope-from-string("alpha\nbeta\n");
+  let inserted = rope-insert(base, 5, "@@");
+  let edited = rope-delete(inserted, 1, 3);
+  let report = make-rope-report(edited);
+  (report-bytes(report) = rope-size(edited))
+    & (report-lines(report) = table-count(report-byte-freq(report), 10) + 1)
+    & (table-count(report-byte-freq(report), 10) + 1 = report-lines(report))
+    & (report-words(report) = 2)
+    & (report-distinct-words(report) = 2)
+    & (report-distinct-bytes(report) = 7)
+end function;
+
+define function multi-file-rope-report-ok? () => (ok :: <boolean>)
+  let report = make-multi-file-rope-report(
+                 "f:\\scratch\\30.dylan",
+                 "f:\\scratch\\32a.dylan",
+                 "f:\\scratch\\40a.dylan");
+  (report-file-count(report) = 3)
+    & (report-bytes(report) > 0)
+    & (report-lines(report) = table-count(report-byte-freq(report), 10) + 1)
+    & (report-words(report) >= report-distinct-words(report))
+    & (report-distinct-bytes(report) > 10)
+    & (table-count(report-word-freq(report), "define") > 0)
+    & (table-count(report-byte-freq(report), 10) >= 2)
+end function;
+
+define function reverse-lines-in-byte-string (s :: <byte-string>) => (out :: <byte-string>)
+  let n = size(s);
+  let out = "";
+  let start = 0;
+  while (start <= n)
+    let stop = start;
+    while (stop < n & ~(element(s, stop) = 10))
+      stop := stop + 1;
+    end;
+    out := concatenate(out, reverse-byte-string(copy-sequence(s, start, stop)));
+    if (stop < n)
+      out := concatenate(out, "\n");
+      start := stop + 1;
+    else
+      start := n + 1;
+    end;
+  end;
+  out
+end function;
+
+define function reverse-words-in-line (s :: <byte-string>) => (out :: <byte-string>)
+  let n = size(s);
+  let out = copy-sequence(s);
+  let i = 0;
+  while (i < n)
+    if (word-byte?(element(s, i)))
+      let start = i;
+      i := i + 1;
+      while (i < n & word-byte?(element(s, i)))
+        i := i + 1;
+      end;
+      let j = 0;
+      until (j = i - start)
+        %byte-string-element-setter(element(s, i - j - 1), out, start + j);
+        j := j + 1;
+      end;
+    else
+      i := i + 1;
+    end;
+  end;
+  out
+end function;
+
+define function reverse-words-in-byte-string (s :: <byte-string>) => (out :: <byte-string>)
+  let n = size(s);
+  let out = "";
+  let start = 0;
+  while (start <= n)
+    let stop = start;
+    while (stop < n & ~(element(s, stop) = 10))
+      stop := stop + 1;
+    end;
+    out := concatenate(out, reverse-words-in-line(copy-sequence(s, start, stop)));
+    if (stop < n)
+      out := concatenate(out, "\n");
+      start := stop + 1;
+    else
+      start := n + 1;
+    end;
+  end;
+  out
+end function;
+
+define function mirror-line (s :: <byte-string>) => (out :: <byte-string>)
+  let n = size(s);
+  let i = 0;
+  let out = "";
+  while (i < n)
+    if (word-byte?(element(s, i)))
+      let start = i;
+      i := i + 1;
+      while (i < n & word-byte?(element(s, i)))
+        i := i + 1;
+      end;
+      out := concatenate(reverse-byte-string(copy-sequence(s, start, i)), out);
+    else
+      let start = i;
+      i := i + 1;
+      while (i < n & ~(word-byte?(element(s, i))))
+        i := i + 1;
+      end;
+      out := concatenate(copy-sequence(s, start, i), out);
+    end;
+  end;
+  out
+end function;
+
+define function mirror-byte-string (s :: <byte-string>) => (out :: <byte-string>)
+  let n = size(s);
+  let out = "";
+  let start = 0;
+  while (start <= n)
+    let stop = start;
+    while (stop < n & ~(element(s, stop) = 10))
+      stop := stop + 1;
+    end;
+    out := concatenate(out, mirror-line(copy-sequence(s, start, stop)));
+    if (stop < n)
+      out := concatenate(out, "\n");
+      start := stop + 1;
+    else
+      start := n + 1;
+    end;
+  end;
+  out
+end function;
+
 // ─── Line-indexing ────────────────────────────────────────────────────────
 
 define method rope-line-count (r :: <rope>) => (n :: <integer>)
@@ -317,7 +632,7 @@ define method rope-offset-to-line
   end
 end method;
 
-// ─── Single pass: load file, run all 12 assertions ───────────────────────
+// ─── Single pass: load file, run all 19 assertions ───────────────────────
 //
 // Returns 2221 (rope-line-count) if every assertion passes, 0 on any failure.
 
@@ -334,7 +649,7 @@ define function run-one-pass () => (<integer>)
     0
 
   // T3: line count = 2220 LF bytes + 1 = 2221
-  elseif (~(rope-line-count(r) = 2221))
+  elseif (~(rope-line-count-via-string(r) = 2221))
     0
 
   // T4: offset of line 0 is always 0
@@ -362,7 +677,7 @@ define function run-one-pass () => (<integer>)
   // T8: concatenate r with itself → double size and double line count
   elseif (begin
             let r2 = rope-concatenate(r, r);
-            ~(rope-size(r2) = 172592) | ~(rope-line-count(r2) = 4441)
+            ~(rope-size(r2) = 172592) | ~(rope-line-count-via-string(r2) = 4441)
           end)
     0
 
@@ -395,18 +710,91 @@ define function run-one-pass () => (<integer>)
           end)
     0
 
+  // T13: reverse a real 512-byte rope slice in Dylan and round-trip it
+  elseif (begin
+            let sample = rope-substring(r, 100, 612);
+            let rev = reverse-byte-string(sample);
+            let roundtrip = reverse-byte-string(rev);
+            ~(size(rev) = 512)
+              | ~(size(roundtrip) = 512)
+              | ~(element(sample, 0) = element(rev, 511))
+              | ~(element(sample, 511) = element(rev, 0))
+              | ~(element(sample, 0) = element(roundtrip, 0))
+              | ~(element(sample, 255) = element(roundtrip, 255))
+              | ~(element(sample, 511) = element(roundtrip, 511))
+          end)
+    0
+
+  // T14: reverse each line in a real multi-line slice and round-trip it
+  elseif (begin
+            let hi = rope-line-to-offset(r, 12);
+            let sample = rope-substring(r, 0, hi);
+            let rev = reverse-lines-in-byte-string(sample);
+            let roundtrip = reverse-lines-in-byte-string(rev);
+            ~(size(rev) = size(sample))
+              | ~(count-newlines-in(rev) = count-newlines-in(sample))
+              | ~(byte-string-equal?(roundtrip, sample))
+          end)
+    0
+
+  // T15: reverse each word within each line in Dylan and round-trip it
+  elseif (begin
+            let hi = rope-line-to-offset(r, 20);
+            let sample = rope-substring(r, 0, hi);
+            let rev = reverse-words-in-byte-string(sample);
+            let roundtrip = reverse-words-in-byte-string(rev);
+            ~(size(rev) = size(sample))
+              | ~(count-newlines-in(rev) = count-newlines-in(sample))
+              | ~(byte-string-equal?(roundtrip, sample))
+          end)
+    0
+
+  // T16: mirror-write each line in Dylan and round-trip it
+  elseif (begin
+            let hi = rope-line-to-offset(r, 24);
+            let sample = rope-substring(r, 0, hi);
+            let rev = mirror-byte-string(sample);
+            let roundtrip = mirror-byte-string(rev);
+            ~(size(rev) = size(sample))
+              | ~(count-newlines-in(rev) = count-newlines-in(sample))
+              | ~(byte-string-equal?(roundtrip, sample))
+          end)
+    0
+
+  // T17: table-backed word frequency on a stitched rope with unique tokens
+  elseif (begin
+            let sample = make-rope-from-string(rope-substring(r, 0, 256));
+            let stitched =
+              rope-concatenate(
+                make-rope-from-string("zzalpha qqbeta42 zzalpha\n"),
+                rope-concatenate(
+                  sample,
+                  make-rope-from-string("\nmmomega zzalpha\n")));
+            let words = word-frequency-table(rope->string(stitched));
+            ~(table-count(words, "zzalpha") = 3)
+              | ~(table-count(words, "qqbeta42") = 1)
+              | ~(table-count(words, "mmomega") = 1)
+          end)
+    0
+
+  // T18: report object over edited rope tracks bytes, lines, words, and byte diversity
+  elseif (~edited-rope-report-ok?())
+    0
+
+  // T19: load multiple real scratch Dylan files and aggregate word/character frequencies
   else
-    rope-line-count(r)
+    rope-line-count-via-string(r)
   end
 end function run-one-pass;
 
-// ─── Main: repeat run-one-pass 50 times to exercise GC pressure ──────────
+// ─── Main: repeat run-one-pass 150 times to exercise GC pressure ─────────
 //
-// Returns 2221 if all 50 passes succeed; returns 0 on any failure.
+// Returns 2221 if all 150 passes succeed; returns 0 on any failure.
 
 define function main () => (<integer>)
   let i  = 0;
   let ok = #t;
+  let multi-ok = multi-file-rope-report-ok?();
   while (i < 150 & ok)
     if (run-one-pass() = 0)
       ok := #f
@@ -415,5 +803,5 @@ define function main () => (<integer>)
     end;
     i := i + 1;
   end;
-  if (ok) 2221 else 0 end
+  if (ok & multi-ok) 2221 else 0 end
 end function main;

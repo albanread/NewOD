@@ -20,6 +20,18 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+fn gc_stats_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target")
+        .join("gc-stats");
+    std::fs::create_dir_all(&dir).expect("create gc stats dir");
+    dir
+}
+
 fn run_main(fixture: &str) -> i64 {
     let path = fixtures_dir().join(fixture);
     run_function_to_i64(&path, "main")
@@ -108,30 +120,59 @@ fn gc_rope_file_load_all_ops() {
     let major_delta = gc_after.major_collections - gc_before.major_collections;
     let prom_delta  = gc_after.bytes_promoted.saturating_sub(gc_before.bytes_promoted);
 
-    println!("\n=== GC activity: gc-rope-file-load (150 passes) ===");
-    println!("  ── heap before run ──────────────────────────");
-    println!("    young used   : {} bytes", young_before);
-    println!("    old used     : {} bytes", old_before);
-    println!("  ── heap after run (before forced GC) ────────");
-    println!("    young used   : {} bytes  (+{} bytes garbage)",
+    let mut report = format!(
+        "=== GC activity: gc-rope-file-load (150 passes) ===\n  \
+         heap before run\n    \
+         young used   : {} bytes\n    \
+         old used     : {} bytes\n  \
+         heap after run (before forced GC)\n    \
+         young used   : {} bytes  (+{} bytes garbage)\n    \
+         old used     : {} bytes\n  \
+         after forced full GC\n    \
+         young used   : {} bytes\n    \
+         old used     : {} bytes\n    \
+         reclaimed    : {} bytes\n  \
+         GC counters (delta over full test)\n    \
+         minor collections  : +{}\n    \
+         major collections  : +{}\n    \
+         bytes promoted     : +{} bytes\n  \
+         absolute counters at report time\n    \
+         minor collections  : {}\n    \
+         major collections  : {}\n    \
+         young allocated    : {} bytes\n    \
+         peak young live    : {} bytes\n    \
+         peak old live      : {} bytes\n",
+        young_before,
+        old_before,
         young_after_run,
-        young_after_run.saturating_sub(young_before));
-    println!("    old used     : {} bytes", old_after_run);
-    println!("  ── after forced full GC ─────────────────────");
-    println!("    young used   : {} bytes", young_after_gc);
-    println!("    old used     : {} bytes", old_after_gc);
-    println!("    reclaimed    : {} bytes",
-        (young_after_run + old_after_run)
-            .saturating_sub(young_after_gc + old_after_gc));
-    println!("  ── GC counters (delta over full test) ───────");
-    println!("    minor collections  : +{}", minor_delta);
-    println!("    major collections  : +{}", major_delta);
-    println!("    bytes promoted     : +{} bytes", prom_delta);
+        young_after_run.saturating_sub(young_before),
+        old_after_run,
+        young_after_gc,
+        old_after_gc,
+        (young_after_run + old_after_run).saturating_sub(young_after_gc + old_after_gc),
+        minor_delta,
+        major_delta,
+        prom_delta,
+        gc_after.minor_collections,
+        gc_after.major_collections,
+        gc_after.young_bytes_allocated,
+        gc_after.peak_young_bytes_live,
+        gc_after.peak_old_bytes_live,
+    );
     if gc_after.last_major_pause_ns > gc_before.last_major_pause_ns || major_delta > 0 {
-        println!("    last major pause   : {} us", gc_after.last_major_pause_ns / 1_000);
-        println!("    roots at last major: {}", gc_after.roots_at_last_major);
+        report.push_str(&format!(
+            "    last major pause   : {} us\n    roots at last major: {}\n",
+            gc_after.last_major_pause_ns / 1_000,
+            gc_after.roots_at_last_major
+        ));
     }
-    println!("====================================================");
+    report.push_str("====================================================\n");
+    std::fs::write(
+        gc_stats_dir().join("gc-rope-file-load.stats.txt"),
+        &report,
+    )
+    .expect("write rope gc stats report");
+    print!("\n{report}");
 
     assert_eq!(result, 2221);
 }
