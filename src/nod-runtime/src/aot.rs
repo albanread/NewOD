@@ -337,6 +337,12 @@ fn registered_aot_safepoint_count() -> usize {
         .len()
 }
 
+/// Number of AOT safepoint frames currently active on this thread.
+/// Used by the crash dump handler (which runs on the faulting thread).
+pub(crate) fn active_aot_safepoint_depth() -> usize {
+    ACTIVE_AOT_SAFEPOINTS.with(|stack| stack.borrow().len())
+}
+
 #[cfg(test)]
 fn reset_aot_safepoints_for_tests() {
     aot_safepoint_registry()
@@ -1067,6 +1073,11 @@ pub extern "C-unwind" fn nod_runtime_init() {
         // exist before the resolver populates the immediate slots.
         // SAFETY: `nod_nil` is `extern "C" fn() -> u64`, infallible.
         let _ = unsafe { crate::nod_nil() };
+        // Install signal-safe crash dump handler (panic hook +
+        // SetUnhandledExceptionFilter).  Must run after all subsystems
+        // are registered so the crash-time safepoint depth reads are
+        // valid.
+        crate::crash_dump::install();
     });
 
     LazyLock::force(&INIT);

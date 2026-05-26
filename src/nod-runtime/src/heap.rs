@@ -749,6 +749,7 @@ impl Heap {
     /// copied into old.live (full promotion — every survivor tenures),
     /// young is reset.
     pub fn collect_minor(&self) {
+        crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_MINOR);
         let start = std::time::Instant::now();
         // Capture young-gen occupancy before collection so we can
         // report bytes_promoted (all young survivors tenure in one step).
@@ -778,6 +779,25 @@ impl Heap {
         inner.stats.roots_at_last_minor = root_count;
         inner.stats.bytes_promoted += young_before_bytes;
         inner.stats.last_pinned_objects = pinned_count as u64;
+        // Publish to crash-dump shadow before clearing the phase flag
+        // so the handler always sees consistent metrics.
+        let snap = HeapStatsSnapshot {
+            minor_collections: inner.stats.minor_collections,
+            major_collections: inner.stats.major_collections,
+            young_bytes_allocated: inner.stats.young_bytes_allocated,
+            young_bytes_live: inner.young.used_bytes() as u64,
+            old_bytes_live: inner.old.live.used_bytes() as u64,
+            last_minor_pause_ns: elapsed_ns,
+            last_major_pause_ns: inner.stats.last_major_pause_ns,
+            total_minor_pause_ns: inner.stats.total_minor_pause_ns,
+            total_major_pause_ns: inner.stats.total_major_pause_ns,
+            roots_at_last_minor: root_count,
+            roots_at_last_major: inner.stats.roots_at_last_major,
+            bytes_promoted: inner.stats.bytes_promoted,
+            last_pinned_objects: inner.stats.last_pinned_objects,
+        };
+        crate::crash_dump::update_gc_metrics(&snap);
+        crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
         if crate::gc_trace_enabled() {
             eprintln!(
                 "[GC minor #{}] roots={} promoted={}B pause={}µs (total {}µs)",
@@ -793,6 +813,7 @@ impl Heap {
     /// Full collection: young + old.live → old.scratch, swap old,
     /// reset young.
     pub fn collect_full(&self) {
+        crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_MAJOR);
         let start = std::time::Instant::now();
         // Sprint 11c: see `collect_minor` — snapshot first, no
         // RefCell borrow across the heap mutex.
@@ -809,6 +830,23 @@ impl Heap {
         inner.stats.last_major_pause_ns = elapsed_ns;
         inner.stats.total_major_pause_ns += elapsed_ns;
         inner.stats.roots_at_last_major = root_count;
+        let snap = HeapStatsSnapshot {
+            minor_collections: inner.stats.minor_collections,
+            major_collections: inner.stats.major_collections,
+            young_bytes_allocated: inner.stats.young_bytes_allocated,
+            young_bytes_live: inner.young.used_bytes() as u64,
+            old_bytes_live: inner.old.live.used_bytes() as u64,
+            last_minor_pause_ns: inner.stats.last_minor_pause_ns,
+            last_major_pause_ns: elapsed_ns,
+            total_minor_pause_ns: inner.stats.total_minor_pause_ns,
+            total_major_pause_ns: inner.stats.total_major_pause_ns,
+            roots_at_last_minor: inner.stats.roots_at_last_minor,
+            roots_at_last_major: root_count,
+            bytes_promoted: inner.stats.bytes_promoted,
+            last_pinned_objects: inner.stats.last_pinned_objects,
+        };
+        crate::crash_dump::update_gc_metrics(&snap);
+        crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
         if crate::gc_trace_enabled() {
             eprintln!(
                 "[GC major #{}] roots={} pause={}µs (total {}µs)",
@@ -1542,6 +1580,7 @@ mod newgc_backend {
         }
 
         pub(super) fn collect_minor(&self) {
+            crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_MINOR);
             let start = Instant::now();
             let roots = snapshot_roots();
             let root_count = roots.len() as u64;
@@ -1562,6 +1601,24 @@ mod newgc_backend {
             inner.stats.total_minor_pause_ns += elapsed_ns;
             inner.stats.roots_at_last_minor = root_count;
             inner.stats.bytes_promoted += g0_before;
+            let gs = inner.heap.stats();
+            let snap = HeapStatsSnapshot {
+                minor_collections: inner.stats.minor_collections,
+                major_collections: inner.stats.major_collections,
+                young_bytes_allocated: inner.stats.young_bytes_allocated,
+                young_bytes_live: gs.g0_used_bytes as u64,
+                old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
+                last_minor_pause_ns: elapsed_ns,
+                last_major_pause_ns: inner.stats.last_major_pause_ns,
+                total_minor_pause_ns: inner.stats.total_minor_pause_ns,
+                total_major_pause_ns: inner.stats.total_major_pause_ns,
+                roots_at_last_minor: root_count,
+                roots_at_last_major: inner.stats.roots_at_last_major,
+                bytes_promoted: inner.stats.bytes_promoted,
+                last_pinned_objects: 0,
+            };
+            crate::crash_dump::update_gc_metrics(&snap);
+            crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
             if crate::gc_trace_enabled() {
                 eprintln!(
                     "[GC minor #{}] roots={} promoted={}B pause={}µs (total {}µs)",
@@ -1581,6 +1638,7 @@ mod newgc_backend {
             // that aged into Tenured AND have no remaining roots are
             // reclaimed. The old `collect_major` (G1→Tenured + G0→G0)
             // never reclaimed Tenured residents; we replaced it.
+            crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_MAJOR);
             let start = Instant::now();
             let roots = snapshot_roots();
             let root_count = roots.len() as u64;
@@ -1597,6 +1655,24 @@ mod newgc_backend {
             inner.stats.last_major_pause_ns = elapsed_ns;
             inner.stats.total_major_pause_ns += elapsed_ns;
             inner.stats.roots_at_last_major = root_count;
+            let gs = inner.heap.stats();
+            let snap = HeapStatsSnapshot {
+                minor_collections: inner.stats.minor_collections,
+                major_collections: inner.stats.major_collections,
+                young_bytes_allocated: inner.stats.young_bytes_allocated,
+                young_bytes_live: gs.g0_used_bytes as u64,
+                old_bytes_live: (gs.g1_used_bytes + gs.tenured_used_bytes) as u64,
+                last_minor_pause_ns: inner.stats.last_minor_pause_ns,
+                last_major_pause_ns: elapsed_ns,
+                total_minor_pause_ns: inner.stats.total_minor_pause_ns,
+                total_major_pause_ns: inner.stats.total_major_pause_ns,
+                roots_at_last_minor: inner.stats.roots_at_last_minor,
+                roots_at_last_major: root_count,
+                bytes_promoted: inner.stats.bytes_promoted,
+                last_pinned_objects: 0,
+            };
+            crate::crash_dump::update_gc_metrics(&snap);
+            crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
             if crate::gc_trace_enabled() {
                 eprintln!(
                     "[GC major #{}] roots={} pause={}µs (total {}µs)",

@@ -54,6 +54,8 @@ mod collections;
 #[cfg(windows)]
 mod com_shim;
 mod conditions;
+/// Signal-safe crash dump: GC metrics + safepoint state on panic/SEH crash.
+mod crash_dump;
 mod dispatch;
 mod winffi;
 #[cfg(feature = "newgc-backend")]
