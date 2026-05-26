@@ -108,6 +108,10 @@ pub const NOD_AOT_VERIFY_SAFEPOINT_SYMBOL: &str = "nod_aot_verify_safepoint";
 /// Sprint 45c: image-only runtime hook that verifies safepoint cleanup
 /// restored the pre-call root-stack baseline.
 pub const NOD_AOT_END_SAFEPOINT_SYMBOL: &str = "nod_aot_end_safepoint";
+/// Sprint 45e: poll hook emitted at every function entry and every
+/// loop back-edge target.  Fast path is a single relaxed load; the
+/// slow path parks the calling thread until the GC clears the flag.
+pub const NOD_SAFEPOINT_POLL_SYMBOL: &str = "nod_safepoint_poll";
 
 /// Sprint 14: invoke the next-most-specific applicable method on the
 /// current dispatch chain, forwarding the current method's args
@@ -2111,6 +2115,10 @@ fn emit_function<'ctx, 'a>(
 
     state.init_safepoint_slot_slab()?;
 
+    // Pre-compute the set of loop-header blocks (back-edge targets).
+    // Polls are emitted at these blocks and at the function entry block.
+    let loop_headers = find_loop_headers(func);
+
     // Bind function parameters to the entry block's SSA temps.
     for (i, p) in func.params.iter().enumerate() {
         let pv = llvm_fn
@@ -2145,6 +2153,12 @@ fn emit_function<'ctx, 'a>(
         let bb = state.blocks[&b.id];
         builder.position_at_end(bb);
         state.current_block_label = b.label.clone();
+        // Safepoint poll at function entry and at every loop-header
+        // block (back-edge target) so the GC can stop-the-world even
+        // in non-allocating tight loops.
+        if b.id == func.entry || loop_headers.contains(&b.id) {
+            state.emit_safepoint_poll()?;
+        }
         for (computation_index, c) in b.computations.iter().enumerate() {
             state.current_computation_index = computation_index;
             state.emit_computation(c)?;
@@ -4389,6 +4403,27 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         self.module
             .add_function(NOD_AOT_END_SAFEPOINT_SYMBOL, ty, None)
     }
+
+    fn get_or_declare_safepoint_poll(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(NOD_SAFEPOINT_POLL_SYMBOL) {
+            return f;
+        }
+        let ty = self.ctx.void_type().fn_type(&[], false);
+        self.module
+            .add_function(NOD_SAFEPOINT_POLL_SYMBOL, ty, None)
+    }
+
+    /// Emit `call void @nod_safepoint_poll()` at the current insert
+    /// point.  Placed at function entry and loop-header blocks so the
+    /// GC can stop-the-world even in non-allocating tight loops.
+    fn emit_safepoint_poll(&mut self) -> Result<(), CodegenError> {
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let f = self.get_or_declare_safepoint_poll();
+        self.builder
+            .build_call(f, &[], "sp.poll")
+            .map_err(map_err)?;
+        Ok(())
+    }
 }
 
 /// One rented entry from the function's safepoint slot pool, used by
@@ -4430,6 +4465,43 @@ fn max_safepoint_slots(func: &DfmFunction) -> usize {
         .filter_map(|computation| computation.safepoint_roots().map(|roots| roots.len()))
         .max()
         .unwrap_or(0)
+}
+
+/// Compute the set of loop-header `BlockId`s in `func`.
+///
+/// A block is a loop header if it is the target of at least one
+/// back edge — i.e., a `Jump` or `If` branch from a block whose
+/// position in `func.blocks` is >= the target block's position.
+/// This is a linear-order approximation (no full dominance analysis)
+/// that correctly identifies all natural loop headers for the DFM IR
+/// which is always produced in RPO / depth-first order by the lowering
+/// pass.
+fn find_loop_headers(func: &DfmFunction) -> std::collections::HashSet<BlockId> {
+    let pos: std::collections::HashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+    let mut headers = std::collections::HashSet::new();
+    for (i, b) in func.blocks.iter().enumerate() {
+        let mut check = |target: &BlockId| {
+            if let Some(&j) = pos.get(target) {
+                if j <= i {
+                    headers.insert(*target);
+                }
+            }
+        };
+        match &b.terminator {
+            Terminator::Jump { target, .. } => check(target),
+            Terminator::If { then_block, else_block, .. } => {
+                check(then_block);
+                check(else_block);
+            }
+            Terminator::Return { .. } => {}
+        }
+    }
+    headers
 }
 
 // ─── CacheSlot / GenericFunction field offsets ─────────────────────────────

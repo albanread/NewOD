@@ -66,6 +66,7 @@ mod immediates;
 mod lists;
 mod make;
 mod roots;
+mod safepoint_poll;
 mod stack_map;
 mod static_area;
 mod strings;
@@ -216,6 +217,7 @@ pub use lists::{
     nod_pair_alloc, nod_pair_head, nod_pair_tail, try_pair,
 };
 pub use roots::RootSet;
+pub use safepoint_poll::{SAFEPOINT_PARK_REQUESTED, nod_safepoint_poll};
 pub use stack_map::{
     JitSafepointEntry, LiveSlot, ParkedFrame, StackMap, StackMapEntry,
     nod_jit_begin_safepoint, nod_jit_end_safepoint, register_jit_safepoints,

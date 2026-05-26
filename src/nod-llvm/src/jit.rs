@@ -28,7 +28,7 @@ use crate::codegen::{
     NOD_PAIR_HEAD_SYMBOL, NOD_PAIR_TAIL_SYMBOL, NOD_POP_SEALED_CHAIN_SYMBOL,
     NOD_PUSH_SEALED_CHAIN_SYMBOL, NOD_RANGE_BY_SYMBOL, NOD_RANGE_FROM_SYMBOL, NOD_RANGE_TO_SYMBOL,
     NOD_JIT_BEGIN_SAFEPOINT_SYMBOL, NOD_JIT_END_SAFEPOINT_SYMBOL,
-    NOD_RUN_BLOCK_SYMBOL, NOD_SIGNAL_SYMBOL,
+    NOD_SAFEPOINT_POLL_SYMBOL, NOD_RUN_BLOCK_SYMBOL, NOD_SIGNAL_SYMBOL,
     NOD_SOV_ELEMENT_SETTER_SYMBOL, NOD_SOV_ELEMENT_SYMBOL, NOD_SOV_SIZE_SYMBOL,
     NOD_STRETCHY_VECTOR_ELEMENT_SETTER_SYMBOL, NOD_STRETCHY_VECTOR_ELEMENT_SYMBOL,
     NOD_STRETCHY_VECTOR_PUSH_SYMBOL, NOD_STRETCHY_VECTOR_SIZE_SYMBOL,
@@ -201,6 +201,7 @@ impl<'ctx> Jit<'ctx> {
         let card_mark_fn = module.get_function(NOD_CARD_MARK_SYMBOL);
         let jit_begin_safepoint_fn = module.get_function(NOD_JIT_BEGIN_SAFEPOINT_SYMBOL);
         let jit_end_safepoint_fn = module.get_function(NOD_JIT_END_SAFEPOINT_SYMBOL);
+        let safepoint_poll_fn = module.get_function(NOD_SAFEPOINT_POLL_SYMBOL);
         let next_method_fn = module.get_function(NOD_NEXT_METHOD_SYMBOL);
         let has_next_method_fn = module.get_function(NOD_HAS_NEXT_METHOD_SYMBOL);
         let push_sealed_chain_fn = module.get_function(NOD_PUSH_SEALED_CHAIN_SYMBOL);
@@ -807,6 +808,11 @@ impl<'ctx> Jit<'ctx> {
             let addr = nod_runtime::nod_jit_end_safepoint as *const () as *mut std::ffi::c_void;
             unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), addr) };
         }
+        if let Some(f) = safepoint_poll_fn {
+            let addr = nod_runtime::nod_safepoint_poll as *const () as *mut std::ffi::c_void;
+            // SAFETY: nod_safepoint_poll is `extern "C" fn()` — no args, no return.
+            unsafe { LLVMAddGlobalMapping(engine, f.as_value_ref(), addr) };
+        }
         // Sprint 14: `next-method()` lowers to a call into the runtime
         // shim, which pops the next applicable method from the
         // dispatch chain and invokes it with the parent method's args.
@@ -1342,6 +1348,7 @@ fn standard_extern_addresses() -> Vec<(&'static str, *mut std::ffi::c_void)> {
         (NOD_CARD_MARK_SYMBOL, nod_runtime::nod_card_mark as *const () as *mut std::ffi::c_void),
         (NOD_JIT_BEGIN_SAFEPOINT_SYMBOL, nod_runtime::nod_jit_begin_safepoint as *const () as *mut std::ffi::c_void),
         (NOD_JIT_END_SAFEPOINT_SYMBOL, nod_runtime::nod_jit_end_safepoint as *const () as *mut std::ffi::c_void),
+        (NOD_SAFEPOINT_POLL_SYMBOL, nod_runtime::nod_safepoint_poll as *const () as *mut std::ffi::c_void),
         (NOD_NEXT_METHOD_SYMBOL, nod_runtime::nod_next_method as *const () as *mut std::ffi::c_void),
         (NOD_HAS_NEXT_METHOD_SYMBOL, nod_runtime::nod_has_next_method as *const () as *mut std::ffi::c_void),
         (NOD_PUSH_SEALED_CHAIN_SYMBOL, nod_runtime::nod_push_sealed_chain_frame as *const () as *mut std::ffi::c_void),
