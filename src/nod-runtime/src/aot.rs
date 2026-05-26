@@ -292,7 +292,40 @@ fn find_registered_aot_safepoint(site_id: u64) -> RegisteredAotSafepoint {
 }
 
 fn trace_exec_safepoints_enabled() -> bool {
-    std::env::var_os("NOD_AOT_TRACE_EXEC_SAFEPOINTS").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NOD_AOT_TRACE_EXEC_SAFEPOINTS").is_some())
+}
+
+/// Whether to run the expensive per-safepoint root-count verification.
+/// Controlled by `NOD_AOT_VERIFY_SAFEPOINTS=1`. Off by default: the
+/// verification requires a global mutex lock + Vec clone on every Dylan
+/// function call, which is ~20 000 allocations per WM_PAINT in the IDE.
+/// Enable during test / debugging; leave off for normal IDE use.
+///
+/// In the test binary the slow path runs unconditionally (the
+/// `VERIFY_ENABLED_FOR_TESTS` thread_local defaults to `true`), so
+/// unit tests that check root-count invariants work without setting the
+/// env var. Tests that explicitly want the fast path can set
+/// `VERIFY_ENABLED_FOR_TESTS.with(|c| c.set(false))`.
+fn verify_safepoints_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return VERIFY_ENABLED_FOR_TESTS.with(|c| c.get());
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("NOD_AOT_VERIFY_SAFEPOINTS").is_some())
+    }
+}
+
+/// Per-thread override for `verify_safepoints_enabled()` in the test
+/// binary. Defaults to `true` so tests see the full root-count check
+/// without setting `NOD_AOT_VERIFY_SAFEPOINTS` in the environment.
+#[cfg(test)]
+thread_local! {
+    static VERIFY_ENABLED_FOR_TESTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
 }
 
 fn active_safepoint_top() -> ActiveAotSafepoint {
@@ -390,19 +423,26 @@ fn begin_aot_safepoint(
     expected_root_count: u64,
     slot_base: *mut crate::word::Word,
 ) {
-    let registered = find_registered_aot_safepoint(site_id);
     let expected_root_count = usize::try_from(expected_root_count)
         .unwrap_or_else(|_| panic!("AOT safepoint {site_id} root count does not fit usize"));
-    assert_eq!(
-        registered.root_count as usize,
-        expected_root_count,
-        "AOT safepoint {} ({}) expected {} roots but codegen emitted {}",
-        site_id,
-        registered.patchpoint_label,
-        registered.root_count,
-        expected_root_count
-    );
-    let baseline_root_count = crate::heap::total_root_count();
+    // Expensive verification (mutex lock + BTreeMap lookup + Vec clone) only
+    // when NOD_AOT_VERIFY_SAFEPOINTS is set. On the hot path we only need the
+    // push so that snapshot_active_aot_roots() can find live slot pointers.
+    let baseline_root_count = if verify_safepoints_enabled() {
+        let registered = find_registered_aot_safepoint(site_id);
+        assert_eq!(
+            registered.root_count as usize,
+            expected_root_count,
+            "AOT safepoint {} ({}) expected {} roots but codegen emitted {}",
+            site_id,
+            registered.patchpoint_label,
+            registered.root_count,
+            expected_root_count
+        );
+        crate::heap::total_root_count()
+    } else {
+        0
+    };
     with_active_safepoint_mut(|stack| {
         stack.push(ActiveAotSafepoint {
             site_id,
@@ -429,6 +469,23 @@ pub extern "C" fn nod_aot_begin_safepoint(
 }
 
 fn verify_aot_safepoint(site_id: u64) {
+    // Fast path: check site_id invariant without cloning the struct.
+    if !verify_safepoints_enabled() {
+        ACTIVE_AOT_SAFEPOINTS.with(|stack| {
+            let top_id = stack
+                .borrow()
+                .last()
+                .expect("AOT safepoint stack empty at verify")
+                .site_id;
+            assert_eq!(
+                top_id, site_id,
+                "AOT safepoint stack mismatch: top site {} but verify requested {}",
+                top_id, site_id
+            );
+        });
+        return;
+    }
+    // Slow path: full root-count check — clone needed for all fields.
     let active = active_safepoint_top();
     assert_eq!(
         active.site_id, site_id,
@@ -460,41 +517,61 @@ pub extern "C" fn nod_aot_verify_safepoint(site_id: u64) {
 }
 
 fn end_aot_safepoint(site_id: u64) {
+    // Fast path: when verification is disabled, pop without cloning.
+    if !verify_safepoints_enabled() {
+        ACTIVE_AOT_SAFEPOINTS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let top = stack.last().expect("AOT safepoint stack empty at end");
+            assert_eq!(
+                top.site_id, site_id,
+                "AOT safepoint stack mismatch: top site {} but end requested {}",
+                top.site_id, site_id
+            );
+            stack.pop();
+        });
+        if trace_exec_safepoints_enabled() {
+            eprintln!("nod-aot: end safepoint site {}", site_id);
+        }
+        return;
+    }
     let active = active_safepoint_top();
     assert_eq!(
         active.site_id, site_id,
         "AOT safepoint stack mismatch: top site {} but end requested {}",
         active.site_id, site_id
     );
-    let current_root_count = crate::heap::total_root_count();
-    // Allow `current > baseline + expected`: permanent roots (e.g. Win32
-    // callback-cell GC roots registered on first touch by
-    // `install_gc_roots_for_this_thread`) may be added inside the call.
-    // What we must NOT see is fewer roots than expected — that would mean
-    // our own safepoint slots were somehow removed prematurely.
-    assert!(
-        current_root_count >= active.baseline_root_count + active.expected_root_count,
-        "AOT safepoint {} lost active roots before end: current {} baseline {} expected {} (patchpoint {})",
-        site_id,
-        current_root_count,
-        active.baseline_root_count,
-        active.expected_root_count,
-        find_registered_aot_safepoint(site_id).patchpoint_label
-    );
+    // Root-count checks are expensive (Vec clone + optional mutex lock).
+    // Only run in debug/verification mode.
+    if verify_safepoints_enabled() {
+        let current_root_count = crate::heap::total_root_count();
+        // Allow `current > baseline + expected`: permanent roots (e.g. Win32
+        // callback-cell GC roots registered on first touch by
+        // `install_gc_roots_for_this_thread`) may be added inside the call.
+        assert!(
+            current_root_count >= active.baseline_root_count + active.expected_root_count,
+            "AOT safepoint {} lost active roots before end: current {} baseline {} expected {} (patchpoint {})",
+            site_id,
+            current_root_count,
+            active.baseline_root_count,
+            active.expected_root_count,
+            find_registered_aot_safepoint(site_id).patchpoint_label
+        );
+    }
     with_active_safepoint_mut(|stack| {
         let popped = stack.pop().expect("AOT safepoint stack empty");
         assert_eq!(popped.site_id, site_id, "AOT safepoint stack corrupted");
     });
-    let post_pop_root_count = crate::heap::total_root_count();
-    // Same rationale: permanent roots added during the call remain after pop.
-    assert!(
-        post_pop_root_count >= active.baseline_root_count,
-        "AOT safepoint {} leaked roots after end: current {} baseline {} (patchpoint {})",
-        site_id,
-        post_pop_root_count,
-        active.baseline_root_count,
-        find_registered_aot_safepoint(site_id).patchpoint_label
-    );
+    if verify_safepoints_enabled() {
+        let post_pop_root_count = crate::heap::total_root_count();
+        assert!(
+            post_pop_root_count >= active.baseline_root_count,
+            "AOT safepoint {} leaked roots after end: current {} baseline {} (patchpoint {})",
+            site_id,
+            post_pop_root_count,
+            active.baseline_root_count,
+            find_registered_aot_safepoint(site_id).patchpoint_label
+        );
+    }
     if trace_exec_safepoints_enabled() {
         eprintln!(
             "nod-aot: end safepoint site {} baseline {}",
@@ -1280,7 +1357,10 @@ mod tests {
         let root_a = crate::Word::from_fixnum(11).expect("test fixnum in range");
         let mut precise_roots = [root_a, crate::Word::from_raw(0)];
 
-        begin_aot_safepoint(7, 2, precise_roots.as_mut_ptr());
+        // Pass expected_root_count=1 while the registered entry says root_count=2.
+        // begin_aot_safepoint checks registered.root_count == expected_root_count
+        // and panics with "expected 2 roots but codegen emitted 1".
+        begin_aot_safepoint(7, 1, precise_roots.as_mut_ptr());
         verify_aot_safepoint(7);
     }
 }

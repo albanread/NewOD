@@ -2168,6 +2168,22 @@ fn emit_function<'ctx, 'a>(
     func: &'a DfmFunction,
     llvm_fn: FunctionValue<'ctx>,
 ) -> Result<(), CodegenError> {
+    // ── Cross-block heap-value contract ──────────────────────────────────
+    // The lowering (nod-sema lower.rs) MUST thread any Dylan heap-shaped
+    // value that is live across a GC point through a block-arg phi node.
+    // Specifically: if a `TempId` produced in block A holds a heap pointer
+    // and is consumed in block B (where a GC may occur between A and B),
+    // the lowering must wire it as a block-arg / phi parameter rather than
+    // referencing the A-local LLVM instruction directly.
+    //
+    // This codegen step enforces that contract by resetting `state.temps[t]`
+    // to the canonical SSA value (function-param alloca or block-param phi)
+    // at every block switch (see the `switch_to` and `emit_block` paths).
+    // If lowering violates the contract — fails to thread a live heap ref
+    // through a phi — this reset will silently install the *pre-evac* LLVM
+    // value after a GC, causing a use-after-collection. The fix is always
+    // in the lowering, not here.
+    // ─────────────────────────────────────────────────────────────────────
     let safepoint_slot_capacity = max_safepoint_slots(func);
     let mut state = Emit {
         ctx,
@@ -4238,6 +4254,18 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         site_id: u64,
         roots: &[TempId],
     ) -> Result<Vec<SafepointSlot<'ctx>>, CodegenError> {
+        // ── JIT / AOT asymmetry note ─────────────────────────────────────
+        // AOT path: nod_aot_begin_safepoint → (spill roots) → call →
+        //           nod_aot_verify_safepoint → nod_aot_end_safepoint.
+        //   The extra verify step is gated on NOD_AOT_VERIFY_SAFEPOINTS at
+        //   runtime (OnceLock), so it is a no-op in normal IDE use and only
+        //   active in debug / verification runs.
+        // JIT path: nod_jit_begin_safepoint → (spill roots) → call →
+        //           nod_jit_end_safepoint. No verify step.
+        //   JIT safepoints are validated via the per-call-site registry
+        //   in nod_jit_require_safepoint; the extra AOT verify step is
+        //   redundant there and is intentionally omitted.
+        // ─────────────────────────────────────────────────────────────────
         let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
         let mut rented: Vec<SafepointSlot<'ctx>> = Vec::with_capacity(roots.len());
         if self.emits_image_safepoint_runtime_checks() {

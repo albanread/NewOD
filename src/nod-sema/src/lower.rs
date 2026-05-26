@@ -5917,7 +5917,7 @@ impl FunctionBuilder {
         for (n, p) in merge_names.iter().zip(join_var_params.iter()) {
             env.insert(n.clone(), *p);
         }
-        // GAP-011: evict any names introduced inside the rhs expression
+        // GAP-012: evict any names introduced inside the rhs expression
         // (e.g. by a nested `begin let x = …; x end`). They are
         // lexically out of scope after the short-circuit join.
         env.retain(|name, _| pre_rhs_env.contains_key(name));
@@ -6053,7 +6053,7 @@ impl FunctionBuilder {
         for (n, p) in merge_names.iter().zip(join_var_params.iter()) {
             env.insert(n.clone(), *p);
         }
-        // GAP-011: evict any names that were introduced by `let`
+        // GAP-012: evict any names that were introduced by `let`
         // bindings inside one of the arms. Arms execute in a scope
         // lexically nested under the `if`; those names are not visible
         // after the join. Without this, post-if code (another `if`,
@@ -6187,7 +6187,7 @@ impl FunctionBuilder {
 
         // ─── loop_body ─── lower each body stmt, then jump back to
         // header with the post-body temps.
-        // GAP-011: snapshot env keys before body lowering so we can
+        // GAP-012: snapshot env keys before body lowering so we can
         // evict loop-body-local `let` bindings at loop exit. Loop-body
         // `let`s (e.g. `let b = element(path, i)`) are lexically scoped
         // to the body; leaving them in env after the loop causes a
@@ -6215,7 +6215,7 @@ impl FunctionBuilder {
         for (n, phi) in loop_var_order.iter().zip(header_params.iter()) {
             env.insert(n.clone(), *phi);
         }
-        // GAP-011: evict loop-body-local `let` bindings from env.
+        // GAP-012: evict loop-body-local `let` bindings from env.
         // Only names that existed before the loop body was entered are
         // in scope after the loop exits. Without this, any name
         // introduced by a `let` inside the body (e.g. `let b =

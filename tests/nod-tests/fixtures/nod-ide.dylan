@@ -52,6 +52,12 @@ define function main () => ()
   // "GC pressure crash". Invalidate the cache (set to "") at every
   // mutation site — Open, Recent, WM_CHAR, VK_BACK, Save-As reload.
   let cached-flat = initial-bytes;
+  // Re-entrancy guard: set to 1 while a modal dialog (Open/Save As) is
+  // open. GetSaveFileNameW / GetOpenFileNameW dispatch WM_ACTIVATE,
+  // WM_NCACTIVATE, WM_PAINT, etc. back to our WndProc via SendMessageW.
+  // Skipping WM_PAINT and WM_TIMER while in-modal-dialog avoids passing
+  // stale/zero handles to DirectWrite in the re-entrant call.
+  let in-modal-dialog = 0;
   // Sprint 43d — cursor-offset is the byte position where the next
   // WM_CHAR insertion lands (and what backspace removes the byte
   // before). Captured by the WNDPROC closure → auto-promoted to a
@@ -257,7 +263,7 @@ define function main () => ()
   // generates this shell shape; for now we hand-wire it.
   let handle-wm-message = method (hwnd, msg, wparam, lparam)
              if (msg = 15)  // WM_PAINT
-               if (swap ~= 0)
+               if (swap ~= 0 & in-modal-dialog = 0)
                  if (bitmap = 0)
                    bitmap := %d2d-create-bitmap-from-swap-chain(dc, swap);
                  else 0 end;
@@ -406,7 +412,7 @@ define function main () => ()
                  %dxgi-swap-chain-present(swap);
                else 0 end;
                0
-             elseif (msg = 275)  // WM_TIMER — Sprint 43e-6 cursor blink
+             elseif (msg = 275 & in-modal-dialog = 0)  // WM_TIMER — Sprint 43e-6 cursor blink
                // Toggle the blink state. Phrased as explicit if /
                // else := 0 / := 1 (rather than `cursor-on := if (...)
                // 0 else 1 end`) because the latter occasionally
@@ -758,7 +764,9 @@ define function main () => ()
                // wparam HIWORD is 0 for menu (vs accelerator/control).
                let cmd-id = %lo-word(wparam);
                if (cmd-id = 100)        // File → Open...
+                 in-modal-dialog := 1;
                  let new-path = %show-open-file-dialog(hwnd);
+                 in-modal-dialog := 0;
                  if (~ empty?(new-path))
                    let new-source = %read-file(new-path);
                    if (~ empty?(new-source))
@@ -795,7 +803,9 @@ define function main () => ()
                  // in-memory contents (currently identical to what's
                  // on disk — Sprint 41h+ adds dirty-flag tracking).
                  if (empty?(current-path))
+                   in-modal-dialog := 1;
                    let chosen = %show-save-file-dialog(hwnd);
+                   in-modal-dialog := 0;
                    if (~ empty?(chosen))
                      // Sprint 43d — serialise rope to flat bytes for
                      // %write-file. Sprint 43e+ can switch to leaf-
@@ -815,7 +825,9 @@ define function main () => ()
                  end;
                  0
                elseif (cmd-id = 102)    // File → Save As...
+                 in-modal-dialog := 1;
                  let chosen = %show-save-file-dialog(hwnd);
+                 in-modal-dialog := 0;
                  if (~ empty?(chosen))
                    let ok = %write-file(chosen, cached-flat);
                    if (ok = 1)

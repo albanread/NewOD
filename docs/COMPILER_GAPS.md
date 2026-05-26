@@ -663,6 +663,15 @@ Sort by ID. New gaps append. Don't renumber.
 * **Status**: **fixed** (this commit). IDE binary runs without
   immediate safepoint assertion failure; GUI window opens and enters
   the Win32 message loop normally.
+* **Leak-detection trade-off**: the `>=` relaxation removes the
+  ability to catch "caller registered MORE roots than expected and
+  never cleaned them up" bugs. The `assert_eq!` form provided that
+  check; `assert!(>=)` does not. This is a permanent loss until
+  `install_gc_roots_for_this_thread`'s permanent-root injection is
+  moved to before the first safepoint (e.g. via a `#[ctor]`-style
+  first-call-init at the AOT main wrapper start), at which point the
+  permanent roots will already be in `baseline_root_count` and the
+  strict equality can be restored.
 
 ---
 
