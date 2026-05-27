@@ -401,6 +401,13 @@ Sort by ID. New gaps append. Don't renumber.
   (`nod-driver dump-dylan-tokens tests/nod-tests/fixtures/dylan-lexer.dylan`)
   succeeding end-to-end on the lexer's own source.
 
+  **Cascade complete**: the broader class of GC phi-wiring and
+  env-scope-leak bugs that GAP-007 represented was fully closed by
+  Sprint 45c–45h through GAP-008–013. Empirical confirmation: the
+  five-file IDE (`nod-ide.exe`) compiles, opens a window, and runs
+  the Win32 message loop without crash. The lexer fixture workaround
+  retirement is the one open action remaining in this gap family.
+
 ## GAP-008 — Short-circuit (`&`/`|`) `sc_join` missing conservative GC-binding phi params
 
 * **Discovered**: Sprint 45e GC integration test (`gc-rope-file-load`)
@@ -672,6 +679,16 @@ Sort by ID. New gaps append. Don't renumber.
   first-call-init at the AOT main wrapper start), at which point the
   permanent roots will already be in `baseline_root_count` and the
   strict equality can be restored.
+* **Open review item**: the test
+  `aot::tests::aot_exec_safepoint_hooks_detect_missing_root`
+  (`src/nod-runtime/src/aot.rs`) is `#[should_panic]` and its
+  expected panic no longer fires. Likely either the `assert_eq!` →
+  `assert!(>=)` relaxation in this fix widened the assertion past the
+  test's trigger condition, or the test was always brittle (env-var
+  gated, `OnceLock`-cached) and this just exposed it. Failure mode is
+  "test doesn't panic when it should", not a live workload misbehaving
+  — but it represents a real gap in leak-detection coverage and should
+  be investigated before the permanent-root injection refactor lands.
 
 ---
 

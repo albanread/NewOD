@@ -1,3 +1,9 @@
+//! **Stdlib boundary**: new list APIs go in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan`, not here. This file
+//! hosts the `<pair>` allocation primitive and head/tail accessors.
+//! Higher-level list operations (map, fold, reverse, take, drop, …)
+//! belong in Dylan. See `docs/STDLIB_BOUNDARY.md`.
+//!
 //! `<pair>` — Dylan cons cell. Sprint 16 adds linked-list support so
 //! Richards-shape fixtures can carry task lists without `<vector>` /
 //! `<simple-object-vector>` macros that Sprint 10 didn't ship.

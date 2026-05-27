@@ -1,4 +1,16 @@
 //! Dylan AST — Sprint 03 expression grammar, Sprint 04 top-level + statements.
+//!
+//! # Macro boundary policy
+//!
+//! **Before adding a new `Expr::*` or `Statement::*` variant for a
+//! control-flow keyword, iteration form, or "sugar" shape, read
+//! `docs/MACRO_BOUNDARY.md`.** The frozen kernel forms (`If`, `Begin`,
+//! `Let`, `Method`, definitional items, `Block`-with-cleanup) are the
+//! complete list of legitimate hardcoded variants. Everything else
+//! belongs in `src/nod-dylan/dylan-sources/stdlib.dylan` as a
+//! `define macro` and gets surfaced via `Expr::MacroCall`. Sprint 25
+//! retired `Expr::Unless` to that pattern; future additions follow
+//! the same path. Rule 3 (pre-flight): try `define macro` first.
 
 use crate::fragments::Fragment;
 use crate::span::Span;

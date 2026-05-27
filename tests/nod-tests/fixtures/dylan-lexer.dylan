@@ -80,6 +80,11 @@ define class <float-token> (<number-token>)
   slot float-token-raw-text :: <byte-string>, init-keyword: raw-text:;
 end class;
 
+// Ratio literal: `3/4`, `-7/8`. Stores raw text; runtime parsing deferred.
+define class <ratio-token> (<number-token>)
+  slot ratio-token-raw-text :: <byte-string>, init-keyword: raw-text:;
+end class;
+
 define class <string-literal-token> (<token>)
   slot string-literal-token-raw-text :: <byte-string>, init-keyword: raw-text:;
   slot string-literal-token-decoded  :: <byte-string>, init-keyword: decoded:;
@@ -98,6 +103,12 @@ define class <boolean-literal-token> (<token>)
 end class;
 
 define class <nil-literal-token> (<token>) end class;
+
+// Backslash-escaped operator name: `\+`, `\if`, `\=`, etc.
+// The stored `name` does NOT include the leading `\`.
+define class <escaped-ident-token> (<token>)
+  slot escaped-ident-token-name :: <byte-string>, init-keyword: name:;
+end class;
 
 define class <literal-vector-open>   (<token>) end class;
 define class <literal-sequence-open> (<token>) end class;
@@ -157,6 +168,10 @@ define method colour-of (t :: <float-token>) => (rgb :: <integer>)
   8388736                          // 0x800080 — purple
 end method;
 
+define method colour-of (t :: <ratio-token>) => (rgb :: <integer>)
+  8388736                          // 0x800080 — purple
+end method;
+
 define method colour-of (t :: <string-literal-token>) => (rgb :: <integer>)
   16711680                         // 0xFF0000 — red
 end method;
@@ -205,6 +220,10 @@ define method colour-of (t :: <eof-token>) => (rgb :: <integer>)
   0                                // 0x000000 — black
 end method;
 
+define method colour-of (t :: <escaped-ident-token>) => (rgb :: <integer>)
+  16777130                         // 0xFFFFAA — pale yellow (operator names)
+end method;
+
 // ─── token-kind-name — uppercase tag for dump-tokens ──────────────────────
 //
 // The canonical dump format uses an uppercase kind tag without the
@@ -219,6 +238,10 @@ define method token-kind-name (t :: <identifier-token>) => (s :: <byte-string>)
   "IDENTIFIER"
 end method;
 
+define method token-kind-name (t :: <escaped-ident-token>) => (s :: <byte-string>)
+  "ESCAPED_IDENT"
+end method;
+
 define method token-kind-name (t :: <keyword-name-token>) => (s :: <byte-string>)
   "KEYWORD_NAME"
 end method;
@@ -229,6 +252,10 @@ end method;
 
 define method token-kind-name (t :: <float-token>) => (s :: <byte-string>)
   "FLOAT"
+end method;
+
+define method token-kind-name (t :: <ratio-token>) => (s :: <byte-string>)
+  "RATIO"
 end method;
 
 define method token-kind-name (t :: <string-literal-token>) => (s :: <byte-string>)
@@ -678,6 +705,7 @@ define function is-name-start? (b :: <integer>) => (yes? :: <boolean>)
     | b = 94   // '^'
     | b = 124  // '|'
     | b = 126  // '~'
+    | b = 64   // '@'
 end function;
 
 // Name-continuation also accepts digits, `?`, `-`, `+`, `=`, `/`.
@@ -689,6 +717,19 @@ define function is-name-cont? (b :: <integer>) => (yes? :: <boolean>)
     | b = 61   // '='
     | b = 47   // '/'
     | b = 63   // '?'
+end function;
+
+// Name-continuation except `=`, used to disambiguate `<foo>` from `<=`.
+define function is-name-cont-not-eq? (b :: <integer>) => (yes? :: <boolean>)
+  is-name-cont?(b) & b ~= 61
+end function;
+
+// Float exponent markers: e/E (decimal), s/S (single), d/D (double), x/X (extended).
+define function is-exponent-marker? (b :: <integer>) => (yes? :: <boolean>)
+  b = 101 | b = 69   // 'e' 'E'
+    | b = 115 | b = 83   // 's' 'S'
+    | b = 100 | b = 68   // 'd' 'D'
+    | b = 120 | b = 88   // 'x' 'X'
 end function;
 
 // Whitespace bytes treated as a single run. Newline (10) is included;
@@ -711,6 +752,7 @@ define function classify-keyword (name :: <byte-string>)
  => (kw :: <object>)   // either a <symbol> on match or #f on miss
   if (name = "define") #"define"
   elseif (name = "end") #"end"
+  elseif (name = "otherwise") #"otherwise"
   elseif (name = "let") #"let"
   elseif (name = "local") #"local"
   elseif (name = "if") #"if"
@@ -976,19 +1018,103 @@ define function scan-character-close
   end
 end function;
 
-// Decimal integer literal. Caller has verified the first byte is a
-// digit. NB: negative numbers are lexed as `-` + digits — this scanner
-// never sees a leading sign.
-define function scan-integer (lo :: <integer>) => (t :: <integer-token>)
-  let value = 0;
-  until (at-end?() | ~ is-ascii-digit?(current-byte()))
-    value := value * 10 + (current-byte() - 48);
+// Float suffix scanner. Called by `scan-punctuation` when a `.` is
+// followed by a digit (leading-dot float like `.5`). `*pos*` points at
+// the `.`; `lo` marks the start of the token. Returns `<float-token>`
+// with raw source text, or `<error-token>` when the exponent has no digits.
+define function scan-float-suffix (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume '.'
+  // Consume optional fractional digits (underscore separators allowed).
+  until (at-end?() | (~ is-ascii-digit?(current-byte()) & current-byte() ~= 95))
     advance(1);
   end;
-  make(<integer-token>,
-       span: span-here(lo),
-       value: value,
-       radix: 10)
+  // Optional exponent: e/E/s/S/d/D/x/X, optional sign, then digits.
+  if (~ at-end?() & is-exponent-marker?(current-byte()))
+    advance(1);
+    if (~ at-end?() & (current-byte() = 43 | current-byte() = 45))  // '+' | '-'
+      advance(1);
+    end;
+    if (at-end?() | ~ is-ascii-digit?(current-byte()))
+      make(<error-token>,
+           span: span-here(lo),
+           message: "float exponent has no digits")
+    else
+      until (at-end?() | (~ is-ascii-digit?(current-byte()) & current-byte() ~= 95))
+        advance(1);
+      end;
+      make(<float-token>, span: span-here(lo), raw-text: slice-from(lo))
+    end
+  else
+    make(<float-token>, span: span-here(lo), raw-text: slice-from(lo))
+  end
+end function;
+
+// Decimal integer literal. Caller has verified the first byte is a
+// digit. NB: negative numbers are lexed as `-` + digits — this scanner
+// never sees a leading sign. `_` digit-group separators are skipped.
+// Handles float suffixes, ratio literals (`3/4`), and numeric-alpha
+// identifiers (spec §3.10: `3foo` → single IDENT token).
+define function scan-integer (lo :: <integer>) => (t :: <token>)
+  // ─── Integer digit body (strict underscore rules) ──────────────────
+  let value = 0;
+  let had-digit? = #f;
+  let last-underscore? = #f;
+  let done? = #f;
+  until (done? | at-end?())
+    let b = current-byte();
+    if (is-ascii-digit?(b))
+      value := value * 10 + (b - 48);
+      had-digit? := #t;
+      last-underscore? := #f;
+      advance(1);
+    elseif (b = 95   // '_' — only between digit runs (no double/trailing)
+              & had-digit?
+              & ~ last-underscore?
+              & is-ascii-digit?(peek-at(1)))
+      last-underscore? := #t;
+      advance(1);
+    else
+      done? := #t;
+    end;
+  end;
+  let is-float? = #f;
+  // ─── Fraction part: `.` not part of `..` or `...` ─────────────────
+  if (~ at-end?() & current-byte() = 46 & peek-at(1) ~= 46)
+    is-float? := #t;
+    advance(1);  // consume '.'
+    until (at-end?() | (~ is-ascii-digit?(current-byte()) & current-byte() ~= 95))
+      advance(1);
+    end;
+  end;
+  // ─── Exponent part: e/E/s/S/d/D/x/X ───────────────────────────────
+  if (~ at-end?() & is-exponent-marker?(current-byte()))
+    is-float? := #t;
+    advance(1);  // consume exponent letter
+    if (~ at-end?() & (current-byte() = 43 | current-byte() = 45))
+      advance(1);  // optional sign
+    end;
+    until (at-end?() | (~ is-ascii-digit?(current-byte()) & current-byte() ~= 95))
+      advance(1);
+    end;
+  end;
+  // ─── Ratio: `<digits>/<digits>` ────────────────────────────────────
+  if (~ is-float? & ~ at-end?() & current-byte() = 47 & is-ascii-digit?(peek-at(1)))
+    advance(1);  // consume '/'
+    until (at-end?() | (~ is-ascii-digit?(current-byte()) & current-byte() ~= 95))
+      advance(1);
+    end;
+    make(<ratio-token>, span: span-here(lo), raw-text: slice-from(lo))
+  // ─── Numeric-alpha (spec §3.10): `3foo` → single identifier ────────
+  elseif (~ at-end?() & is-name-cont?(current-byte()))
+    until (at-end?() | ~ is-name-cont?(current-byte()))
+      advance(1);
+    end;
+    make(<identifier-token>, span: span-here(lo), name: slice-from(lo))
+  elseif (is-float?)
+    make(<float-token>, span: span-here(lo), raw-text: slice-from(lo))
+  else
+    make(<integer-token>, span: span-here(lo), value: value, radix: 10)
+  end
 end function;
 
 // Radix-prefixed integer. Caller has consumed `#` and the letter (`b`,
@@ -998,28 +1124,39 @@ define function scan-radix-integer
     (lo :: <integer>, radix :: <integer>) => (t :: <token>)
   let value = 0;
   let any-digit? = #f;
+  let last-underscore? = #f;
   let done = #f;
   until (done)
     if (at-end?())
       done := #t;
     else
       let b = current-byte();
-      let digit-value =
-        if (is-ascii-digit?(b)) b - 48
-        elseif (b >= 97 & b <= 102) b - 87   // a..f → 10..15
-        elseif (b >= 65 & b <= 70) b - 55    // A..F → 10..15
-        else -1
+      if (b = 95)  // '_' — only between digit runs (no leading/double/trailing)
+        if (~ any-digit? | last-underscore?)
+          done := #t;  // leading or double underscore: stop
+        else
+          last-underscore? := #t;
+          advance(1);
         end;
-      if (digit-value < 0 | digit-value >= radix)
-        done := #t;
       else
-        value := value * radix + digit-value;
-        any-digit? := #t;
-        advance(1);
+        let digit-value =
+          if (is-ascii-digit?(b)) b - 48
+          elseif (b >= 97 & b <= 102) b - 87   // a..f → 10..15
+          elseif (b >= 65 & b <= 70) b - 55    // A..F → 10..15
+          else -1
+          end;
+        if (digit-value < 0 | digit-value >= radix)
+          done := #t;
+        else
+          value := value * radix + digit-value;
+          any-digit? := #t;
+          last-underscore? := #f;
+          advance(1);
+        end;
       end;
     end;
   end;
-  if (any-digit?)
+  if (any-digit? & ~ last-underscore?)
     make(<integer-token>,
          span: span-here(lo),
          value: value,
@@ -1096,6 +1233,36 @@ define function scan-hash (lo :: <integer>) => (t :: <token>)
       scan-radix-integer(lo, 8)
     elseif (b = 34)  // '"' — symbol literal #"foo"
       scan-hash-symbol(lo)
+    elseif (b = 35)  // '#' — ##
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"hash-hash")
+    elseif (b = 123)  // '{' — #{
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"hash-lbrace")
+    elseif (b = 58)  // ':' — #:name colon-symbol
+      scan-hash-colon-symbol(lo)
+    elseif (is-name-start?(b))
+      // #next, #rest, #key, #all-keys hash-word forms; also #nil.
+      let word-lo = *pos*;
+      until (at-end?() | ~ is-name-cont?(current-byte()))
+        advance(1);
+      end;
+      let word = slice-from(word-lo);
+      if (word = "next")
+        make(<keyword-token>, span: span-here(lo), keyword: #"hash-next")
+      elseif (word = "rest")
+        make(<keyword-token>, span: span-here(lo), keyword: #"hash-rest")
+      elseif (word = "key")
+        make(<keyword-token>, span: span-here(lo), keyword: #"hash-key")
+      elseif (word = "all-keys")
+        make(<keyword-token>, span: span-here(lo), keyword: #"hash-all-keys")
+      elseif (word = "nil")
+        make(<nil-literal-token>, span: span-here(lo))
+      else
+        make(<error-token>,
+             span: span-here(lo),
+             message: "unrecognised `#` word form")
+      end
     else
       // Unrecognised: consume one byte so we make progress.
       advance(1);
@@ -1155,10 +1322,75 @@ define function scan-hash-symbol (lo :: <integer>) => (t :: <token>)
   result
 end function;
 
+// `#:name` colon-symbol literal. The `#` is already consumed and
+// `*pos*` is at the `:`. Scans the identifier name and returns a
+// `<symbol-literal-token>` with the same value as `#"name"`.
+define function scan-hash-colon-symbol (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume ':'
+  if (at-end?() | ~ is-name-start?(current-byte()))
+    make(<error-token>,
+         span: span-here(lo),
+         message: "expected name after `#:`")
+  else
+    let name-lo = *pos*;
+    until (at-end?() | ~ is-name-cont?(current-byte()))
+      advance(1);
+    end;
+    let name = slice-from(name-lo);
+    make(<symbol-literal-token>,
+         span: span-here(lo),
+         name: name)
+  end
+end function;
+
+// ─── `~`, `~=`, `~==` ────────────────────────────────────────────────────
+define function scan-tilde (lo :: <integer>) => (t :: <token>)
+  advance(1);  // consume '~'
+  if (~ at-end?() & current-byte() = 61 & peek-at(1) = 61)  // `~==`
+    advance(2);
+    make(<punctuation-token>, span: span-here(lo), form: #"tilde-equal-equal")
+  elseif (~ at-end?() & current-byte() = 61)  // `~=`
+    advance(1);
+    make(<punctuation-token>, span: span-here(lo), form: #"tilde-equal")
+  else
+    make(<punctuation-token>, span: span-here(lo), form: #"tilde")
+  end
+end function;
+
+// ─── `<`, `<=`, or identifier starting with `<` e.g. `<integer>` ─────────
+define function scan-less-or-ident (lo :: <integer>) => (t :: <token>)
+  if (is-name-cont-not-eq?(peek-at(1)))
+    scan-identifier(lo)
+  else
+    advance(1);  // consume '<'
+    if (~ at-end?() & current-byte() = 61)  // `<=`
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"less-equal")
+    else
+      make(<punctuation-token>, span: span-here(lo), form: #"less")
+    end
+  end
+end function;
+
+// ─── `>`, `>=`, or identifier starting with `>` ──────────────────────────
+define function scan-greater-or-ident (lo :: <integer>) => (t :: <token>)
+  if (is-name-cont-not-eq?(peek-at(1)))
+    scan-identifier(lo)
+  else
+    advance(1);  // consume '>'
+    if (~ at-end?() & current-byte() = 61)  // `>=`
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"greater-equal")
+    else
+      make(<punctuation-token>, span: span-here(lo), form: #"greater")
+    end
+  end
+end function;
+
 // Punctuation dispatch — single-byte operators plus the multi-char
-// combinations `==`, `=>`, `::`, `:=`, `...`, `??`, `?=`. The form
-// slot uses canonical short symbols so the parser can dispatch with a
-// single `select` on the punctuation symbol later.
+// combinations `==`, `=>`, `::`, `:=`, `...`, `??`, `?=`, `?@`. The
+// form slot uses canonical short symbols so the parser can dispatch
+// with a single `select` on the punctuation symbol later.
 define function scan-punctuation (lo :: <integer>) => (t :: <token>)
   let b = current-byte();
   if (b = 40)        // '('
@@ -1185,10 +1417,12 @@ define function scan-punctuation (lo :: <integer>) => (t :: <token>)
   elseif (b = 44)    // ','
     advance(1);
     make(<punctuation-token>, span: span-here(lo), form: #"comma")
-  elseif (b = 46)    // '.'  -- check for "..."
+  elseif (b = 46)    // '.'  -- check for "...", ".5" leading-dot float
     if (peek-at(1) = 46 & peek-at(2) = 46)
       advance(3);
       make(<punctuation-token>, span: span-here(lo), form: #"ellipsis")
+    elseif (is-ascii-digit?(peek-at(1)))  // ".5" → leading-dot float
+      scan-float-suffix(lo)
     else
       advance(1);
       make(<punctuation-token>, span: span-here(lo), form: #"dot")
@@ -1215,13 +1449,16 @@ define function scan-punctuation (lo :: <integer>) => (t :: <token>)
       advance(1);
       make(<punctuation-token>, span: span-here(lo), form: #"equal")
     end
-  elseif (b = 63)    // '?' -- check for "??" "?="
+  elseif (b = 63)    // '?' -- check for "??" "?=" "?@"
     if (peek-at(1) = 63)
       advance(2);
       make(<punctuation-token>, span: span-here(lo), form: #"query-query")
     elseif (peek-at(1) = 61)
       advance(2);
       make(<punctuation-token>, span: span-here(lo), form: #"query-equal")
+    elseif (peek-at(1) = 64)  // '?@' — macro rest-splice
+      advance(2);
+      make(<punctuation-token>, span: span-here(lo), form: #"query-at")
     else
       advance(1);
       make(<punctuation-token>, span: span-here(lo), form: #"query")
@@ -1244,7 +1481,7 @@ end function;
 // ends up in exactly one token.
 //
 // The `else` arm is the catch-all `<error-token>` producer for bytes
-// that no scanner accepted (e.g. a stray `@` outside an identifier).
+// that no scanner accepted.
 
 define function next-token () => (t :: <token>)
   let lo = *pos*;
@@ -1267,6 +1504,24 @@ define function next-token () => (t :: <token>)
       scan-hash(lo)
     elseif (is-ascii-digit?(b))
       scan-integer(lo)
+    elseif (b = 126)  // '~' — tilde / ~= / ~==
+      scan-tilde(lo)
+    elseif (b = 60)   // '<' — less, less-equal, or identifier like <integer>
+      scan-less-or-ident(lo)
+    elseif (b = 62)   // '>' — greater, greater-equal, or identifier
+      scan-greater-or-ident(lo)
+    elseif (b = 42 | b = 94 | b = 38 | b = 124)  // '*' '^' '&' '|'
+      // Followed by ident-continuation → operator-name identifier; alone → punct.
+      if (is-name-cont?(peek-at(1)))
+        scan-identifier(lo)
+      else
+        advance(1);
+        let form = if (b = 42) #"star"
+                   elseif (b = 94) #"caret"
+                   elseif (b = 38) #"amp"
+                   else #"bar" end;
+        make(<punctuation-token>, span: span-here(lo), form: form)
+      end
     elseif (is-name-start?(b))
       scan-identifier(lo)
     elseif (b = 40 | b = 41 | b = 91 | b = 93 | b = 123 | b = 125
@@ -1278,6 +1533,23 @@ define function next-token () => (t :: <token>)
     elseif (b = 43)  // '+'
       advance(1);
       make(<punctuation-token>, span: span-here(lo), form: #"plus")
+    elseif (b = 47)  // '/' — division operator (// and /* already caught above)
+      advance(1);
+      make(<punctuation-token>, span: span-here(lo), form: #"slash")
+    elseif (b = 92)  // '\' — backslash-escaped identifier: `\+`, `\if`, `\=`
+      advance(1);  // consume '\'
+      if (at-end?() | ~ is-name-cont?(current-byte()))
+        make(<error-token>, span: span-here(lo),
+             message: "backslash not followed by identifier")
+      else
+        let name-start = *pos*;
+        until (at-end?() | ~ is-name-cont?(current-byte()))
+          advance(1);
+        end;
+        make(<escaped-ident-token>,
+             span: span-here(lo),
+             name: slice-from(name-start))
+      end
     else
       // Catch-all: unrecognised byte. Advance one byte and emit an
       // error-token so the loop terminates.
@@ -1430,35 +1702,10 @@ define function load-source-via-rope (path :: <byte-string>) => (source :: <byte
   rope->string(make-rope-from-string(%read-file(path)))
 end function;
 
-// ─── main — driver entry for `dump-dylan-tokens` ──────────────────────────
+// ─── main ─────────────────────────────────────────────────────────────────
 //
-// The nod-driver subcommand bakes this file + a thin wrapper into an
-// AOT EXE, runs the EXE with the user's path as argv[1], and forwards
-// the stdout. Keeping `main` here means the subcommand's wrapper is
-// effectively zero code; the wrapper module just re-exports `main`.
-// This block also intentionally changes when the embedded lexer EXE
-// cache needs to be invalidated for runtime debugging.
-//
-// Empty argv[1] → print a usage line to stderr-style stdout and exit
-// cleanly. Sprint 45a doesn't have a process-exit primitive that
-// returns non-zero from main, so usage failures still exit 0; the
-// driver layer can detect the empty-stdout case if it wants to.
-
-define function main () => ()
-  let path = %argv1();
-  let mode = %argv2();
-  if (empty?(path))
-    format-out("dylan-lexer: missing input path\n");
-  else
-    let source = load-source-via-rope(path);
-    if (empty?(source))
-      format-out("dylan-lexer: could not read %s\n", path);
-    else
-      let tokens = lex(source);
-      format-out("%s", dump-tokens(tokens, source));
-      if (mode = "--gc-stats")
-        %print-gc-stats();
-      end;
-    end;
-  end;
-end function main;
+// main() lives in dylan-lexer-main.dylan so that dylan-parser.dylan can
+// compile together with this file (as a two-file build) without a
+// duplicate-main conflict.  The `dump-dylan-tokens` driver subcommand
+// builds [dylan-lexer.dylan, dylan-lexer-main.dylan]; the `parse-dylan`
+// subcommand builds [dylan-lexer.dylan, dylan-parser.dylan].

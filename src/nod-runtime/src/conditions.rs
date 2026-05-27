@@ -1,3 +1,17 @@
+//! **Stdlib boundary**: new condition CLASSES go in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan`. The signal/handler/unwind
+//! MECHANISM stays here per `docs/STDLIB_BOUNDARY.md` (Rust panic
+//! coordination, CleanupGuard NLX path — frozen exception). Condition
+//! hierarchy, accessor methods, and printers belong in Dylan.
+//!
+//! **Platform note**: `CleanupGuard`'s Drop currently coordinates with
+//! Rust panic + Windows SEH. The macOS variant will rebuild this
+//! coordination against Mach exception ports + Rust panic. See
+//! `docs/PLATFORMS.md`. The Dylan-side condition surface (`<error>`,
+//! `<warning>`, `signal`, `block`/`exception`/`cleanup`) stays
+//! identical across platforms; only this Rust coordination layer
+//! rebuilds.
+//!
 //! Sprint 19 — conditions, non-local exit, and the parallel handler chain.
 //!
 //! This module owns three things:
@@ -1089,6 +1103,33 @@ pub unsafe extern "C-unwind" fn nod_condition_message(c_raw: u64) -> u64 {
     let c = Word::from_raw(c_raw);
     condition_message(c).raw()
 }
+
+/// Dylan `error(msg)` — construct a `<simple-error>` from a
+/// `<byte-string>` Word and signal it.  Diverges: either an enclosing
+/// `block`/`exception` catches it (NLX), or the process panics with an
+/// "unhandled error" message.
+///
+/// # Safety
+///
+/// `msg_raw` must be a pointer-tagged Dylan `<byte-string>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_error(msg_raw: u64) -> u64 {
+    use crate::strings::ByteString;
+
+    // Decode the <byte-string> to a Rust &str so we can call make_simple_error.
+    let msg_word = Word::from_raw(msg_raw);
+    let msg_str: std::borrow::Cow<str> = if let Some(p) = msg_word.as_ptr::<u8>() {
+        // SAFETY: caller guarantees a valid heap-tagged <byte-string>.
+        let bs = unsafe { &*(p as *const ByteString) };
+        let bytes = unsafe { bs.bytes() };
+        String::from_utf8_lossy(bytes)
+    } else {
+        std::borrow::Cow::Borrowed("<non-string error argument>")
+    };
+    let cond = make_simple_error(&msg_str);
+    nod_signal_inner(cond)
+}
+
 
 #[cfg(test)]
 mod tests {

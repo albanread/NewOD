@@ -141,6 +141,26 @@ pub unsafe fn try_symbol(w: Word, symbol: crate::classes::ClassId) -> Option<&'s
     }
 }
 
+/// `write-to-string` shim — converts a Dylan value to a `<byte-string>`.
+///
+/// Currently handles `<symbol>` (returns the symbol name) and falls back to
+/// `"<object>"` for any other type.  The returned Word is pointer-tagged and
+/// GC-tracked in the literal pool.
+///
+/// # Safety
+///
+/// `val_raw` must be a valid Dylan Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_write_to_string(val_raw: u64) -> u64 {
+    let val = Word::from_raw(val_raw);
+    if let Some(sym) = unsafe { try_symbol(val, crate::classes::ClassId::SYMBOL) } {
+        // Return the symbol's own name `<byte-string>` directly.
+        return sym.name.raw();
+    }
+    // Fallback: return a static `"<object>"` literal.
+    crate::intern_string_literal("<object>").raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

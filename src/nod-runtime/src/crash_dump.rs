@@ -1,3 +1,11 @@
+//! **Platform-specific module — Windows-only.** See
+//! `docs/PLATFORMS.md`. SEH coupling
+//! (`SetUnhandledExceptionFilter`, structured exception records) is
+//! intentional — this is one of the named modules that hosts
+//! Windows-specific code. The macOS variant will ship a Mach-exception-
+//! port-based equivalent covering the same role: signal-safe GC state
+//! emission on unhandled exceptions.
+//!
 //! Signal-safe crash dump: GC state + heap metrics written to stderr
 //! on panic or unhandled Windows structured exception.
 //!

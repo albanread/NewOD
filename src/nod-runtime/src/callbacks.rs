@@ -1,3 +1,9 @@
+//! **Platform-specific module — Windows-only.** See
+//! `docs/PLATFORMS.md`. The trampoline pool's Win64 ABI assumptions
+//! (Win32 callback signatures, x64 calling convention) are
+//! Windows-specific. The macOS variant will ship a sibling module
+//! against AArch64 System V or Objective-C method-IMP conventions.
+//!
 //! Sprint 32 — closure-to-C-function-pointer trampoline pool.
 //!
 //! Win32 callbacks (`WNDPROC`, `WNDENUMPROC`, …) need function pointers

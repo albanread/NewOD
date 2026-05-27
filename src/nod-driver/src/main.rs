@@ -2,6 +2,14 @@
 //!
 //! Sprint 02: `dump-tokens` lights up. `compile` and `repl` are still
 //! stubs; they land in later sprints.
+//!
+//! # Platform notes
+//!
+//! The `build` subcommand invokes `link.exe` with Windows `.lib`
+//! import libraries. That linker invocation is the main Windows-
+//! specific surface in this crate. The macOS variant will swap it for
+//! `clang` / `ld` with `-framework`/`-l` flags. See
+//! `docs/PLATFORMS.md` for the platform-strategy policy.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -115,6 +123,14 @@ enum Command {
         #[arg(long = "gc-stats")]
         gc_stats: bool,
     },
+    /// Run the Dylan-in-Dylan parser over a source file and print the AST dump.
+    ///
+    /// Builds [dylan-lexer.dylan, dylan-parser.dylan] into a cached EXE,
+    /// then spawns it with the input path as argv[1].
+    ParseDylan {
+        /// Path to a `.dylan` source file to parse.
+        input: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -153,6 +169,7 @@ fn main() -> ExitCode {
         Some(Command::DumpLlvm { input }) => run_dump_llvm(&input),
         Some(Command::Eval { expr }) => run_eval(&expr),
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
+        Some(Command::ParseDylan { input }) => run_parse_dylan(&input),
     }
 }
 
@@ -616,18 +633,29 @@ fn run_dump_ast(input: &std::path::Path) -> ExitCode {
 // `1:1-1:1  EOF\n`. Sprint 45b's real lex fills out the dump; the
 // driver path is unchanged.
 
-/// Lexer source baked into the driver. Lives in the repo at
-/// `tests/nod-tests/fixtures/dylan-lexer.dylan`; build.rs (none yet)
-/// or `include_str!` keeps it pinned to the matching version at
-/// driver-compile time.
+/// Lexer library source (no main). Lives in the repo at
+/// `tests/nod-tests/fixtures/dylan-lexer.dylan`; compiled together with
+/// either `dylan-lexer-main.dylan` (for `dump-dylan-tokens`) or
+/// `dylan-parser.dylan` (for `parse-dylan`).
 const DYLAN_LEXER_SOURCE: &str =
     include_str!("../../../tests/nod-tests/fixtures/dylan-lexer.dylan");
+
+/// Lexer entry-point source. Compiled with DYLAN_LEXER_SOURCE to produce
+/// the `dump-dylan-tokens` EXE.
+const DYLAN_LEXER_MAIN_SOURCE: &str =
+    include_str!("../../../tests/nod-tests/fixtures/dylan-lexer-main.dylan");
+
+/// Parser source. Compiled with DYLAN_LEXER_SOURCE to produce the
+/// `parse-dylan` EXE. Contains its own main().
+const DYLAN_PARSER_SOURCE: &str =
+    include_str!("../../../tests/nod-tests/fixtures/dylan-parser.dylan");
 
 fn dylan_lexer_cache_dir() -> Result<PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     DYLAN_LEXER_SOURCE.hash(&mut h);
+    DYLAN_LEXER_MAIN_SOURCE.hash(&mut h);
     env!("CARGO_PKG_VERSION").hash(&mut h);
     let driver = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let meta = std::fs::metadata(&driver)
@@ -646,34 +674,25 @@ fn dylan_lexer_cache_dir() -> Result<PathBuf, String> {
 
 fn ensure_dylan_lexer_exe() -> Result<PathBuf, String> {
     let dir = dylan_lexer_cache_dir()?;
-    let src = dir.join("dylan-lexer.dylan");
+    let src      = dir.join("dylan-lexer.dylan");
+    let src_main = dir.join("dylan-lexer-main.dylan");
     let exe = dir.join("dylan-lexer.exe");
-    // Always (re-)write the source — cheap, ensures source-tree
+    // Always (re-)write the sources — cheap, ensures source-tree
     // consistency with the EXE if the hash collided or the source
     // file was deleted out from under us.
     std::fs::write(&src, DYLAN_LEXER_SOURCE)
         .map_err(|e| format!("write {}: {e}", src.display()))?;
+    std::fs::write(&src_main, DYLAN_LEXER_MAIN_SOURCE)
+        .map_err(|e| format!("write {}: {e}", src_main.display()))?;
     if exe.is_file() {
         return Ok(exe);
     }
-    // Compile via the existing AOT pipeline. `run_build` prints
-    // `compiled: …` to stdout on success — we redirect by capturing
-    // it manually since `run_build` writes directly. Easiest: route
-    // through `nod_sema::compile_files_for_aot` + the same codegen
-    // dance. But that's a lot of duplication; instead we just call
-    // `run_build` and accept the one-line trailer on first build —
-    // then suppress the trailing line by detecting it before we
-    // print the lex output. Simpler still: shell out to ourselves.
-    //
-    // Since `run_build` is in this same binary and uses println!, the
-    // cleanest pattern is to call ourselves as a subprocess so the
-    // `compiled: ...` line goes to the child's stdout instead of
-    // mingling with ours.
     let driver = std::env::current_exe()
         .map_err(|e| format!("current_exe: {e}"))?;
     let out = std::process::Command::new(&driver)
         .arg("build")
         .arg(&src)
+        .arg(&src_main)
         .arg("-o")
         .arg(&exe)
         .output()
@@ -723,6 +742,102 @@ fn run_dump_dylan_tokens(input: &std::path::Path, gc_stats: bool) -> ExitCode {
     };
     // Forward stdout byte-for-byte so the canonical dump (sprint 45d
     // oracle contract) survives any console transcoding.
+    use std::io::Write;
+    std::io::stdout().write_all(&out.stdout).ok();
+    std::io::stderr().write_all(&out.stderr).ok();
+    if out.status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(out.status.code().unwrap_or(1) as u8)
+    }
+}
+
+// ─── `parse-dylan` subcommand ─────────────────────────────────────────────
+//
+// Builds [dylan-lexer.dylan, dylan-parser.dylan] into a cached EXE using
+// the same strategy as `dump-dylan-tokens`.  The parser's main() reads
+// argv[1] as a source path, lexes + parses, then dumps the AST to stdout.
+
+fn dylan_parser_cache_dir() -> Result<PathBuf, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    DYLAN_LEXER_SOURCE.hash(&mut h);
+    DYLAN_PARSER_SOURCE.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    let driver = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let meta = std::fs::metadata(&driver)
+        .map_err(|e| format!("metadata {}: {e}", driver.display()))?;
+    driver.hash(&mut h);
+    meta.len().hash(&mut h);
+    meta.modified()
+        .map_err(|e| format!("modified {}: {e}", driver.display()))?
+        .hash(&mut h);
+    let digest = h.finish();
+    let dir = std::env::temp_dir().join(format!("nod-dylan-parser-{digest:016x}"));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create cache dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+fn ensure_dylan_parser_exe() -> Result<PathBuf, String> {
+    let dir = dylan_parser_cache_dir()?;
+    let src_lexer  = dir.join("dylan-lexer.dylan");
+    let src_parser = dir.join("dylan-parser.dylan");
+    let exe = dir.join("dylan-parser.exe");
+    std::fs::write(&src_lexer, DYLAN_LEXER_SOURCE)
+        .map_err(|e| format!("write {}: {e}", src_lexer.display()))?;
+    std::fs::write(&src_parser, DYLAN_PARSER_SOURCE)
+        .map_err(|e| format!("write {}: {e}", src_parser.display()))?;
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    let driver = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+    let out = std::process::Command::new(&driver)
+        .arg("build")
+        .arg(&src_lexer)
+        .arg(&src_parser)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .map_err(|e| format!("spawn nod-driver build: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "dylan-parser build failed: {}\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    if !exe.is_file() {
+        return Err(format!(
+            "dylan-parser build claimed success but {} is missing",
+            exe.display()
+        ));
+    }
+    Ok(exe)
+}
+
+fn run_parse_dylan(input: &std::path::Path) -> ExitCode {
+    let exe = match ensure_dylan_parser_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("nod-driver parse-dylan: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let input_abs = match std::fs::canonicalize(input) {
+        Ok(p) => p,
+        Err(_) => input.to_path_buf(),
+    };
+    let out = match std::process::Command::new(&exe).arg(&input_abs).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("nod-driver parse-dylan: spawn {}: {e}", exe.display());
+            return ExitCode::from(1);
+        }
+    };
     use std::io::Write;
     std::io::stdout().write_all(&out.stdout).ok();
     std::io::stderr().write_all(&out.stderr).ok();

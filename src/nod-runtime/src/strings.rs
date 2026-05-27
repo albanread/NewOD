@@ -1,3 +1,10 @@
+//! **Stdlib boundary**: new string APIs go in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan`, not here. This file
+//! hosts byte-string PRIMITIVES (allocation, byte-get/set, bulk-copy)
+//! per `docs/STDLIB_BOUNDARY.md` Rule 2 (tag/layout + GC integration).
+//! Higher-level string operations (split, format, search, replace)
+//! belong in Dylan composed over these primitives.
+//!
 //! `<byte-string>` — UTF-8-encoded heap-allocated string.
 //!
 //! Layout:
@@ -316,6 +323,21 @@ pub unsafe fn try_byte_string(w: Word, byte_string: ClassId) -> Option<&'static 
     } else {
         None
     }
+}
+
+/// `integer-to-string(n :: <integer>) -> <byte-string>`.
+///
+/// Converts a Dylan fixnum to its decimal string representation.  The
+/// result is allocated on the GC heap.
+///
+/// # Safety
+///
+/// `n_raw` must be a fixnum-tagged Dylan Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn nod_integer_to_string(n_raw: u64) -> u64 {
+    let n = Word::from_raw(n_raw).as_fixnum().unwrap_or(0);
+    let s = n.to_string();
+    crate::with_literal_pool(|pool| pool.heap.alloc_byte_string(&s, &pool.classes)).raw()
 }
 
 #[cfg(test)]

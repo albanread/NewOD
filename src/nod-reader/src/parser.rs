@@ -780,7 +780,46 @@ impl<'a> Parser<'a> {
         // `<name> body end` without a head paren ambiguates badly
         // with `<name>` as an expression followed by a statement,
         // so the head paren is required.
+        //
+        // Sprint N extension: also accept the no-head-paren shape when
+        // the tokens directly contain a closing `end` at depth 0.
+        // `end` at depth 0 can ONLY appear as a closing form delimiter,
+        // never as a standalone statement, so the presence of a reachable
+        // `end` unambiguously identifies a body-shaped call.  This unlocks
+        // macros like `with-cleanup body cleanup cleanup-body end` that
+        // have no parenthesised condition before the body.
         if self.tokens.get(i).map(|t| t.kind) != Some(TokenKind::LParen) {
+            // No-paren path: scan forward for a balancing `end`.
+            let mut depth = 0i32;
+            let mut saw_body_content = false;
+            while let Some(t) = self.tokens.get(i) {
+                match t.kind {
+                    TokenKind::LParen
+                    | TokenKind::LBracket
+                    | TokenKind::LBrace
+                    | TokenKind::HashLParen
+                    | TokenKind::HashLBracket
+                    | TokenKind::HashLBrace => {
+                        depth += 1;
+                        saw_body_content = true;
+                    }
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                        if depth == 0 {
+                            return false;
+                        }
+                        depth -= 1;
+                    }
+                    TokenKind::KwEnd if depth == 0 => return saw_body_content,
+                    TokenKind::Semicolon if depth == 0 => {
+                        // Semicolons separate body statements — stay.
+                    }
+                    TokenKind::Eof => return false,
+                    _ => {
+                        saw_body_content = true;
+                    }
+                }
+                i += 1;
+            }
             return false;
         }
         i += 1;
@@ -2156,8 +2195,13 @@ impl<'a> Parser<'a> {
                 self.bump();
                 type_ = Some(self.parse_postfix()?);
             }
-            // Trailing `, key: value` options.
+            // `= expr` shorthand for init-value (standard Dylan syntax).
             let mut init_value: Option<Expr> = None;
+            if matches!(self.peek_kind(), TokenKind::Equal) {
+                self.bump();
+                init_value = Some(self.parse_expr_full()?);
+            }
+            // Trailing `, key: value` options.
             let mut init_keyword: Option<String> = None;
             let mut required_init_keyword = false;
             let mut setter: Option<bool> = None;

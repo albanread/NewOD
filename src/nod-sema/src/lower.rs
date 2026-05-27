@@ -1,4 +1,20 @@
 //! AST → DFM lowering.
+//!
+//! # Macro boundary policy
+//!
+//! The match arms in this file that handle `Expr::*` / `Statement::*`
+//! variants ARE the second temptation surface for hardcoded
+//! control-flow drift (the first being `nod-reader::ast`). Before
+//! adding another arm for a new control-flow form, read
+//! `docs/MACRO_BOUNDARY.md`. New surface forms should be `define
+//! macro` in `src/nod-dylan/dylan-sources/stdlib.dylan` and expanded
+//! by `nod-macro` before this file ever sees them.
+//!
+//! The remaining hardcoded forms here (`If`, `Begin`, `Let`,
+//! `Method`/`LocalMethod`, definitional items, `Statement::Block`)
+//! are the frozen kernel list per the policy. `Statement::While`,
+//! `Until`, `For`, and `Expr::Case` are retirement candidates per
+//! the macro-boundary porting plan (Wave 2).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -3114,6 +3130,40 @@ fn lower_function_inner(
         let is_last = i == last_idx;
         match stmt {
             Statement::Expr(e) => {
+                // Flatten `Statement::Expr(Expr::Stmt(Statement::Block {...}))` —
+                // produced when a body-shaped macro (e.g. `with-cleanup`) expands
+                // to a block form.  The macro re-parser always returns an Expr, so
+                // the block gets double-wrapped.  We unwrap it here where `sink` is
+                // in scope so `lower_block_form` can lift the body thunk.
+                if let Expr::Stmt(inner) = e {
+                    if let Statement::Block {
+                        span,
+                        exit_var,
+                        body: blk_body,
+                        handlers,
+                        cleanup,
+                        afterwards,
+                    } = inner.as_ref()
+                    {
+                        let t = lower_block_form(
+                            &mut b,
+                            sink,
+                            &mut env,
+                            ctx,
+                            *span,
+                            name,
+                            exit_var.as_deref(),
+                            blk_body,
+                            handlers,
+                            cleanup,
+                            afterwards,
+                        )?;
+                        if is_last {
+                            final_temp = Some(t);
+                        }
+                        continue;
+                    }
+                }
                 let t = b.lower_expr(e, &mut env, ctx)?;
                 if is_last {
                     final_temp = Some(t);

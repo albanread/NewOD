@@ -1,3 +1,10 @@
+//! **Platform-specific crate — Windows-only.** See
+//! `docs/PLATFORMS.md`. The macOS variant will ship `nod-macapi` (or
+//! equivalent) providing the same role: a vendored API projection
+//! that the compiler reads at JIT-time / AOT-time to resolve bare-
+//! name native calls. Likely smaller than this crate's 15,067-function
+//! Win32 surface, but structurally analogous.
+//!
 //! Vendored Windows API metadata for NewOpenDylan FFI (Sprint 27).
 //!
 //! ## What this crate is

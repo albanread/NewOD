@@ -2,6 +2,15 @@
 //! copying heap, class metadata table, write barrier. The Sprint 09
 //! foundation grew into the Sprint 11 GC.
 //!
+//! # Standard library boundary policy
+//!
+//! **Before adding stdlib-shape functions to this crate, read
+//! `docs/STDLIB_BOUNDARY.md`.** New user-visible stdlib API belongs in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan` by default. Rust additions
+//! are gated to six legitimate categories (GC, safepoints, FFI/OS, tag
+//! manipulation, atomics on shared state, bootstrap primitives). Rule 4
+//! is the pre-flight: write the Dylan version first.
+//!
 //! Sprint 11 lights up:
 //!   - **Generational copying GC** (semispace young + 2-semispace
 //!     old). Structural lift from NCL's `ncl-runtime/src/heap.rs`,

@@ -1,3 +1,9 @@
+//! **Stdlib boundary**: new table APIs go in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan`, not here. The bucket-array
+//! ops and hash-function inner loop are *frozen exceptions* per
+//! `docs/STDLIB_BOUNDARY.md` (need tight GC-root coordination and
+//! eventually SIMD). Higher-level table methods belong in Dylan.
+//!
 //! Sprint 22 — `<table>` + hashing.
 //!
 //! `<table>` is a Dylan `<explicit-key-collection>`: a hash table with

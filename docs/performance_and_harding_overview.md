@@ -440,7 +440,11 @@ remaining correctness gap for non-allocating loops.
 **Demo**
 
 - Dylan lexer self-dump runs cleanly under GC pressure without any
-  module-variable workaround driven by temp-root fragility
+  module-variable workaround driven by temp-root fragility.
+  **Status (Sprint 45h)**: the root cause is fixed (GAP-007–013
+  closed). The `*tokens*`/`*dump-stream*` workaround in
+  `dylan-lexer.dylan` is still in tree pending a retirement commit;
+  the self-dump on the lexer's own source is the acceptance gate.
 
 ---
 

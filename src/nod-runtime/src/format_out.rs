@@ -1,3 +1,10 @@
+//! **Stdlib boundary**: new format-string APIs go in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan`. This file is the JIT
+//! shim that connects Dylan's `format-out(fmt, ...)` call to the OS
+//! stdout write — that part stays here per `docs/STDLIB_BOUNDARY.md`
+//! (Rule 2: FFI/OS). Format-spec parsing and richer formatting (named
+//! args, padding, alignment) belong in Dylan over the primitives.
+//!
 //! `format-out` JIT shim — the one Sprint 10 well-known intrinsic.
 //!
 //! The JIT'd code calls `nod_format_out(fmt, arg1, arg2, arg3)` where

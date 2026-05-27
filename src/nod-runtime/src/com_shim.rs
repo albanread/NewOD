@@ -1,3 +1,9 @@
+//! **Platform-specific module — Windows-only.** See
+//! `docs/PLATFORMS.md`. This is one of the named modules that hosts
+//! platform-specific code so the rest of `nod-runtime` stays portable.
+//! The macOS variant will ship its own `cocoa_shim.rs` analogue
+//! (Cocoa/UIKit + Metal + Core Text) covering the same role.
+//!
 //! Sprint 35 — COM shim for DXGI / D3D11 / D2D / DirectWrite via the
 //! `windows` crate.
 //!

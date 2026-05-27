@@ -1,3 +1,9 @@
+//! **Stdlib boundary**: new collection APIs go in
+//! `src/nod-dylan/dylan-sources/stdlib.dylan`, not here. This file is a
+//! frozen-by-policy host for collection PRIMITIVES that genuinely need
+//! Rust (allocation, GC root coordination, tag-aware iteration). See
+//! `docs/STDLIB_BOUNDARY.md` — Rule 4 (pre-flight) is the gate.
+//!
 //! Sprint 20 — collection class hierarchy, forward iteration protocol,
 //! and the core collection types (`<range>`, `<stretchy-vector>`,
 //! plus collection-protocol attachments to `<list>` and
@@ -202,6 +208,39 @@ pub fn ensure_registered() {
         let range_md = class_metadata_for(range);
         let stretchy_vector_md = class_metadata_for(stretchy_vector);
         let out_of_range_error_md = class_metadata_for(out_of_range_error);
+
+        // Register generic dispatch methods for <stretchy-vector> so that
+        // `element(sv, i)` / `size(sv)` resolve correctly when the compiler
+        // cannot statically infer the primitive form.
+        //
+        // SAFETY: `nod_stretchy_vector_*` shims have the standard
+        // `extern "C" fn(u64, ...) -> u64` ABI expected by the dispatcher.
+        unsafe {
+            crate::dispatch::add_method(
+                "element",
+                stretchy_vector,
+                nod_stretchy_vector_element as *const u8,
+                2,
+            );
+            crate::dispatch::add_method(
+                "size",
+                stretchy_vector,
+                nod_stretchy_vector_size as *const u8,
+                1,
+            );
+            // element-setter(val, sv :: <stretchy-vector>, idx) — receiver is
+            // arg[1], so use add_method_full with the specialiser list.
+            crate::dispatch::add_method_full(
+                "element-setter",
+                vec![
+                    crate::classes::ClassId::OBJECT,
+                    stretchy_vector,
+                    crate::classes::ClassId::OBJECT,
+                ],
+                nod_stretchy_vector_element_setter as *const u8,
+                3,
+            );
+        }
 
         CollectionClassIds {
             collection,
@@ -1843,5 +1882,42 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.bounds, 3);
+    }
+
+    #[test]
+    fn old_stretchy_vector_keeps_user_object_alive_across_gc() {
+        ensure_registered();
+
+        let (tokenish_id, _) = crate::register_simple_user_class(
+            "<gc-tokenish>",
+            Some(crate::ClassId::OBJECT),
+            Vec::new(),
+        );
+        let md = crate::class_metadata_for(tokenish_id);
+
+        let sv = make_stretchy_vector(4);
+        let _sv_guard = crate::RootGuard::new(&sv);
+
+        for _ in 0..3 {
+            crate::with_literal_pool(|pool| pool.heap.collect_minor());
+        }
+        crate::with_literal_pool(|pool| pool.heap.collect_full());
+
+        let obj = unsafe { crate::rust_make(md, &[]) };
+        stretchy_vector_push(sv, obj);
+
+        for _ in 0..8 {
+            crate::with_literal_pool(|pool| pool.heap.collect_minor());
+        }
+        for _ in 0..2 {
+            crate::with_literal_pool(|pool| pool.heap.collect_full());
+        }
+
+        let stored = collection_element(sv, 0, None).expect("stored element");
+        assert!(crate::nod_is_instance_of_word(stored, tokenish_id));
+        let wrapper = crate::with_literal_pool(|pool| {
+            pool.heap.wrapper_of(stored).expect("stored object still in heap")
+        });
+        assert_eq!(wrapper.class(), tokenish_id);
     }
 }

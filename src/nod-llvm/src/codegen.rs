@@ -169,6 +169,12 @@ pub const NOD_MAKE_EXIT_PROCEDURE_SYMBOL: &str = "nod_make_exit_procedure";
 pub const NOD_INVOKE_EXIT_SYMBOL: &str = "nod_invoke_exit";
 /// Sprint 19: `nod_condition_message(c) -> <byte-string>`.
 pub const NOD_CONDITION_MESSAGE_SYMBOL: &str = "nod_condition_message";
+/// `error(msg)` — construct a `<simple-error>` and signal it. Diverges.
+pub const NOD_ERROR_SYMBOL: &str = "nod_error";
+/// `write-to-string(val)` — return a `<byte-string>` representation.
+pub const NOD_WRITE_TO_STRING_SYMBOL: &str = "nod_write_to_string";
+/// `integer-to-string(n)` — decimal string from a Dylan fixnum.
+pub const NOD_INTEGER_TO_STRING_SYMBOL: &str = "nod_integer_to_string";
 
 // ─── Sprint 20b — collection / FIP / primitive-op shims ───────────────────
 //
@@ -3438,6 +3444,10 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             "%make-exit-procedure" => Some((NOD_MAKE_EXIT_PROCEDURE_SYMBOL, 1)),
             "%invoke-exit" => Some((NOD_INVOKE_EXIT_SYMBOL, 2)),
             "%run-block" => Some((NOD_RUN_BLOCK_SYMBOL, 9)), // block_id + 8 captured
+            "error" => Some((NOD_ERROR_SYMBOL, 1)),
+            "add!" => Some((NOD_STRETCHY_VECTOR_PUSH_SYMBOL, 2)),
+            "write-to-string" => Some((NOD_WRITE_TO_STRING_SYMBOL, 1)),
+            "integer-to-string" => Some((NOD_INTEGER_TO_STRING_SYMBOL, 1)),
             _ => None,
         } {
             return self.emit_list_builtin_call(sym, arity, args, dst, safepoint_roots);
@@ -3481,10 +3491,6 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 callee: callee.to_string(),
             });
         };
-        let arg_vals: Vec<BasicMetadataValueEnum<'ctx>> = args
-            .iter()
-            .map(|a| self.temp_val(*a).into())
-            .collect();
         let name = format!("call.t{}", dst.0);
         // Sprint 11b: bracket the call with register/unregister pairs.
         // Sprint 12-shaped DirectCalls into user-defined Dylan functions
@@ -3494,6 +3500,10 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // liveness pass produced no live pointer-shaped temps) and the
         // bracketing is a no-op.
         let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
+        let arg_vals: Vec<BasicMetadataValueEnum<'ctx>> = args
+            .iter()
+            .map(|a| self.temp_val(*a).into())
+            .collect();
         let site = self
             .builder
             .build_call(callee_fn, &arg_vals, &name)
@@ -3543,6 +3553,8 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 self.module.add_function(NOD_MAKE_SYMBOL, ty, None)
             }
         };
+        let name = format!("call.t{}", dst.0);
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let zero = i64ty.const_zero();
         let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
             Vec::with_capacity(2 + 2 * max_pairs);
@@ -3563,8 +3575,6 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 call_args.push(zero.into());
             }
         }
-        let name = format!("call.t{}", dst.0);
-        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(make_fn, &call_args, &name)
@@ -3598,6 +3608,8 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 self.module.add_function(FORMAT_OUT_SYMBOL, ty, None)
             }
         };
+        let name = format!("call.t{}", dst.0);
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         // Pad to four i64 args, zero-filling missing slots.
         let zero = i64ty.const_zero();
         let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(4);
@@ -3608,8 +3620,6 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 call_args.push(zero.into());
             }
         }
-        let name = format!("call.t{}", dst.0);
-        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(fmt_fn, &call_args, &name)
@@ -3680,12 +3690,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 self.module.add_function(sym, ty, None)
             }
         };
+        let name = format!("call.t{}", dst.0);
+        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let call_args: Vec<BasicMetadataValueEnum<'ctx>> = args
             .iter()
             .map(|a| self.temp_val(*a).into())
             .collect();
-        let name = format!("call.t{}", dst.0);
-        let emitted = self.begin_emitted_safepoint(SafepointKind::DirectCall, safepoint_roots)?;
         let site = self
             .builder
             .build_call(fn_, &call_args, &name)
@@ -3945,9 +3955,9 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         let generic_ptr_const = generic_ptr_loaded;
         let cache_slot_const = cache_slot_loaded;
 
-        // Snapshot arg SSA values BEFORE the safepoint (still valid
-        // because spill doesn't invalidate the original temp mapping —
-        // it only forces the temp to live through the call).
+        // Snapshot arg SSA values after the safepoint bracket is in
+        // place so every call path consistently reads the current temp
+        // binding at the actual call site.
         let arg_vals: Vec<inkwell::values::IntValue<'ctx>> = args
             .iter()
             .map(|t| self.temp_val(*t).into_int_value())

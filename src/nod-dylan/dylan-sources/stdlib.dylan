@@ -1,6 +1,24 @@
 Module: dylan
 Author: NewOpenDylan stdlib (Sprint 20b)
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ STDLIB + MACRO BOUNDARY POLICY                                           ║
+// ║                                                                          ║
+// ║ This file is the DEFAULT home for new stdlib API AND for new control-    ║
+// ║ flow surface forms (case, cond, select, while, for, with-*, when, etc.). ║
+// ║                                                                          ║
+// ║   • docs/STDLIB_BOUNDARY.md — new API belongs in Dylan, not Rust.        ║
+// ║     Pre-flight: write the Dylan version first.                           ║
+// ║                                                                          ║
+// ║   • docs/MACRO_BOUNDARY.md — new control-flow shapes belong here as      ║
+// ║     `define macro`, not as hardcoded Expr::* / Statement::* variants     ║
+// ║     in nod-reader::ast. The frozen kernel list (If, Begin, Let, Method,  ║
+// ║     definitional items, Block-with-cleanup) is the only legitimate set. ║
+// ║                                                                          ║
+// ║   • docs/UPSTREAM_OPENDYLAN.md — when porting code from Open Dylan       ║
+// ║     rather than writing fresh, preserve attribution per that workflow.   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
 // ── stdlib.dylan — collection ops, FIP wrappers, for-each macro ───────────
 //
 // Sprint 20b: this file is auto-loaded by `nod_sema::stdlib::ensure_loaded()`
@@ -413,6 +431,49 @@ end macro;
 define macro unless
   { unless ?cond:expression ?body:body end }
     => { if (~ ?cond) ?body else #f end }
+end macro;
+
+// ─── when macro ────────────────────────────────────────────────────────────
+//
+// One-armed conditional — the natural partner to `unless`.
+// `when` fires the body when the condition is true; `unless` fires it
+// when the condition is false. Both expand to `if` with an `else #f`
+// so the return type is always well-defined even when the body is
+// not taken.
+//
+//   when (condition) body end
+//   ⟹  if (condition) body else #f end
+//
+// Like `unless`, the condition is an `expression` constraint so the
+// parser wraps it in a paren group before fragment-matching begins.
+
+define macro when
+  { when ?cond:expression ?body:body end }
+    => { if (?cond) ?body else #f end }
+end macro;
+
+// ─── with-cleanup macro ────────────────────────────────────────────────────
+//
+// Resource-management sugar over `block / cleanup / end`.  The cleanup
+// arm is guaranteed to run whether the body exits normally or via a
+// non-local exit (NLX) — see `Statement::Block` + `CleanupGuard` in
+// the runtime.
+//
+//   with-cleanup
+//     body
+//   cleanup
+//     cleanup-body
+//   end
+//   ⟹  block () body cleanup cleanup-body end
+//
+// The two `:body` variables split at the `cleanup` delimiter keyword.
+// This works because the body matcher now uses delimiter-aware greedy
+// matching (forward scan for the next Literal in the pattern) rather
+// than the old trailing-count-only approach.
+
+define macro with-cleanup
+  { with-cleanup ?body:body cleanup ?cleanup:body end }
+    => { block () ?body cleanup ?cleanup end }
 end macro;
 
 // ─── Sprint 32: closure → C callback pointer ──────────────────────────────

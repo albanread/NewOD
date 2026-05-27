@@ -82,6 +82,39 @@ pub unsafe extern "C" fn nod_make(
     let metadata: &'static ClassMetadata =
         unsafe { &*(class_metadata_ptr_raw as *const ClassMetadata) };
 
+    // Special-case <stretchy-vector>: its backing storage SOV must be
+    // allocated before the outer object, which generic slot-init can't do.
+    if metadata.id == crate::collections::stretchy_vector_class_id() {
+        return crate::collections::make_stretchy_vector(4).raw();
+    }
+
+    // Special-case <byte-string>: backed by inline bytes, not slots.
+    // Dylan: make(<byte-string>, size: N) → alloc_byte_string_uninit(N).
+    if metadata.id == crate::classes::ClassId::BYTE_STRING {
+        // Decode the `size:` keyword if present.
+        let kw_count_local = (kw_count as usize).min(MAKE_MAX_KW_PAIRS);
+        let kw_name_raw = [
+            kw_name_0, kw_name_1, kw_name_2, kw_name_3,
+            kw_name_4, kw_name_5, kw_name_6, kw_name_7,
+        ];
+        let kw_value_raw = [
+            value_0, value_1, value_2, value_3,
+            value_4, value_5, value_6, value_7,
+        ];
+        let mut size_n: usize = 0;
+        for i in 0..kw_count_local {
+            if let Some(name) = decode_keyword_name(crate::word::Word::from_raw(kw_name_raw[i])) {
+                if name == "size" {
+                    size_n = crate::word::Word::from_raw(kw_value_raw[i])
+                        .as_fixnum()
+                        .unwrap_or(0)
+                        .max(0) as usize;
+                }
+            }
+        }
+        return with_literal_pool(|pool| pool.heap.alloc_byte_string_uninit(size_n, &pool.classes)).raw();
+    }
+
     let kw_count = (kw_count as usize).min(MAKE_MAX_KW_PAIRS);
 
     // Sprint 11b: stable-stack-bind each `(name, value)` pair and

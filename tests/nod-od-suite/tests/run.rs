@@ -10,11 +10,18 @@
 //! regresses.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
+use nod_od_suite::test_support::run_command_with_watchdog;
 use serial_test::serial;
 
 use nod_sema::run_function_to_i64;
 use nod_runtime;
+
+const CHILD_FIXTURE_ENV: &str = "NOD_OD_CHILD_FIXTURE";
+const CHILD_ENTRY_ENV: &str = "NOD_OD_CHILD_ENTRY";
+const CHILD_RESULT_PREFIX: &str = "__NOD_OD_RESULT__=";
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
@@ -33,9 +40,73 @@ fn gc_stats_dir() -> PathBuf {
 }
 
 fn run_main(fixture: &str) -> i64 {
-    let path = fixtures_dir().join(fixture);
-    run_function_to_i64(&path, "main")
-        .unwrap_or_else(|e| panic!("run {fixture}::main: {e:?}"))
+    let exe = std::env::current_exe().expect("test exe path");
+    let mut child = Command::new(&exe);
+    child
+        .args([
+            "--ignored",
+            "--exact",
+            "__nod_od_child_run_fixture",
+            "--nocapture",
+        ])
+        .env(CHILD_FIXTURE_ENV, fixture)
+        .env(CHILD_ENTRY_ENV, "main");
+    let output = run_command_with_watchdog(
+        fixture,
+        "jit-run-main",
+        fixture_timeout(fixture),
+        &mut child,
+    );
+    assert!(
+        output.status.success(),
+        "child fixture runner failed for {}\nstdout:\n{}\nstderr:\n{}\nstdout log: {}\nstderr log: {}\nmeta: {}",
+        fixture,
+        output.stdout,
+        output.stderr,
+        output.stdout_path.display(),
+        output.stderr_path.display(),
+        output.meta_path.display()
+    );
+    output
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(CHILD_RESULT_PREFIX))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing child result marker for {}\nstdout:\n{}\nstderr:\n{}\nstdout log: {}\nstderr log: {}\nmeta: {}",
+                fixture,
+                output.stdout,
+                output.stderr,
+                output.stdout_path.display(),
+                output.stderr_path.display(),
+                output.meta_path.display()
+            )
+        })
+        .parse::<i64>()
+        .unwrap_or_else(|err| panic!("parse child result for {fixture}: {err}"))
+}
+
+fn fixture_timeout(fixture: &str) -> Duration {
+    if fixture.contains("gc-rope") {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(120)
+    }
+}
+
+#[test]
+#[ignore]
+#[serial]
+fn __nod_od_child_run_fixture() {
+    let fixture = match std::env::var(CHILD_FIXTURE_ENV) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let entry = std::env::var(CHILD_ENTRY_ENV).unwrap_or_else(|_| "main".to_string());
+    let path = fixtures_dir().join(&fixture);
+    let result = run_function_to_i64(&path, &entry)
+        .unwrap_or_else(|e| panic!("run {fixture}::{entry}: {e:?}"));
+    println!("{CHILD_RESULT_PREFIX}{result}");
 }
 
 /// Sprint 07-shape: pure recursion + branching + i64 arithmetic.

@@ -17,12 +17,13 @@
 //! `link.exe`, and concurrent invocations would stall on Cargo's
 //! build-system lock.
 //!
-//! Note GAP-007: the runtime's GC root-tracking does not survive
-//! enough internal allocations for the lexer to handle very long
-//! source files (~> 650 lines of the lexer's own source). The unit
-//! tests below all use tiny snippets that stay comfortably inside
-//! the working envelope; the lexer's own source is too large for
-//! a self-dump until GAP-007 is fixed.
+//! Note: GAP-007 (phi-wiring / stale-pointer) and the full cascade
+//! through GAP-013 are fixed as of Sprint 45c–45h. The `*tokens*` /
+//! `*dump-stream*` module-variable workaround in the lexer fixture is
+//! still in tree pending a retirement commit; the acceptance gate is
+//! `nod-driver dump-dylan-tokens` on the lexer's own source completing
+//! without error. Tests below use short snippets for speed, not because
+//! of any remaining root-tracking limitation.
 //!
 //! Run with:
 //!
@@ -34,7 +35,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
+use nod_tests::test_support::run_command_with_watchdog;
 use serial_test::serial;
 
 /// Workspace root inferred from `CARGO_MANIFEST_DIR`. Mirrors the
@@ -71,16 +74,24 @@ fn write_snippet(name: &str, contents: &str) -> PathBuf {
 /// Pre-build `nod-driver` + `nod-runtime` once per test to avoid
 /// races against Cargo's build lock when the lexer EXE is built.
 fn prebuild_driver(workspace: &Path) {
-    let build = Command::new("cargo")
+    let mut build = Command::new("cargo");
+    build
         .current_dir(workspace)
-        .args(["build", "-p", "nod-driver", "-p", "nod-runtime"])
-        .output()
-        .expect("spawn cargo build");
+        .args(["build", "-p", "nod-driver", "-p", "nod-runtime"]);
+    let build = run_command_with_watchdog(
+        "dylan_lexer",
+        "cargo-build",
+        Duration::from_secs(300),
+        &mut build,
+    );
     assert!(
         build.status.success(),
-        "cargo build failed: {}\nstderr:\n{}",
+        "cargo build failed: {}\nstderr:\n{}\nstdout log: {}\nstderr log: {}\nmeta: {}",
         build.status,
-        String::from_utf8_lossy(&build.stderr)
+        build.stderr,
+        build.stdout_path.display(),
+        build.stderr_path.display(),
+        build.meta_path.display()
     );
 }
 
@@ -93,7 +104,8 @@ fn driver_exe(workspace: &Path) -> PathBuf {
 fn lex_snippet(snippet: &Path) -> String {
     let workspace = workspace_root();
     prebuild_driver(&workspace);
-    let driver = Command::new("cargo")
+    let mut driver = Command::new("cargo");
+    driver
         .current_dir(&workspace)
         .args([
             "run",
@@ -103,18 +115,25 @@ fn lex_snippet(snippet: &Path) -> String {
             "--",
             "dump-dylan-tokens",
             snippet.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn nod-driver dump-dylan-tokens");
-    let stdout = String::from_utf8_lossy(&driver.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&driver.stderr).into_owned();
+        ]);
+    let driver = run_command_with_watchdog(
+        "dylan_lexer",
+        "dump-dylan-tokens",
+        Duration::from_secs(180),
+        &mut driver,
+    );
+    let stdout = driver.stdout.clone();
+    let stderr = driver.stderr.clone();
     assert!(
         driver.status.success(),
-        "dump-dylan-tokens on {} failed: {}\nstdout:\n{}\nstderr:\n{}",
+        "dump-dylan-tokens on {} failed: {}\nstdout:\n{}\nstderr:\n{}\nstdout log: {}\nstderr log: {}\nmeta: {}",
         snippet.display(),
         driver.status,
         stdout,
-        stderr
+        stderr,
+        driver.stdout_path.display(),
+        driver.stderr_path.display(),
+        driver.meta_path.display()
     );
     stdout
 }
@@ -124,25 +143,32 @@ fn lex_snippet_with_gc_stats(snippet: &Path, stats_file_name: &str) -> (String, 
     prebuild_driver(&workspace);
     let driver = driver_exe(&workspace);
     assert!(driver.is_file(), "driver exe missing: {}", driver.display());
-    let out = Command::new(&driver)
-        .args([
+    let mut out = Command::new(&driver);
+    out.args([
             "dump-dylan-tokens",
             snippet.to_str().unwrap(),
             "--gc-stats",
-        ])
-        .output()
-        .expect("spawn nod-driver dump-dylan-tokens --gc-stats");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        ]);
+    let out = run_command_with_watchdog(
+        "dylan_lexer",
+        stats_file_name,
+        Duration::from_secs(180),
+        &mut out,
+    );
+    let stdout = out.stdout.clone();
+    let stderr = out.stderr.clone();
     std::fs::write(gc_stats_dir().join(stats_file_name), &stderr)
         .expect("write lexer gc stats report");
     assert!(
         out.status.success(),
-        "dump-dylan-tokens --gc-stats on {} failed: {}\nstdout:\n{}\nstderr:\n{}",
+        "dump-dylan-tokens --gc-stats on {} failed: {}\nstdout:\n{}\nstderr:\n{}\nstdout log: {}\nstderr log: {}\nmeta: {}",
         snippet.display(),
         out.status,
         stdout,
-        stderr
+        stderr,
+        out.stdout_path.display(),
+        out.stderr_path.display(),
+        out.meta_path.display()
     );
     (stdout, stderr)
 }

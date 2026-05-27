@@ -1,5 +1,24 @@
 //! `nod-macro` — Dylan macro expander (Sprint 17 + Sprint 18).
 //!
+//! # Macro boundary policy
+//!
+//! This engine is the **default home for new control-flow surface**
+//! in NewOpenDylan. New `case`/`cond`/`while`/`for`/`with-*`-shaped
+//! forms land as `define macro` in `stdlib.dylan` and expand through
+//! this engine — they do NOT add `Expr::*` / `Statement::*` variants
+//! to `nod-reader::ast`. See `docs/MACRO_BOUNDARY.md` for the full
+//! rules; the frozen kernel list (`If`, `Begin`, `Let`, `Method`,
+//! definitional items, `Block`-with-cleanup) is the complete set of
+//! hardcoded forms.
+//!
+//! When a real-world macro can't be expressed in the current
+//! pattern language, the answer is **extend this engine** (per
+//! Rule 4 of the policy), not add to the AST. The known deferred
+//! extensions (auxiliary `rule` clauses, cleanup-aware expansion,
+//! cross-file macro use, definition macros) each unlock a family of
+//! subsequent surface forms — pay the engine cost once, get many
+//! ports for free.
+//!
 //! Sprint 17 shipped single-rule macros, three pattern-variable kinds
 //! (`expression` / `name` / `body`), and over-conservative hygiene.
 //! Sprint 18 widens the engine to:
@@ -613,16 +632,99 @@ pub fn match_pattern(pattern: &[PatternElem], call: &[Fragment]) -> Option<Bindi
                 PatternKind::Body => {
                     // Sprint 18: Body matches "everything up to the
                     // remaining trailing literals in the pattern".
-                    // Count how many literal tokens come AFTER this
-                    // `?body:body` in the pattern — those many fragments
-                    // at the END of the call must match those literals;
-                    // Body binds the middle. (Group-tail literals like
-                    // a closing `end` are common: `?body:body end`.)
-                    let trailing_lits = count_trailing_literals(&pattern[pi + 1..]);
-                    if call.len() < ci + trailing_lits {
+                    //
+                    // Sprint N (delimiter-aware body): if the NEXT
+                    // pattern element is a Literal, scan FORWARD in the
+                    // call for the first occurrence of that literal and
+                    // stop there.  This lets two adjacent `:body`
+                    // variables split at an intervening keyword:
+                    //
+                    //   with-cleanup ?body:body cleanup ?cleanup:body end
+                    //
+                    // Without the forward scan the old trailing-count
+                    // approach only sees `end` as a trailer (it stops at
+                    // the `?cleanup:body` variable), so the first body
+                    // greedily consumes `cleanup` + its content.
+                    //
+                    // For `KwEnd` delimiters the scan is DEPTH-AWARE:
+                    // body-forming keywords (`if`, `unless`, `while`,
+                    // `until`, `for`, `block`, `select`, `case`,
+                    // `begin`, `method`, `when`, `with-cleanup`) bump a
+                    // nesting depth counter; only a `KwEnd` at depth 0
+                    // is accepted as the body terminator.  Without this,
+                    // `unless (c) if (y) z end end` would match the
+                    // inner `end` (closing the `if`) instead of the
+                    // outer one (closing the `unless`), producing a
+                    // truncated body and a mis-matched pattern.
+                    //
+                    // For other delimiters (e.g. `cleanup` in
+                    // `with-cleanup`) simple first-occurrence is correct
+                    // because those separator words cannot be nested.
+                    //
+                    // Fallback: if the next element is NOT a Literal (or
+                    // there is no next element) use the old
+                    // `count_trailing_literals` approach unchanged.
+                    let body_end = match pattern.get(pi + 1) {
+                        Some(PatternElem::Literal { kind, text, .. }) => {
+                            let found = if *kind == TokenKind::KwEnd {
+                                // Depth-aware: track end-terminated forms.
+                                let mut depth = 0i32;
+                                call[ci..].iter().position(|f| match f {
+                                    Fragment::Token(t)
+                                        if t.kind == TokenKind::Ident =>
+                                    {
+                                        // Idents that open end-terminated body forms.
+                                        if tok_text_eq(t, "if")
+                                            || tok_text_eq(t, "unless")
+                                            || tok_text_eq(t, "while")
+                                            || tok_text_eq(t, "until")
+                                            || tok_text_eq(t, "for")
+                                            || tok_text_eq(t, "block")
+                                            || tok_text_eq(t, "select")
+                                            || tok_text_eq(t, "case")
+                                            || tok_text_eq(t, "begin")
+                                            || tok_text_eq(t, "method")
+                                            || tok_text_eq(t, "when")
+                                            || tok_text_eq(t, "with-cleanup")
+                                        {
+                                            depth += 1;
+                                        }
+                                        false
+                                    }
+                                    Fragment::Token(t)
+                                        if t.kind == TokenKind::KwEnd =>
+                                    {
+                                        if depth == 0 {
+                                            true
+                                        } else {
+                                            depth -= 1;
+                                            false
+                                        }
+                                    }
+                                    _ => false,
+                                })
+                            } else {
+                                // Simple first-occurrence for non-`end` delimiters.
+                                call[ci..]
+                                    .iter()
+                                    .position(|f| token_matches_literal(f, *kind, text))
+                            };
+                            found
+                                .map(|pos| ci + pos)
+                                .unwrap_or_else(|| {
+                                    let trailing_lits =
+                                        count_trailing_literals(&pattern[pi + 1..]);
+                                    call.len().saturating_sub(trailing_lits)
+                                })
+                        }
+                        _ => {
+                            let trailing_lits = count_trailing_literals(&pattern[pi + 1..]);
+                            call.len().saturating_sub(trailing_lits)
+                        }
+                    };
+                    if call.len() < ci {
                         return None;
                     }
-                    let body_end = call.len() - trailing_lits;
                     let body_slice: Vec<Fragment> = call[ci..body_end].to_vec();
                     b.insert(name.clone(), MatchedFragment::Frags(body_slice));
                     ci = body_end;
