@@ -644,3 +644,204 @@ fn gap_004_assign_to_define_constant_is_error() {
         "expected `cannot assign to $magic` diagnostic, got: {combined}"
     );
 }
+
+// ─── GAP-003 — multi-value return / multi-binder `let` ───────────────────
+
+/// Sprint 47 Phase B smoke test — the four `%values-*` primitives in
+/// `LOWER_PRIMITIVE_TABLE` lower cleanly to DirectCalls against the
+/// matching `nod_values_*` runtime shims. This is the gate before
+/// Phase D's `values()`/`let (a, b) = …` lowerings can build on top:
+/// if the primops don't lower, the higher-level forms can't either.
+#[test]
+fn gap_003_phase_b_values_primops_lower() {
+    let src = "\
+        define function direct-buffer-poke () => (n :: <integer>)\n  \
+            %values-clear();\n  \
+            %values-set!(0, 11);\n  \
+            %values-set!(1, 22);\n  \
+            let n = %values-count();\n  \
+            let a = %values-get(0);\n  \
+            let b = %values-get(1);\n  \
+            n + a + b\n\
+        end function;\n";
+    let fns = lower_src(src);
+    assert_eq!(fns.len(), 1);
+    let f = &fns[0];
+    assert_eq!(f.name, "direct-buffer-poke");
+    let dump = format!("{f:?}");
+    assert!(dump.contains("nod_values_clear"),  "no nod_values_clear: {dump}");
+    assert!(dump.contains("nod_values_set"),    "no nod_values_set: {dump}");
+    assert!(dump.contains("nod_values_get"),    "no nod_values_get: {dump}");
+    assert!(dump.contains("nod_values_count"),  "no nod_values_count: {dump}");
+    verify(f).expect("verify");
+}
+
+/// Sprint 47 Phase D — `values(x)` with a single argument is the
+/// degenerate form: it should lower to just `x`, with no buffer touch.
+/// Zero-overhead is the point of the SBCL design for the common case.
+#[test]
+fn gap_003_values_returns_first_value_when_called_with_one_arg() {
+    let src = "\
+        define function single () => (x :: <integer>)\n  \
+            values(42)\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let f = &fns[0];
+    let dump = format!("{f:?}");
+    // No buffer mutation should appear.
+    assert!(
+        !dump.contains("nod_values_set"),
+        "single-value values(x) must not emit any nod_values_set; dump:\n{dump}"
+    );
+    verify(f).expect("verify");
+}
+
+/// Sprint 47 Phase D — `values(a, b, c)` lowers to writes into the
+/// secondary-values buffer for the extras, returning `a` through the
+/// ordinary ABI. Each extra produces one `nod_values_set` DirectCall.
+#[test]
+fn gap_003_values_writes_extras_to_buffer_and_returns_first() {
+    let src = "\
+        define function triple () => (a :: <integer>)\n  \
+            values(1, 2, 3)\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let f = &fns[0];
+    let dump = format!("{f:?}");
+    // Two extras → two nod_values_set calls.
+    let n_sets = dump.matches("nod_values_set").count();
+    assert_eq!(
+        n_sets, 2,
+        "expected exactly two nod_values_set calls for values(a, b, c); dump:\n{dump}"
+    );
+    verify(f).expect("verify");
+}
+
+/// Sprint 47 Phase D — `let (a, b) = call()` lowers as
+///   `%values-clear(); let a = call(); let b = %values-get(0);`
+/// Each step appears as a DirectCall to the matching nod_values_* shim.
+#[test]
+fn gap_003_multi_binder_let_destructures_two_values() {
+    let src = "\
+        define function two-values () => (a :: <integer>)\n  \
+            values(7, 8)\n\
+        end function;\n\
+        define function consume () => (sum :: <integer>)\n  \
+            let (x, y) = two-values();\n  \
+            x + y\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let consume = fns.iter().find(|f| f.name == "consume").expect("consume");
+    let dump = format!("{consume:?}");
+    assert!(
+        dump.contains("nod_values_clear"),
+        "multi-binder let must call nod_values_clear before the RHS; dump:\n{dump}"
+    );
+    // Exactly one `nod_values_get` for the (x, y) binding — y at index 0.
+    let n_gets = dump.matches("nod_values_get").count();
+    assert_eq!(
+        n_gets, 1,
+        "expected one nod_values_get for `let (x, y)`; dump:\n{dump}"
+    );
+    for f in &fns {
+        verify(f).expect("verify");
+    }
+}
+
+/// Sprint 47 Phase D — three binders → two `nod_values_get` calls
+/// (indices 0 and 1 for the second and third return values).
+#[test]
+fn gap_003_multi_binder_let_destructures_three_values() {
+    let src = "\
+        define function three-values () => (a :: <integer>)\n  \
+            values(1, 2, 3)\n\
+        end function;\n\
+        define function consume3 () => (sum :: <integer>)\n  \
+            let (x, y, z) = three-values();\n  \
+            x + y + z\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let consume = fns.iter().find(|f| f.name == "consume3").expect("consume3");
+    let dump = format!("{consume:?}");
+    assert!(
+        dump.contains("nod_values_clear"),
+        "expected nod_values_clear; dump:\n{dump}"
+    );
+    let n_gets = dump.matches("nod_values_get").count();
+    assert_eq!(
+        n_gets, 2,
+        "expected two nod_values_get calls for `let (x, y, z)`; dump:\n{dump}"
+    );
+    for f in &fns {
+        verify(f).expect("verify");
+    }
+}
+
+/// Sprint 47 Phase D — multi-binder `let` against a single-value RHS
+/// still lowers cleanly. The unfilled binders read `nod_values_get(i)`
+/// which returns `#f` when `i >= count` (the runtime contract). The
+/// lowering itself doesn't care that the call turns out to be
+/// single-valued — that's the whole point of the SBCL discipline
+/// (clear → call → read past the count → #f).
+#[test]
+fn gap_003_multi_binder_let_with_single_value_returns_pad_with_false() {
+    let src = "\
+        define function single () => (x :: <integer>)\n  \
+            7\n\
+        end function;\n\
+        define function consume () => (sum :: <integer>)\n  \
+            let (a, b) = single();\n  \
+            a\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let consume = fns.iter().find(|f| f.name == "consume").expect("consume");
+    let dump = format!("{consume:?}");
+    // The lowering still emits nod_values_clear + nod_values_get even
+    // though the RHS is single-valued; the runtime is what makes the
+    // missing extras default to #f.
+    assert!(dump.contains("nod_values_clear"),
+        "expected nod_values_clear; dump:\n{dump}");
+    assert!(dump.contains("nod_values_get"),
+        "expected nod_values_get for the second binder; dump:\n{dump}");
+    for f in &fns {
+        verify(f).expect("verify");
+    }
+}
+
+/// Sprint 47 Phase D — the polluted-buffer correctness story. Call A
+/// returns two values, leaving extras in the buffer. The caller then
+/// invokes call B (single-valued) and destructures with multi-binder
+/// `let`. The CLEAR before B's call is what protects against A's
+/// extras leaking into B's destructure. We can't run the program from
+/// the lowering test, but we CAN assert the lowering emits the clear
+/// — without it, the bug returns. (End-to-end runtime check lives in
+/// the AOT smoke test.)
+#[test]
+fn gap_003_polluted_buffer_does_not_leak_across_calls() {
+    let src = "\
+        define function call-a () => (a :: <integer>)\n  \
+            values(11, 22)\n\
+        end function;\n\
+        define function call-b () => (b :: <integer>)\n  \
+            99\n\
+        end function;\n\
+        define function user () => (n :: <integer>)\n  \
+            let (a1, a2) = call-a();\n  \
+            let (b1, b2) = call-b();\n  \
+            b2\n\
+        end function;\n";
+    let fns = lower_src(src);
+    let user = fns.iter().find(|f| f.name == "user").expect("user");
+    let dump = format!("{user:?}");
+    // Both `let (…)` forms must emit their own nod_values_clear — the
+    // second one is what stops A's extras polluting B's destructure.
+    let n_clears = dump.matches("nod_values_clear").count();
+    assert_eq!(
+        n_clears, 2,
+        "each multi-binder `let` must emit its own nod_values_clear \
+         before its RHS so polluted state can't leak; dump:\n{dump}"
+    );
+    for f in &fns {
+        verify(f).expect("verify");
+    }
+}

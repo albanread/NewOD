@@ -11,6 +11,16 @@
 //! `define macro` and gets surfaced via `Expr::MacroCall`. Sprint 25
 //! retired `Expr::Unless` to that pattern; future additions follow
 //! the same path. Rule 3 (pre-flight): try `define macro` first.
+//!
+//! Sprint 47 — `Statement::Let { binders: Vec<Binder>, … }` carries the
+//! multi-binder `let (a, b, c) = expr;` shape (GAP-003 fix). Although
+//! it shares the `Let` variant with the single-binder form, the
+//! multi-binder shape is **also a frozen kernel binding form** — it
+//! can't desugar to nested single-binder `Let`s because the RHS must
+//! be evaluated exactly once and the binders see distinct return values
+//! from one call. The SBCL-style secondary-values lowering happens in
+//! `nod-sema::lower` against the same AST shape; no separate
+//! `LetMulti` variant is needed.
 
 use crate::fragments::Fragment;
 use crate::span::Span;

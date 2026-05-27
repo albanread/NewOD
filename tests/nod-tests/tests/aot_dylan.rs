@@ -549,3 +549,64 @@ fn aot_gap_004_define_variable_round_trip() {
     assert_eq!(stdout, "41\n42\n99\n7\n",
         "round-trip mismatch; stderr=\n{stderr}");
 }
+
+/// Sprint 47 / GAP-003 — multi-value return + multi-binder `let`
+/// end-to-end through the AOT pipeline. `divmod` returns
+/// `values(a / b, a mod b)`; main binds both via
+/// `let (q, r) = divmod(13, 5)` and prints them. Asserts the SBCL-style
+/// secondary-values protocol (caller `clear` + `get`, callee `set` +
+/// ordinary return) survives codegen and runs correctly under the
+/// real GC.
+#[test]
+#[ignore]
+#[serial]
+fn aot_gap_003_divmod_multi_value() {
+    let source = "Module: divmod\n\n\
+        define function divmod (a :: <integer>, b :: <integer>)\n \
+         => (q :: <integer>, r :: <integer>)\n  \
+            values(a / b, a mod b)\n\
+        end function;\n\n\
+        define function main () => ()\n  \
+            let (q, r) = divmod(13, 5);\n  \
+            format-out(\"q=%d r=%d\\n\", q, r);\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("gap-003-divmod", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "q=2 r=3\n",
+        "divmod multi-value mismatch; stderr=\n{stderr}");
+}
+
+/// Sprint 47 / GAP-003 — polluted-buffer correctness end-to-end. Call
+/// A returns two values, then call B is single-valued, then a multi-
+/// binder `let` destructures B's result. Without the `clear` before
+/// B's call, B's second binder would pick up A's leftover extra and
+/// the test would print A's extra instead of `#f`. With the clear, it
+/// prints `#f` (Dylan formats `#f` as `#f` in `format-out` — but for
+/// a clean integer compare, we sum the second binder with 100 after
+/// detecting `#f` via `instance?`).
+#[test]
+#[ignore]
+#[serial]
+fn aot_gap_003_polluted_buffer_does_not_leak() {
+    let source = "Module: leak\n\n\
+        define function call-a () => (n :: <integer>)\n  \
+            values(11, 22)\n\
+        end function;\n\n\
+        define function call-b () => (n :: <integer>)\n  \
+            99\n\
+        end function;\n\n\
+        define function main () => ()\n  \
+            let (a1, a2) = call-a();\n  \
+            let (b1, b2) = call-b();\n  \
+            // b2 should be #f (call-b is single-valued, and the multi-\n  \
+            // binder `let` cleared the buffer before the call).\n  \
+            // a1=11, a2=22, b1=99. Print all three plus whether b2 is #f.\n  \
+            format-out(\"a1=%d a2=%d b1=%d b2-is-false=%d\\n\",\n             \
+                a1, a2, b1,\n             \
+                if (b2 = #f) 1 else 0 end);\n\
+        end function main;\n";
+    let (stdout, stderr, code) = build_and_run("gap-003-leak", source);
+    assert_eq!(code, 0, "exit code; stderr=\n{stderr}");
+    assert_eq!(stdout, "a1=11 a2=22 b1=99 b2-is-false=1\n",
+        "polluted-buffer test mismatch; stderr=\n{stderr}");
+}
