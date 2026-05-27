@@ -257,6 +257,20 @@ pub const NOD_WINFFI_CALL_12_SYMBOL: &str = "nod_winffi_call_12";
 pub const NOD_REGISTER_WNDPROC_SYMBOL: &str = "nod_register_wndproc";
 pub const NOD_REGISTER_WNDENUMPROC_SYMBOL: &str = "nod_register_wndenumproc";
 
+// ─── Sprint 47 — multi-value return secondary-values buffer (GAP-003) ─────
+//
+// SBCL-style TLS buffer + count. `nod_values_clear` resets the count to
+// 0; `nod_values_set` writes an extra at the given fixnum index and
+// updates the count; `nod_values_get` reads an extra (returning `#f`
+// past the count); `nod_values_count` reads the current count as a
+// fixnum. See `src/nod-runtime/src/values.rs` and
+// `docs/COMPILER_GAPS.md` GAP-003. Wired into the stdlib via the four
+// `%values-*` primitives in `nod-sema::lower::LOWER_PRIMITIVE_TABLE`.
+pub const NOD_VALUES_CLEAR_SYMBOL: &str = "nod_values_clear";
+pub const NOD_VALUES_SET_SYMBOL: &str = "nod_values_set";
+pub const NOD_VALUES_GET_SYMBOL: &str = "nod_values_get";
+pub const NOD_VALUES_COUNT_SYMBOL: &str = "nod_values_count";
+
 // ─── Sprint 24 — closures: <cell> and <environment> ───────────────────────
 pub const NOD_MAKE_CELL_SYMBOL: &str = "nod_make_cell";
 pub const NOD_CELL_GET_SYMBOL: &str = "nod_cell_get";
@@ -468,6 +482,11 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_env_cell", NOD_ENV_CELL_SYMBOL, 2),
     ("nod_make_environment", NOD_MAKE_ENVIRONMENT_SYMBOL, 1),
     ("nod_make_closure", NOD_MAKE_CLOSURE_SYMBOL, 3),
+    // Sprint 47 — multi-value return secondary-values buffer (GAP-003).
+    ("nod_values_clear", NOD_VALUES_CLEAR_SYMBOL, 0),
+    ("nod_values_set", NOD_VALUES_SET_SYMBOL, 2),
+    ("nod_values_get", NOD_VALUES_GET_SYMBOL, 1),
+    ("nod_values_count", NOD_VALUES_COUNT_SYMBOL, 0),
     // GAP-004 — `define variable` shims (name-by-byte-string).
     ("nod_var_get_by_name", NOD_VAR_GET_BY_NAME_SYMBOL, 1),
     ("nod_var_set_by_name", NOD_VAR_SET_BY_NAME_SYMBOL, 2),

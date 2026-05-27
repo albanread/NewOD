@@ -44,7 +44,7 @@ use nod_dfm::{
     Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp,
     SlotTypeKind, TempId, Temporary, Terminator, TypeEstimate,
 };
-use nod_reader::{BinOp, Expr, Item, Module, Param, ReturnSig, Span, Statement, UnOp};
+use nod_reader::{BinOp, Binder, Expr, Item, Module, Param, ReturnSig, Span, Statement, UnOp};
 use nod_runtime::{
     ClassId, ClassMetadata, SlotDefault, SlotInfo, SlotType, Word, class_metadata_for,
     class_metadata_ptr, find_class_id_by_name, register_mi_user_class,
@@ -248,6 +248,21 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     // later, far from the originating site). Declared TypeEstimate::Top
     // because the type system doesn't model never-returns yet.
     ("%error", "nod_error", 1, TypeEstimate::Top),
+    // Sprint 47 — multi-value return secondary-values buffer. See
+    // `docs/COMPILER_GAPS.md` GAP-003 and
+    // `src/nod-runtime/src/values.rs`. The SBCL-style discipline:
+    // `values(a, b, c)` lowers as `%values-set!(0, b); %values-set!(1, c)`
+    // then returns `a` through the ordinary ABI; the multi-binder `let
+    // (x, y, z) = …` form calls `%values-clear()` before evaluating the
+    // RHS so polluted state from earlier calls doesn't leak in, binds
+    // `x` to the RHS's normal return, then reads `y` from `%values-get(0)`
+    // and `z` from `%values-get(1)`. `%values-count` is exposed for
+    // completeness (rarely used directly from Dylan; the receiver-side
+    // lowering relies on `%values-get` returning `#f` for missing extras).
+    ("%values-clear", "nod_values_clear", 0, TypeEstimate::Top),
+    ("%values-set!", "nod_values_set", 2, TypeEstimate::Top),
+    ("%values-get", "nod_values_get", 1, TypeEstimate::Top),
+    ("%values-count", "nod_values_count", 0, TypeEstimate::Integer),
     // Collection-class primitives (Sprint 20b — wraps the Rust Sprint 20 API).
     ("%collection-size", "nod_collection_size", 1, TypeEstimate::Integer),
     ("%collection-concatenate", "nod_collection_concatenate", 2, TypeEstimate::Top),
@@ -3184,31 +3199,48 @@ fn lower_function_inner(
                 value,
                 span,
             } => {
-                if rest.is_some() || binders.len() != 1 {
+                if rest.is_some() {
                     return Err(LoweringError::Unsupported {
                         span: *span,
-                        message: "Sprint 06 lowers single-binder `let` only".to_string(),
+                        message: "`#rest` binder in `let` not supported yet".to_string(),
                     });
                 }
-                let bname = &binders[0].name;
-                let t = b.lower_expr(value, &mut env, ctx)?;
-                // Sprint 24: cell-promote the binding if any inner
-                // closure captures it.
-                let bound = if b.cell_ctx.cell_locals.contains(bname) {
-                    let cell = b.fresh_temp(TypeEstimate::Top);
-                    b.push(Computation::DirectCall {
-                        dst: cell,
-                        callee: "nod_make_cell".to_string(),
-                        args: vec![t],
-                        safepoint_roots: Vec::new(),
+                if binders.is_empty() {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "`let` with no binders".to_string(),
                     });
-                    cell
+                }
+                if binders.len() > 1 {
+                    // Sprint 47 — multi-binder `let (a, b, …) = expr`.
+                    // See `docs/COMPILER_GAPS.md` GAP-003. Delegates to
+                    // the shared helper that runs the SBCL-style
+                    // secondary-values destructure.
+                    let t = b.lower_let_multi_binders(binders, value, &mut env, ctx)?;
+                    if is_last {
+                        final_temp = Some(t);
+                    }
                 } else {
-                    t
-                };
-                env.insert(bname.clone(), bound);
-                if is_last {
-                    final_temp = Some(t);
+                    let bname = &binders[0].name;
+                    let t = b.lower_expr(value, &mut env, ctx)?;
+                    // Sprint 24: cell-promote the binding if any inner
+                    // closure captures it.
+                    let bound = if b.cell_ctx.cell_locals.contains(bname) {
+                        let cell = b.fresh_temp(TypeEstimate::Top);
+                        b.push(Computation::DirectCall {
+                            dst: cell,
+                            callee: "nod_make_cell".to_string(),
+                            args: vec![t],
+                            safepoint_roots: Vec::new(),
+                        });
+                        cell
+                    } else {
+                        t
+                    };
+                    env.insert(bname.clone(), bound);
+                    if is_last {
+                        final_temp = Some(t);
+                    }
                 }
             }
             Statement::Local { span, .. } => {
@@ -5157,6 +5189,19 @@ impl FunctionBuilder {
         {
             return self.lower_make(args, env, ctx, span);
         }
+        // Sprint 47 — `values(a, b, c)` intrinsic. See
+        // `docs/COMPILER_GAPS.md` GAP-003. Lowers as:
+        //   `%values-set!(0, b); %values-set!(1, c); ...; return a`
+        // so the callee returns its first value through the ordinary
+        // single-value ABI and stashes the extras in the thread-local
+        // secondary-values buffer. `values()` with no args returns `#f`;
+        // `values(x)` is equivalent to `x` and is lowered without any
+        // buffer writes.
+        if let Expr::Ident(_, name) = callee
+            && name == "values"
+        {
+            return self.lower_values(args, env, ctx, span);
+        }
         // Sprint 14: `next-method()` and `next-method?()` intrinsics.
         // Lower to DirectCall against the runtime shim. Explicit-args
         // form `(next-method x y)` is Sprint 17 macro territory; today
@@ -5723,6 +5768,172 @@ impl FunctionBuilder {
             value: ConstValue::WordBits(w.raw()),
         });
         t
+    }
+
+    /// Sprint 47 — lower `values(a, b, c, …)` to the SBCL-style
+    /// secondary-values protocol (see `docs/COMPILER_GAPS.md` GAP-003
+    /// and `src/nod-runtime/src/values.rs`).
+    ///
+    /// Lowering shape:
+    ///   * Empty `values()` → return `#f` (matches Dylan's "no values"
+    ///     convention; multi-binder receivers with `count = 0` see all
+    ///     binders bound to `#f` via `%values-get` returning `#f` past
+    ///     the count boundary).
+    ///   * Single `values(x)` → just `x`. No buffer touch. This keeps
+    ///     the common "I wrote `values(x)` for symmetry but only want
+    ///     one value" case zero-cost.
+    ///   * Multi `values(a, b, c)` → emit
+    ///     `nod_values_set(0, b); nod_values_set(1, c); return a`.
+    ///     The first value flows out through the ordinary single-value
+    ///     ABI; extras are stashed in the TLS buffer for the caller to
+    ///     pick up via `nod_values_get(i)` after a corresponding
+    ///     `nod_values_clear` cleared count to 0.
+    fn lower_values(
+        &mut self,
+        args: &[Expr],
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+        _span: Span,
+    ) -> Result<TempId, LoweringError> {
+        if args.is_empty() {
+            // `values()` — no values. Return `#f`. Multi-binder receivers
+            // observe all binders as `#f` (since count stays at 0 after
+            // the caller's `nod_values_clear`).
+            let t = self.fresh_temp(TypeEstimate::Boolean);
+            self.push(Computation::Const {
+                dst: t,
+                value: ConstValue::Bool(false),
+            });
+            return Ok(t);
+        }
+        if args.len() == 1 {
+            // `values(x)` — degenerate single-value form. The ordinary
+            // ABI return is exactly `x`; no extras to stash, no buffer
+            // touch.
+            return self.lower_expr(&args[0], env, ctx);
+        }
+        // First, evaluate every argument expression and capture its
+        // temp. We do this in source order BEFORE emitting any
+        // `nod_values_set` calls so the evaluation effects of arg N+1
+        // can't perturb the secondary-values buffer in a way that
+        // arg N's set would then overwrite (each `set` writes a
+        // specific index, but the cleanest correctness story is "all
+        // extras computed before any `set` runs"). It also matches
+        // how Dylan call arguments are evaluated.
+        let arg_temps: Vec<TempId> = args
+            .iter()
+            .map(|a| self.lower_expr(a, env, ctx))
+            .collect::<Result<_, _>>()?;
+        // Stash extras (indices 1..) into the secondary-values buffer.
+        // The first arg flows out through the ordinary return path.
+        for (extra_idx, &val_temp) in arg_temps.iter().enumerate().skip(1) {
+            // Buffer index is `extra_idx - 1` because index 0 of the
+            // buffer holds the SECOND return value (the first goes
+            // through the normal ABI).
+            let buf_idx = (extra_idx - 1) as i64;
+            let idx_t = self.emit_fixnum_const(buf_idx);
+            let dst = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst,
+                callee: "nod_values_set".to_string(),
+                args: vec![idx_t, val_temp],
+                safepoint_roots: Vec::new(),
+            });
+        }
+        Ok(arg_temps[0])
+    }
+
+    /// Sprint 47 — common helper for the multi-binder
+    /// `Statement::Let { binders: [a, b, c], value }` lowering. Called
+    /// from every site that processes `Statement::Let` (function body,
+    /// expression-context `Stmt`, loop body) when `binders.len() > 1`.
+    ///
+    /// Emits, in order:
+    ///   1. `nod_values_clear()` — defensive reset so polluted state
+    ///      from any earlier multi-value call doesn't leak into the
+    ///      `(b, c, …) = …` destructure if the RHS turns out to be
+    ///      single-valued.
+    ///   2. The value expression — its result is the first return value
+    ///      and is bound to `binders[0]` (with cell-promotion if the
+    ///      binder is captured by an inner closure, matching the
+    ///      single-binder path).
+    ///   3. For each subsequent binder at index `i`, emit
+    ///      `nod_values_get(i - 1)` and bind the resulting temp to
+    ///      `binders[i]`. If the call returned fewer values than asked
+    ///      for, `nod_values_get` returns `#f` past the count boundary
+    ///      (standard CL discipline).
+    ///
+    /// Returns the temp bound to `binders[0]` — that's the "value of
+    /// the let" for callers that care (loop-body / Expr::Stmt contexts).
+    fn lower_let_multi_binders(
+        &mut self,
+        binders: &[Binder],
+        value: &Expr,
+        env: &mut LocalEnv,
+        ctx: &LowerCtx,
+    ) -> Result<TempId, LoweringError> {
+        debug_assert!(
+            binders.len() > 1,
+            "lower_let_multi_binders called with {} binders; \
+             single-binder path handles len()==1",
+            binders.len()
+        );
+        // 1. Clear the secondary-values buffer.
+        let clear_dst = self.fresh_temp(TypeEstimate::Top);
+        self.push(Computation::DirectCall {
+            dst: clear_dst,
+            callee: "nod_values_clear".to_string(),
+            args: Vec::new(),
+            safepoint_roots: Vec::new(),
+        });
+        // 2. Evaluate the RHS. Its primary return goes through the
+        //    ordinary ABI; any extras live in the TLS buffer.
+        let primary = self.lower_expr(value, env, ctx)?;
+        // Bind `binders[0]`, with cell-promotion when the binder is
+        // captured by an inner closure (matches the single-binder path
+        // in lower_body_stmts).
+        let first_name = &binders[0].name;
+        let bound_first = if self.cell_ctx.cell_locals.contains(first_name) {
+            let cell = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst: cell,
+                callee: "nod_make_cell".to_string(),
+                args: vec![primary],
+                safepoint_roots: Vec::new(),
+            });
+            cell
+        } else {
+            primary
+        };
+        env.insert(first_name.clone(), bound_first);
+        // 3. Read each extra and bind. Buffer index `b_i - 1` because
+        //    buffer slot 0 holds the SECOND return value (the first
+        //    one came through the ordinary ABI).
+        for (extra_idx, b) in binders.iter().enumerate().skip(1) {
+            let buf_idx = (extra_idx - 1) as i64;
+            let idx_t = self.emit_fixnum_const(buf_idx);
+            let val_t = self.fresh_temp(TypeEstimate::Top);
+            self.push(Computation::DirectCall {
+                dst: val_t,
+                callee: "nod_values_get".to_string(),
+                args: vec![idx_t],
+                safepoint_roots: Vec::new(),
+            });
+            let bound = if self.cell_ctx.cell_locals.contains(&b.name) {
+                let cell = self.fresh_temp(TypeEstimate::Top);
+                self.push(Computation::DirectCall {
+                    dst: cell,
+                    callee: "nod_make_cell".to_string(),
+                    args: vec![val_t],
+                    safepoint_roots: Vec::new(),
+                });
+                cell
+            } else {
+                val_t
+            };
+            env.insert(b.name.clone(), bound);
+        }
+        Ok(primary)
     }
 
     fn emit_class_metadata_ptr_const(&mut self, class_id: ClassId) -> TempId {
@@ -6305,15 +6516,26 @@ impl FunctionBuilder {
             Statement::Let {
                 binders, rest, value, span,
             } => {
-                if rest.is_some() || binders.len() != 1 {
+                if rest.is_some() {
                     return Err(LoweringError::Unsupported {
                         span: *span,
-                        message: "Sprint 18 lowers single-binder `let` only inside loops".to_string(),
+                        message: "`#rest` binder in `let` not supported yet".to_string(),
                     });
                 }
-                let bname = &binders[0].name;
-                let t = self.lower_expr(value, env, ctx)?;
-                env.insert(bname.clone(), t);
+                if binders.is_empty() {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "`let` with no binders".to_string(),
+                    });
+                }
+                if binders.len() > 1 {
+                    // Sprint 47 — multi-binder `let` inside a loop body.
+                    self.lower_let_multi_binders(binders, value, env, ctx)?;
+                } else {
+                    let bname = &binders[0].name;
+                    let t = self.lower_expr(value, env, ctx)?;
+                    env.insert(bname.clone(), t);
+                }
                 Ok(())
             }
             Statement::While { cond, body, .. } => {
@@ -6360,16 +6582,28 @@ impl FunctionBuilder {
             Statement::Let {
                 binders, rest, value, span,
             } => {
-                if rest.is_some() || binders.len() != 1 {
+                if rest.is_some() {
                     return Err(LoweringError::Unsupported {
                         span: *span,
-                        message: "Sprint 18 lowers single-binder `let` only".to_string(),
+                        message: "`#rest` binder in `let` not supported yet".to_string(),
                     });
                 }
-                let bname = &binders[0].name;
-                let t = self.lower_expr(value, env, ctx)?;
-                env.insert(bname.clone(), t);
-                Ok(t)
+                if binders.is_empty() {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "`let` with no binders".to_string(),
+                    });
+                }
+                if binders.len() > 1 {
+                    // Sprint 47 — multi-binder `let` in expression-stmt context.
+                    let t = self.lower_let_multi_binders(binders, value, env, ctx)?;
+                    Ok(t)
+                } else {
+                    let bname = &binders[0].name;
+                    let t = self.lower_expr(value, env, ctx)?;
+                    env.insert(bname.clone(), t);
+                    Ok(t)
+                }
             }
             Statement::Expr(e) => self.lower_expr(e, env, ctx),
             Statement::For { span, .. }
@@ -7295,16 +7529,28 @@ fn lower_statements_into(
                 value,
                 span,
             } => {
-                if rest.is_some() || binders.len() != 1 {
+                if rest.is_some() {
                     return Err(LoweringError::Unsupported {
                         span: *span,
-                        message: "Sprint 06 lowers single-binder `let` only".to_string(),
+                        message: "`#rest` binder in `let` not supported yet".to_string(),
                     });
                 }
-                let bname = &binders[0].name;
-                let t = b.lower_expr(value, env, ctx)?;
-                env.insert(bname.clone(), t);
-                b.set_last_temp(t);
+                if binders.is_empty() {
+                    return Err(LoweringError::Unsupported {
+                        span: *span,
+                        message: "`let` with no binders".to_string(),
+                    });
+                }
+                if binders.len() > 1 {
+                    // Sprint 47 — multi-binder `let` in lifted-thunk context.
+                    let t = b.lower_let_multi_binders(binders, value, env, ctx)?;
+                    b.set_last_temp(t);
+                } else {
+                    let bname = &binders[0].name;
+                    let t = b.lower_expr(value, env, ctx)?;
+                    env.insert(bname.clone(), t);
+                    b.set_last_temp(t);
+                }
             }
             Statement::Local { span, .. } => {
                 return Err(LoweringError::Unsupported {
