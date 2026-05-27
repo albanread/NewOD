@@ -473,6 +473,12 @@ fn snapshot_roots() -> Vec<*const Word> {
     let mut roots = ROOT_STACK.with(|s| s.borrow().clone());
     roots.extend(crate::stack_map::snapshot_active_jit_roots());
     roots.extend(crate::aot::snapshot_active_aot_roots());
+    // Sprint 47 — multi-value return secondary-values buffer (see
+    // `docs/COMPILER_GAPS.md` GAP-003 and `nod-runtime/src/values.rs`).
+    // The first `VALUES_COUNT` entries of the TLS buffer are heap-pointer
+    // candidates that must be scanned alongside the other roots while a
+    // multi-binder `let` is destructuring a call's return.
+    roots.extend(crate::values::snapshot_active_values_roots());
     roots
 }
 

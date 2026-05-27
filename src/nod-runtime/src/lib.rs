@@ -86,6 +86,7 @@ mod structs;
 mod symbols;
 mod tables;
 mod tracer;
+mod values;
 mod vectors;
 mod word;
 mod wrapper;
@@ -262,6 +263,10 @@ pub use tables::{
     table_element_setter, table_keys, table_remove_key, table_size, table_values,
 };
 pub use tracer::{HeapObjectInfo, HeapTrace, trace_heap};
+pub use values::{
+    nod_values_clear, nod_values_count, nod_values_get, nod_values_set,
+    snapshot_active_values_roots,
+};
 pub use vectors::{
     SimpleObjectVector, nod_make_sov_len, nod_make_sov_literal, nod_sov_element,
     nod_sov_element_setter, nod_sov_size, try_simple_object_vector, try_simple_object_vector_mut,
