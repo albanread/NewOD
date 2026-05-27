@@ -76,13 +76,20 @@ fn ir_dump_has_no_same_value_phi_incomings() {
         "expected at least one i64 phi in the dumped IR — fixture no \
          longer exercises the loop-carried-temp shape:\n{ir}"
     );
-    // The fixture allocates inside the loop body, so a `gc.reload` is
-    // expected as one phi-incoming. The bug shape was BOTH incomings
-    // being the same reload.
+    // The fixture allocates inside the loop body, so a safepoint reload
+    // (`gc.s<N>.reload.tN`) is expected as one phi-incoming. The bug
+    // shape was BOTH incomings being the same reload.
+    //
+    // Naming note: codegen emits per-site reload names of the form
+    // `gc.s<site_id>.reload.t<temp_id>` (see
+    // `src/nod-llvm/src/codegen.rs:4395`). An earlier draft of this
+    // assertion looked for the bare `gc.reload.` literal that does
+    // not appear in the actual IR — this is the codegen's current
+    // shape.
     assert!(
-        ir.contains("gc.reload."),
-        "expected at least one gc.reload in the dumped IR — fixture no \
-         longer exercises safepoint reloads:\n{ir}"
+        ir.contains(".reload.t"),
+        "expected at least one safepoint reload (`.reload.tN`) in the \
+         dumped IR — fixture no longer exercises safepoint reloads:\n{ir}"
     );
 
     // Scan each phi line and check no `[ %X, %B1 ], [ %X, %B2 ]` shape

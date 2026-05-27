@@ -497,19 +497,69 @@ Sort by ID. New gaps append. Don't renumber.
   let (line, col) = offset-to-line-col(off, source);
   ```
   Neither the multiple-value return nor the multi-binder `let`
-  form is implemented. Per nod-sema's "Out of scope" doc-comment,
-  multi-value is a recognised future feature.
-* **Workaround**: pack `line * 1_000_000 + col` into one integer
-  return. Paired `unpack-line` / `unpack-col` accessors decode it
-  at call sites. Works because both line and col are bounded
-  small integers, but is ugly and would be wrong for anything else.
-* **Planned fix**: real multi-value return as a first-class Dylan
-  feature. Touches parser (multi-binder `let` form), sema (lower
-  `values(...)` and the receiving destructure), DFM IR (multi-temp
-  return), and codegen (multi-register return convention or
-  caller-spilled slots).
-* **Scope**: large. Plan it as its own sprint. Not blocking.
-* **Status**: open.
+  form was implemented. Per nod-sema's "Out of scope" doc-comment,
+  multi-value was a recognised future feature.
+* **Workaround (retired)**: packed `line * 1_000_000 + col` into one
+  integer return. Paired `unpack-line` / `unpack-col` accessors
+  decoded it at call sites. Worked because both line and col are
+  bounded small integers, but was ugly and would be wrong for
+  anything else. Retired with the fix.
+* **Fix (Sprint 47)**: SBCL-style secondary-values buffer. No ABI
+  changes. Five phases:
+  1. **Runtime** (`src/nod-runtime/src/values.rs`) — thread-local
+     `[Word; 8]` buffer + `usize` count, `extern "C"` shims
+     `nod_values_clear` / `nod_values_set` / `nod_values_get` /
+     `nod_values_count`, and `snapshot_active_values_roots` wired
+     into `heap::snapshot_roots` so the GC scans the buffer when a
+     multi-binder `let` is mid-destructure across a safepoint.
+  2. **Primitives** — four entries in
+     `LOWER_PRIMITIVE_TABLE` (`%values-clear`, `%values-set!`,
+     `%values-get`, `%values-count`) routing to the runtime shims.
+  3. **Parser/AST** — `Statement::Let { binders: Vec<Binder>, … }`
+     already accepted multi-binder `let (a, b, c) = …` from earlier
+     work; Sprint 47 only flips its lowering from "Unsupported" to
+     the SBCL destructure. The multi-binder shape is a frozen
+     kernel binding form (can't desugar to nested single-binder
+     `let` — the RHS must be evaluated exactly once).
+  4. **Sema** (`src/nod-sema/src/lower.rs`) —
+     `values(a, b, c)` (recognised on the call's callee name)
+     lowers to `nod_values_set(0, b); nod_values_set(1, c); return a`;
+     multi-binder `Statement::Let` lowers to
+     `nod_values_clear(); let a = expr; let b = nod_values_get(0); …`.
+     A new `lower_let_multi_binders` helper is called from every
+     site that processes `Statement::Let` (function body, lift
+     thunk, loop body, expression-stmt context).
+  5. **Workaround retirement** — lexer fixture's
+     `offset-to-line-col-packed` → `offset-to-line-col` returning
+     `values(line, col)`; call sites use `let (l, c) = …`. The
+     `$line-col-shift` constant and `unpack-line` / `unpack-col`
+     helpers are deleted.
+
+  Single-value receivers (`let x = call()`) don't touch the buffer
+  at all — zero overhead for the common case. The polluted-buffer
+  trap (call A returns multi, call B is single-valued, then `let
+  (b1, b2) = B`) is solved by the receiver-side `nod_values_clear`
+  before the call: if B doesn't write to the buffer, B2 reads past
+  count and gets `#f`.
+* **Regression tests** (this commit):
+  - `tests/nod-tests/tests/sema.rs::gap_003_phase_b_values_primops_lower`
+    — the four `%values-*` primops resolve.
+  - `tests/nod-tests/tests/sema.rs::gap_003_values_*` + `…multi_binder_let_*`
+    + `…polluted_buffer_does_not_leak_across_calls` — six lowering
+    shape checks covering single/multi `values()`, two/three binder
+    `let`, single-value RHS fallback, and clear-before-each-call.
+  - `tests/nod-tests/tests/aot_dylan.rs::aot_gap_003_divmod_multi_value`
+    + `…polluted_buffer_does_not_leak` — end-to-end through the AOT
+    pipeline.
+  - Runtime unit tests in `src/nod-runtime/src/values.rs`
+    (clear/set/get round-trip, count growth, snapshot returns
+    pointers, set-at-cap panics, polluted-buffer test).
+* **Scope (actual)**: medium. ~250 lines runtime, ~250 lines sema,
+  ~400 lines tests. Five atomic commits, one per phase.
+* **Status**: **fixed in Sprint 47** — runtime mechanism (`values.rs`)
+  in `abc61e3`; sema lowering for `values(...)` and multi-binder `let`
+  in `5181da5`; AST policy + regression tests in `a2a448b`; lexer
+  fixture retirement + this doc update in this commit.
 
 ## GAP-010 — AOT zero-root safepoints panic in codegen when no slot slab exists
 

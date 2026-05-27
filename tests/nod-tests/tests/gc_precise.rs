@@ -68,9 +68,18 @@ fn mk_temp(id: u32, ty: TypeEstimate) -> Temporary {
 }
 
 /// 1. JIT IR shape: a Dylan function that allocates two instances in
-///    sequence emits `nod_register_root` and `nod_unregister_root`
-///    calls bracketing the second `make`, with the first instance's
-///    Word spilled to an `alloca` slot.
+///    sequence emits safepoint brackets around the second `make`, with
+///    the first instance's Word spilled to an `alloca` slot.
+///
+/// Naming note: codegen migrated from the legacy
+/// `nod_register_root` / `nod_unregister_root` per-Word root-stack
+/// pattern to the per-safepoint slot-slab + `nod_jit_begin_safepoint`
+/// / `nod_jit_end_safepoint` protocol (see
+/// `src/nod-llvm/src/codegen.rs::begin_safepoint`). The slot names
+/// also gained a per-site prefix (`gc.s<N>.reload.tN`). Assertions
+/// updated to match — the structural shape we want is the same
+/// (entry-block alloca slot + bracketing safepoint calls +
+/// post-safepoint reload).
 #[test]
 #[serial]
 fn jit_ir_brackets_second_make_with_register_root() {
@@ -81,12 +90,12 @@ fn jit_ir_brackets_second_make_with_register_root() {
     let path = fixtures_dir().join("gc_precise_two_makes_ir.dylan");
     let ir = dump_llvm_for_file(&path).expect("dump LLVM IR");
     assert!(
-        ir.contains("nod_register_root"),
-        "expected nod_register_root in IR:\n{ir}"
+        ir.contains("nod_jit_begin_safepoint"),
+        "expected nod_jit_begin_safepoint in IR:\n{ir}"
     );
     assert!(
-        ir.contains("nod_unregister_root"),
-        "expected nod_unregister_root in IR:\n{ir}"
+        ir.contains("nod_jit_end_safepoint"),
+        "expected nod_jit_end_safepoint in IR:\n{ir}"
     );
     assert!(
         ir.contains("gc.root.slot."),
@@ -95,8 +104,8 @@ fn jit_ir_brackets_second_make_with_register_root() {
     // The reload-after-call path is the key correctness sequence —
     // verify a `load i64, ptr %gc.root.slot.*` and a subsequent use.
     assert!(
-        ir.contains("gc.reload."),
-        "expected reload label in IR:\n{ir}"
+        ir.contains(".reload.t"),
+        "expected reload label (`.reload.tN`) in IR:\n{ir}"
     );
 }
 

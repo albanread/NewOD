@@ -345,11 +345,13 @@ define method print-token
     (t :: <token>, source :: <byte-string>, stream :: <string-stream>)
  => ()
   let span = token-span(t);
-  let start-packed = offset-to-line-col-packed(source, span-start(span));
-  let end-packed   = offset-to-line-col-packed(source, span-end(span));
-  write-line-col-to-dump-stream(unpack-line(start-packed), unpack-col(start-packed));
+  // Sprint 47 — GAP-003 fixed; we destructure the two return values
+  // directly rather than packing them through `line * 1_000_000 + col`.
+  let (start-line, start-col) = offset-to-line-col(source, span-start(span));
+  let (end-line, end-col)     = offset-to-line-col(source, span-end(span));
+  write-line-col-to-dump-stream(start-line, start-col);
   write-byte(*dump-stream*, 45);  // '-'
-  write-line-col-to-dump-stream(unpack-line(end-packed),   unpack-col(end-packed));
+  write-line-col-to-dump-stream(end-line, end-col);
   write-string(*dump-stream*, "  ");
   write-string(*dump-stream*, token-kind-name(t));
   if (~instance?(t, <eof-token>))
@@ -421,23 +423,16 @@ end function;
 // Sprint 45a's hello.dylan the input is LF-only so the simple form is
 // enough. Sprint 45b will revisit if/when we hit CRLF fixtures.
 //
-// Returns `line * 1_000_000 + col`. The Sprint 06 sema kernel doesn't
-// lower `values(a, b)` / multi-binder `let (a, b) =` yet (see
-// nod-sema/src/lib.rs §"Out of scope"), so we pack the two integers
-// into one. Callers that just want the line use `/ 1_000_000`; column
-// is `mod 1_000_000`. The cap is enforced implicitly: any column
-// >= 1_000_000 would collide, but no source file we'll ever lex has
-// a single line that long.
+// Sprint 47 (GAP-003 fix) — returns `(line, col)` via SBCL-style
+// secondary values. Replaces the earlier `line * 1_000_000 + col`
+// packing workaround: the compiler now lowers `values(a, b)` and
+// multi-binder `let (a, b) = …`, so the natural shape is the right
+// shape. The packed-into-one workaround (and the `$line-col-shift`
+// constant plus `unpack-line` / `unpack-col` accessors) is retired.
 
-// Packing scale: line * $line-col-shift + col. GAP-002 is fixed —
-// `define constant` names now resolve from inside function bodies,
-// so we use the named constant at all three sites. (Until GAP-003
-// lands proper multi-value return, the packing trick stays.)
-
-define constant $line-col-shift = 1000000;
-
-define function offset-to-line-col-packed
-    (source :: <byte-string>, offset :: <integer>) => (packed :: <integer>)
+define function offset-to-line-col
+    (source :: <byte-string>, offset :: <integer>)
+ => (line :: <integer>, col :: <integer>)
   let n = %byte-string-size(source);
   let stop = if (offset > n) n elseif (offset < 0) 0 else offset end;
   let line = 1;
@@ -458,15 +453,7 @@ define function offset-to-line-col-packed
     end;
     i := i + 1;
   end;
-  line * $line-col-shift + col
-end function;
-
-define function unpack-line (packed :: <integer>) => (line :: <integer>)
-  packed / $line-col-shift
-end function;
-
-define function unpack-col (packed :: <integer>) => (col :: <integer>)
-  packed - (packed / $line-col-shift) * $line-col-shift
+  values(line, col)
 end function;
 
 // ─── write-escaped-source-text — escape control bytes into a stream ──────
@@ -741,8 +728,8 @@ define function is-exponent-marker? (b :: <integer>) => (yes? :: <boolean>)
 end function;
 
 // Whitespace bytes treated as a single run. Newline (10) is included;
-// the line/col packing in `offset-to-line-col-packed` separately tracks
-// line breaks.
+// `offset-to-line-col` separately tracks line breaks via its multi-
+// value return.
 define function is-whitespace-byte? (b :: <integer>) => (yes? :: <boolean>)
   b = 32 | b = 9 | b = 10 | b = 13 | b = 12  // ' ' \t \n \r \f
 end function;
