@@ -139,6 +139,11 @@ pub fn resolve_dispatches(
                             callee: head.clone(),
                             args: preserved_args,
                             safepoint_roots: preserved_roots,
+                            // Sprint 48: dispatch resolver doesn't (yet)
+                            // analyse user-method bodies for no_alloc.
+                            // Phase B would propagate it from the
+                            // resolved method's Function::no_alloc.
+                            is_no_alloc: false,
                         };
                     } else {
                         *c = Computation::SealedDirectCall {
@@ -148,6 +153,7 @@ pub fn resolve_dispatches(
                             generic_name: preserved_generic.clone(),
                             args: preserved_args,
                             safepoint_roots: preserved_roots,
+                            is_no_alloc: false,
                         };
                     }
 

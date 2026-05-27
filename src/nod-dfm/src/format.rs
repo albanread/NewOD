@@ -100,7 +100,7 @@ fn fmt_computation(c: &Computation, f: &Function, out: &mut String) {
             }
             out.push('\n');
         }
-        Computation::DirectCall { dst, callee, args, safepoint_roots } => {
+        Computation::DirectCall { dst, callee, args, safepoint_roots, is_no_alloc } => {
             let _ = write!(
                 out,
                 "t{}: {} = DirectCall {}(",
@@ -116,6 +116,13 @@ fn fmt_computation(c: &Computation, f: &Function, out: &mut String) {
             }
             out.push(')');
             fmt_safepoint(safepoint_roots, out);
+            // Sprint 48: emit [no_alloc] annotation when set. Folded
+            // into the dump output (and therefore into the cache key
+            // produced by `format_for_cache_key`) so that flipping a
+            // primitive's annotation invalidates stale cached bitcode.
+            if *is_no_alloc {
+                out.push_str(" [no_alloc]");
+            }
             out.push('\n');
         }
         Computation::Call { dst, callee, args, safepoint_roots } => {
@@ -204,6 +211,7 @@ fn fmt_computation(c: &Computation, f: &Function, out: &mut String) {
             generic_name,
             args,
             safepoint_roots,
+            is_no_alloc,
         } => {
             let _ = write!(
                 out,
@@ -220,6 +228,10 @@ fn fmt_computation(c: &Computation, f: &Function, out: &mut String) {
             }
             out.push(')');
             fmt_safepoint(safepoint_roots, out);
+            // Sprint 48: see DirectCall above.
+            if *is_no_alloc {
+                out.push_str(" [no_alloc]");
+            }
             // Trailing comment annotation per spec §7.3 — `; sealed-direct`
             // marker plus the generic name and chain depth, so the dump is
             // self-explanatory.

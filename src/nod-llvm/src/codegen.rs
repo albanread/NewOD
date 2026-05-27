@@ -2635,6 +2635,12 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 callee,
                 args,
                 safepoint_roots,
+                // Sprint 48: codegen doesn't directly consult this — when
+                // the call is no_alloc, the liveness pass produces empty
+                // safepoint_roots and the existing `!rented.is_empty()`
+                // guard in `begin_safepoint` skips the brackets. Pattern
+                // mention is for the exhaustive-match requirement only.
+                is_no_alloc: _,
             } => {
                 let v = self.emit_direct_call(callee, args, *dst, safepoint_roots)?;
                 // GAP-006 fix: even when the called function returns
@@ -2701,6 +2707,7 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                 generic_name,
                 args,
                 safepoint_roots,
+                is_no_alloc: _,
             } => {
                 let v = self.emit_sealed_direct_call(
                     method,

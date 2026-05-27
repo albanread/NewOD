@@ -2021,6 +2021,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
                     callee: "nod_var_get_by_name".to_string(),
                     args: vec![name_t],
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 getter.func.return_type = TypeEstimate::Top;
                 getter.terminate_current(Terminator::Return { value: Some(value_t) });
@@ -3136,7 +3137,7 @@ fn lower_function_inner(
                 dst: cell,
                 callee: "nod_make_cell".to_string(),
                 args: vec![t],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             env.insert(p.name.clone(), cell);
         } else {
@@ -3231,7 +3232,7 @@ fn lower_function_inner(
                             dst: cell,
                             callee: "nod_make_cell".to_string(),
                             args: vec![t],
-                            safepoint_roots: Vec::new(),
+                            safepoint_roots: Vec::new(), is_no_alloc: false,
                         });
                         cell
                     } else {
@@ -4481,7 +4482,7 @@ impl FunctionBuilder {
                             dst,
                             callee: "nod_cell_get".to_string(),
                             args: vec![t],
-                            safepoint_roots: Vec::new(),
+                            safepoint_roots: Vec::new(), is_no_alloc: false,
                         });
                         return Ok(dst);
                     }
@@ -4571,7 +4572,7 @@ impl FunctionBuilder {
                         dst,
                         callee: name.clone(),
                         args: Vec::new(),
-                        safepoint_roots: Vec::new(),
+                        safepoint_roots: Vec::new(), is_no_alloc: false,
                     });
                     return Ok(dst);
                 }
@@ -4662,7 +4663,7 @@ impl FunctionBuilder {
                         dst: eq_dst,
                         callee: "nod_object_equal_p".to_string(),
                         args: vec![l, r],
-                        safepoint_roots: Vec::new(),
+                        safepoint_roots: Vec::new(), is_no_alloc: false,
                     });
                     if matches!(*op, BinOp::Ne | BinOp::NeEq) {
                         let neg_dst = self.fresh_temp(TypeEstimate::Boolean);
@@ -4753,7 +4754,7 @@ impl FunctionBuilder {
                         dst: cell,
                         callee: "nod_make_cell".to_string(),
                         args: vec![t],
-                        safepoint_roots: Vec::new(),
+                        safepoint_roots: Vec::new(), is_no_alloc: false,
                     });
                     cell
                 } else {
@@ -4813,14 +4814,14 @@ impl FunctionBuilder {
             dst: cell_t,
             callee: "nod_env_cell".to_string(),
             args: vec![env_temp, idx_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         let val_t = self.fresh_temp(TypeEstimate::Top);
         self.push(Computation::DirectCall {
             dst: val_t,
             callee: "nod_cell_get".to_string(),
             args: vec![cell_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         val_t
     }
@@ -4844,14 +4845,14 @@ impl FunctionBuilder {
             dst: cell_t,
             callee: "nod_env_cell".to_string(),
             args: vec![env_temp, idx_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         let dst = self.fresh_temp(TypeEstimate::Top);
         self.push(Computation::DirectCall {
             dst,
             callee: "nod_cell_set".to_string(),
             args: vec![value, cell_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         dst
     }
@@ -4878,7 +4879,7 @@ impl FunctionBuilder {
             dst: sov_t,
             callee: "nod_make_sov_len".to_string(),
             args: vec![len_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         // 2. Fill the SOV slots with the captured cell Words.
         for (i, &cell) in captured_cells.iter().enumerate() {
@@ -4895,7 +4896,7 @@ impl FunctionBuilder {
             dst: env_t,
             callee: "nod_make_environment".to_string(),
             args: vec![sov_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         // 4. Allocate the closure Word with this env.
         let name_word = self.emit_string_literal(lifted_name);
@@ -4909,7 +4910,7 @@ impl FunctionBuilder {
             dst,
             callee: "nod_make_closure".to_string(),
             args: vec![name_word, arity_t, env_t],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         dst
     }
@@ -4925,7 +4926,7 @@ impl FunctionBuilder {
             dst,
             callee: "nod_sov_element_setter".to_string(),
             args: vec![value, sov, idx],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         dst
     }
@@ -4947,7 +4948,7 @@ impl FunctionBuilder {
             dst,
             callee: "nod_make_function_ref".to_string(),
             args: vec![name_word, arity_temp],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         dst
     }
@@ -5027,7 +5028,7 @@ impl FunctionBuilder {
                         dst,
                         callee: "nod_cell_set".to_string(),
                         args: vec![v, cell_t],
-                        safepoint_roots: Vec::new(),
+                        safepoint_roots: Vec::new(), is_no_alloc: false,
                     });
                     return Ok(dst);
                 }
@@ -5062,6 +5063,7 @@ impl FunctionBuilder {
                     callee: "nod_var_set_by_name".to_string(),
                     args: vec![v, name_t],
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 return Ok(dst);
             }
@@ -5221,7 +5223,7 @@ impl FunctionBuilder {
                 dst,
                 callee: "nod_next_method".to_string(),
                 args: Vec::new(),
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5234,7 +5236,7 @@ impl FunctionBuilder {
                 dst,
                 callee: "nod_has_next_method".to_string(),
                 args: Vec::new(),
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5265,6 +5267,7 @@ impl FunctionBuilder {
                     callee: "%nil".to_string(),
                     args: Vec::new(),
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 return Ok(dst);
             }
@@ -5281,7 +5284,7 @@ impl FunctionBuilder {
                 dst: tail,
                 callee: "%nil".to_string(),
                 args: Vec::new(),
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             for elt in elem_temps.into_iter().rev() {
                 let pair_dst = self.fresh_temp(TypeEstimate::Class(
@@ -5292,6 +5295,7 @@ impl FunctionBuilder {
                     callee: "%pair-alloc".to_string(),
                     args: vec![elt, tail],
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 tail = pair_dst;
             }
@@ -5324,7 +5328,7 @@ impl FunctionBuilder {
                 dst,
                 callee: sym.to_string(),
                 args: arg_temps,
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5339,7 +5343,7 @@ impl FunctionBuilder {
                 dst,
                 callee: "%signal".to_string(),
                 args: vec![a],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5353,7 +5357,7 @@ impl FunctionBuilder {
                 dst,
                 callee: "%condition-message".to_string(),
                 args: vec![a],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5441,7 +5445,7 @@ impl FunctionBuilder {
                 dst,
                 callee: funcall_sym.to_string(),
                 args: call_args,
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5541,6 +5545,7 @@ impl FunctionBuilder {
                     callee: callee_sym.to_string(),
                     args: call_args,
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 return Ok(dst);
             }
@@ -5560,6 +5565,7 @@ impl FunctionBuilder {
                     callee: name.clone(),
                     args: arg_temps,
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 return Ok(dst);
             }
@@ -5587,7 +5593,7 @@ impl FunctionBuilder {
                 dst,
                 callee: name.clone(),
                 args: arg_temps,
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             Ok(dst)
         } else {
@@ -5659,7 +5665,7 @@ impl FunctionBuilder {
                 dst,
                 callee: "nod_make_table".to_string(),
                 args: vec![cap],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             return Ok(dst);
         }
@@ -5702,7 +5708,7 @@ impl FunctionBuilder {
             dst,
             callee: "%make".to_string(),
             args: make_args,
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         Ok(dst)
     }
@@ -5753,7 +5759,7 @@ impl FunctionBuilder {
             dst,
             callee: builtin.callee_symbol().to_string(),
             args: arg_temps,
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         Ok(dst)
     }
@@ -5837,7 +5843,7 @@ impl FunctionBuilder {
                 dst,
                 callee: "nod_values_set".to_string(),
                 args: vec![idx_t, val_temp],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
         }
         Ok(arg_temps[0])
@@ -5884,7 +5890,7 @@ impl FunctionBuilder {
             dst: clear_dst,
             callee: "nod_values_clear".to_string(),
             args: Vec::new(),
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         // 2. Evaluate the RHS. Its primary return goes through the
         //    ordinary ABI; any extras live in the TLS buffer.
@@ -5899,7 +5905,7 @@ impl FunctionBuilder {
                 dst: cell,
                 callee: "nod_make_cell".to_string(),
                 args: vec![primary],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             cell
         } else {
@@ -5917,7 +5923,7 @@ impl FunctionBuilder {
                 dst: val_t,
                 callee: "nod_values_get".to_string(),
                 args: vec![idx_t],
-                safepoint_roots: Vec::new(),
+                safepoint_roots: Vec::new(), is_no_alloc: false,
             });
             let bound = if self.cell_ctx.cell_locals.contains(&b.name) {
                 let cell = self.fresh_temp(TypeEstimate::Top);
@@ -5926,6 +5932,7 @@ impl FunctionBuilder {
                     callee: "nod_make_cell".to_string(),
                     args: vec![val_t],
                     safepoint_roots: Vec::new(),
+                    is_no_alloc: false,
                 });
                 cell
             } else {
@@ -7351,7 +7358,7 @@ fn lower_block_form(
             dst: ep_temp,
             callee: BLOCK_MAKE_EXIT_CALLEE.to_string(),
             args: vec![bid_temp],
-            safepoint_roots: Vec::new(),
+            safepoint_roots: Vec::new(), is_no_alloc: false,
         });
         capture_temps.push(ep_temp);
     }
@@ -7370,7 +7377,7 @@ fn lower_block_form(
         dst,
         callee: BLOCK_RUN_CALLEE.to_string(),
         args,
-        safepoint_roots: Vec::new(),
+        safepoint_roots: Vec::new(), is_no_alloc: false,
     });
 
     // The block's result type is intentionally `Top` — Sprint 19

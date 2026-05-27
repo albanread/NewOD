@@ -90,6 +90,17 @@ pub enum Computation {
         callee: String,
         args: Vec<TempId>,
         safepoint_roots: Vec<TempId>,
+        /// Sprint 48: when true, the callee is known not to allocate
+        /// (no `nod_make` calls, no growth of any heap-backed structure,
+        /// no condition signalling). Sourced from `LOWER_PRIMITIVE_TABLE`
+        /// at lowering time for `%`-prefixed primitives; user-defined
+        /// functions default to `false` unless a future fixed-point
+        /// analysis (Sprint 48 Phase B) propagates it. When true,
+        /// `is_potentially_allocating_call` returns false → the liveness
+        /// pass leaves `safepoint_roots` empty → codegen skips the
+        /// `nod_jit_begin_safepoint` / `nod_jit_end_safepoint` brackets
+        /// (existing `!rented.is_empty()` guard).
+        is_no_alloc: bool,
     },
     /// Call an evaluated callee value. Lowered for higher-order calls
     /// once the callee expression isn't a bare ident.
@@ -200,6 +211,11 @@ pub enum Computation {
         generic_name: String,
         args: Vec<TempId>,
         safepoint_roots: Vec<TempId>,
+        /// Sprint 48 — see `DirectCall::is_no_alloc`. Practically
+        /// always `false` for sealed-direct calls today (user-defined
+        /// methods aren't analysed); reserved for the Phase B
+        /// extension.
+        is_no_alloc: bool,
     },
     // TODO(sprint-08+): `Values`, `BindExit`, `UnbindExit`, `Closure`,
     // `MakeEnvironment`. Verifier rejects them today because they aren't
@@ -680,13 +696,18 @@ impl Computation {
     /// nodes that can lead to heap allocation (via `nod_make`, JIT'd
     /// Dylan bodies that internally allocate, or method bodies behind
     /// a dispatch).
+    /// Sprint 48: returns false for `DirectCall` / `SealedDirectCall`
+    /// where `is_no_alloc` is set, even though they're call-shaped.
+    /// `Call` (computed callee) and `Dispatch` (runtime dispatch) are
+    /// always treated as potentially allocating — the resolved callee
+    /// isn't known at IR-build time, so we can't safely assert
+    /// no-allocation.
     pub fn is_potentially_allocating_call(&self) -> bool {
-        matches!(
-            self,
-            Computation::DirectCall { .. }
-                | Computation::Call { .. }
-                | Computation::Dispatch { .. }
-                | Computation::SealedDirectCall { .. }
-        )
+        match self {
+            Computation::DirectCall { is_no_alloc, .. } => !is_no_alloc,
+            Computation::SealedDirectCall { is_no_alloc, .. } => !is_no_alloc,
+            Computation::Call { .. } | Computation::Dispatch { .. } => true,
+            _ => false,
+        }
     }
 }
