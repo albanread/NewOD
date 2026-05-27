@@ -239,6 +239,15 @@ impl MethodRegistration {
 /// generics (`size`, `concatenate`, `for-each`) live in
 /// `src/nod-dylan/dylan-sources/stdlib.dylan` and call these.
 const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
+    // Fail-fast: signal a <simple-error> with the given <byte-string> as
+    // message. Does not return — the runtime's nod_error path raises
+    // a Rust panic that the Sprint 45g crash dumper catches, exits 99,
+    // and prints GC + safepoint state. Used by the in-flight Dylan
+    // parser to crash at the closest point to a syntax problem (rather
+    // than building a partial AST with inline error nodes that fail
+    // later, far from the originating site). Declared TypeEstimate::Top
+    // because the type system doesn't model never-returns yet.
+    ("%error", "nod_error", 1, TypeEstimate::Top),
     // Collection-class primitives (Sprint 20b — wraps the Rust Sprint 20 API).
     ("%collection-size", "nod_collection_size", 1, TypeEstimate::Integer),
     ("%collection-concatenate", "nod_collection_concatenate", 2, TypeEstimate::Top),

@@ -4485,23 +4485,15 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         .map_err(|e| CodegenError::Builder(e.to_string()))
     }
 
-    fn get_or_declare_register_root(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function(NOD_REGISTER_ROOT_SYMBOL) {
-            return f;
-        }
-        let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
-        let ty = self.ctx.void_type().fn_type(&[ptr_ty.into()], false);
-        self.module.add_function(NOD_REGISTER_ROOT_SYMBOL, ty, None)
-    }
-
-    fn get_or_declare_unregister_root(&self) -> FunctionValue<'ctx> {
-        if let Some(f) = self.module.get_function(NOD_UNREGISTER_ROOT_SYMBOL) {
-            return f;
-        }
-        let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
-        let ty = self.ctx.void_type().fn_type(&[ptr_ty.into()], false);
-        self.module.add_function(NOD_UNREGISTER_ROOT_SYMBOL, ty, None)
-    }
+    // Sprint 45e retired `get_or_declare_register_root` and
+    // `get_or_declare_unregister_root` — the JIT and AOT call paths
+    // now use the precise per-callsite safepoint maps exclusively (see
+    // `get_or_declare_jit_begin_safepoint` /
+    // `get_or_declare_aot_begin_safepoint` below). The
+    // `NOD_REGISTER_ROOT_SYMBOL` / `NOD_UNREGISTER_ROOT_SYMBOL` string
+    // constants remain — codegen smoke tests assert NEGATIVELY that
+    // emitted IR no longer contains them, guarding against accidental
+    // resurrection of the legacy scheme.
 
     fn get_or_declare_jit_begin_safepoint(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function(NOD_JIT_BEGIN_SAFEPOINT_SYMBOL) {

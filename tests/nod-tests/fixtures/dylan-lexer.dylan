@@ -691,7 +691,12 @@ end function;
 
 // Dylan's "name-start" alphabet: letters plus the punctuation graphics
 // allowed at the head of an identifier. Note `-` is NOT in the start
-// set (so `-7` lexes as `-` + `7`).
+// set (so `-7` lexes as `-` + `7`). `@` is NOT here either — a lone
+// `@` is an error (caught by the unrecognised-byte fallback). `@`
+// appears in `?@var:name` macro-rest-splice patterns, which the `?`
+// scanner handles directly as a multi-byte operator; it can also
+// appear inside an identifier as a continuation character (see
+// `is-name-cont?` below).
 define function is-name-start? (b :: <integer>) => (yes? :: <boolean>)
   is-ascii-alpha?(b)
     | b = 95   // '_'
@@ -705,10 +710,12 @@ define function is-name-start? (b :: <integer>) => (yes? :: <boolean>)
     | b = 94   // '^'
     | b = 124  // '|'
     | b = 126  // '~'
-    | b = 64   // '@'
 end function;
 
-// Name-continuation also accepts digits, `?`, `-`, `+`, `=`, `/`.
+// Name-continuation also accepts digits, `?`, `-`, `+`, `=`, `/`, `@`.
+// `@` is allowed mid-identifier but not as a name-start (DRM-style
+// rule: keeps lone `@` an error while permitting `foo@bar`-shaped
+// names if a Dylan dialect ever uses them).
 define function is-name-cont? (b :: <integer>) => (yes? :: <boolean>)
   is-name-start?(b)
     | is-ascii-digit?(b)
@@ -717,6 +724,7 @@ define function is-name-cont? (b :: <integer>) => (yes? :: <boolean>)
     | b = 61   // '='
     | b = 47   // '/'
     | b = 63   // '?'
+    | b = 64   // '@'
 end function;
 
 // Name-continuation except `=`, used to disambiguate `<foo>` from `<=`.

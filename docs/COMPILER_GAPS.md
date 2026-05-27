@@ -679,16 +679,20 @@ Sort by ID. New gaps append. Don't renumber.
   first-call-init at the AOT main wrapper start), at which point the
   permanent roots will already be in `baseline_root_count` and the
   strict equality can be restored.
-* **Open review item**: the test
+* **Test resolved in `3986171`**: the
   `aot::tests::aot_exec_safepoint_hooks_detect_missing_root`
-  (`src/nod-runtime/src/aot.rs`) is `#[should_panic]` and its
-  expected panic no longer fires. Likely either the `assert_eq!` →
-  `assert!(>=)` relaxation in this fix widened the assertion past the
-  test's trigger condition, or the test was always brittle (env-var
-  gated, `OnceLock`-cached) and this just exposed it. Failure mode is
-  "test doesn't panic when it should", not a live workload misbehaving
-  — but it represents a real gap in leak-detection coverage and should
-  be investigated before the permanent-root injection refactor lands.
+  `#[should_panic]` test was failing because (a) the test called
+  `begin_aot_safepoint(7, 2, ...)` matching the registered
+  `root_count=2`, so verify's count check trivially passed, and (b)
+  `verify_safepoints_enabled()`'s `OnceLock` could cache `false` from
+  other tests that ran first. The fix passes `expected_root_count=1`
+  so `begin`'s `assert_eq!` catches the mismatch (registered 2 ≠
+  codegen-emitted 1) and panics with the expected message, and adds a
+  `#[cfg(test)] thread_local` so `verify_safepoints_enabled()` returns
+  true in the test binary without needing the env var. Leak-detection
+  coverage at end-of-safepoint remains permanently weaker (the
+  trade-off documented above) until permanent-root injection moves
+  before the first safepoint.
 
 ---
 

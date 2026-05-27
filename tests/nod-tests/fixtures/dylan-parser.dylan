@@ -506,7 +506,21 @@ end function;
 
 // ── 6. Parse helpers ──────────────────────────────────────────────────────
 
+// Fail-fast: print the message to stdout for visibility, then call
+// `%error` to signal a <simple-error>. The runtime's unhandled-
+// signalled-condition path raises a Rust panic, which the Sprint 45g
+// crash dumper catches and reports with GC + safepoint state, exiting
+// 99. This makes the in-flight parser crash at the closest point to
+// the actual syntax problem rather than building a partial AST with
+// inline error nodes that fail later, far from the originating site.
+// The trailing `make(<ast-error-node>, ...)` is unreachable but
+// satisfies the return type — `%error` never returns. Once the parser
+// is feature-complete and we want recoverable diagnostics, this
+// function can revert to its earlier `make(<ast-error-node>, ...)`
+// behaviour and the call sites stay unchanged.
 define function parse-error (msg :: <byte-string>) => (n :: <ast-error-node>)
+  format-out("parse-error: %s\n", msg);
+  %error(msg);
   make(<ast-error-node>, message: msg)
 end function;
 
