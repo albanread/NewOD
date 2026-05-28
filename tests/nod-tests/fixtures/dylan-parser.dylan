@@ -277,6 +277,10 @@ define class <ast-body-definition> (<ast-node>)
   slot defn-body        :: <ast-body>, init-keyword: body:;
   slot defn-end-word    :: <object>, init-value: #f;   // <token> or #f
   slot defn-end-name    :: <object>, init-value: #f;   // <token> or #f
+  // Method / function definitions carry a name and signature.
+  slot defn-method-name :: <object>, init-value: #f;   // <token> or #f
+  slot defn-params      :: <object>, init-value: #f;   // <ast-param-list> or #f
+  slot defn-return      :: <object>, init-value: #f;   // <ast-return-spec> or #f
 end class;
 
 // `define [modifiers] LIST-WORD list-fragment`
@@ -384,6 +388,10 @@ define class <ast-statement> (<ast-node>)
   slot stmt-body     :: <ast-body>, init-keyword: body:;
   slot stmt-end-word :: <object> = #f;   // <token> in `end method` or #f
   slot stmt-end-name :: <object> = #f;   // <token> in `end method foo` or #f
+  // Anonymous method / function literals carry a signature.
+  slot stmt-method-name :: <object> = #f;   // <token> or #f (local method name)
+  slot stmt-params      :: <object> = #f;   // <ast-param-list> or #f
+  slot stmt-return      :: <object> = #f;   // <ast-return-spec> or #f
 end class;
 
 // A positional call argument
@@ -401,6 +409,42 @@ end class;
 define class <ast-typed-name> (<ast-node>)
   slot typed-name-tok  :: <token>,  init-keyword: tok:;
   slot typed-name-type :: <object>, init-value: #f;   // #f or <ast-node>
+end class;
+
+// `keyword [:: type] [= default]` — one `#key` parameter spec.
+define class <ast-key-spec> (<ast-node>)
+  slot key-spec-tok     :: <token>,  init-keyword: tok:;
+  slot key-spec-type    :: <object>, init-value: #f;   // #f or <ast-node>
+  slot key-spec-default :: <object>, init-value: #f;   // #f or <ast-node>
+end class;
+
+// `( var, ..., #rest r, #key k ..., #all-keys, #next n )`
+// A method / function parameter list.
+//   params-required : vector of <ast-typed-name>
+//   params-rest     : <token> name after #rest, or #f
+//   params-keys     : vector of <ast-key-spec> after #key
+//   params-key?     : #t if #key appeared (even with no specs)
+//   params-all-keys?: #t if #all-keys appeared
+//   params-next     : <token> name after #next, or #f
+define class <ast-param-list> (<ast-node>)
+  slot params-required :: <stretchy-vector>;
+  slot params-rest     :: <object>,  init-value: #f;   // <token> or #f
+  slot params-keys     :: <stretchy-vector>;
+  slot params-key?     :: <boolean>, init-value: #f;
+  slot params-all-keys? :: <boolean>, init-value: #f;
+  slot params-next     :: <object>,  init-value: #f;   // <token> or #f
+end class;
+
+// `=> spec` — a return specification.
+//   ret-present?  : #t when an `=>` was actually present
+//   ret-values    : vector of <ast-typed-name> (value name [:: type])
+//   ret-rest      : <token> name after #rest, or #f
+//   ret-rest-type : type after `#rest name :: type`, or #f
+define class <ast-return-spec> (<ast-node>)
+  slot ret-present?  :: <boolean>, init-value: #f;
+  slot ret-values    :: <stretchy-vector>;
+  slot ret-rest      :: <object>, init-value: #f;   // <token> or #f
+  slot ret-rest-type :: <object>, init-value: #f;   // <ast-node> or #f
 end class;
 
 // ── 4. Constructors for AST nodes with vector slots ───────────────────────
@@ -456,6 +500,19 @@ define function make-ast-vector-lit () => (v :: <ast-vector-lit>)
   let v = make(<ast-vector-lit>);
   lit-elems(v) := make(<stretchy-vector>);
   v
+end function;
+
+define function make-ast-param-list () => (p :: <ast-param-list>)
+  let p = make(<ast-param-list>);
+  params-required(p) := make(<stretchy-vector>);
+  params-keys(p)     := make(<stretchy-vector>);
+  p
+end function;
+
+define function make-ast-return-spec () => (r :: <ast-return-spec>)
+  let r = make(<ast-return-spec>);
+  ret-values(r) := make(<stretchy-vector>);
+  r
 end function;
 
 // ── 5. Name extraction helpers ────────────────────────────────────────────
