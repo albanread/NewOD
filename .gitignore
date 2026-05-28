@@ -6,3 +6,6 @@ Cargo.lock.bak
 .idea/
 *.swp
 tests/nod-tests/fixtures/_tmp/
+
+# Claude Code personal settings (machine-local, not shared)
+.claude/settings.local.json
