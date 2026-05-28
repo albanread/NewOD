@@ -827,7 +827,12 @@ pub struct AotSlotEntry {
     /// Bools as `u8` (0/1) — easier for codegen than packing into a
     /// bit field.
     pub required_init_keyword: u8,
-    /// `SlotDefault` encoding: 0 = Unbound, 1 = Value(default_value).
+    /// `SlotDefault` encoding: 0 = Unbound, 1 = Value(raw bits in
+    /// `default_init_value`), 2 = `#t`, 3 = `#f`, 4 = `nil`. Tags 2/3/4
+    /// carry no bits — they're re-resolved from this process's live
+    /// immediates at registration (GAP-009), because the compile-time
+    /// boolean/nil Words embed a literal-pool pointer that is stale in
+    /// the EXE process.
     pub default_init_tag: u8,
     pub has_setter: u8,
     /// 4-byte hole so `type_class_id` lands at a 4-byte boundary
@@ -968,8 +973,16 @@ pub unsafe extern "C" fn nod_aot_register_user_class(
                 };
                 Some(s.to_string())
             };
+            // GAP-009: tags 2/3/4 are symbolic boolean/nil defaults —
+            // resolve them from THIS process's live immediates. The
+            // compile-time bits embed a literal-pool pointer that is
+            // stale here, so baking them (tag 1) would fault on first
+            // read. Tag 1 remains a process-stable raw Word (fixnums etc.).
             let default_init = match e.default_init_tag {
                 1 => crate::SlotDefault::Value(crate::Word::from_raw(e.default_init_value)),
+                2 => crate::SlotDefault::Value(crate::literal_pool_immediates().true_),
+                3 => crate::SlotDefault::Value(crate::literal_pool_immediates().false_),
+                4 => crate::SlotDefault::Value(crate::literal_pool_immediates().nil),
                 _ => crate::SlotDefault::Unbound,
             };
             crate::SlotInfo {

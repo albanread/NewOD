@@ -1015,8 +1015,22 @@ pub fn build_aot_registrations(lm: &LoweredModule) -> nod_llvm::AotRegistrations
             .iter()
             .map(|s| {
                 let (type_tag, type_class_id) = encode_slot_type(s.type_kind);
+                // GAP-009: boolean / nil defaults are process-specific
+                // immediate Words (their bits embed a pointer into the
+                // literal pool / static area), so baking the compile-time
+                // bits into AOT registration produces a stale pointer in
+                // the EXE process — reading the slot then faults. Encode
+                // them symbolically (tags 2/3/4) and let the AOT registrar
+                // re-resolve them from the EXE's own immediates. Fixnums
+                // and other process-stable Words stay raw (tag 1). Mirrors
+                // Sprint 38b's immediate relocation for codegen bake-sites,
+                // which the slot-default path had missed.
+                let imm = nod_runtime::literal_pool_immediates();
                 let (default_init_tag, default_init_value) = match s.default_init {
                     SlotDefault::Unbound => (0u8, 0u64),
+                    SlotDefault::Value(w) if w.raw() == imm.true_.raw() => (2u8, 0u64),
+                    SlotDefault::Value(w) if w.raw() == imm.false_.raw() => (3u8, 0u64),
+                    SlotDefault::Value(w) if w.raw() == imm.nil.raw() => (4u8, 0u64),
                     SlotDefault::Value(w) => (1u8, w.raw()),
                 };
                 AotSlotRegistration {
