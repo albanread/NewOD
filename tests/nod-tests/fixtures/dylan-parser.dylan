@@ -412,10 +412,15 @@ define class <ast-typed-name> (<ast-node>)
 end class;
 
 // `keyword [:: type] [= default]` — one `#key` parameter spec.
+//
+// NOTE: every slot is given an explicit `init-keyword:` and supplied at
+// `make` time (see make-ast-key-spec).  See the GAP note on slot
+// defaulting near <ast-param-list>; `init-value:` / `= #f` defaults are
+// NOT reliably applied for these classes in the current compiler.
 define class <ast-key-spec> (<ast-node>)
   slot key-spec-tok     :: <token>,  init-keyword: tok:;
-  slot key-spec-type    :: <object>, init-value: #f;   // #f or <ast-node>
-  slot key-spec-default :: <object>, init-value: #f;   // #f or <ast-node>
+  slot key-spec-type    :: <object>, init-keyword: type:;     // #f or <ast-node>
+  slot key-spec-default :: <object>, init-keyword: default:;  // #f or <ast-node>
 end class;
 
 // `( var, ..., #rest r, #key k ..., #all-keys, #next n )`
@@ -426,13 +431,26 @@ end class;
 //   params-key?     : #t if #key appeared (even with no specs)
 //   params-all-keys?: #t if #all-keys appeared
 //   params-next     : <token> name after #next, or #f
+//
+// COMPILER GAP (Sprint 46) — slot defaults are NOT applied for these
+// classes.  A slot declared `slot x :: <object> = #f;` or
+// `slot x :: <object>, init-value: #f;` reads back GARBAGE (a non-#f,
+// faulting value) when the instance is built with `make` and other slots
+// carry `init-keyword:` with no default.  Symptom: `instance?`/`==` on the
+// "defaulted" slot's value raises EXCEPTION_ACCESS_VIOLATION, and a
+// defaulted `<boolean>` slot reads `#t` when it should be `#f`.
+// Workaround used here (the file's existing idiom, see §4): give EVERY
+// slot an explicit `init-keyword:` and supply ALL of them at `make` time
+// in the constructor — never rely on `init-value:` / `= default`.
+// The `#f`/#t flags are typed `<object>` (not `<boolean>`) for the same
+// reason.  Minimal repro for the lead is in the final report.
 define class <ast-param-list> (<ast-node>)
-  slot params-required :: <stretchy-vector>;
-  slot params-rest     :: <object>,  init-value: #f;   // <token> or #f
-  slot params-keys     :: <stretchy-vector>;
-  slot params-key?     :: <boolean>, init-value: #f;
-  slot params-all-keys? :: <boolean>, init-value: #f;
-  slot params-next     :: <object>,  init-value: #f;   // <token> or #f
+  slot params-required :: <stretchy-vector>, init-keyword: required:;
+  slot params-keys     :: <stretchy-vector>, init-keyword: keys:;
+  slot params-rest     :: <object>,  init-keyword: rest:;     // <token> or #f
+  slot params-key?     :: <object>,  init-keyword: key?:;     // #f / #t
+  slot params-all-keys? :: <object>, init-keyword: all-keys?:; // #f / #t
+  slot params-next     :: <object>,  init-keyword: next:;     // <token> or #f
 end class;
 
 // `=> spec` — a return specification.
@@ -441,10 +459,10 @@ end class;
 //   ret-rest      : <token> name after #rest, or #f
 //   ret-rest-type : type after `#rest name :: type`, or #f
 define class <ast-return-spec> (<ast-node>)
-  slot ret-present?  :: <boolean>, init-value: #f;
-  slot ret-values    :: <stretchy-vector>;
-  slot ret-rest      :: <object>, init-value: #f;   // <token> or #f
-  slot ret-rest-type :: <object>, init-value: #f;   // <ast-node> or #f
+  slot ret-present?  :: <object>, init-keyword: present?:;   // #f / #t
+  slot ret-values    :: <stretchy-vector>, init-keyword: values:;
+  slot ret-rest      :: <object>, init-keyword: rest:;       // <token> or #f
+  slot ret-rest-type :: <object>, init-keyword: rest-type:;  // <ast-node> or #f
 end class;
 
 // ── 4. Constructors for AST nodes with vector slots ───────────────────────
@@ -503,16 +521,21 @@ define function make-ast-vector-lit () => (v :: <ast-vector-lit>)
 end function;
 
 define function make-ast-param-list () => (p :: <ast-param-list>)
-  let p = make(<ast-param-list>);
-  params-required(p) := make(<stretchy-vector>);
-  params-keys(p)     := make(<stretchy-vector>);
-  p
+  make(<ast-param-list>,
+       required: make(<stretchy-vector>),
+       keys: make(<stretchy-vector>),
+       rest: #f, key?: #f, all-keys?: #f, next: #f)
 end function;
 
 define function make-ast-return-spec () => (r :: <ast-return-spec>)
-  let r = make(<ast-return-spec>);
-  ret-values(r) := make(<stretchy-vector>);
-  r
+  make(<ast-return-spec>,
+       present?: #f,
+       values: make(<stretchy-vector>),
+       rest: #f, rest-type: #f)
+end function;
+
+define function make-ast-key-spec (name-tok :: <token>) => (k :: <ast-key-spec>)
+  make(<ast-key-spec>, tok: name-tok, type: #f, default: #f)
 end function;
 
 // ── 5. Name extraction helpers ────────────────────────────────────────────
@@ -671,6 +694,19 @@ define function parse-definition (ts :: <token-stream>) => (n :: <ast-node>)
     ts-advance(ts);   // consume the word
     let d = make-ast-body-definition(word);
     defn-modifiers(d) := modifiers;
+    if (is-function-word?(word))
+      // `define method NAME (params) => (returns) body end ...`
+      // `define function NAME (params) => (returns) body end ...`
+      // Optional method name (a name token before the `(`).
+      if (is-name-token?(ts-peek(ts)) & ~ is-punct?(ts-peek(ts), #"lparen"))
+        defn-method-name(d) := ts-advance(ts);
+      end;
+      // Parameter list and return spec, if present.
+      if (is-punct?(ts-peek(ts), #"lparen"))
+        defn-params(d) := parse-parameter-list(ts);
+      end;
+      defn-return(d) := parse-return-spec(ts);
+    end;
     // Parse body-fragment until `end` (or EOF).
     defn-body(d) := parse-body(ts);
     // Parse definition-tail.
@@ -777,23 +813,38 @@ end function;
 define function parse-local-method-item (ts :: <token-stream>) => (n :: <ast-node>)
   let t = ts-peek(ts);
   if (is-function-word?(t))
-    // `method name params body end method name`
+    // `method name (params) => (returns) body end method name`
     let word = ts-advance(ts);
-    let body = parse-body(ts);
+    let s = make(<ast-statement>, word: word, body: make-ast-body());
+    node-token(s) := word;
+    // Optional method name before the parameter list.
+    if (is-name-token?(ts-peek(ts)) & ~ is-punct?(ts-peek(ts), #"lparen"))
+      stmt-method-name(s) := ts-advance(ts);
+    end;
+    if (is-punct?(ts-peek(ts), #"lparen"))
+      stmt-params(s) := parse-parameter-list(ts);
+    end;
+    stmt-return(s) := parse-return-spec(ts);
+    stmt-body(s) := parse-body(ts);
     // Consume the end clause for this local method.
     let dummy = make-ast-body-definition(word);
     parse-definition-tail(ts, dummy);
-    let s = make(<ast-statement>, word: word, body: body);
     stmt-end-word(s) := defn-end-word(dummy);
     stmt-end-name(s) := defn-end-name(dummy);
     s
   elseif (is-name-token?(t))
-    // `name params body end method name`  (implicit `method` word)
+    // `name (params) => (returns) body end name`  (implicit `method` word)
     let word = ts-advance(ts);
-    let body = parse-body(ts);
+    let s = make(<ast-statement>, word: word, body: make-ast-body());
+    node-token(s) := word;
+    stmt-method-name(s) := word;
+    if (is-punct?(ts-peek(ts), #"lparen"))
+      stmt-params(s) := parse-parameter-list(ts);
+    end;
+    stmt-return(s) := parse-return-spec(ts);
+    stmt-body(s) := parse-body(ts);
     let dummy = make-ast-body-definition(word);
     parse-definition-tail(ts, dummy);
-    let s = make(<ast-statement>, word: word, body: body);
     stmt-end-word(s) := defn-end-word(dummy);
     stmt-end-name(s) := defn-end-name(dummy);
     s
@@ -1051,9 +1102,18 @@ end function;
 // These are anonymous function expressions in leaf position.
 define function parse-function-literal (ts :: <token-stream>) => (n :: <ast-statement>)
   let word = ts-advance(ts);   // consume `method` or `function`
+  // Anonymous literal: optional parameter list, then optional return spec,
+  // then the body.  There is no method name in expression position.
+  let params = #f;
+  if (is-punct?(ts-peek(ts), #"lparen"))
+    params := parse-parameter-list(ts);
+  end;
+  let returns = parse-return-spec(ts);
   let body = parse-body(ts);
   let s = make(<ast-statement>, word: word, body: body);
   node-token(s) := word;
+  stmt-params(s) := params;
+  stmt-return(s) := returns;
   // Consume end-clause if present (function literals always have `end`).
   if (is-end-token?(ts-peek(ts)))
     ts-advance(ts);
@@ -1163,6 +1223,185 @@ define function parse-variable (ts :: <token-stream>) => (v :: <ast-typed-name>)
   end
 end function;
 
+// Parse a single specialiser / type in a parameter or value position.
+// Uses parse-operand (postfix level) rather than parse-expression so a
+// trailing `=` default or `,` separator is NOT swallowed into the type.
+define function parse-type-spec (ts :: <token-stream>) => (n :: <ast-node>)
+  parse-operand(ts)
+end function;
+
+// ── 15b. Parsing: parameter lists ────────────────────────────────────────
+//
+// parameter-list:
+//     LPAREN parameters-OPT RPAREN
+//
+// parameters:
+//     required-parameter , ...
+//     ... #rest NAME
+//     ... #key key-spec ... [#all-keys]
+//     ... #all-keys
+//     ... #next NAME
+//
+// A required parameter is a `variable` (NAME [:: type]).
+// A key-spec is NAME [:: type] [= default].
+//
+// Modelled after nod-reader's parse_param_list_loose.
+
+define function parse-parameter-list (ts :: <token-stream>)
+ => (p :: <ast-param-list>)
+  let open-tok = ts-expect-punct(ts, #"lparen", "expected ( to open parameter list");
+  let p = make-ast-param-list();
+  node-token(p) := open-tok;
+  // mode: #"required" → #"key" once #key is seen.
+  let mode = #"required";
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (is-punct?(t, #"rparen"))
+      done? := #t;
+    elseif (is-punct?(t, #"comma"))
+      ts-advance(ts);   // skip stray separators
+    elseif (is-keyword?(t, #"hash-rest"))
+      ts-advance(ts);
+      let name-tok = ts-peek(ts);
+      if (is-name-token?(name-tok))
+        ts-advance(ts);
+        params-rest(p) := name-tok;
+      else
+        parse-error("expected name after #rest in parameter list");
+      end;
+    elseif (is-keyword?(t, #"hash-key"))
+      ts-advance(ts);
+      params-key?(p) := #t;
+      mode := #"key";
+    elseif (is-keyword?(t, #"hash-all-keys"))
+      ts-advance(ts);
+      params-all-keys?(p) := #t;
+    elseif (is-keyword?(t, #"hash-next"))
+      ts-advance(ts);
+      let name-tok = ts-peek(ts);
+      if (is-name-token?(name-tok))
+        ts-advance(ts);
+        params-next(p) := name-tok;
+      else
+        parse-error("expected name after #next in parameter list");
+      end;
+    elseif (is-name-token?(t))
+      if (mode = #"key")
+        // key-spec: NAME [:: type] [= default]
+        let name-tok = ts-advance(ts);
+        let k = make-ast-key-spec(name-tok);
+        node-token(k) := name-tok;
+        if (is-punct?(ts-peek(ts), #"colon-colon"))
+          ts-advance(ts);
+          key-spec-type(k) := parse-type-spec(ts);
+        end;
+        if (is-punct?(ts-peek(ts), #"equal"))
+          ts-advance(ts);
+          key-spec-default(k) := parse-expression(ts);
+        end;
+        add!(params-keys(p), k);
+      else
+        // required parameter: NAME [:: type]
+        add!(params-required(p), parse-variable(ts));
+      end;
+    else
+      parse-error("unexpected token in parameter list");
+    end;
+    // Consume a comma separator if present.
+    if (is-punct?(ts-peek(ts), #"comma"))
+      ts-advance(ts);
+    end;
+  end;
+  ts-expect-punct(ts, #"rparen", "expected ) to close parameter list");
+  p
+end function;
+
+// ── 15c. Parsing: return specifications ───────────────────────────────────
+//
+// return-spec:
+//     <empty>
+//     ARROW value-name                  ← single bare value (a type)
+//     ARROW LPAREN value-specs-OPT RPAREN
+//
+// value-specs:
+//     value-spec , ...
+//     ... #rest NAME [:: type]
+//
+// value-spec:  NAME [:: type]  |  type
+//
+// Modelled after nod-reader's maybe_return_sig.
+
+define function parse-return-spec (ts :: <token-stream>)
+ => (r :: <ast-return-spec>)
+  let r = make-ast-return-spec();
+  if (~ is-punct?(ts-peek(ts), #"arrow"))
+    // No `=>`: empty/absent return spec.
+    r
+  else
+    let arrow = ts-advance(ts);   // consume `=>`
+    node-token(r) := arrow;
+    ret-present?(r) := #t;
+    if (is-punct?(ts-peek(ts), #"lparen"))
+      // ARROW ( value-specs )
+      ts-advance(ts);   // consume `(`
+      let done? = #f;
+      until (done? | ts-at-end?(ts))
+        let t = ts-peek(ts);
+        if (is-punct?(t, #"rparen"))
+          done? := #t;
+        elseif (is-punct?(t, #"comma"))
+          ts-advance(ts);
+        elseif (is-keyword?(t, #"hash-rest"))
+          ts-advance(ts);
+          let name-tok = ts-peek(ts);
+          if (is-name-token?(name-tok))
+            ts-advance(ts);
+            ret-rest(r) := name-tok;
+            if (is-punct?(ts-peek(ts), #"colon-colon"))
+              ts-advance(ts);
+              ret-rest-type(r) := parse-type-spec(ts);
+            end;
+          else
+            parse-error("expected name after #rest in return spec");
+          end;
+        elseif (is-name-token?(t))
+          // value-spec: NAME [:: type]
+          add!(ret-values(r), parse-value-spec(ts));
+        else
+          parse-error("unexpected token in return spec");
+        end;
+        if (is-punct?(ts-peek(ts), #"comma"))
+          ts-advance(ts);
+        end;
+      end;
+      ts-expect-punct(ts, #"rparen", "expected ) to close return spec");
+      r
+    elseif (is-name-token?(ts-peek(ts)))
+      // ARROW single-value (bare type/name, no parens)
+      add!(ret-values(r), parse-value-spec(ts));
+      r
+    else
+      // `=>` with nothing parseable after it (e.g. before `;`): leave empty.
+      r
+    end
+  end
+end function;
+
+// value-spec: NAME [:: type].  A bare type with no name is recorded as an
+// <ast-typed-name> whose name token is the type's leading token and whose
+// type is the parsed type — matching the existing typed-name shape.
+define function parse-value-spec (ts :: <token-stream>) => (v :: <ast-typed-name>)
+  let name-tok = ts-advance(ts);
+  let v = make(<ast-typed-name>, tok: name-tok);
+  node-token(v) := name-tok;
+  if (is-punct?(ts-peek(ts), #"colon-colon"))
+    ts-advance(ts);
+    typed-name-type(v) := parse-type-spec(ts);
+  end;
+  v
+end function;
+
 // ── 16. AST dump ─────────────────────────────────────────────────────────
 //
 // A simple indented text dump for debugging and snapshot testing.
@@ -1206,6 +1445,101 @@ define function acc-newline (acc :: <stretchy-vector>) => ()
   add!(acc, 10);  // '\n'
 end function;
 
+// Dump a TYPED-NAME-like line: a label, the name, and (if a type slot
+// value is given) the type subtree on the following indented lines.
+define function dump-typed-name (label :: <byte-string>, name-tok :: <token>,
+                                 type-node :: <object>,
+                                 acc :: <stretchy-vector>, depth :: <integer>)
+ => ()
+  acc-indent(acc, depth);
+  acc-string(acc, label);
+  acc-string(acc, " ");
+  acc-string(acc, token-name(name-tok));
+  acc-newline(acc);
+  if (instance?(type-node, <ast-node>))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "TYPE");
+    acc-newline(acc);
+    dump-node(type-node, acc, depth + 2);
+  end;
+end function;
+
+// Dump a parameter list as a PARAMS block.
+define function dump-param-list (p :: <ast-param-list>, acc :: <stretchy-vector>,
+                                 depth :: <integer>) => ()
+  acc-indent(acc, depth);
+  acc-string(acc, "PARAMS");
+  acc-newline(acc);
+  let req = params-required(p);
+  let n = size(req);
+  let i = 0;
+  until (i >= n)
+    let v = req[i];
+    dump-typed-name("PARAM", typed-name-tok(v), typed-name-type(v),
+                    acc, depth + 1);
+    i := i + 1;
+  end;
+  if (instance?(params-rest(p), <token>))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "REST ");
+    acc-string(acc, token-name(params-rest(p)));
+    acc-newline(acc);
+  end;
+  if (params-key?(p))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "KEY");
+    acc-newline(acc);
+    let keys = params-keys(p);
+    let m = size(keys);
+    let j = 0;
+    until (j >= m)
+      let k = keys[j];
+      dump-typed-name("KEY-PARAM", key-spec-tok(k), key-spec-type(k),
+                      acc, depth + 2);
+      if (instance?(key-spec-default(k), <ast-node>))
+        acc-indent(acc, depth + 3);
+        acc-string(acc, "DEFAULT");
+        acc-newline(acc);
+        dump-node(key-spec-default(k), acc, depth + 4);
+      end;
+      j := j + 1;
+    end;
+  end;
+  if (params-all-keys?(p))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "ALL-KEYS");
+    acc-newline(acc);
+  end;
+  if (instance?(params-next(p), <token>))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "NEXT ");
+    acc-string(acc, token-name(params-next(p)));
+    acc-newline(acc);
+  end;
+end function;
+
+// Dump a return spec as a RETURNS block (only when an `=>` was present).
+define function dump-return-spec (r :: <ast-return-spec>, acc :: <stretchy-vector>,
+                                  depth :: <integer>) => ()
+  if (ret-present?(r))
+    acc-indent(acc, depth);
+    acc-string(acc, "RETURNS");
+    acc-newline(acc);
+    let vals = ret-values(r);
+    let n = size(vals);
+    let i = 0;
+    until (i >= n)
+      let v = vals[i];
+      dump-typed-name("VALUE", typed-name-tok(v), typed-name-type(v),
+                      acc, depth + 1);
+      i := i + 1;
+    end;
+    if (instance?(ret-rest(r), <token>))
+      dump-typed-name("REST", ret-rest(r), ret-rest-type(r), acc, depth + 1);
+    end;
+  end;
+end function;
+
 define function dump-node (node :: <ast-node>,
                            acc  :: <stretchy-vector>,
                            depth :: <integer>) => ()
@@ -1223,7 +1557,17 @@ define function dump-node (node :: <ast-node>,
   elseif (instance?(node, <ast-body-definition>))
     acc-string(acc, "DEFINE-BODY ");
     acc-string(acc, token-name(defn-word(node)));
+    if (instance?(defn-method-name(node), <token>))
+      acc-string(acc, " ");
+      acc-string(acc, token-name(defn-method-name(node)));
+    end;
     acc-newline(acc);
+    if (instance?(defn-params(node), <ast-param-list>))
+      dump-param-list(defn-params(node), acc, depth + 1);
+    end;
+    if (instance?(defn-return(node), <ast-return-spec>))
+      dump-return-spec(defn-return(node), acc, depth + 1);
+    end;
     dump-node(defn-body(node), acc, depth + 1);
   elseif (instance?(node, <ast-list-definition>))
     acc-string(acc, "DEFINE-LIST ");
@@ -1345,7 +1689,17 @@ define function dump-node (node :: <ast-node>,
   elseif (instance?(node, <ast-statement>))
     acc-string(acc, "STMT ");
     acc-string(acc, token-name(stmt-word(node)));
+    if (instance?(stmt-method-name(node), <token>))
+      acc-string(acc, " ");
+      acc-string(acc, token-name(stmt-method-name(node)));
+    end;
     acc-newline(acc);
+    if (instance?(stmt-params(node), <ast-param-list>))
+      dump-param-list(stmt-params(node), acc, depth + 1);
+    end;
+    if (instance?(stmt-return(node), <ast-return-spec>))
+      dump-return-spec(stmt-return(node), acc, depth + 1);
+    end;
     dump-node(stmt-body(node), acc, depth + 1);
   elseif (instance?(node, <ast-pos-arg>))
     acc-string(acc, "ARG");
@@ -1357,9 +1711,16 @@ define function dump-node (node :: <ast-node>,
     acc-newline(acc);
     dump-node(kw-arg-value(node), acc, depth + 1);
   elseif (instance?(node, <ast-typed-name>))
+    // Leading indent already emitted at the top of dump-node.
     acc-string(acc, "TYPED-NAME ");
     acc-string(acc, token-name(typed-name-tok(node)));
     acc-newline(acc);
+    if (instance?(typed-name-type(node), <ast-node>))
+      acc-indent(acc, depth + 1);
+      acc-string(acc, "TYPE");
+      acc-newline(acc);
+      dump-node(typed-name-type(node), acc, depth + 2);
+    end;
   elseif (instance?(node, <ast-error-node>))
     acc-string(acc, "ERROR: ");
     acc-string(acc, ast-error-msg(node));
