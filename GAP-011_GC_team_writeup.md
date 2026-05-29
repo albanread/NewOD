@@ -309,3 +309,50 @@ where noted:
    none, so it cannot produce *this* signature. Separate correctness item.
 
 `jcs-40.dylan` remains the live repro. No further code touched this round.
+
+### Supplement — second source-validated sweep (line-level corroboration + new items)
+
+A second, independent re-sweep validated findings directly in source. It
+corroborates the above and adds two items worth tracking. **Status
+correction first:**
+
+> **GAP-011 is NOT closed.** The second sweep, reading only
+> `nod-dfm/src/liveness.rs`, marked GAP-011 "fixed." That is true of the
+> *liveness layer* (the global fixpoint landed and is correct) but **not** of
+> the end-to-end bug: `jcs-40.dylan` still aborts at `collections.rs:1028`. The
+> codegen residual above (`note_successor_entry_temps`) is the open layer. Do
+> not treat GAP-011 as resolved until `jcs-40` exits 0.
+
+New / corroborated items (verified by reading the cited lines):
+
+- **(Medium, new) `collection_reduce` rooting invariant is comment-enforced.**
+  `collections.rs:1450-1472`: `acc_slot` is a stack slot RootGuarded at 1459;
+  the closure must read/write *through the slot*, never a local copy, or the
+  collector's pointer-rewrite is defeated. Enforced only by the comment at
+  1456-1457. A future refactor to `let acc = ...; f(acc, ...)` would silently
+  reintroduce a stale-root window. Worth a structural guard, not just a comment.
+- **(Medium, new but bounded) Function-ref / generic-trampoline cells are
+  leaked roots.** `functions.rs:961` (`make_function_ref`) and `:1008`
+  (`make_generic_trampoline_ref`) both `heap_register_root(Box::leak(Box::new(w)))`.
+  This is **bounded**, not a churn leak: `FUNCTION_REF_CACHE` dedupes by
+  `(name, arity)`, so each distinct ref leaks exactly once for process life.
+  Retention contributor + manual-rooting lifecycle risk, but not unbounded.
+- **(Corroborates) `NOD_AOT_VERIFY_SAFEPOINTS` is off by default outside
+  tests.** `aot.rs:294-320`: env-gated in release, on-by-default only in the
+  test binary (`VERIFY_ENABLED_FOR_TESTS`), because the check costs a global
+  lock + Vec clone per Dylan call (~20k allocs/WM_PAINT). And it verifies root
+  *counts* only — so it cannot catch the codegen residual even when enabled.
+  Recommendation: keep it on in CI/debug lanes; add value-dominance checking if
+  we want it to catch the residual class.
+- **(Info, confirms) GAP-010 entry-block alloca guard is present and strong.**
+  `codegen.rs:2329,2333` (task #293) enforces entry-block alloca placement, so
+  the per-call-site safepoint slot slabs do not leak native stack per loop
+  iteration. No action.
+- **(Info) No Rc/Arc GC-ownership cycle risk.** `Arc` is used only for shared
+  immutable text/bitmaps (`nod-reader/src/span.rs:50`,
+  `nod-runtime/src/heap_common.rs:114`), never for Dylan-object ownership graphs
+  (those are GC-traced). No reference-cycle leak path.
+
+Net: the second sweep changes no conclusion — the open correctness item is the
+codegen residual; everything else is footprint/perf or comment-discipline
+fragility. `jcs-40.dylan` is still the gating repro.
