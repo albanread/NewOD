@@ -12,6 +12,7 @@ members = [
     "src/nod-runtime",
     "src/nod-dylan",
     "src/nod-winapi",
+    "src/newgc-core",
     "tests/nod-tests",
     "tests/nod-od-suite",
 ]
@@ -40,12 +41,16 @@ llvm-sys    = { version = "=221.0.1", features = ["force-static"] }
 # = false` drops the conservative-pin scanner — Dylan is a precise-
 # roots client via the Sprint 11c lock-free root registry.
 #
-# PINNED to a specific NewGC commit (was a live `path` into the GC
-# team's working tree, which moved underneath our build mid-session).
-# Cargo snapshots this rev into its git cache; the GC team's ongoing
-# multi-mutator testing/changes can't affect us until we deliberately
-# bump `rev`. 22ec0e7 is "Fix GAP-010: dirty-card scan corrupted
-# byte-string opaque payloads" — the object-aware reservation card
-# scan that fixes the AOT byte-string-relocation crash (was b66726a).
-# To adopt a new GC release: bump `rev`, rebuild, re-run the gates.
-newgc-core  = { git = "file:///E:/NewGC", rev = "22ec0e7e692ac468fc7682f0aacb9683d01c1688", default-features = false }
+# VENDORED in-tree at `src/newgc-core` (was `git file:///E:/NewGC` @ 22ec0e7).
+# Refreshed to NewGC HEAD 15b50c6986057f8e03ee4c8d1fa3598e85ca4821 ("Fix
+# conservatively-pinned objects' children dropped in the bare collect path")
+# via `git archive`. This pulls three Lisp-team GC fixes past the old pin
+# (9b960c3 byte-string card-scan, 6d1a799 cons-elision pin promotion,
+# 15b50c6 conservative-pin children). We build `default-features = false`
+# (conservative-pin compiled out), so the headline fix likely doesn't affect
+# us, but they're proven fixes and the card/evac changes are relevant to the
+# GAP-011 investigation. We now own the source so we can add GC-collection
+# tracing (the `gc-trace` feature) and fix GAP-011 directly. Re-sync: re-
+# `git archive` a new rev over `src/newgc-core`, re-run gates. Provenance in
+# src/newgc-core/VENDOR.md.
+newgc-core  = { path = "src/newgc-core", default-features = false }
