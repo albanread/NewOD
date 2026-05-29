@@ -230,6 +230,24 @@ define function is-ordinary-name? (t :: <token>) => (yes? :: <boolean>)
     | is-define-list-word?(t)
 end function;
 
+// MODIFIER-WORD: an adjective that may precede the define-word, e.g.
+//   define SEALED generic ...   define OPEN ABSTRACT class ...
+// Identifiers count (arbitrary unreserved adjectives), as do the adjective
+// keywords the lexer reserves (sealed / open / abstract / concrete / primary
+// / free).  Define-words themselves (class/generic/method/...) are excluded,
+// so modifier collection stops cleanly at the define-word.
+define function is-modifier-word? (t :: <token>) => (yes? :: <boolean>)
+  if (instance?(t, <identifier-token>) | instance?(t, <escaped-ident-token>))
+    #t
+  elseif (instance?(t, <keyword-token>))
+    let kw = keyword-token-keyword(t);
+    kw = #"sealed" | kw = #"open" | kw = #"abstract"
+      | kw = #"concrete" | kw = #"primary" | kw = #"free"
+  else
+    #f
+  end
+end function;
+
 // BINARY-OPERATOR: tokens that appear as infix operators.
 // `:=` (assign) is included here for assignment expressions.
 define function is-binary-op? (t :: <token>) => (yes? :: <boolean>)
@@ -627,6 +645,17 @@ define class <ast-class-definition> (<ast-node>)
   slot defn-end-name  :: <object>, init-keyword: end-name:;  // <token> or #f
 end class;
 
+// `define [modifiers] generic NAME (params) => (returns) ;`
+// A generic function declaration: a name and a signature (parameter list +
+// return spec), but NO body and NO `end` — it is terminated by `;`.
+define class <ast-generic-definition> (<ast-node>)
+  slot defn-modifiers :: <stretchy-vector>, init-keyword: modifiers:;
+  slot gen-word    :: <token>,  init-keyword: word:;   // the `generic` keyword
+  slot gen-name    :: <object> = #f;   // <token> or #f
+  slot gen-params  :: <object> = #f;   // <ast-param-list> or #f
+  slot gen-return  :: <object> = #f;   // <ast-return-spec> or #f
+end class;
+
 // ── 4. Constructors for AST nodes with vector slots ───────────────────────
 //
 // Dylan's `init-value:` shares one initial value across instances, which
@@ -720,6 +749,13 @@ define function make-ast-class-definition (word :: <token>)
        end-word: #f, end-name: #f)
 end function;
 
+define function make-ast-generic-definition (word :: <token>)
+ => (d :: <ast-generic-definition>)
+  make(<ast-generic-definition>,
+       modifiers: make(<stretchy-vector>),
+       word: word)
+end function;
+
 // ── 5. Name extraction helpers ────────────────────────────────────────────
 
 // Retrieve a printable name from a name-like token.
@@ -759,6 +795,11 @@ define function token-name (t :: <token>) => (s :: <byte-string>)
     elseif  (kw = #"virtual")   "virtual"
     elseif  (kw = #"inherited") "inherited"
     elseif  (kw = #"sealed")    "sealed"
+    elseif  (kw = #"open")      "open"
+    elseif  (kw = #"abstract")  "abstract"
+    elseif  (kw = #"concrete")  "concrete"
+    elseif  (kw = #"primary")   "primary"
+    elseif  (kw = #"free")      "free"
     elseif  (kw = #"domain")    "domain"
     elseif  (kw = #"for")       "for"
     elseif  (kw = #"from")      "from"
@@ -869,12 +910,13 @@ end function;
 define function parse-definition (ts :: <token-stream>) => (n :: <ast-node>)
   // Consume `define`.
   ts-advance(ts);
-  // Parse optional modifiers: unreserved names before the define-word.
+  // Parse optional modifiers: adjective words (identifiers or reserved
+  // adjective keywords like `sealed` / `open`) before the define-word.
   let modifiers = make(<stretchy-vector>);
   let done? = #f;
   until (done? | ts-at-end?(ts))
     let t = ts-peek(ts);
-    if (is-ordinary-name?(t)
+    if (is-modifier-word?(t)
           & ~ is-define-body-word?(t)
           & ~ is-define-list-word?(t))
       add!(modifiers, ts-advance(ts));
@@ -887,6 +929,10 @@ define function parse-definition (ts :: <token-stream>) => (n :: <ast-node>)
     // DEFINE modifiers class NAME (supers) slot-specs ... end [class] [NAME]
     ts-advance(ts);   // consume `class`
     parse-class-definition(ts, word, modifiers)
+  elseif (is-keyword?(word, #"generic"))
+    // DEFINE modifiers generic NAME (params) => (returns) ;   (no body, no end)
+    ts-advance(ts);   // consume `generic`
+    parse-generic-definition(ts, word, modifiers)
   elseif (is-define-body-word?(word))
     // DEFINE modifiers BODY-WORD body ... end [word] [name]
     ts-advance(ts);   // consume the word
@@ -995,6 +1041,33 @@ define function parse-class-definition (ts :: <token-stream>,
   parse-definition-tail(ts, tail);
   defn-end-word(d) := defn-end-word(tail);
   defn-end-name(d) := defn-end-name(tail);
+  d
+end function;
+
+// generic-definition:
+//     DEFINE modifiers GENERIC NAME parameter-list ARROW return-spec ;
+//
+// A generic has the same signature shape as a method/function but NO body
+// and NO `end` — it is terminated by the body's `;`.  The signature is
+// optional in degenerate forms, so each piece is guarded.
+define function parse-generic-definition (ts :: <token-stream>,
+                                          word :: <token>,
+                                          modifiers :: <stretchy-vector>)
+ => (d :: <ast-generic-definition>)
+  let d = make-ast-generic-definition(word);
+  defn-modifiers(d) := modifiers;
+  node-token(d) := word;
+  // Generic name — a name token before the parameter list's `(`.
+  if (is-name-token?(ts-peek(ts)) & ~ is-punct?(ts-peek(ts), #"lparen"))
+    gen-name(d) := ts-advance(ts);
+  else
+    parse-error("define generic: expected generic name");
+  end;
+  // Parameter list, then return spec.  No body, no `end`.
+  if (is-punct?(ts-peek(ts), #"lparen"))
+    gen-params(d) := parse-parameter-list(ts);
+  end;
+  gen-return(d) := parse-return-spec(ts);
   d
 end function;
 
@@ -2283,6 +2356,30 @@ define function dump-node (node :: <ast-node>,
     until (isl >= nsl)
       dump-slot-spec(slots[isl], acc, depth + 1);
       isl := isl + 1;
+    end;
+  elseif (instance?(node, <ast-generic-definition>))
+    acc-string(acc, "DEFINE-GENERIC");
+    if (instance?(gen-name(node), <token>))
+      acc-string(acc, " ");
+      acc-string(acc, token-name(gen-name(node)));
+    end;
+    acc-newline(acc);
+    // Modifiers (open / sealed / …).
+    let mods = defn-modifiers(node);
+    let nm = size(mods);
+    let im = 0;
+    until (im >= nm)
+      acc-indent(acc, depth + 1);
+      acc-string(acc, "MOD ");
+      acc-string(acc, token-name(mods[im]));
+      acc-newline(acc);
+      im := im + 1;
+    end;
+    if (instance?(gen-params(node), <ast-param-list>))
+      dump-param-list(gen-params(node), acc, depth + 1);
+    end;
+    if (instance?(gen-return(node), <ast-return-spec>))
+      dump-return-spec(gen-return(node), acc, depth + 1);
     end;
   elseif (instance?(node, <ast-list-definition>))
     acc-string(acc, "DEFINE-LIST ");

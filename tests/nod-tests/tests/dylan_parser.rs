@@ -616,3 +616,53 @@ end function;
         ],
     );
 }
+
+// ─── define generic ────────────────────────────────────────────────────────
+
+/// `define generic NAME (params) => (returns);` parses into a DEFINE-GENERIC
+/// node with a parameter list and return spec, no body and no `end`.
+/// Previously routed through the body-word path, which tried to parse a body
+/// and crashed ("expected ) after arguments").
+#[test]
+#[ignore]
+#[serial]
+fn define_generic_signature() {
+    let source = "define generic area (shape :: <shape>) => (a :: <float>);\n";
+    assert_dump(
+        "define_generic_signature",
+        source,
+        &[
+            "DEFINE-GENERIC area",
+            "PARAMS",
+            "PARAM shape",
+            "NAME <shape>",
+            "RETURNS",
+            "VALUE a",
+            "NAME <float>",
+        ],
+    );
+}
+
+/// `define sealed generic ... => (<integer>);` — the `sealed` adjective is a
+/// reserved keyword token, so it must still be collected as a MOD (the old
+/// identifier-only modifier scan dropped it and then failed). The bare-type
+/// return `(<integer>)` carries no value name.
+#[test]
+#[ignore]
+#[serial]
+fn define_generic_sealed_bare_return() {
+    let source =
+        "define sealed generic run-task (t :: <task>, packet :: <integer>) => (<integer>);\n";
+    assert_dump(
+        "define_generic_sealed_bare_return",
+        source,
+        &[
+            "DEFINE-GENERIC run-task",
+            "MOD sealed",
+            "PARAM t",
+            "PARAM packet",
+            "RETURNS",
+            "VALUE <integer>",
+        ],
+    );
+}
