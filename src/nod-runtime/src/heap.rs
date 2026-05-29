@@ -1964,6 +1964,178 @@ mod tests {
         assert_eq!(wrap.class(), ct.byte_string());
     }
 
+    /// GAP-010 reproduction on the REAL `DylanLayout`-backed heap,
+    /// without the AOT compiler. Mirrors `F:\scratch\gap010.dylan`: one
+    /// rooted size-10 `<byte-string>` held live across a churn loop of
+    /// dead size-512 `<byte-string>`s. Allocation auto-drives minor GCs
+    /// (and promotion of the survivor). After every churn alloc we
+    /// re-read `keep` through its registered root slot and confirm it is
+    /// still a live `<byte-string>` of size 10 with intact bytes. The
+    /// first cycle that mis-relocates or corrupts the survivor trips an
+    /// assert here, pinpointing the bad promotion — the deref-and-validate
+    /// probe the Dylan team couldn't run without a debugger (GAP-010 §8).
+    #[cfg(feature = "newgc-backend")]
+    #[test]
+    fn gap010_surviving_bytestring_survives_promotion_under_churn() {
+        newgc_core::crash::install();
+
+        // Small young gen so minors fire often and `keep` promotes fast.
+        let heap = Heap::with_config(GcConfig {
+            young_bytes: 256 * 1024,
+            old_bytes: 32 * 1024 * 1024,
+        });
+        let ct = ClassTable::new();
+        let bs_class = ct.byte_string();
+
+        // `keep` = size-10 byte-string with a recognizable fill so a torn
+        // payload is detectable (the real repro zero-fills; 'k' is stricter).
+        let keep0 = heap.alloc_byte_string("kkkkkkkkkk", &ct);
+
+        // Stable registered root slot — exactly the codegen spill-slot
+        // contract: a raw `*const Word` the collector rewrites in place.
+        let mut keep_slot: crate::word::Word = keep0;
+        heap.register_root(&keep_slot as *const crate::word::Word);
+
+        let first_addr = keep_slot.raw() & !1;
+        let mut last_addr = first_addr;
+        let mut moves = 0u64;
+
+        let junk_src = "y".repeat(512);
+        let iters: usize = std::env::var("GAP010_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+
+        for i in 0..iters {
+            // churn: dead size-512 byte-string. May trigger a minor.
+            let _junk = heap.alloc_byte_string(&junk_src, &ct);
+
+            // Re-validate `keep` via its (possibly rewritten) slot.
+            let cur = keep_slot.raw() & !1;
+            if cur != last_addr {
+                moves += 1;
+                last_addr = cur;
+            }
+            // SAFETY: `keep_slot` holds a (relocated) pointer-tagged Word
+            // the GC rewrote in place; try_byte_string validates the class.
+            let bs = match unsafe { crate::strings::try_byte_string(keep_slot, bs_class) } {
+                Some(b) => b,
+                None => panic!(
+                    "iter {i}: keep is no longer a <byte-string> \
+                     (raw {:#x}, moved {moves}x from {first_addr:#x})",
+                    keep_slot.raw()
+                ),
+            };
+            assert_eq!(
+                bs.len, 10,
+                "iter {i}: keep size wrong: {} (raw {:#x}, moved {moves}x)",
+                bs.len,
+                keep_slot.raw()
+            );
+            // SAFETY: bs is a live byte-string of the asserted size.
+            let bytes = unsafe { bs.bytes() };
+            assert!(
+                bytes.iter().all(|&b| b == b'k'),
+                "iter {i}: keep payload torn: {:?} (raw {:#x}, moved {moves}x)",
+                bytes,
+                keep_slot.raw()
+            );
+        }
+
+        heap.unregister_root(&keep_slot as *const crate::word::Word);
+        eprintln!(
+            "gap010 repro OK: keep survived {iters} churn allocs, moved {moves}x, ended at {:#x}",
+            keep_slot.raw()
+        );
+    }
+
+    /// GAP-010 reproduction at MAXIMUM fidelity short of the AOT EXE:
+    /// run on the **process-global literal-pool heap** (default 4 MB
+    /// young, exactly like the EXE) with the **full runtime initialised**
+    /// (`nod_runtime_init` — class metadata, singletons, condition
+    /// classes), allocating both `keep` and the churn through the **exact
+    /// primitive** `make(<byte-string>, size: n)` lowers to:
+    /// `nod_byte_string_allocate`. The only remaining difference from the
+    /// crashing EXE is that the driving loop here is Rust, not AOT-emitted
+    /// machine code. If this stays green, the GC + runtime-integration is
+    /// exonerated and GAP-010 is squarely an AOT-codegen defect; if it
+    /// reproduces, the fault is runtime/GC-side and reproducible in-process.
+    ///
+    /// `#[ignore]`: this drives the **process-global** literal-pool heap and
+    /// runs minor collections whose root set is this thread's thread-local
+    /// roots only — so in the default parallel test run its collections
+    /// would reclaim *other* tests' live objects on the shared heap. Run it
+    /// alone: `cargo test -p nod-runtime --
+    /// gap010_global_heap_runtime_init_bytestring_churn --ignored
+    /// --test-threads=1`. The sibling `gap010_surviving_bytestring_*` test
+    /// uses a private local heap and is the parallel-safe regression guard.
+    #[cfg(feature = "newgc-backend")]
+    #[test]
+    #[ignore = "drives the process-global heap; unsafe to run in parallel with other tests"]
+    fn gap010_global_heap_runtime_init_bytestring_churn() {
+        use crate::word::Word;
+        newgc_core::crash::install();
+        crate::aot::nod_runtime_init();
+
+        // `keep = make(<byte-string>, size: 10)` — global heap, zero-filled.
+        let keep_raw =
+            unsafe { crate::strings::nod_byte_string_allocate(Word::from_fixnum(10).unwrap().raw()) };
+        let mut keep_slot = Word::from_raw(keep_raw);
+        super::register_root(&keep_slot as *const Word);
+
+        let bs_class = crate::ClassId::BYTE_STRING;
+        // Sanity: keep is a size-10 byte-string before any churn/GC.
+        {
+            let bs = unsafe { crate::strings::try_byte_string(keep_slot, bs_class) }
+                .expect("keep should be a <byte-string> at allocation");
+            assert_eq!(bs.len, 10, "keep initial size");
+        }
+
+        let first_addr = keep_slot.raw() & !1;
+        let mut last_addr = first_addr;
+        let mut moves = 0u64;
+        let iters: usize = std::env::var("GAP010_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+
+        for i in 0..iters {
+            // churn: `make(<byte-string>, size: 512)`, immediately dead.
+            let _junk = unsafe {
+                crate::strings::nod_byte_string_allocate(Word::from_fixnum(512).unwrap().raw())
+            };
+
+            let cur = keep_slot.raw() & !1;
+            if cur != last_addr {
+                moves += 1;
+                last_addr = cur;
+            }
+            // SAFETY: keep_slot holds the (relocated) pointer-tagged Word
+            // the collector rewrote in place via the registered root.
+            let bs = match unsafe { crate::strings::try_byte_string(keep_slot, bs_class) } {
+                Some(b) => b,
+                None => panic!(
+                    "iter {i}: keep no longer a <byte-string> \
+                     (raw {:#x}, moved {moves}x from {first_addr:#x})",
+                    keep_slot.raw()
+                ),
+            };
+            assert_eq!(
+                bs.len, 10,
+                "iter {i}: keep size corrupted: {} (raw {:#x}, moved {moves}x)",
+                bs.len,
+                keep_slot.raw()
+            );
+        }
+
+        super::unregister_root(&keep_slot as *const Word);
+        eprintln!(
+            "gap010 global-heap repro OK: keep survived {iters} make(<byte-string>,512) churns, \
+             moved {moves}x, ended at {:#x}",
+            keep_slot.raw()
+        );
+    }
+
     #[test]
     fn live_bytes_advances() {
         let heap = Heap::new();

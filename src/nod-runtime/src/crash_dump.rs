@@ -353,8 +353,128 @@ pub(crate) fn install() {
     INSTALLED.get_or_init(|| {
         install_panic_hook();
         #[cfg(windows)]
-        install_seh_filter();
+        {
+            install_seh_filter();
+            // A STATUS_STACK_OVERFLOW leaves no stack for the unhandled
+            // exception filter to run, so without this a stack overflow
+            // terminates the process *silently* (this was the GAP-010
+            // symptom: empty stderr, no crash dump). Reserve a guaranteed
+            // stack reserve + install a vectored handler that fires
+            // first-chance — see install_stack_overflow_handler.
+            install_stack_overflow_handler();
+        }
     });
+}
+
+/// Windows-only: make stack overflows reportable instead of silent.
+///
+/// Two parts:
+///   1. `SetThreadStackGuarantee` reserves a slice of stack that stays
+///      available *after* the guard page is hit, so an exception handler
+///      can actually run on the overflowing thread.
+///   2. `AddVectoredExceptionHandler` installs a first-chance handler.
+///      `SetUnhandledExceptionFilter` (our `install_seh_filter`) is only
+///      reached on the *second chance*, and a stack overflow never gets
+///      there — frame-based dispatch can't unwind without stack. A VEH
+///      runs first-chance, within the guaranteed reserve, so it can emit
+///      a dump before the OS tears the process down.
+///
+/// Call once per process for the main thread; worker/mutator threads that
+/// want the same protection should call
+/// [`ensure_stack_overflow_reserve_this_thread`] after they start.
+#[cfg(windows)]
+fn install_stack_overflow_handler() {
+    ensure_stack_overflow_reserve_this_thread();
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: *const core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+    }
+    unsafe {
+        // first = 1 → run before any previously-registered VEH.
+        AddVectoredExceptionHandler(
+            1,
+            vectored_stack_overflow_handler
+                as unsafe extern "system" fn(*mut ExceptionPointers) -> i32
+                as *const core::ffi::c_void,
+        );
+    }
+}
+
+/// Reserve enough stack on the *current* thread that a handler can run
+/// after a stack-overflow guard-page fault. Idempotent and cheap; safe to
+/// call from every thread that runs Dylan/GC code.
+#[cfg(windows)]
+pub(crate) fn ensure_stack_overflow_reserve_this_thread() {
+    unsafe extern "system" {
+        fn SetThreadStackGuarantee(stack_size_in_bytes: *mut u32) -> i32;
+    }
+    // 64 KiB is comfortably more than `report_stack_overflow` needs
+    // (it uses a 512-byte stack buffer) while leaving slack for the OS
+    // exception-dispatch machinery.
+    let mut guarantee: u32 = 64 * 1024;
+    unsafe {
+        SetThreadStackGuarantee(&mut guarantee);
+    }
+}
+
+/// Vectored handler: report (only) stack overflows, then let normal
+/// dispatch proceed. Returns `EXCEPTION_CONTINUE_SEARCH` for everything,
+/// so it never swallows an exception — including the runtime's own
+/// deliberately-handled access violations, which it ignores entirely.
+#[cfg(windows)]
+unsafe extern "system" fn vectored_stack_overflow_handler(
+    info: *mut ExceptionPointers,
+) -> i32 {
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
+    if !info.is_null() {
+        let exc_record = unsafe { (*info).exception_record };
+        if !exc_record.is_null() {
+            let code = unsafe { (*exc_record).exception_code };
+            if code == STATUS_STACK_OVERFLOW {
+                let addr = unsafe { (*exc_record).exception_address };
+                report_stack_overflow(addr);
+            }
+        }
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Lean stack-overflow report. Deliberately uses a *small* stack buffer
+/// (we are, by definition, nearly out of stack) and the same direct
+/// `write_bytes_to_stderr` path as the full crash dump.
+#[cfg(windows)]
+fn report_stack_overflow(addr: *mut core::ffi::c_void) {
+    use core::fmt::Write as _;
+    let phase = GC_PHASE.load(Ordering::SeqCst);
+    let phase_str = match phase {
+        GC_PHASE_MINOR => "MINOR GC in progress",
+        GC_PHASE_MAJOR => "MAJOR GC in progress",
+        _ => "idle (mutator)",
+    };
+    let aot_depth = crate::aot::active_aot_safepoint_depth();
+    let jit_depth = crate::stack_map::active_jit_safepoint_depth();
+    // Small but enough for the whole message; we are nearly out of stack,
+    // but `SetThreadStackGuarantee` reserved 64 KiB so 1 KiB is safe.
+    let mut buf = StackBuf::<1024>::new();
+    let _ = write!(
+        buf,
+        "\n\
+        ============================================================\n\
+        === NOD CRASH DUMP: STACK OVERFLOW =========================\n\
+        ============================================================\n  \
+        EXCEPTION_STACK_OVERFLOW (code 0xc00000fd) at {addr:p}\n  \
+        gc phase             : {phase_str}\n  \
+        AOT safepoint frames : {aot_depth}\n  \
+        JIT safepoint frames : {jit_depth}\n  \
+        note                 : a thread exhausted its stack. A frame with a\n                         \
+        huge/looping alloca is the usual cause (a loop-body alloca leaks\n                         \
+        stack every iteration at -O0; hoist it to the entry block).\n\
+        ============================================================\n\n"
+    );
+    write_bytes_to_stderr(buf.as_bytes());
 }
 
 fn install_panic_hook() {

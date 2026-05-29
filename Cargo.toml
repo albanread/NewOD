@@ -44,7 +44,8 @@ llvm-sys    = { version = "=221.0.1", features = ["force-static"] }
 # team's working tree, which moved underneath our build mid-session).
 # Cargo snapshots this rev into its git cache; the GC team's ongoing
 # multi-mutator testing/changes can't affect us until we deliberately
-# bump `rev`. b66726a is the version GAP-009 was validated against
-# (MM-8 multi-mutator + card-scan/decommit fix + SEH crash handler).
+# bump `rev`. 22ec0e7 is "Fix GAP-010: dirty-card scan corrupted
+# byte-string opaque payloads" — the object-aware reservation card
+# scan that fixes the AOT byte-string-relocation crash (was b66726a).
 # To adopt a new GC release: bump `rev`, rebuild, re-run the gates.
-newgc-core  = { git = "file:///E:/NewGC", rev = "b66726a17cab9d7bb9c0e836fd535549fd9de30e", default-features = false }
+newgc-core  = { git = "file:///E:/NewGC", rev = "22ec0e7e692ac468fc7682f0aacb9683d01c1688", default-features = false }

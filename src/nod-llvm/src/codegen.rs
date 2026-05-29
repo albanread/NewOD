@@ -2784,10 +2784,9 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // Spill args into a stack-local i64 array.
         let arity = args.len();
         let args_arr_ty = i64ty.array_type(arity.max(1) as u32);
-        let args_alloca = self
-            .builder
-            .build_alloca(args_arr_ty, "sd.args")
-            .map_err(map_err)?;
+        // Entry-block alloca: a loop-body alloca would leak stack every
+        // iteration at -O0 (GAP-010 stack overflow). See build_entry_alloca.
+        let args_alloca = self.build_entry_alloca(args_arr_ty, "sd.args")?;
         for (i, arg) in args.iter().enumerate() {
             let v = self.temp_val(*arg).into_int_value();
             let idx_const = i64ty.const_int(i as u64, false);
@@ -2809,10 +2808,8 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
         // body symbol.
         let chain_len = fallback_chain.len();
         let chain_arr_ty = i64ty.array_type(chain_len.max(1) as u32);
-        let chain_alloca = self
-            .builder
-            .build_alloca(chain_arr_ty, "sd.chain")
-            .map_err(map_err)?;
+        // Entry-block alloca (see build_entry_alloca / args_alloca above).
+        let chain_alloca = self.build_entry_alloca(chain_arr_ty, "sd.chain")?;
         for (i, body_name) in fallback_chain.iter().enumerate() {
             // Ensure an extern function declaration exists for the
             // body symbol — same shape as `callee_fn`. Same three-tier
@@ -4439,6 +4436,46 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             self.mctx.install_surface,
             SafepointInstallSurface::InMemoryCodeText
         )
+    }
+
+    /// Allocate `ty` in the function's **entry block** (before its first
+    /// instruction), regardless of the current insert position, then
+    /// restore the builder to where it was.
+    ///
+    /// Why this matters: an `alloca` emitted in a loop-body block is, at
+    /// `-O0`, executed on *every* iteration and the stack space is only
+    /// reclaimed when the function returns (LLVM never auto-inserts
+    /// `stackrestore`). A scratch buffer allocated inside a hot loop
+    /// therefore grows the frame without bound until the stack overflows
+    /// — this was GAP-010: `emit_sealed_direct_call`'s `sd.args` / `sd.chain`
+    /// slabs leaked ~32 bytes per iteration of a `size(keep)`-style sealed
+    /// call, blowing the 1 MB stack after ~31 K iterations (and the
+    /// resulting `STATUS_STACK_OVERFLOW` left no stack for the unhandled
+    /// exception filter, so it died silently). Entry-block allocas run
+    /// exactly once per activation and are safely reused across iterations,
+    /// since the buffer is consumed synchronously before the next one.
+    /// Mirrors `init_safepoint_slot_slab`'s placement.
+    fn build_entry_alloca(
+        &self,
+        ty: impl inkwell::types::BasicType<'ctx>,
+        name: &str,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, CodegenError> {
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        let saved = self.builder.get_insert_block();
+        let entry_bb = self
+            .llvm_fn
+            .get_first_basic_block()
+            .expect("function has at least one block");
+        if let Some(first_inst) = entry_bb.get_first_instruction() {
+            self.builder.position_before(&first_inst);
+        } else {
+            self.builder.position_at_end(entry_bb);
+        }
+        let p = self.builder.build_alloca(ty, name).map_err(map_err)?;
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        Ok(p)
     }
 
     fn init_safepoint_slot_slab(&mut self) -> Result<(), CodegenError> {

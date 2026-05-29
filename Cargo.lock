@@ -403,7 +403,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "newgc-core"
 version = "0.0.0"
-source = "git+file:///E:/NewGC?rev=b66726a17cab9d7bb9c0e836fd535549fd9de30e#b66726a17cab9d7bb9c0e836fd535549fd9de30e"
+source = "git+file:///E:/NewGC?rev=22ec0e7e692ac468fc7682f0aacb9683d01c1688#22ec0e7e692ac468fc7682f0aacb9683d01c1688"
 dependencies = [
  "libc",
  "loom",
