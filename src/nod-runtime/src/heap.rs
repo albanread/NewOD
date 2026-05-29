@@ -1656,6 +1656,17 @@ mod newgc_backend {
                 let inner = self.inner.lock().expect("heap mutex poisoned");
                 inner.heap.stats().g0_used_bytes as u64
             };
+            // GAP-011 trace: open the cycle and dump the full root set
+            // (with provenance) BEFORE evacuation, so the log shows exactly
+            // what the collector was handed. `visit_roots` reads the cycle
+            // id back to attach per-root-rewrite records.
+            let trace_cycle = if crate::gc_trace::enabled() {
+                let c = crate::gc_trace::begin_cycle("minor", g0_before);
+                trace_emit_root_set(c);
+                c
+            } else {
+                0
+            };
             {
                 let mut inner = self.inner.lock().expect("heap mutex poisoned");
                 inner.heap.collect_minor(|evac| visit_roots(evac, &roots));
@@ -1690,6 +1701,17 @@ mod newgc_backend {
             };
             crate::crash_dump::update_gc_metrics(&snap);
             crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
+            if crate::gc_trace::enabled() {
+                crate::gc_trace::end_cycle(
+                    trace_cycle,
+                    "minor",
+                    inner.stats.minor_collections,
+                    inner.stats.major_collections,
+                    young_live,
+                    old_live,
+                    g0_before,
+                );
+            }
             if crate::gc_trace_enabled() {
                 eprintln!(
                     "[GC minor #{}] roots={} promoted={}B pause={}µs (total {}µs)",
@@ -1713,6 +1735,13 @@ mod newgc_backend {
             let start = Instant::now();
             let roots = snapshot_roots();
             let root_count = roots.len() as u64;
+            let trace_cycle = if crate::gc_trace::enabled() {
+                let c = crate::gc_trace::begin_cycle("major", 0);
+                trace_emit_root_set(c);
+                c
+            } else {
+                0
+            };
             {
                 let mut inner = self.inner.lock().expect("heap mutex poisoned");
                 let _result = inner.heap.collect_full(|evac| visit_roots(evac, &roots));
@@ -1749,6 +1778,17 @@ mod newgc_backend {
             };
             crate::crash_dump::update_gc_metrics(&snap);
             crate::crash_dump::set_gc_phase(crate::crash_dump::GC_PHASE_IDLE);
+            if crate::gc_trace::enabled() {
+                crate::gc_trace::end_cycle(
+                    trace_cycle,
+                    "major",
+                    inner.stats.minor_collections,
+                    inner.stats.major_collections,
+                    young_live,
+                    old_live,
+                    0,
+                );
+            }
             if crate::gc_trace_enabled() {
                 eprintln!(
                     "[GC major #{}] roots={} pause={}µs (total {}µs)",
@@ -1789,6 +1829,10 @@ mod newgc_backend {
         evac: &mut newgc_core::page_heap::PageEvacuator<'_, DylanLayout>,
         roots: &[*const Word],
     ) {
+        // GAP-011 trace setup: read the owning cycle id once (set by
+        // `begin_cycle` just before this collection started).
+        let tracing = crate::gc_trace::enabled();
+        let cycle = if tracing { crate::gc_trace::current_cycle() } else { 0 };
         for &slot in roots.iter() {
             // SAFETY: `slot` is a registered root — the caller's
             // contract is that it remains writable until
@@ -1801,10 +1845,51 @@ mod newgc_backend {
             // No interpretation of the Word type's fields beyond
             // `raw()` happens.
             unsafe {
-                let ngc_slot =
-                    slot as *mut newgc_core::Word;
-                evac.visit(&mut *ngc_slot);
+                let ngc_slot = slot as *mut newgc_core::Word;
+                // GAP-011 trace: snapshot the slot before/after the visit so
+                // the log records whether this root was rewritten to a moved
+                // address. Reading `*slot` as u64 is sound (repr(transparent)).
+                if tracing {
+                    let old = *(slot as *const u64);
+                    evac.visit(&mut *ngc_slot);
+                    let new = *(slot as *const u64);
+                    crate::gc_trace::root_rewrite(cycle, slot as usize, old, new);
+                } else {
+                    evac.visit(&mut *ngc_slot);
+                }
             }
+        }
+    }
+
+    /// GAP-011 trace helper: emit one `root` record for a registered slot,
+    /// reading the raw Word the slot currently holds (pre-collection).
+    fn trace_one_root(cycle: u64, idx: usize, src: &str, slot: *const Word) {
+        // SAFETY: a registered root slot address is always valid to read;
+        // `Word` is repr(transparent) u64.
+        let w = unsafe { *(slot as *const u64) };
+        crate::gc_trace::root(cycle, idx, src, slot as usize, w);
+    }
+
+    /// GAP-011 trace helper: dump the full registered root set, labelled by
+    /// provenance, in the same order `snapshot_roots` concatenates the four
+    /// sources (thread root-stack, JIT frames, AOT frames, multi-values).
+    fn trace_emit_root_set(cycle: u64) {
+        let mut i = 0usize;
+        for slot in super::ROOT_STACK.with(|s| s.borrow().clone()) {
+            trace_one_root(cycle, i, "stack", slot);
+            i += 1;
+        }
+        for slot in crate::stack_map::snapshot_active_jit_roots() {
+            trace_one_root(cycle, i, "jit", slot);
+            i += 1;
+        }
+        for slot in crate::aot::snapshot_active_aot_roots() {
+            trace_one_root(cycle, i, "aot", slot);
+            i += 1;
+        }
+        for slot in crate::values::snapshot_active_values_roots() {
+            trace_one_root(cycle, i, "values", slot);
+            i += 1;
         }
     }
 }

@@ -72,6 +72,7 @@ mod winffi;
 mod dylan_layout;
 mod format_out;
 mod functions;
+mod gc_trace;
 mod heap;
 mod heap_common;
 mod immediates;

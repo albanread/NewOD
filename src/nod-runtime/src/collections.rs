@@ -1024,8 +1024,22 @@ pub fn make_stretchy_vector(initial_capacity: usize) -> Word {
 /// Push a value onto the end of a `<stretchy-vector>`. Grows the backing
 /// SOV by 2x when capacity is exhausted.
 pub fn stretchy_vector_push(sv: Word, value: Word) {
-    let (length, capacity, storage) =
-        stretchy_vector_fields(sv).expect("stretchy_vector_push: not a <stretchy-vector>");
+    let (length, capacity, storage) = match stretchy_vector_fields(sv) {
+        Some(fields) => fields,
+        None => {
+            // GAP-011: the caller handed us a stale/dead `<stretchy-vector>`.
+            // Print the raw `sv` so a `NOD_GC_TRACE` log can be grepped for
+            // this address — to see whether it was ever a registered root and
+            // whether the collector rewrote that slot across each cycle.
+            eprintln!(
+                "[GAP-011] stretchy_vector_push: not a <stretchy-vector>: \
+                 sv=0x{:016x} ptr=0x{:016x}",
+                sv.raw(),
+                sv.raw() & !1,
+            );
+            panic!("stretchy_vector_push: not a <stretchy-vector>");
+        }
+    };
     // Root the value across any allocations.
     let value_local = value;
     let _value_guard = crate::make::RootGuard::new(&value_local);
