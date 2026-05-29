@@ -2326,6 +2326,33 @@ fn emit_function<'ctx, 'a>(
         }
     }
 
+    // GAP-010 guard: every `alloca` MUST live in the entry block. An
+    // alloca reached on a loop back-edge is executed each iteration and,
+    // at -O0, never reclaimed until the function returns (LLVM inserts no
+    // `stackrestore`) — so a scratch buffer in a hot loop grows the frame
+    // without bound until the stack overflows. That was GAP-010 (the
+    // sealed-call sd.args/sd.chain slabs). All scratch allocas must route
+    // through `build_entry_alloca` / be placed like `init_safepoint_slot_slab`.
+    // Catch a regression at codegen time rather than as a silent
+    // STATUS_STACK_OVERFLOW at runtime.
+    {
+        use inkwell::values::InstructionOpcode;
+        for bb in llvm_fn.get_basic_blocks().iter().skip(1) {
+            let mut inst = bb.get_first_instruction();
+            while let Some(i) = inst {
+                if i.get_opcode() == InstructionOpcode::Alloca {
+                    return Err(CodegenError::Builder(format!(
+                        "GAP-010 guard: `alloca` emitted outside the entry block in \
+                         `{}` — a loop-reachable alloca leaks stack every iteration \
+                         at -O0. Route the scratch buffer through `build_entry_alloca`.",
+                        func.name
+                    )));
+                }
+                inst = i.get_next_instruction();
+            }
+        }
+    }
+
     Ok(())
 }
 impl<'ctx, 'a> Emit<'ctx, 'a> {
