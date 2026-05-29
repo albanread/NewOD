@@ -2177,6 +2177,15 @@ struct Emit<'ctx, 'a> {
     safepoint_slot_slab: Option<inkwell::values::PointerValue<'ctx>>,
     current_block_label: String,
     current_computation_index: usize,
+    /// GAP-011 diagnostic (`NOD_DIAG_MERGE_DIVERGENCE`): when set, every
+    /// value carried across a CFG edge by `note_successor_entry_temps` is
+    /// recorded as (target block, source label, temp, value). After the
+    /// block loop we report any GC-typed temp that arrives at a block from
+    /// two predecessors with DIFFERENT LLVM values yet is NOT a block param
+    /// — the exact stale-reload signature. Off by default; zero cost when
+    /// the env var is unset.
+    diag_merge: bool,
+    merge_diag: Vec<(BlockId, String, TempId, BasicValueEnum<'ctx>)>,
     // Sprint 38e / 45c — site ids were previously dispatch-local. The
     // module-wide allocator now lives in
     // `ModuleCodegenCtx::next_safepoint_site_id` so site_ids are
@@ -2227,6 +2236,8 @@ fn emit_function<'ctx, 'a>(
         safepoint_slot_slab: None,
         current_block_label: String::new(),
         current_computation_index: 0,
+        diag_merge: std::env::var_os("NOD_DIAG_MERGE_DIVERGENCE").is_some(),
+        merge_diag: Vec::new(),
     };
 
     // Pre-create every LLVM basic block so terminators can branch
@@ -2326,6 +2337,56 @@ fn emit_function<'ctx, 'a>(
         }
     }
 
+    // GAP-011 diagnostic analysis (NOD_DIAG_MERGE_DIVERGENCE): report any
+    // GC-typed temp that arrives at a block from ≥2 predecessors with
+    // DIFFERENT LLVM values, yet is NOT a block param — the exact codegen
+    // stale-reload signature. Such a temp would be installed via
+    // `note_successor_entry_temps` (first-writer-wins), so a non-dominating
+    // predecessor's reload value can leak into a sibling/merge block.
+    if state.diag_merge {
+        let mut groups: HashMap<(BlockId, TempId), Vec<BasicValueEnum<'ctx>>> = HashMap::new();
+        for (tgt, _label, t, v) in &state.merge_diag {
+            groups.entry((*tgt, *t)).or_default().push(*v);
+        }
+        let mut hits = 0usize;
+        for ((tgt, t), vals) in &groups {
+            let mut distinct: Vec<BasicValueEnum<'ctx>> = Vec::new();
+            for v in vals {
+                if !distinct.iter().any(|d| d == v) {
+                    distinct.push(*v);
+                }
+            }
+            if distinct.len() < 2 {
+                continue; // dominating value (same on all edges) — safe
+            }
+            let blk = func.blocks.iter().find(|b| b.id == *tgt);
+            let is_param = blk.map(|b| b.params.contains(t)).unwrap_or(false);
+            if is_param {
+                continue; // handled correctly by the phi / pending_incoming path
+            }
+            let ty = func.temp_type(*t);
+            if !ty.needs_gc_protection() {
+                continue; // a stale non-pointer is a wrong-value bug, not the crash
+            }
+            hits += 1;
+            eprintln!(
+                "MERGE-DIVERGENCE fn={} block={} temp=t{} type={:?} distinct_values={} edges={}",
+                func.name,
+                blk.map(|b| b.label.as_str()).unwrap_or("?"),
+                t.0,
+                ty,
+                distinct.len(),
+                vals.len(),
+            );
+        }
+        if hits > 0 {
+            eprintln!(
+                "MERGE-DIVERGENCE: {} GC stale-reload site(s) in fn={}",
+                hits, func.name
+            );
+        }
+    }
+
     // GAP-010 guard: every `alloca` MUST live in the entry block. An
     // alloca reached on a loop back-edge is executed each iteration and,
     // at -O0, never reclaimed until the function returns (LLVM inserts no
@@ -2363,6 +2424,17 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .or_default();
         for (&temp, &value) in &self.temps {
             entry.entry(temp).or_insert(value);
+        }
+        if self.diag_merge {
+            // GAP-011 diagnostic: snapshot what value THIS predecessor would
+            // carry into `target` for every temp it currently binds. Cloned
+            // out first to release the borrow of `self.temps`.
+            let label = self.current_block_label.clone();
+            let recs: Vec<(TempId, BasicValueEnum<'ctx>)> =
+                self.temps.iter().map(|(&t, &v)| (t, v)).collect();
+            for (t, v) in recs {
+                self.merge_diag.push((target, label.clone(), t, v));
+            }
         }
     }
 

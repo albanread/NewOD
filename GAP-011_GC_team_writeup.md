@@ -1,7 +1,9 @@
 # GAP-011 — stale precise root: status & action list
 
-**Owner:** NewOpenDylan compiler side (root cause is ours, not `newgc-core`).
-**Status:** OPEN. The liveness layer is fixed; a codegen layer still crashes.
+**Owner:** NewOpenDylan compiler side — but the front-end is now exonerated by
+measurement (see P0). The residual is in the runtime/collector layer.
+**Status:** OPEN. The liveness layer is fixed and front-end roots are complete;
+something downstream strands a registered vector root. Layer not yet located.
 **Gating test:** `nod-driver parse-dylan F:\scratch\jcs-40.dylan` must exit **0**
 (today: exit 9, panic at `nod-runtime/src/collections.rs:1028`,
 `stretchy_vector_push: not a <stretchy-vector>`, zeroed/non-forwarded wrapper).
@@ -20,30 +22,73 @@ correct, but not sufficient.
 
 ## P0 — close the crash (correctness, blocks the parser corpus)
 
-**A1. Fix the codegen stale-reload residual.**
-`note_successor_entry_temps` (`src/nod-llvm/src/codegen.rs:2359-2367`, called at
-`4266-4267`/`4290`) snapshots the *entire* `self.temps` — including a
-post-`end_safepoint` reload SSA value (`codegen.rs:4448`) — into every
-successor's entry temps, for **all** temps, not just declared block params. For
-an *unnamed intermediate* heap temp that lowering didn't thread as a block
-param, a successor not strictly dominated by the call block reads a
-non-dominating, pre-relocation `Word` → stale root after the next collection.
-Pick one:
-- **(preferred, matches #298/#300)** make lowering thread every `live_in` heap
-  temp (incl. unnamed intermediates) as an explicit block param, **and** make
-  `note_successor_entry_temps` refuse non-param temps (fail loud instead of
-  installing a non-dominating reload).
-- **(codegen-local)** reload each root from a stable per-temp frame slot via a
-  `load` at the entry of every block whose `live_in` contains the temp — not
-  only the block that made the call.
+> **A1 (the `note_successor_entry_temps` stale-reload) is REFUTED by direct
+> measurement.** Do not implement the SSA-renaming / per-temp-slot rewrite — it
+> targets a mechanism that does not fire here. See "What measurement showed"
+> below.
 
-Done-test: `jcs-40` exits 0 **and** `dylan_parser` suite stays 25/25.
+### What measurement showed (this round)
 
-**A2. Make the safepoint verifier able to catch this class.**
+Added an env-gated codegen diagnostic `NOD_DIAG_MERGE_DIVERGENCE`
+(`src/nod-llvm/src/codegen.rs`, in `note_successor_entry_temps` + post-block
+analysis; inert when the env var is unset). It records, per CFG edge, the LLVM
+value each predecessor would carry into a successor, then reports any GC-typed
+temp that arrives at a block from ≥2 predecessors with **different** values yet
+is **not** a block param — the exact A1 stale-reload signature.
+
+Built the parser fresh (cleared `target/nod-jit-cache` + the temp parser EXE;
+confirmed `dylan-parser.obj` re-emitted, so `emit_function` ran for every
+parser+lexer+stdlib function), ran it on `jcs-40` with the diagnostic on:
+
+- **Zero** GC merge-divergence sites across the entire parser. → A1 refuted.
+- `NOD_AOT_VERIFY_SAFEPOINTS=1` on the same run: **no** verifier failure (root
+  counts consistent at every site).
+- `dump-dfm` of the lexer: every push site protects the vector
+  (`nod_stretchy_vector_push(t7, …) safepoint=[t7]`, etc.); `scan-string`'s
+  byte-string copy loop carries `safepoint=[t27, t28]`. Roots are **complete**
+  where the vector is live.
+- Crash is at `collections.rs:1028`, the **first line** of
+  `stretchy_vector_push` (`stretchy_vector_fields(sv).expect(...)`): `sv` is
+  stale **on entry**. The runtime grow path (1035–1088) correctly re-reads
+  `sv_local` after its grow alloc, so the runtime push is **not** at fault — the
+  caller handed `push` a dead vector.
+
+### Narrowed hypothesis space (all front-end root-completeness ruled out)
+
+Liveness is complete, the type filter is comprehensive, no merge-divergence, the
+verifier passes, the spill/reload slab is symmetric, no `is_no_alloc`
+suppression. So the stale `sv` is **not** a missing/ stale front-end root. The
+remaining live suspects, in rough order:
+
+1. **A registered root the collector doesn't rewrite in some shape**
+   (`newgc-core` evacuation, or an AOT active-frame slab that isn't scanned).
+   Needs a `newgc`-side check: was the reclaimed vector's address presented as a
+   root at the last collection? If yes → collector didn't rewrite it; if no →
+   it was reachable only through a path precise roots don't cover (next item).
+2. **The vector lives in a heap object's slot whose class slot-map is wrong**
+   (collector doesn't trace/rewrite that slot), so a node holding the vector is
+   evacuated but the slot keeps the stale address. A runtime class-layout bug,
+   not codegen. The parser builds many AST nodes via `%make`.
+3. **`nod_make`/`rust_make` don't root the fresh instance across user
+   `initialize`** (A4) — only bites classes with a user `initialize`.
+
+### Next decisive step (re-scoped from A1)
+
+Get **runtime ground truth**, not more static analysis: at the
+`stretchy_vector_push` panic, identify (a) which AOT function called it with a
+stale `sv`, and (b) whether that `sv` address was in the collector's root set at
+the last collection. Cheapest path: a one-shot instrument in
+`stretchy_vector_push`'s entry-check + `newgc-core` evacuation diag keyed on the
+faulting address. That disambiguates suspect #1 vs #2/#3 in a single run.
+
+**A2. Make the safepoint verifier able to catch a real stale root.**
 `NOD_AOT_VERIFY_SAFEPOINTS` (`src/nod-runtime/src/aot.rs:294-320`) checks root
-*counts* only and is off by default outside tests, so it passed this bug clean.
-Add reload-**value dominance** checking, and keep verification on in CI/debug
-lanes. (Cheap insurance against A1 regressing.)
+*counts* only — it passed this bug clean. Even a completeness/value-dominance
+check wouldn't have caught this (roots ARE complete), so the higher-value add is
+a **post-collection slot sanity check**: after evacuation, assert every
+registered root slot holds either an immediate or a forwarded/valid wrapper (not
+a zeroed/from-space cell). That would fire AT the collection that strands `sv`,
+naming the slot.
 
 ---
 
