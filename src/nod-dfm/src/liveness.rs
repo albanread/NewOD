@@ -9,44 +9,45 @@
 //! after the call so downstream uses see the relocated address.
 //!
 //! This module computes the "which temps need protecting at which
-//! call?" set. The algorithm is the simple per-block one described in
-//! the Sprint 11b brief:
+//! call?" set via a real global **backward liveness dataflow fixpoint**
+//! (GAP-011). An earlier version used a per-block approximation; it was
+//! unsound for *live-through* temps — a temp defined in block A, used in
+//! block C, but neither mentioned nor threaded through an intermediate
+//! block B was invisible to B's analysis, so allocating calls in B got
+//! no protecting root for it. A collection in that window reclaimed the
+//! object without forwarding the (never-registered) root, leaving a
+//! dangling pointer for the next use. Recursive-descent code (allocate,
+//! then branch deeper, with an accumulator live throughout) hit this
+//! constantly; straight-line / single-branch code did not.
 //!
-//!   for each block:
-//!     compute def_index(t) = position of t's defining Computation in
-//!         the block's `computations` list (or `-1` if t is a function
-//!         param or block param — defined before any computation).
-//!     compute last_use_index(t) = the *maximum* index at which `t`
-//!         appears as an operand in this block, OR `len` if `t`
-//!         appears in the block's terminator, OR `len + 1` if `t` is
-//!         live-out of this block via a successor's block-param
-//!         (approximation: any temp passed in `Terminator::Jump.args`
-//!         or referenced in `Terminator::Return.value` /
-//!         `Terminator::If.cond`, plus temps defined in this block
-//!         that are used in any other block).
+//! The algorithm now is the textbook one:
 //!
-//!   for each call at index `c` in the block:
-//!     live_across(c) = { t : def_index(t) < c ≤ last_use_index(t)
-//!                          and t.type.needs_gc_protection() }
+//!   gen[B]  = upward-exposed uses (operands used in B before any def in B)
+//!   kill[B] = temps defined in B (block params + each computation's dst)
+//!   live_out[B] = U over successors S of live_in[S]
+//!   live_in[B]  = gen[B] U (live_out[B] \ kill[B])
+//!     iterated to a fixpoint.
 //!
-//! Multi-block "is t defined in block A and used in block B" is the
-//! conservative bit: we treat any temp defined in block A and
-//! mentioned anywhere in another block as live to the end of A. This
-//! over-protects when the actual control flow doesn't reach the
-//! allocating block, but soundness wins.
+//! Then within each block, a backward sweep seeded with `live_out[B]`
+//! (plus the terminator's operands) yields `live_after(c)` = the temps
+//! live immediately after computation `c`. A temp is "live across" an
+//! allocating call at `c` iff it is in `live_after(c)` and is not the
+//! call's own result (the result is produced BY the call, not a
+//! pre-existing value flowing across it).
 //!
-//! Function parameters are conceptually live from "before any
-//! computation in the entry block" — `def_index` for them is `-1`. A
-//! parameter that's a pointer-shaped type, used in any computation
-//! after a call, must be protected.
+//!   safepoint_roots(c) = { t in live_after(c)
+//!                            : t != dst(c) and t.type.needs_gc_protection() }
 //!
-//! The output is written back into each call's `safepoint_roots`
-//! field. The list is sorted for deterministic codegen output and
-//! deterministic test snapshots.
+//! Function parameters need no special-casing: they are never killed and
+//! propagate as ordinary live-in/uses, so they are protected exactly
+//! where they are actually live across a call.
+//!
+//! The output is written back into each call's `safepoint_roots` field,
+//! sorted for deterministic codegen output and test snapshots.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{Block, Computation, Function, TempId, Terminator};
+use crate::ir::{Block, BlockId, Computation, Function, TempId, Terminator};
 
 /// Run the per-block live-across-call analysis and populate
 /// `safepoint_roots` on every call-shaped Computation in `f`.
@@ -56,170 +57,159 @@ use crate::ir::{Block, Computation, Function, TempId, Terminator};
 pub fn populate_safepoint_roots(f: &mut Function) {
     let temp_types: HashMap<TempId, crate::ir::TypeEstimate> =
         f.temps.iter().map(|t| (t.id, t.type_estimate)).collect();
-    let param_set: HashSet<TempId> = f.params.iter().copied().collect();
+    let live_out = compute_global_live_out(f);
 
-    // 1. For each temp, compute "is it used outside its defining
-    //    block?". A temp defined in block B and used in block B' != B
-    //    is considered live-out of B for the entire tail of B (after
-    //    its definition).
-    let escapes_block = compute_escaping_temps(f);
-
-    // 2. For each block, run the local analysis and rewrite calls.
-    let blocks_len = f.blocks.len();
-    for block_idx in 0..blocks_len {
+    for block_idx in 0..f.blocks.len() {
+        // `live_after` owns its sets, so the immutable borrow of the block
+        // ends here — we can mutate computations below.
+        let live_after = live_after_per_computation(&f.blocks[block_idx], &live_out[block_idx]);
         let computations_len = f.blocks[block_idx].computations.len();
-
-        // Pass 1: collect def_index for each temp DEFINED in this block.
-        // Block params get def_index = -1 ("defined before any computation").
-        // Function params also get def_index = -1 in EVERY block, not only
-        // the entry block. More generally, if a temp is USED in this block
-        // but not defined here, it must be treated as live-in with def_index
-        // = -1 as well. Dylan lowering can reference outer-scope temps
-        // directly from nested loop / branch / join blocks without threading
-        // them through block params when they are only read. If those temps
-        // are absent from def_index, they disappear from safepoint root sets
-        // exactly when GC pressure is highest.
-        let mut def_index: HashMap<TempId, isize> = HashMap::new();
-        for bp in &f.blocks[block_idx].params {
-            def_index.insert(*bp, -1);
-        }
-        for p in &param_set {
-            def_index.insert(*p, -1);
-        }
-        for (i, c) in f.blocks[block_idx].computations.iter().enumerate() {
-            def_index.insert(c.dst(), i as isize);
-        }
-
-        // Pass 2: collect last_use_index for each temp used in this
-        // block. `len()` means "used in the terminator"; `len() + 1`
-        // means "used in a successor block" (i.e. live-out — approx by
-        // `escapes_block`).
-        let term_uses = terminator_uses(&f.blocks[block_idx].terminator);
-        let mut last_use_index: HashMap<TempId, isize> = HashMap::new();
-        for (i, c) in f.blocks[block_idx].computations.iter().enumerate() {
-            for op in computation_operands(c) {
-                let entry = last_use_index.entry(op).or_insert(-1);
-                if (i as isize) > *entry {
-                    *entry = i as isize;
-                }
-            }
-        }
-        let term_idx = computations_len as isize;
-        for op in &term_uses {
-            let entry = last_use_index.entry(*op).or_insert(-1);
-            if term_idx > *entry {
-                *entry = term_idx;
-            }
-        }
-        // Any temp used in this block but not defined here is a live-in from
-        // an outer scope or predecessor block. Treat it as pre-existing at
-        // block entry so across-call liveness can protect it.
-        for &t in last_use_index.keys() {
-            def_index.entry(t).or_insert(-1);
-        }
-        // Live-out via escapes_block: any temp defined here that's
-        // used in another block is considered live for the rest of
-        // THIS block (last_use_index >= every call index in this
-        // block).
-        let block_live_out_idx = (computations_len + 1) as isize;
-        for t in def_index.keys() {
-            if escapes_block.contains(t) {
-                let entry = last_use_index.entry(*t).or_insert(-1);
-                if block_live_out_idx > *entry {
-                    *entry = block_live_out_idx;
-                }
-            }
-        }
-
-        // Pass 3: for each call at index c, compute live_across(c) and
-        // write it into the call's `safepoint_roots`.
         for c_idx in 0..computations_len {
             if !f.blocks[block_idx].computations[c_idx].is_potentially_allocating_call() {
                 continue;
             }
-            let mut live: Vec<TempId> = Vec::new();
-            // Walk every temp known to this block-context.
-            for (&t, &di) in &def_index {
-                if di >= c_idx as isize {
-                    continue; // Defined at or after the call — not yet live.
-                }
-                let Some(&lu) = last_use_index.get(&t) else {
-                    continue; // Never used in this block — dead.
-                };
-                if lu <= c_idx as isize {
-                    continue; // Last use is at or before the call — already dead.
-                }
-                // Exclude the call's own dst from protection — its
-                // value is produced BY the call, not flowing into it.
-                if t == f.blocks[block_idx].computations[c_idx].dst() {
-                    continue;
-                }
-                // Exclude operands of the call itself from protection
-                // (their bit-patterns are arguments to the call, the
-                // call sees them in registers; what we protect is
-                // values that survive PAST the call, not "operand
-                // copies"). However, if a temp is BOTH a call operand
-                // AND used later in the block, the "later use" needs
-                // the temp protected — the existing rule (last_use >
-                // c) handles this correctly.
-                let ty = match temp_types.get(&t) {
-                    Some(t) => *t,
-                    None => continue,
-                };
-                if !ty.needs_gc_protection() {
-                    continue;
-                }
-                live.push(t);
-            }
-            live.sort_by_key(|t| t.0);
-            live.dedup();
-            if let Some(roots) = f.blocks[block_idx].computations[c_idx].safepoint_roots_mut() {
-                *roots = live;
+            let call_dst = f.blocks[block_idx].computations[c_idx].dst();
+            // A temp is "live across" the call iff it is live immediately
+            // after the call — excluding the call's own result (produced BY
+            // the call) — and is GC-managed.
+            let mut roots: Vec<TempId> = live_after[c_idx]
+                .iter()
+                .copied()
+                .filter(|&t| t != call_dst)
+                .filter(|t| {
+                    temp_types
+                        .get(t)
+                        .map(|ty| ty.needs_gc_protection())
+                        .unwrap_or(false)
+                })
+                .collect();
+            roots.sort_by_key(|t| t.0);
+            roots.dedup();
+            if let Some(slot) = f.blocks[block_idx].computations[c_idx].safepoint_roots_mut() {
+                *slot = roots;
             }
         }
     }
 }
 
-/// Compute the set of temps defined in some block A and used in some
-/// other block B != A (i.e. "escapes A"). The mapping is
-/// (defining_block → set of escapees); we only need the union, since
-/// the per-block driver checks "does THIS temp escape from THIS block".
-fn compute_escaping_temps(f: &Function) -> HashSet<TempId> {
-    // Where each temp is defined (block id).
-    let mut def_block: HashMap<TempId, crate::ir::BlockId> = HashMap::new();
-    for &p in &f.params {
-        def_block.insert(p, f.entry);
+/// Successor blocks of a terminator.
+fn terminator_successors(t: &Terminator) -> Vec<BlockId> {
+    match t {
+        Terminator::Return { .. } => Vec::new(),
+        Terminator::If { then_block, else_block, .. } => vec![*then_block, *else_block],
+        Terminator::Jump { target, .. } => vec![*target],
     }
-    for b in &f.blocks {
-        for bp in &b.params {
-            def_block.insert(*bp, b.id);
+}
+
+/// Global backward liveness fixpoint. Returns `live_out`, indexed by block
+/// *position* in `f.blocks`: `live_out[i]` is the set of temps live on exit
+/// from `f.blocks[i]` (= the union of the live-in sets of its successors).
+///
+/// This is the real dataflow the old per-block approximation lacked. Without
+/// it, a temp live THROUGH a block — defined upstream, used downstream,
+/// neither referenced nor threaded through the block — was invisible, so
+/// allocating calls in that block got no protecting root for it (GAP-011).
+fn compute_global_live_out(f: &Function) -> Vec<HashSet<TempId>> {
+    let n = f.blocks.len();
+    let id_to_idx: HashMap<BlockId, usize> =
+        f.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+
+    // Per-block gen (upward-exposed uses: used before any def in the block)
+    // and kill (defs: block params + each computation's dst). Function params
+    // are never killed and propagate naturally as live-in/uses.
+    let mut gen_set: Vec<HashSet<TempId>> = vec![HashSet::new(); n];
+    let mut kill: Vec<HashSet<TempId>> = vec![HashSet::new(); n];
+    for (i, b) in f.blocks.iter().enumerate() {
+        let mut defined: HashSet<TempId> = HashSet::new();
+        for &bp in &b.params {
+            defined.insert(bp);
+            kill[i].insert(bp);
         }
-        for c in &b.computations {
-            def_block.insert(c.dst(), b.id);
-        }
-    }
-    // Walk all uses; record any temp used in a block other than its
-    // defining block.
-    let mut escapes: HashSet<TempId> = HashSet::new();
-    for b in &f.blocks {
         for c in &b.computations {
             for op in computation_operands(c) {
-                if let Some(&db) = def_block.get(&op)
-                    && db != b.id
-                {
-                    escapes.insert(op);
+                if !defined.contains(&op) {
+                    gen_set[i].insert(op);
                 }
             }
+            let d = c.dst();
+            defined.insert(d);
+            kill[i].insert(d);
         }
         for op in terminator_uses(&b.terminator) {
-            if let Some(&db) = def_block.get(&op)
-                && db != b.id
-            {
-                escapes.insert(op);
+            if !defined.contains(&op) {
+                gen_set[i].insert(op);
             }
         }
     }
-    escapes
+
+    let succ_idx: Vec<Vec<usize>> = f
+        .blocks
+        .iter()
+        .map(|b| {
+            terminator_successors(&b.terminator)
+                .into_iter()
+                .filter_map(|s| id_to_idx.get(&s).copied())
+                .collect()
+        })
+        .collect();
+
+    let mut live_in: Vec<HashSet<TempId>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<TempId>> = vec![HashSet::new(); n];
+
+    // Backward dataflow to a fixpoint. Reverse block order converges fast for
+    // the forward-emitted blocks Dylan lowering produces; correctness is
+    // order-independent.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..n).rev() {
+            let mut new_out: HashSet<TempId> = HashSet::new();
+            for &s in &succ_idx[i] {
+                new_out.extend(live_in[s].iter().copied());
+            }
+            let mut new_in = gen_set[i].clone();
+            for &t in &new_out {
+                if !kill[i].contains(&t) {
+                    new_in.insert(t);
+                }
+            }
+            if new_out != live_out[i] {
+                live_out[i] = new_out;
+                changed = true;
+            }
+            if new_in != live_in[i] {
+                live_in[i] = new_in;
+                changed = true;
+            }
+        }
+    }
+
+    live_out
+}
+
+/// For one block (given its `live_out`), compute `live_after[i]` = the set of
+/// temps live immediately AFTER computation `i`. A temp is "live across" an
+/// allocating call at index `i` iff it is in `live_after[i]` (and is not the
+/// call's own result).
+fn live_after_per_computation(block: &Block, live_out: &HashSet<TempId>) -> Vec<HashSet<TempId>> {
+    let n = block.computations.len();
+    // Seed with live-out, plus the terminator's operands (jump args / branch
+    // cond / return value are live entering the terminator but may not be in
+    // live-out, which holds successor block-PARAMS, not the args bound to them).
+    let mut live = live_out.clone();
+    for op in terminator_uses(&block.terminator) {
+        live.insert(op);
+    }
+    let mut live_after: Vec<HashSet<TempId>> = vec![HashSet::new(); n];
+    for i in (0..n).rev() {
+        live_after[i] = live.clone();
+        let c = &block.computations[i];
+        live.remove(&c.dst());
+        for op in computation_operands(c) {
+            live.insert(op);
+        }
+    }
+    live_after
 }
 
 fn computation_operands(c: &Computation) -> Vec<TempId> {
@@ -260,30 +250,31 @@ fn terminator_uses(t: &Terminator) -> Vec<TempId> {
 /// miscompilation.
 pub fn verify_safepoint_roots(f: &Function) -> Result<(), Vec<SafepointError>> {
     let mut errs = Vec::new();
-    let escapes_block = compute_escaping_temps(f);
     let temp_types: HashMap<TempId, crate::ir::TypeEstimate> =
         f.temps.iter().map(|t| (t.id, t.type_estimate)).collect();
-    let param_set: HashSet<TempId> = f.params.iter().copied().collect();
+    let live_out = compute_global_live_out(f);
 
-    for block in &f.blocks {
-        let block_live_data = block_live_intervals(f, block, &param_set, &escapes_block);
+    for (block_idx, block) in f.blocks.iter().enumerate() {
+        let live_after = live_after_per_computation(block, &live_out[block_idx]);
         for (c_idx, c) in block.computations.iter().enumerate() {
             let Some(roots) = c.safepoint_roots() else {
                 continue;
             };
+            let call_dst = c.dst();
             for r in roots {
-                let di = block_live_data.def_index.get(r).copied().unwrap_or(isize::MAX);
-                let lu = block_live_data.last_use.get(r).copied().unwrap_or(-1);
-                if !(di < c_idx as isize && lu > c_idx as isize) {
+                // Each registered root must be live across the call (live
+                // immediately after it, excluding the call's own result) ...
+                if !live_after[c_idx].contains(r) || *r == call_dst {
                     errs.push(SafepointError::TempNotLiveAcrossCall {
-                        call_dst: c.dst(),
+                        call_dst,
                         temp: *r,
                     });
                 }
+                // ... and must actually be a GC-managed type.
                 let ty = temp_types.get(r).copied().unwrap_or(crate::ir::TypeEstimate::Top);
                 if !ty.needs_gc_protection() {
                     errs.push(SafepointError::TempDoesNotNeedProtection {
-                        call_dst: c.dst(),
+                        call_dst,
                         temp: *r,
                     });
                 }
@@ -291,77 +282,6 @@ pub fn verify_safepoint_roots(f: &Function) -> Result<(), Vec<SafepointError>> {
         }
     }
     if errs.is_empty() { Ok(()) } else { Err(errs) }
-}
-
-struct BlockLive {
-    def_index: HashMap<TempId, isize>,
-    last_use: HashMap<TempId, isize>,
-}
-
-fn block_live_intervals(
-    f: &Function,
-    block: &Block,
-    param_set: &HashSet<TempId>,
-    escapes_block: &HashSet<TempId>,
-) -> BlockLive {
-    let computations_len = block.computations.len();
-    let mut def_index: HashMap<TempId, isize> = HashMap::new();
-    for bp in &block.params {
-        def_index.insert(*bp, -1);
-    }
-    if block.id == f.entry {
-        for &p in param_set {
-            def_index.insert(p, -1);
-        }
-    }
-    for (i, c) in block.computations.iter().enumerate() {
-        def_index.insert(c.dst(), i as isize);
-    }
-    let term_uses = terminator_uses(&block.terminator);
-    let mut last_use: HashMap<TempId, isize> = HashMap::new();
-    for (i, c) in block.computations.iter().enumerate() {
-        for op in computation_operands(c) {
-            let entry = last_use.entry(op).or_insert(-1);
-            if (i as isize) > *entry {
-                *entry = i as isize;
-            }
-        }
-    }
-    let term_idx = computations_len as isize;
-    for op in &term_uses {
-        let entry = last_use.entry(*op).or_insert(-1);
-        if term_idx > *entry {
-            *entry = term_idx;
-        }
-    }
-    let block_live_out_idx = (computations_len + 1) as isize;
-    for (t, &di) in &def_index {
-        if di >= 0 && escapes_block.contains(t) {
-            let entry = last_use.entry(*t).or_insert(-1);
-            if block_live_out_idx > *entry {
-                *entry = block_live_out_idx;
-            }
-        }
-    }
-    if block.id == f.entry {
-        for &p in param_set {
-            if escapes_block.contains(&p) {
-                let entry = last_use.entry(p).or_insert(-1);
-                if block_live_out_idx > *entry {
-                    *entry = block_live_out_idx;
-                }
-            }
-        }
-    }
-    for bp in &block.params {
-        if escapes_block.contains(bp) {
-            let entry = last_use.entry(*bp).or_insert(-1);
-            if block_live_out_idx > *entry {
-                *entry = block_live_out_idx;
-            }
-        }
-    }
-    BlockLive { def_index, last_use }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -415,6 +335,7 @@ mod tests {
                         callee: "foo".into(),
                         args: vec![TempId(0)],
                         safepoint_roots: vec![],
+                        is_no_alloc: false,
                     },
                 ],
                 terminator: Terminator::Return { value: Some(TempId(1)) },
@@ -458,12 +379,14 @@ mod tests {
                         callee: "foo".into(),
                         args: vec![],
                         safepoint_roots: vec![],
+                        is_no_alloc: false,
                     },
                     Computation::DirectCall {
                         dst: TempId(2),
                         callee: "bar".into(),
                         args: vec![TempId(0), TempId(1)],
                         safepoint_roots: vec![],
+                        is_no_alloc: false,
                     },
                 ],
                 terminator: Terminator::Return { value: Some(TempId(2)) },
