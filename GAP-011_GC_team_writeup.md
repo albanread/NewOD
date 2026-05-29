@@ -97,3 +97,96 @@ Our JIT/AOT codegen spills live GC roots to per-call-site stack-slot slabs, brac
 2. Is `mid_evac_oom` (§4 parenthetical) meant to be caught and handled by the embedder (grow + retry), or is hitting it always a client bug (over-retention)? Our runtime currently lets it abort.
 
 Repro files staged under `F:\scratch\`: `jcs-40.dylan` (crashes), `gc-major-churn.dylan` / `gc-stale-root.dylan` / `gc-stale-slot.dylan` (the three negatives), `gc-deep-churn.dylan` (the OOM).
+
+---
+
+## ADDENDUM — ROOT CAUSE CONFIRMED: it is neither (a) nor (b). It is us — the liveness pass.
+
+Follow-up analysis (credit: a colleague's review) located the bug, and a
+**compile-time `dump-dfm`** check plus a **minimal standalone reproducer**
+confirm it. Neither the collector nor nod-llvm spill is at fault: **a root is
+simply never registered** because `nod-dfm`'s liveness pass cannot see
+*live-through* temps.
+
+### The bug
+
+`populate_safepoint_roots` (`src/nod-dfm/src/liveness.rs`) is a **per-block
+approximation** with **no global live-in/live-out fixpoint** (see its own
+module doc, and `compute_escaping_temps`, which only extends a temp's range
+within its *defining* block). In Pass 3 it iterates only `def_index`, which
+holds: function params, block params, and temps **defined or used in that
+block**. A temp that is **live-in and live-out of a block but neither
+mentioned nor threaded through it** is invisible there, so it is omitted from
+the `safepoint_roots` of every allocating call in that block.
+
+The GAP-008 merge-threading (`lower_if` / `lower_while_like`) hides this for
+straight-line and single-branch code by threading env bindings through
+**join/header** block params — but **arm blocks never get those params**, so an
+allocating call in an arm, followed by nested control flow, with an outer GC
+local live across it, falls straight into the hole. Recursive-descent parsers
+are saturated with that shape; the toy repros above were not — which is
+exactly why they passed.
+
+### Compile-time proof (no runtime, no crash)
+
+`F:\scratch\gc-livethrough.dylan` — `acc` is a GC local defined in the entry
+block, first used only *after* an outer `if`; the then-arm makes a heavy
+allocating call (`churn`) then branches again:
+
+```
+nod-driver dump-dfm F:\scratch\gc-livethrough.dylan
+```
+```
+fn step (t0: <integer>) -> <integer>:
+  entry:
+    t2: <top> = DirectCall nod_make_stretchy_vector(t1)   ; t2 = acc
+    ...
+    If t4 then1 else2
+  then1:
+    t6: <integer> = DirectCall churn(t5)                  ; ALLOCATES — no safepoint=, t2 omitted
+    ...
+    If t8 then3 else4
+  ...
+  join6(t16: <top>, t17: <top>):                          ; t17 = acc, threaded in
+    t21: <top> = DirectCall %make(...)  safepoint=[t17]
+    t22: <top> = DirectCall nod_stretchy_vector_push(t17, t21)  safepoint=[t17]
+```
+
+`t2` (acc) is live across `churn` in `then1` (it reappears as `t17` in
+`join6`), yet `churn`'s `safepoint_roots` is empty — `t2` is not a param of
+`then1`, not defined there, not used there. **Missing root, proven at compile
+time.** (Merge blocks `then3`/`join6` *do* list it — `safepoint=[t2, t7]` /
+`[t17]` — confirming the hole is specifically the arm with the alloc.)
+
+### Runtime seal
+
+Building and running `gc-livethrough.dylan` crashes at
+**`collections.rs:1028`** (`stretchy_vector_push` on stale `acc`) — the *same
+site* as the parser — at **1 minor / 0 major collections, ~4 MB young**.
+Removing the alloc-then-nested-branch shape makes it exit 0.
+
+> **Refinement to §2:** the fault is **not** major-collection-specific. It
+> bites on the **first relocating collection (minor included)** that fires in
+> the unprotected window. The parser showed majors only because it allocates
+> more before hitting an unprotected window; the mechanism is the same.
+
+### Why every earlier signature still matches
+
+* **Zeroed, non-forwarded wrapper / clean `NOD_AOT_VERIFY_SAFEPOINTS`:** the
+  slot was *never registered*, so the collector never forwarded it (correct
+  behaviour), and the verifier (which only checks registered ⊆ live) cannot
+  detect a *missing* root. Both consistent.
+* **(a) ruled out:** nod-llvm faithfully spills/reloads the roots it is given;
+  it was given too few. **(b) ruled out:** newgc-core correctly leaves
+  unregistered cells alone.
+
+### Fix direction (our side, `nod-dfm`)
+
+Replace the per-block approximation in `liveness.rs` with a real backward
+**live-in/live-out dataflow fixpoint**, and feed *that* into
+`safepoint_roots`. (Also worth: have `NOD_AOT_VERIFY_SAFEPOINTS` additionally
+assert *completeness* — every GC-typed temp live across a call is registered —
+so a too-small set can't pass silently.)
+
+New repro: `F:\scratch\gc-livethrough.dylan` (confirmed crash + the `dump-dfm`
+above).
