@@ -190,3 +190,122 @@ so a too-small set can't pass silently.)
 
 New repro: `F:\scratch\gc-livethrough.dylan` (confirmed crash + the `dump-dfm`
 above).
+
+---
+
+## ADDENDUM 2 — liveness fix LANDED and verified, but a SECOND layer remains (codegen). Full subsystem sweep.
+
+The fix from ADDENDUM 1 is done and is **necessary but not sufficient**. A
+read-only sweep of every subsystem on the root lifecycle (four independent
+reviewers: nod-dfm, nod-sema, nod-runtime, nod-llvm) has now triangulated the
+residual to a specific codegen line. **No code has been changed in this round —
+this is a findings dump for triage.**
+
+### What the liveness fix did (committed `37e1f69`, `src/nod-dfm/src/liveness.rs`)
+
+Replaced the per-block approximation with a real **global backward
+live-in/live-out dataflow fixpoint** (`compute_global_live_out` +
+`live_after_per_computation`), feeding `live_after` into `populate_safepoint_roots`.
+Verified:
+- `gc-livethrough.dylan` (ADDENDUM 1's compile-time + runtime repro) now exits **0**.
+- nod-dfm unit tests pass (`fixnum_args_do_not_register_as_roots`,
+  `live_pointer_across_call_gets_protected`).
+- `dylan_parser` regression suite green (25/25) — no codegen regression.
+
+### …but `jcs-40` still crashes — identical `collections.rs:1028` signature
+
+After the fix, with **both** caches cleared and a fresh parser EXE rebuilt,
+`F:\scratch\jcs-40.dylan` still aborts (exit 9) at `stretchy_vector_push: not a
+<stretchy-vector>`, zeroed wrapper. So the missing-root layer is fixed; a
+**stale-reload** layer remains.
+
+### Sweep result — the four subsystems, ranked
+
+The reviewers independently converged. Three subsystems are **clean for this
+signature**; the fourth holds the residual.
+
+| Subsystem | Verdict for GAP-011 residual | Evidence |
+|---|---|---|
+| **nod-dfm** liveness/passes | **CLEAN** — fixpoint correct on all operand categories, block-params-in-kill, back-edge re-iteration, live-after semantics, unreachable blocks. No later pass drops `safepoint_roots` (`dispatch.rs` does `mem::take`+reinstall at 113/141/155; `merge_modules` clones whole computations). | `liveness.rs:78,124-127,162-213`; `dispatch.rs:113,141,155`; `lib.rs:1222-1230` |
+| **nod-sema** lowering | **CLEAN** — every *lexically-named* GC value live across a join/back-edge is threaded as a block param; cells always reloaded (`nod_cell_get`/`set` on every access). Lowering never sets `safepoint_roots` (always `Vec::new()`). NB: `for` is *rejected* at lowering, so the parser's new `for` can't reach codegen. | `lower.rs:6240-6341,6090-6201,6367-6506,4466-4488,4994-5034` |
+| **nod-runtime** root bookkeeping | **CLEAN at the crash site** — `stretchy_vector_push` RootGuards `sv`+`value` and **re-reads** the backing store after the grow alloc (`collections.rs:1031,1033,1046,1048`). `snapshot_active_aot_roots` correct (`aot.rs:341-356`). `sv` is therefore stale **on entry** — the caller's frame handed it a dead Word. | `collections.rs:1026-1112`; `aot.rs:341-356`; `closures.rs:289-320` |
+| **nod-llvm** codegen | **RESIDUAL LIVES HERE** — see below | `codegen.rs:2157,2282-2302,2359-2367,4266-4267,4290,4300,4448` |
+
+### Root cause of the residual: non-dominating reload propagated to successors
+
+The first guess (a function-wide `self.temps` never reset) was **refuted**:
+`emit_function` rebuilds `self.temps` per block from `block_entry_temps`
+(`codegen.rs:2282-2302`), re-pins params and phis, and phi incomings are
+captured eagerly at jump-emit time (`pending_incoming`, the GAP-007 fix). The
+`Jump`-with-args/phi path is sound.
+
+The actual hole is **`note_successor_entry_temps`** (`codegen.rs:2359-2367`,
+called for both `If` arms at `4266-4267` and `Jump` targets at `4290`). After
+`end_safepoint` rebinds a root to its reload SSA value (`codegen.rs:4448`), this
+helper snapshots the **entire** `self.temps` — including that reload — into each
+successor's `block_entry_temps`, for **all** temps, not just declared block
+params (first-writer-wins `or_insert`). Consequence:
+
+1. Block A allocates; `end_safepoint` binds `t` → `gc.sN.reload.tN` (an instr in A).
+2. A ends in `If`/`Jump` to B; `note_successor_entry_temps(B)` copies A's reload SSA into `block_entry_temps[B][t]`.
+3. B installs it as its binding for `t`. If `t` is **not** a block param of B, the phi re-pin (`2298-2302`) does *not* overwrite it, so B's uses read A's reload directly.
+4. If B is **not strictly dominated by A** (any join reachable from another predecessor, or a back-edge — exactly what a 40-function recursive-descent parser produces), that's a dominance-invalid reference. After a *later* collection between A and B's use, it's a pre-relocation (stale) `Word` → zeroed wrapper → the crash.
+
+This is the **unnamed-intermediate-SSA-temp** class: sema threads all *named*
+(lexical) live values as block params, but a transient like a freshly-`make`'d
+object held while the next argument is evaluated is **not** env-named and **not**
+threaded — so it leaks across a block boundary via this fallback. That reconciles
+"sema is clean" with "codegen has the bug": the scheme is correct **only if**
+lowering threads *every* cross-GC-live heap temp as an explicit block param; the
+`note_successor_entry_temps` fallback silently masks a non-threaded temp with a
+non-dominating reload.
+
+### Why the verifier still passes it
+
+`NOD_AOT_VERIFY_SAFEPOINTS` (`aot.rs:471-512,519-581`) asserts root **counts** and
+stack-discipline site-ids only — never which SSA value the consumer reads. A
+dominance-invalid/stale reload passes verification clean. (ADDENDUM 1 already
+recommended adding *completeness*; this round adds: it should also check reload
+**value** dominance, or it will keep missing this class.)
+
+### Fix direction (our side — DEFERRED, not done this round)
+
+Two viable paths:
+1. **Preferred / matches in-progress #300 + #298:** make lowering thread every
+   `live_in` heap temp (including unnamed intermediates) as an explicit block
+   param/phi, **and** make codegen's `note_successor_entry_temps` refuse to
+   propagate non-param temps (fail loud rather than silently install a
+   non-dominating reload).
+2. **Codegen-local:** reload each root from a stable per-temp frame slot via a
+   `load` at the **entry of every block whose `live_in` contains the temp**, not
+   just the block that made the call — so every use loads a dominance-valid
+   post-relocation value.
+
+### Adjacent findings from the sweep (not this crash; logged for triage)
+
+These are real but **do not** corrupt the heap — they are footprint/perf, except
+where noted:
+
+1. **(Correctness-adjacent) FFI closure `<environment>` root visibility** —
+   callback registration currently forces a full `collect_full` to tenure the
+   closure environment so Minor GC won't reclaim it (a band-aid, also Sprint 11d
+   Step E). This implies the FFI environment is **not** a Minor-GC-visible root.
+   Same *family* as GAP-011 (a live root the collector can't track), different
+   site. Removing the band-aid without first fixing root visibility would
+   reintroduce a dangling environment. `callbacks.rs`.
+2. **FFI callback trampolines never unregister** (leak by design — no cleanup
+   path for Dylan closures used as C-callable trampolines). Unbounded growth
+   under callback churn. `callbacks.rs`.
+3. **`alloca` in loop bodies (GAP-010 family)** — native stack leak per
+   iteration at -O0; the per-call-site safepoint slot slabs are allocas, so worth
+   confirming the hoist (`build_entry_alloca` / task #293 guard) covers the slot
+   machinery too. Footprint, not heap corruption. `codegen.rs`.
+4. **JIT/dispatch cache `Box::leak`** — LLVM engines/contexts and `u64` dispatch
+   slots are intentionally leaked on cache miss; steady growth under churn.
+   Bounded-LRU/periodic-sweep is the fix. `nod-sema/lib.rs`, `nod-runtime/lib.rs`.
+5. **`nod_make`/`rust_make` don't root the fresh instance across user
+   `initialize`** (`make.rs:243-253,342-348`) — a genuine alloc-while-unrooted
+   hole, but only for classes with a user `initialize`; `<stretchy-vector>` has
+   none, so it cannot produce *this* signature. Separate correctness item.
+
+`jcs-40.dylan` remains the live repro. No further code touched this round.
