@@ -268,6 +268,12 @@ define function is-binary-op? (t :: <token>) => (yes? :: <boolean>)
       // (`(key) => (body)`) is a faithful token-level capture for the macro
       // expander to interpret later.
       | f = #"arrow"
+  elseif (instance?(t, <identifier-token>))
+    // `mod` and `rem` are the only word (identifier) infix operators —
+    // multiplicative precedence in nod-reader (parser.rs parse_mul).  Every
+    // other Dylan word (`to`, `below`, `in`, …) is NOT infix.
+    let nm = identifier-token-name(t);
+    nm = "mod" | nm = "rem"
   else
     #f
   end
@@ -2408,7 +2414,8 @@ define function dump-node (node :: <ast-node>,
     if (instance?(binop-operator(node), <punctuation-token>))
       acc-string(acc, write-to-string(punctuation-token-form(binop-operator(node))));
     else
-      acc-string(acc, "?op?");
+      // Word operator (`mod` / `rem`) — an identifier token.
+      acc-string(acc, token-name(binop-operator(node)));
     end;
     acc-newline(acc);
     dump-node(binop-right(node), acc, depth + 1);

@@ -666,3 +666,24 @@ fn define_generic_sealed_bare_return() {
         ],
     );
 }
+
+// ─── infix word operators ──────────────────────────────────────────────────
+
+/// `mod` and `rem` are the only identifier (word) infix operators (nod-reader
+/// parse_mul). They previously weren't recognized, so `a mod b` (e.g. inside
+/// a call: `gcd(b, a mod b)`) crashed with "expected ) after arguments".
+#[test]
+#[ignore]
+#[serial]
+fn infix_mod_rem_operators() {
+    let source = "\
+define function f (a :: <integer>, b :: <integer>) => (<integer>)
+  (a mod b) + (a rem b)
+end function;
+";
+    assert_dump(
+        "infix_mod_rem_operators",
+        source,
+        &["BINOP", "mod", "rem", "plus", "NAME a", "NAME b"],
+    );
+}
