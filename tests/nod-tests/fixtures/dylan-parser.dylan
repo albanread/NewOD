@@ -243,6 +243,13 @@ define function is-binary-op? (t :: <token>) => (yes? :: <boolean>)
       | f = #"less-equal"        | f = #"greater-equal"
       | f = #"tilde-equal"       | f = #"tilde-equal-equal"
       | f = #"dot-dot" | f = #"assign"
+      // `=>` inside a body is a select/case arm separator (`key => body`).
+      // It never reaches expression context elsewhere: method / function /
+      // generic return specs consume their `=>` via parse-return-spec before
+      // the body is parsed.  Modelling the arm as a left-associative BINOP
+      // (`(key) => (body)`) is a faithful token-level capture for the macro
+      // expander to interpret later.
+      | f = #"arrow"
   else
     #f
   end
@@ -260,6 +267,10 @@ end function;
 
 // Tokens that terminate a body at nesting depth 0.
 // Used by parse-body to know when to stop consuming constituents.
+// NOTE: `otherwise` is deliberately NOT here.  In select / case it begins an
+// arm (`otherwise => body`), exactly like a key arm (`1 => body`), so it stays
+// inside the body and parses as BINOP(NAME otherwise, =>, body).  Treating it
+// as a terminator/clause-separator would strand the leading `=>` of its arm.
 define function is-body-terminator? (t :: <token>) => (yes? :: <boolean>)
   is-end-token?(t)
     | is-keyword?(t, #"else")
@@ -267,11 +278,25 @@ define function is-body-terminator? (t :: <token>) => (yes? :: <boolean>)
     | is-keyword?(t, #"cleanup")
     | is-keyword?(t, #"exception")
     | is-keyword?(t, #"finally")
-    | is-keyword?(t, #"otherwise")
     | instance?(t, <eof-token>)
     | is-punct?(t, #"rparen")
     | is-punct?(t, #"rbracket")
     | is-punct?(t, #"rbrace")
+end function;
+
+// CLAUSE-SEPARATOR: a keyword that introduces a fresh clause inside a
+// statement (between the leading body and the closing `end`).  These are
+// exactly the body-terminating clause keywords from is-body-terminator? —
+// `parse-body` halts on each, and parse-statement then resumes a new clause
+// when it sees one here:
+//   if (c) ... elseif (c) ... else ...
+//   block () ... cleanup ... exception (e) ... finally ...
+// `otherwise` is NOT a separator: it stays in the select/case body as an arm
+// (`otherwise => body`), parsed like any other `key => body` arm.
+define function is-clause-separator? (t :: <token>) => (yes? :: <boolean>)
+  is-keyword?(t, #"else")      | is-keyword?(t, #"elseif")
+    | is-keyword?(t, #"cleanup")   | is-keyword?(t, #"exception")
+    | is-keyword?(t, #"finally")
 end function;
 
 // ── 3. AST node classes ───────────────────────────────────────────────────
@@ -362,6 +387,16 @@ define class <ast-variable-ref> (<ast-node>)
   slot varref-tok :: <token>, init-keyword: tok:;
 end class;
 
+// A parenthesised fragment that is NOT a single bare expression: either a
+// comma-separated list `(a, b)` or a typed binding `(e :: <error>)`, as found
+// in clause heads (`block (return)`, `exception (e :: <error>)`).  A single
+// untyped item is returned transparently as that item (ordinary grouping), so
+// this node only appears for multi-item or typed heads.  Items are <ast-node>
+// (typed items are <ast-typed-name>).
+define class <ast-paren-list> (<ast-node>)
+  slot paren-list-items :: <stretchy-vector>, init-keyword: items:;
+end class;
+
 // Abstract base for all literal values.
 define class <ast-literal> (<ast-node>) end class;
 
@@ -416,6 +451,25 @@ define class <ast-statement> (<ast-node>)
   slot stmt-method-name :: <object> = #f;   // <token> or #f (local method name)
   slot stmt-params      :: <object> = #f;   // <ast-param-list> or #f
   slot stmt-return      :: <object> = #f;   // <ast-return-spec> or #f
+  // Subsequent clauses introduced by a clause-separator keyword:
+  //   if ... elseif ... else ...     block ... cleanup ... exception ...
+  //   select/case ... otherwise ...
+  // A <stretchy-vector> of <ast-statement-clause>, or #f when the statement
+  // has only its leading body (begin/for/while/method-literal, etc.).  Held
+  // as <object> so the unset default is the immutable #f rather than one
+  // shared mutable vector across instances (see <ast-param-list> note).
+  slot stmt-clauses     :: <object> = #f;   // <stretchy-vector> or #f
+end class;
+
+// One trailing clause of a multi-clause statement.  `clause-word` is the
+// separator keyword that introduced it (else / elseif / cleanup / exception
+// / finally / otherwise); `clause-body` is the body fragment up to the next
+// separator or `end`.  A clause head such as `elseif (cond)` keeps its
+// `(cond)` as the first constituent of `clause-body`, exactly as the leading
+// `if`'s own condition lands as the first constituent of `stmt-body`.
+define class <ast-statement-clause> (<ast-node>)
+  slot clause-word :: <token>,    init-keyword: word:;
+  slot clause-body :: <ast-body>, init-keyword: body:;
 end class;
 
 // A positional call argument
@@ -646,6 +700,9 @@ define function token-name (t :: <token>) => (s :: <byte-string>)
     elseif  (kw = #"else")      "else"
     elseif  (kw = #"elseif")    "elseif"
     elseif  (kw = #"then")      "then"
+    elseif  (kw = #"cleanup")   "cleanup"
+    elseif  (kw = #"exception") "exception"
+    elseif  (kw = #"finally")   "finally"
     elseif  (kw = #"begin")     "begin"
     elseif  (kw = #"method")    "method"
     elseif  (kw = #"function")  "function"
@@ -1341,11 +1398,11 @@ define function parse-leaf (ts :: <token-stream>) => (n :: <ast-node>)
     make(<ast-symbol-lit>,
          name: token-name(tok))
   elseif (is-punct?(t, #"lparen"))
-    // Parenthesised expression
+    // Parenthesised fragment: a grouped expression `(e)`, a typed binding
+    // `(e :: <error>)`, or a comma list `(a, b)`.  parse-paren-fragment
+    // returns the inner expression transparently for the single-untyped case.
     ts-advance(ts);
-    let inner = parse-expression(ts);
-    ts-expect-punct(ts, #"rparen", "expected ) after parenthesised expression");
-    inner
+    parse-paren-fragment(ts)
   elseif (is-function-word?(t))
     // FUNCTION-WORD ( body ) — function macro call  (method (...) => (...) body end)
     parse-function-literal(ts)
@@ -1360,6 +1417,54 @@ define function parse-leaf (ts :: <token-stream>) => (n :: <ast-node>)
     // Unrecognised leaf — consume and return error node.
     let tok = ts-advance(ts);
     parse-error("unexpected token in expression")
+  end
+end function;
+
+// Parenthesised fragment (the leading `(` is already consumed).
+//
+//   ( expr )                  → expr               (transparent grouping)
+//   ( expr :: type )          → <ast-paren-list>[ <ast-typed-name> ]
+//   ( e1 , e2 , … )           → <ast-paren-list>[ … ]
+//
+// Each item is `expression` optionally followed by `:: type`.  A typed item
+// whose expression is a plain variable reference becomes an <ast-typed-name>
+// (name token + type); otherwise the bare expression is kept (type dropped —
+// non-name typed heads do not occur in practice).  This lets clause heads
+// like `block (return)`, `exception (e :: <error>)`, and `select (n)` parse
+// without forcing the whole `(…)` to be a single bare expression.
+define function parse-paren-fragment (ts :: <token-stream>) => (n :: <ast-node>)
+  let items = make(<stretchy-vector>);
+  let any-typed? = #f;
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-punct?(ts-peek(ts), #"rparen"))
+      done? := #t;
+    else
+      let expr = parse-expression(ts);
+      let item = expr;
+      if (is-punct?(ts-peek(ts), #"colon-colon"))
+        ts-advance(ts);   // consume `::`
+        let ty = parse-type-spec(ts);
+        any-typed? := #t;
+        if (instance?(expr, <ast-variable-ref>))
+          let tn = make(<ast-typed-name>, tok: varref-tok(expr));
+          typed-name-type(tn) := ty;
+          item := tn;
+        end;
+      end;
+      add!(items, item);
+      if (is-punct?(ts-peek(ts), #"comma"))
+        ts-advance(ts);
+      else
+        done? := #t;
+      end;
+    end;
+  end;
+  ts-expect-punct(ts, #"rparen", "expected ) after parenthesised expression");
+  if (size(items) = 1 & ~ any-typed?)
+    items[0]                                  // transparent single grouping
+  else
+    make(<ast-paren-list>, items: items)
   end
 end function;
 
@@ -1482,9 +1587,27 @@ end function;
 
 define function parse-statement (ts :: <token-stream>) => (n :: <ast-statement>)
   let word = ts-advance(ts);   // consume begin-word
-  let body = parse-body(ts);
+  let body = parse-body(ts);   // leading clause body (stops at sep / end)
   let s = make(<ast-statement>, word: word, body: body);
   node-token(s) := word;
+  // Collect any trailing clauses: (CLAUSE-SEP body)* up to `end`.  parse-body
+  // halts on each clause separator, so each iteration consumes one separator
+  // and the body that follows it.  An `elseif (c)` head keeps `(c)` as the
+  // first constituent of its clause body, mirroring the leading `if`.
+  let clauses = make(<stretchy-vector>);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-clause-separator?(ts-peek(ts)))
+      let sep = ts-advance(ts);          // consume else / elseif / cleanup / …
+      let cbody = parse-body(ts);
+      add!(clauses, make(<ast-statement-clause>, word: sep, body: cbody));
+    else
+      done? := #t;
+    end;
+  end;
+  if (size(clauses) > 0)
+    stmt-clauses(s) := clauses;
+  end;
   // Consume the `end` and optional tail name.
   if (is-end-token?(ts-peek(ts)))
     ts-advance(ts);
@@ -1941,6 +2064,19 @@ define function dump-slot-spec (s :: <ast-slot-spec>, acc :: <stretchy-vector>,
   end;
 end function;
 
+// Dump one trailing statement clause:
+//   CLAUSE <sep>          (else / elseif / cleanup / exception / …)
+//     <body subtree>
+define function dump-statement-clause (c :: <ast-statement-clause>,
+                                       acc :: <stretchy-vector>,
+                                       depth :: <integer>) => ()
+  acc-indent(acc, depth);
+  acc-string(acc, "CLAUSE ");
+  acc-string(acc, token-name(clause-word(c)));
+  acc-newline(acc);
+  dump-node(clause-body(c), acc, depth + 1);
+end function;
+
 define function dump-node (node :: <ast-node>,
                            acc  :: <stretchy-vector>,
                            depth :: <integer>) => ()
@@ -2062,6 +2198,16 @@ define function dump-node (node :: <ast-node>,
     acc-string(acc, "NAME ");
     acc-string(acc, token-name(varref-tok(node)));
     acc-newline(acc);
+  elseif (instance?(node, <ast-paren-list>))
+    acc-string(acc, "PAREN-LIST");
+    acc-newline(acc);
+    let items = paren-list-items(node);
+    let n = size(items);
+    let i = 0;
+    until (i >= n)
+      dump-node(items[i], acc, depth + 1);
+      i := i + 1;
+    end;
   elseif (instance?(node, <ast-integer-lit>))
     acc-string(acc, "INT ");
     acc-string(acc, integer-to-string(lit-value(node)));
@@ -2128,6 +2274,16 @@ define function dump-node (node :: <ast-node>,
       dump-return-spec(stmt-return(node), acc, depth + 1);
     end;
     dump-node(stmt-body(node), acc, depth + 1);
+    // Trailing clauses (elseif / else / cleanup / exception / …).
+    if (instance?(stmt-clauses(node), <stretchy-vector>))
+      let cs = stmt-clauses(node);
+      let nc = size(cs);
+      let ic = 0;
+      until (ic >= nc)
+        dump-statement-clause(cs[ic], acc, depth + 1);
+        ic := ic + 1;
+      end;
+    end;
   elseif (instance?(node, <ast-pos-arg>))
     acc-string(acc, "ARG");
     acc-newline(acc);

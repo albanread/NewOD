@@ -454,3 +454,103 @@ fn simple_call_and_let_still_parse() {
         &["CALL", "NAME format-out", "LET", "BINOP"],
     );
 }
+
+// ─── multi-clause statements (if / block / select) ─────────────────────────
+
+/// `if (c) ... elseif (c) ... else ...` parses into a STMT with the leading
+/// body plus one CLAUSE per `elseif` / `else`.  Previously everything after
+/// the first clause was silently dropped (parse-statement parsed one body
+/// then looked straight for `end`).
+#[test]
+#[ignore]
+#[serial]
+fn if_elseif_else_clauses() {
+    let source = "\
+define function classify (n :: <integer>) => (s :: <byte-string>)
+  if (n < 0)
+    \"negative\"
+  elseif (n = 0)
+    \"zero\"
+  else
+    \"positive\"
+  end if
+end function;
+";
+    assert_dump(
+        "if_elseif_else_clauses",
+        source,
+        &[
+            "STMT if",
+            "STRING \"negative\"",
+            "CLAUSE elseif",
+            "STRING \"zero\"",
+            "CLAUSE else",
+            "STRING \"positive\"",
+        ],
+    );
+}
+
+/// `block (return) ... exception (e :: <error>) ... cleanup ... end block`
+/// parses into a STMT with CLAUSE exception / CLAUSE cleanup.  The typed
+/// exception head `(e :: <error>)` becomes a PAREN-LIST holding a TYPED-NAME.
+#[test]
+#[ignore]
+#[serial]
+fn block_cleanup_exception_clauses() {
+    let source = "\
+define function risky () => (r :: <object>)
+  block (return)
+    do-work();
+    return(42);
+  exception (e :: <error>)
+    handle-it(e);
+  cleanup
+    close-things();
+  end block
+end function;
+";
+    assert_dump(
+        "block_cleanup_exception_clauses",
+        source,
+        &[
+            "STMT block",
+            "CLAUSE exception",
+            "PAREN-LIST",
+            "TYPED-NAME e",
+            "NAME <error>",
+            "CLAUSE cleanup",
+            "NAME close-things",
+        ],
+    );
+}
+
+/// `select (n) 1 => "one"; ... otherwise => "many"; end select` parses each
+/// arm as BINOP(key, =>, body); `otherwise` stays in the body as an arm key
+/// (NAME otherwise) rather than splitting the statement.
+#[test]
+#[ignore]
+#[serial]
+fn select_arms_and_otherwise() {
+    let source = "\
+define function name-of (n :: <integer>) => (s :: <byte-string>)
+  select (n)
+    1 => \"one\";
+    2 => \"two\";
+    otherwise => \"many\";
+  end select
+end function;
+";
+    assert_dump(
+        "select_arms_and_otherwise",
+        source,
+        &[
+            "STMT select",
+            "BINOP",
+            "INT 1",
+            "arrow",
+            "STRING \"one\"",
+            "NAME otherwise",
+            "STRING \"many\"",
+        ],
+    );
+}
