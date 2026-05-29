@@ -39,4 +39,12 @@ llvm-sys    = { version = "=221.0.1", features = ["force-static"] }
 # bound into nod-runtime via the `HeapLayout` trait. `default-features
 # = false` drops the conservative-pin scanner — Dylan is a precise-
 # roots client via the Sprint 11c lock-free root registry.
-newgc-core  = { path = "../../NewGC/crates/newgc-core", default-features = false }
+#
+# PINNED to a specific NewGC commit (was a live `path` into the GC
+# team's working tree, which moved underneath our build mid-session).
+# Cargo snapshots this rev into its git cache; the GC team's ongoing
+# multi-mutator testing/changes can't affect us until we deliberately
+# bump `rev`. b66726a is the version GAP-009 was validated against
+# (MM-8 multi-mutator + card-scan/decommit fix + SEH crash handler).
+# To adopt a new GC release: bump `rev`, rebuild, re-run the gates.
+newgc-core  = { git = "file:///E:/NewGC", rev = "b66726a17cab9d7bb9c0e836fd535549fd9de30e", default-features = false }
