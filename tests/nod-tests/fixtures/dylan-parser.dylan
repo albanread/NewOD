@@ -175,6 +175,30 @@ define function is-define-list-word? (t :: <token>) => (yes? :: <boolean>)
   end
 end function;
 
+// SLOT-ALLOCATION-WORD: `slot` itself, the word that introduces a slot
+// spec in a `define class` body.  The lexer classifies `slot` as a
+// <keyword-token> keyword: #"slot" (see classify-keyword).
+define function is-slot-word? (t :: <token>) => (yes? :: <boolean>)
+  is-keyword?(t, #"slot")
+end function;
+
+// SLOT-ADJECTIVE: a word that may precede `slot` in a slot spec, e.g.
+//   constant slot ...  /  each-subclass slot ...  /  class slot ...
+//   virtual slot ...   /  inherited slot ...      /  sealed slot ...
+// The lexer maps each of these to a <keyword-token> with the matching
+// symbol (see classify-keyword).  `inherited` can introduce an inherited
+// slot directly, so it is accepted both as an adjective and (handled in
+// parse-slot-spec) as a standalone allocation word.
+define function is-slot-adjective? (t :: <token>) => (yes? :: <boolean>)
+  if (instance?(t, <keyword-token>))
+    let kw = keyword-token-keyword(t);
+    kw = #"constant" | kw = #"each-subclass" | kw = #"class"
+      | kw = #"virtual" | kw = #"inherited" | kw = #"sealed"
+  else
+    #f
+  end
+end function;
+
 // LOCAL-DECLARATION-WORD: `let` introduces a local binding.
 define function is-local-decl-word? (t :: <token>) => (yes? :: <boolean>)
   is-keyword?(t, #"let")
@@ -465,6 +489,50 @@ define class <ast-return-spec> (<ast-node>)
   slot ret-rest-type :: <object>, init-keyword: rest-type:;  // <ast-node> or #f
 end class;
 
+// `slot NAME [:: type] [= default] [, init-option ...]` — one slot spec.
+//
+// adjectives    : vector of <token> (the words before `slot`, e.g.
+//                 `constant`, `each-subclass`, `class`, `virtual`,
+//                 `inherited`, `sealed`).  Recorded verbatim as tokens.
+// slot-word     : the `slot` <keyword-token> itself (allocation word).
+// slot-name-tok : the slot's name token (e.g. `point-x`).
+// slot-type     : the type after `::`, or #f.
+// slot-init-kw  : the init-keyword / required-init-keyword name token
+//                 (a <keyword-name-token>, e.g. `x:`), or #f.
+// slot-required?: #t when the keyword came from `required-init-keyword:`.
+// slot-init     : the init-value / init-function expr, OR the `= default`
+//                 shorthand expression (sugar for init-value:), or #f.
+//
+// Same compiler-gap workaround as <ast-param-list>: EVERY slot carries an
+// explicit `init-keyword:` and is supplied at `make` time; flags are typed
+// <object> so a faulting "defaulted" value never leaks in.
+define class <ast-slot-spec> (<ast-node>)
+  slot slot-adjectives :: <stretchy-vector>, init-keyword: adjectives:;
+  slot slot-word       :: <object>, init-keyword: word:;       // <token> or #f
+  slot slot-name-tok   :: <object>, init-keyword: name-tok:;   // <token> or #f
+  slot slot-type       :: <object>, init-keyword: type:;       // <ast-node> or #f
+  slot slot-init-kw    :: <object>, init-keyword: init-kw:;    // <token> or #f
+  slot slot-required?  :: <object>, init-keyword: required?:;  // #f / #t
+  slot slot-init       :: <object>, init-keyword: init:;       // <ast-node> or #f
+end class;
+
+// `define [modifiers] class NAME (super, ...) slot-spec ... end [class] [NAME]`
+//   class-name : the class name <token>
+//   supers     : vector of <ast-node> (one per superclass expression)
+//   slots      : vector of <ast-slot-spec>
+//   end-word / end-name : the `end class NAME` tail, like <ast-body-definition>.
+//
+// Init-keyword'd vector slots are built via make-ast-class-definition.
+define class <ast-class-definition> (<ast-node>)
+  slot defn-modifiers :: <stretchy-vector>, init-keyword: modifiers:;
+  slot defn-word      :: <token>,  init-keyword: word:;      // the `class` keyword
+  slot class-name     :: <object>, init-keyword: name:;      // <token> or #f
+  slot class-supers   :: <stretchy-vector>, init-keyword: supers:;
+  slot class-slots    :: <stretchy-vector>, init-keyword: slots:;
+  slot defn-end-word  :: <object>, init-keyword: end-word:;  // <token> or #f
+  slot defn-end-name  :: <object>, init-keyword: end-name:;  // <token> or #f
+end class;
+
 // ── 4. Constructors for AST nodes with vector slots ───────────────────────
 //
 // Dylan's `init-value:` shares one initial value across instances, which
@@ -538,6 +606,26 @@ define function make-ast-key-spec (name-tok :: <token>) => (k :: <ast-key-spec>)
   make(<ast-key-spec>, tok: name-tok, type: #f, default: #f)
 end function;
 
+// A fresh slot-spec with empty adjectives and every option cleared.
+define function make-ast-slot-spec () => (s :: <ast-slot-spec>)
+  make(<ast-slot-spec>,
+       adjectives: make(<stretchy-vector>),
+       word: #f, name-tok: #f, type: #f,
+       init-kw: #f, required?: #f, init: #f)
+end function;
+
+// A fresh class definition with empty modifier/super/slot vectors.
+define function make-ast-class-definition (word :: <token>)
+ => (d :: <ast-class-definition>)
+  make(<ast-class-definition>,
+       modifiers: make(<stretchy-vector>),
+       word: word,
+       name: #f,
+       supers: make(<stretchy-vector>),
+       slots: make(<stretchy-vector>),
+       end-word: #f, end-name: #f)
+end function;
+
 // ── 5. Name extraction helpers ────────────────────────────────────────────
 
 // Retrieve a printable name from a name-like token.
@@ -569,6 +657,11 @@ define function token-name (t :: <token>) => (s :: <byte-string>)
     elseif  (kw = #"local")     "local"
     elseif  (kw = #"variable")  "variable"
     elseif  (kw = #"constant")  "constant"
+    elseif  (kw = #"slot")      "slot"
+    elseif  (kw = #"each-subclass") "each-subclass"
+    elseif  (kw = #"virtual")   "virtual"
+    elseif  (kw = #"inherited") "inherited"
+    elseif  (kw = #"sealed")    "sealed"
     elseif  (kw = #"domain")    "domain"
     elseif  (kw = #"for")       "for"
     elseif  (kw = #"while")     "while"
@@ -689,7 +782,11 @@ define function parse-definition (ts :: <token-stream>) => (n :: <ast-node>)
     end;
   end;
   let word = ts-peek(ts);
-  if (is-define-body-word?(word))
+  if (is-keyword?(word, #"class"))
+    // DEFINE modifiers class NAME (supers) slot-specs ... end [class] [NAME]
+    ts-advance(ts);   // consume `class`
+    parse-class-definition(ts, word, modifiers)
+  elseif (is-define-body-word?(word))
     // DEFINE modifiers BODY-WORD body ... end [word] [name]
     ts-advance(ts);   // consume the word
     let d = make-ast-body-definition(word);
@@ -745,6 +842,251 @@ define function parse-definition-tail (ts :: <token-stream>,
       end;
     end;
   end;
+end function;
+
+// ── 9b. Parsing: class definitions ────────────────────────────────────────
+//
+// class-definition:
+//     DEFINE modifiers CLASS class-name superclass-list class-clauses
+//       END [CLASS] [class-name]
+//
+// superclass-list:
+//     LPAREN superclasses-OPT RPAREN
+//
+// superclasses:
+//     expression , ...                 ← each superclass is an expression
+//
+// class-clauses:
+//     class-clause ; ...               ← `;`/`,` separated, zero or more
+//
+// class-clause (we model `slot` specs; other member clauses are skipped):
+//     slot-adjectives SLOT-WORD slot-name [:: type] [= default]
+//       [, init-option ...]
+//
+// init-option:
+//     INIT-KEYWORD SYMBOL               ← init-keyword: foo:
+//     REQUIRED-INIT-KEYWORD SYMBOL      ← required-init-keyword: foo:
+//     INIT-VALUE expression             ← init-value: <expr>
+//     INIT-FUNCTION expression          ← init-function: <expr>
+//
+// Modelled after nod-reader's parse_define_class / parse_class_body.
+
+define function parse-class-definition (ts :: <token-stream>,
+                                        word :: <token>,
+                                        modifiers :: <stretchy-vector>)
+ => (d :: <ast-class-definition>)
+  let d = make-ast-class-definition(word);
+  defn-modifiers(d) := modifiers;
+  node-token(d) := word;
+  // Class name — a name token (e.g. <point>).
+  if (is-name-token?(ts-peek(ts)))
+    class-name(d) := ts-advance(ts);
+  else
+    parse-error("define class: expected class name");
+  end;
+  // Superclass list — `(expr, expr, ...)`.
+  parse-super-list(ts, class-supers(d));
+  // Slot specs and other clauses until `end`.
+  parse-class-clauses(ts, class-slots(d));
+  // definition-tail: `end [class] [NAME]`.  Reuse the body-definition shape
+  // by parsing into a scratch node, then copy the end word/name across.
+  let tail = make-ast-body-definition(word);
+  parse-definition-tail(ts, tail);
+  defn-end-word(d) := defn-end-word(tail);
+  defn-end-name(d) := defn-end-name(tail);
+  d
+end function;
+
+// superclass-list: `(` expr (`,` expr)* `)`, or absent.  Each superclass is
+// a full expression (a class name, `subclass(<c>)`, a union, etc.).  Reuses
+// parse-expression so commas inside an argument list are not swallowed —
+// the comma at this level separates superclasses.
+define function parse-super-list (ts :: <token-stream>,
+                                  supers :: <stretchy-vector>) => ()
+  if (is-punct?(ts-peek(ts), #"lparen"))
+    ts-advance(ts);   // consume `(`
+    let done? = #f;
+    until (done? | ts-at-end?(ts))
+      let t = ts-peek(ts);
+      if (is-punct?(t, #"rparen"))
+        done? := #t;
+      elseif (is-punct?(t, #"comma"))
+        ts-advance(ts);   // skip stray separators
+      else
+        add!(supers, parse-expression(ts));
+        if (is-punct?(ts-peek(ts), #"comma"))
+          ts-advance(ts);
+        end;
+      end;
+    end;
+    ts-expect-punct(ts, #"rparen", "expected ) to close superclass list");
+  end;
+end function;
+
+// class-clauses: zero or more clauses separated by `;` (and/or `,`), until
+// `end` (or EOF).  We model slot specs; any other member clause (init-form,
+// bare `keyword foo:;`, etc.) is skipped up to the next `;` so the parse
+// stays in sync.
+define function parse-class-clauses (ts :: <token-stream>,
+                                     slots :: <stretchy-vector>) => ()
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (is-end-token?(t))
+      done? := #t;
+    elseif (is-punct?(t, #"semicolon") | is-punct?(t, #"comma"))
+      ts-advance(ts);   // skip separators between clauses
+    elseif (is-slot-word?(t) | is-slot-adjective?(t))
+      // A slot clause (possibly preceded by adjectives).  Confirm a `slot`
+      // word follows the adjectives before committing; otherwise skip the
+      // rest of this clause so the cursor stays in sync.
+      let spec = parse-slot-spec(ts);
+      if (instance?(spec, <ast-slot-spec>))
+        add!(slots, spec);
+      else
+        skip-class-clause(ts);
+      end;
+    else
+      // Unmodelled member clause — skip to the next `;` or `end`.
+      skip-class-clause(ts);
+    end;
+  end;
+end function;
+
+// Skip an unmodelled class clause: consume tokens up to (but not past) the
+// next `;` or `end`/EOF, so parse-class-clauses can resume cleanly.
+define function skip-class-clause (ts :: <token-stream>) => ()
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (is-end-token?(t) | is-punct?(t, #"semicolon"))
+      done? := #t;
+    else
+      ts-advance(ts);
+    end;
+  end;
+end function;
+
+// slot-spec:
+//     slot-adjectives SLOT-WORD slot-name [:: type] [= default]
+//       [, init-option ...]
+//
+// Returns an <ast-slot-spec>, or an <ast-error-node> if no `slot` word is
+// found after the adjectives (caller treats non-slot-spec results as skips).
+define function parse-slot-spec (ts :: <token-stream>) => (n :: <ast-node>)
+  let s = make-ast-slot-spec();
+  // Leading adjectives: zero or more slot-adjective keyword tokens.  Stop as
+  // soon as we hit the `slot` word.
+  let done-adj? = #f;
+  until (done-adj? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (is-slot-word?(t))
+      done-adj? := #t;
+    elseif (is-slot-adjective?(t))
+      add!(slot-adjectives(s), ts-advance(ts));
+    else
+      done-adj? := #t;
+    end;
+  end;
+  // The `slot` allocation word.  If absent (e.g. a lone `inherited` clause
+  // we don't model), bail with an error node so the caller can skip.
+  if (is-slot-word?(ts-peek(ts)))
+    let sw = ts-advance(ts);
+    slot-word(s) := sw;
+    node-token(s) := sw;
+    // Slot name.
+    if (is-name-token?(ts-peek(ts)))
+      slot-name-tok(s) := ts-advance(ts);
+    else
+      parse-error("slot: expected slot name");
+    end;
+    // Optional `:: type`.
+    if (is-punct?(ts-peek(ts), #"colon-colon"))
+      ts-advance(ts);   // consume `::`
+      slot-type(s) := parse-type-spec(ts);
+    end;
+    // Optional `= default` shorthand (sugar for init-value:).
+    if (is-punct?(ts-peek(ts), #"equal"))
+      ts-advance(ts);   // consume `=`
+      slot-init(s) := parse-expression(ts);
+    end;
+    // Trailing `, init-option ...` clauses.  A comma followed by a
+    // keyword-name token (e.g. `init-keyword:`) is an init option for THIS
+    // slot; a comma followed by anything else separates slot specs and is
+    // left for parse-class-clauses to consume.
+    let more? = #t;
+    until (~ more? | ts-at-end?(ts))
+      if (is-punct?(ts-peek(ts), #"comma")
+            & instance?(ts-peek-after-comma(ts), <keyword-name-token>))
+        ts-advance(ts);   // consume `,`
+        parse-slot-init-option(ts, s);
+      else
+        more? := #f;
+      end;
+    end;
+    s
+  else
+    // No `slot` word — return an error node; caller skips remaining tokens.
+    make(<ast-error-node>, message: "expected slot word in class clause")
+  end
+end function;
+
+// Look one meaningful token PAST a leading comma without consuming anything.
+// Used by parse-slot-spec to decide whether a comma begins an init option
+// (next token is a keyword-name) or separates two slot specs.
+define function ts-peek-after-comma (ts :: <token-stream>) => (t :: <token>)
+  let save = ts-pos(ts);
+  // Consume the comma we are positioned on.
+  if (is-punct?(ts-peek(ts), #"comma"))
+    ts-advance(ts);
+  end;
+  let t = ts-peek(ts);
+  ts-pos(ts) := save;
+  t
+end function;
+
+// init-option:  KEYWORD-NAME value
+//   init-keyword: foo:            → slot-init-kw, slot-required? = #f
+//   required-init-keyword: foo:   → slot-init-kw, slot-required? = #t
+//   init-value: <expr>            → slot-init
+//   init-function: <expr>         → slot-init
+// Any other keyword-name option is consumed (value parsed) but not recorded.
+define function parse-slot-init-option (ts :: <token-stream>,
+                                        s :: <ast-slot-spec>) => ()
+  let key-tok = ts-advance(ts);   // the <keyword-name-token>
+  let key = keyword-name-token-name(key-tok);
+  if (key = "init-keyword")
+    // Value is a keyword-name token (the init keyword, e.g. `x:`).
+    if (instance?(ts-peek(ts), <keyword-name-token>))
+      slot-init-kw(s) := ts-advance(ts);
+    else
+      slot-init-kw(s) := %extract-symbol-value(ts);
+    end;
+  elseif (key = "required-init-keyword")
+    slot-required?(s) := #t;
+    if (instance?(ts-peek(ts), <keyword-name-token>))
+      slot-init-kw(s) := ts-advance(ts);
+    else
+      slot-init-kw(s) := %extract-symbol-value(ts);
+    end;
+  elseif (key = "init-value")
+    slot-init(s) := parse-expression(ts);
+  elseif (key = "init-function")
+    slot-init(s) := parse-expression(ts);
+  else
+    // Unknown option (setter:, type:, …) — consume its value, don't record.
+    parse-expression(ts);
+  end;
+end function;
+
+// Fallback for an init-keyword whose value is NOT a bare keyword-name token
+// (e.g. a `#"sym"` symbol literal).  Parse it as an expression and, if it is
+// a symbol literal, keep #f for the name token (we only model bare-keyword
+// forms here); otherwise just discard.  Returns #f so the caller's
+// slot-init-kw stays #f when the form is non-bare.
+define function %extract-symbol-value (ts :: <token-stream>) => (t :: <object>)
+  parse-expression(ts);
+  #f
 end function;
 
 // list-fragment: expressions and punctuation up to `;` or EOF.
@@ -1540,6 +1882,65 @@ define function dump-return-spec (r :: <ast-return-spec>, acc :: <stretchy-vecto
   end;
 end function;
 
+// Dump one slot spec as a SLOT block:
+//   SLOT <name>
+//     ADJ <word> ...            (one per adjective)
+//     TYPE / <type subtree>     (when :: type present)
+//     INIT-KEYWORD <kw>         (init-keyword: kw:)
+//     REQUIRED-INIT-KEYWORD <kw>(required-init-keyword: kw:)
+//     INIT / <expr subtree>     (= default, init-value:, or init-function:)
+define function dump-slot-spec (s :: <ast-slot-spec>, acc :: <stretchy-vector>,
+                                depth :: <integer>) => ()
+  acc-indent(acc, depth);
+  acc-string(acc, "SLOT");
+  if (instance?(slot-name-tok(s), <token>))
+    acc-string(acc, " ");
+    acc-string(acc, token-name(slot-name-tok(s)));
+  end;
+  acc-newline(acc);
+  // Adjectives.
+  let adjs = slot-adjectives(s);
+  let na = size(adjs);
+  let ia = 0;
+  until (ia >= na)
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "ADJ ");
+    acc-string(acc, token-name(adjs[ia]));
+    acc-newline(acc);
+    ia := ia + 1;
+  end;
+  // Type.
+  if (instance?(slot-type(s), <ast-node>))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "TYPE");
+    acc-newline(acc);
+    dump-node(slot-type(s), acc, depth + 2);
+  end;
+  // Init keyword (required or not).
+  if (instance?(slot-init-kw(s), <token>))
+    acc-indent(acc, depth + 1);
+    if (slot-required?(s))
+      acc-string(acc, "REQUIRED-INIT-KEYWORD ");
+    else
+      acc-string(acc, "INIT-KEYWORD ");
+    end;
+    acc-string(acc, keyword-name-token-name(slot-init-kw(s)));
+    acc-newline(acc);
+  elseif (slot-required?(s))
+    // required-init-keyword whose value was not a bare keyword-name.
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "REQUIRED-INIT-KEYWORD");
+    acc-newline(acc);
+  end;
+  // Init value / function / `= default`.
+  if (instance?(slot-init(s), <ast-node>))
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "INIT");
+    acc-newline(acc);
+    dump-node(slot-init(s), acc, depth + 2);
+  end;
+end function;
+
 define function dump-node (node :: <ast-node>,
                            acc  :: <stretchy-vector>,
                            depth :: <integer>) => ()
@@ -1569,6 +1970,32 @@ define function dump-node (node :: <ast-node>,
       dump-return-spec(defn-return(node), acc, depth + 1);
     end;
     dump-node(defn-body(node), acc, depth + 1);
+  elseif (instance?(node, <ast-class-definition>))
+    acc-string(acc, "DEFINE-CLASS");
+    if (instance?(class-name(node), <token>))
+      acc-string(acc, " ");
+      acc-string(acc, token-name(class-name(node)));
+    end;
+    acc-newline(acc);
+    // Superclasses.
+    let supers = class-supers(node);
+    let ns = size(supers);
+    let is = 0;
+    until (is >= ns)
+      acc-indent(acc, depth + 1);
+      acc-string(acc, "SUPER");
+      acc-newline(acc);
+      dump-node(supers[is], acc, depth + 2);
+      is := is + 1;
+    end;
+    // Slot specs.
+    let slots = class-slots(node);
+    let nsl = size(slots);
+    let isl = 0;
+    until (isl >= nsl)
+      dump-slot-spec(slots[isl], acc, depth + 1);
+      isl := isl + 1;
+    end;
   elseif (instance?(node, <ast-list-definition>))
     acc-string(acc, "DEFINE-LIST ");
     acc-string(acc, token-name(defn-word(node)));

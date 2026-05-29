@@ -304,6 +304,143 @@ end method helper;
     );
 }
 
+// ─── headline: define class ────────────────────────────────────────────────
+
+/// Sprint 46 (class chunk) headline acceptance — `define class <point>
+/// (<object>) slot ... end class;` must parse into a structured class node
+/// with superclass and slot specs instead of crashing with "unexpected token
+/// in expression".
+#[test]
+#[ignore]
+#[serial]
+fn define_class_headline() {
+    let source = "\
+define class <point> (<object>)
+  slot point-x :: <integer>, init-keyword: x:;
+  slot point-y :: <integer> = 0;
+  constant slot point-name :: <string>, required-init-keyword: name:;
+end class;
+";
+    assert_dump(
+        "define_class_headline",
+        source,
+        &[
+            "DEFINE-CLASS <point>",
+            "SUPER",
+            "NAME <object>",
+            "SLOT point-x",
+            "TYPE",
+            "NAME <integer>",
+            "INIT-KEYWORD x",
+            "SLOT point-y",
+            "INIT",
+            "INT 0",
+            "SLOT point-name",
+            "ADJ constant",
+            "REQUIRED-INIT-KEYWORD name",
+        ],
+    );
+}
+
+/// Multiple superclasses `(<a>, <b>)` — each becomes its own SUPER subtree.
+#[test]
+#[ignore]
+#[serial]
+fn define_class_multiple_supers() {
+    let source = "\
+define class <c> (<a>, <b>)
+  slot x;
+end class;
+";
+    assert_dump(
+        "define_class_multiple_supers",
+        source,
+        &[
+            "DEFINE-CLASS <c>",
+            "SUPER",
+            "NAME <a>",
+            "NAME <b>",
+            "SLOT x",
+        ],
+    );
+}
+
+/// Slot adjectives — `each-subclass slot`, `class slot`, `virtual slot` and a
+/// `constant slot` all surface as ADJ lines before the slot name.
+#[test]
+#[ignore]
+#[serial]
+fn define_class_slot_adjectives() {
+    let source = "\
+define class <thing> (<object>)
+  each-subclass slot count :: <integer> = 0;
+  class slot total :: <integer>;
+  constant slot tag :: <symbol>;
+end class;
+";
+    assert_dump(
+        "define_class_slot_adjectives",
+        source,
+        &[
+            "DEFINE-CLASS <thing>",
+            "ADJ each-subclass",
+            "SLOT count",
+            "ADJ class",
+            "SLOT total",
+            "ADJ constant",
+            "SLOT tag",
+        ],
+    );
+}
+
+/// Empty class body — `define class <c> (<object>) end class;` parses to a
+/// class node with one super and no slots.
+#[test]
+#[ignore]
+#[serial]
+fn define_class_empty_body() {
+    let source = "define class <empty> (<object>) end class;\n";
+    assert_dump(
+        "define_class_empty_body",
+        source,
+        &["DEFINE-CLASS <empty>", "SUPER", "NAME <object>"],
+    );
+}
+
+/// A bare slot with no type and no init options still parses.
+#[test]
+#[ignore]
+#[serial]
+fn define_class_bare_slot() {
+    let source = "\
+define class <c> (<object>)
+  slot x;
+end class;
+";
+    assert_dump(
+        "define_class_bare_slot",
+        source,
+        &["DEFINE-CLASS <c>", "SLOT x"],
+    );
+}
+
+/// `init-value:` option (explicit, not the `=` shorthand).
+#[test]
+#[ignore]
+#[serial]
+fn define_class_init_value_option() {
+    let source = "\
+define class <c> (<object>)
+  slot x :: <integer>, init-value: 42;
+end class;
+";
+    assert_dump(
+        "define_class_init_value_option",
+        source,
+        &["SLOT x", "INIT", "INT 42"],
+    );
+}
+
 // ─── no-regression: simpler shapes still parse ─────────────────────────────
 
 #[test]
