@@ -299,6 +299,20 @@ define function is-clause-separator? (t :: <token>) => (yes? :: <boolean>)
     | is-keyword?(t, #"finally")
 end function;
 
+// FOR-CONNECTOR: a token that joins a for-clause variable to an expression in
+// the `for` header (`i FROM 1 TO 10 BY 2`, `x = init THEN next`, `item IN c`).
+// `above` / `below` are not lexer keywords (they lex as identifiers), so they
+// are matched by name.  None of these are binary operators, so each one
+// cleanly delimits the parts of a for-clause.
+define function is-for-connector? (t :: <token>) => (yes? :: <boolean>)
+  is-keyword?(t, #"from") | is-keyword?(t, #"to") | is-keyword?(t, #"by")
+    | is-keyword?(t, #"in") | is-keyword?(t, #"then")
+    | is-punct?(t, #"equal")
+    | (instance?(t, <identifier-token>)
+         & (identifier-token-name(t) = "above"
+              | identifier-token-name(t) = "below"))
+end function;
+
 // ── 3. AST node classes ───────────────────────────────────────────────────
 //
 // Every node carries the leading token for source-location reporting.
@@ -459,6 +473,10 @@ define class <ast-statement> (<ast-node>)
   // as <object> so the unset default is the immutable #f rather than one
   // shared mutable vector across instances (see <ast-param-list> note).
   slot stmt-clauses     :: <object> = #f;   // <stretchy-vector> or #f
+  // `for (clauses)` iteration header — a <stretchy-vector> of
+  // <ast-for-clause>, or #f for every other statement (whose parenthesised
+  // head, if any, is just an ordinary expression in the leading body).
+  slot stmt-for-header  :: <object> = #f;   // <stretchy-vector> or #f
 end class;
 
 // One trailing clause of a multi-clause statement.  `clause-word` is the
@@ -470,6 +488,28 @@ end class;
 define class <ast-statement-clause> (<ast-node>)
   slot clause-word :: <token>,    init-keyword: word:;
   slot clause-body :: <ast-body>, init-keyword: body:;
+end class;
+
+// One clause of a `for` iteration header.  Modelled uniformly as an optional
+// leading variable name followed by a sequence of `connector expr` parts, so
+// every DRM clause shape collapses to the same shape:
+//   i from 1 to 10     → var i ;  parts (from 1) (to 10)
+//   x = init then next → var x ;  parts (= init) (then next)
+//   item in coll       → var item ; parts (in coll)
+//   until count > 100  → var #f ;  parts (until count > 100)   (end-test)
+// The `for` macro interprets the connector sequence later; the parser just
+// captures the fragment faithfully.
+define class <ast-for-clause> (<ast-node>)
+  slot for-clause-var   :: <object> = #f;   // <token> (loop variable) or #f
+  slot for-clause-parts :: <stretchy-vector>, init-keyword: parts:;
+end class;
+
+// One `connector expr` part of a for-clause.  `for-part-conn` is the
+// connector token (the keyword from/to/by/in/then/while/until, the `=` punct,
+// or the identifier above/below); `for-part-expr` is the expression after it.
+define class <ast-for-part> (<ast-node>)
+  slot for-part-conn :: <token>,    init-keyword: conn:;
+  slot for-part-expr :: <ast-node>, init-keyword: expr:;
 end class;
 
 // A positional call argument
@@ -721,6 +761,10 @@ define function token-name (t :: <token>) => (s :: <byte-string>)
     elseif  (kw = #"sealed")    "sealed"
     elseif  (kw = #"domain")    "domain"
     elseif  (kw = #"for")       "for"
+    elseif  (kw = #"from")      "from"
+    elseif  (kw = #"to")        "to"
+    elseif  (kw = #"by")        "by"
+    elseif  (kw = #"in")        "in"
     elseif  (kw = #"while")     "while"
     elseif  (kw = #"until")     "until"
     elseif  (kw = #"unless")    "unless"
@@ -1587,9 +1631,17 @@ end function;
 
 define function parse-statement (ts :: <token-stream>) => (n :: <ast-statement>)
   let word = ts-advance(ts);   // consume begin-word
-  let body = parse-body(ts);   // leading clause body (stops at sep / end)
-  let s = make(<ast-statement>, word: word, body: body);
+  let s = make(<ast-statement>, word: word, body: make-ast-body());
   node-token(s) := word;
+  // `for (clauses)` carries an iteration header with its own micro-syntax
+  // (`i from 1 to 10`, `x = init then next`, `item in c`, `until test`).  It
+  // is parsed structurally here, BEFORE the body, so the connector keywords
+  // never reach ordinary expression parsing.  Every other begin-word's
+  // parenthesised head (if any) is just an expression in the leading body.
+  if (is-keyword?(word, #"for") & is-punct?(ts-peek(ts), #"lparen"))
+    stmt-for-header(s) := parse-for-header(ts);
+  end;
+  stmt-body(s) := parse-body(ts);   // leading clause body (stops at sep / end)
   // Collect any trailing clauses: (CLAUSE-SEP body)* up to `end`.  parse-body
   // halts on each clause separator, so each iteration consumes one separator
   // and the body that follows it.  An `elseif (c)` head keeps `(c)` as the
@@ -1617,6 +1669,68 @@ define function parse-statement (ts :: <token-stream>) => (n :: <ast-statement>)
     end;
   end;
   s
+end function;
+
+// for-header: `( for-clause (, for-clause)* )`  — the leading `(` is at the
+// current position.  Returns a vector of <ast-for-clause>.
+define function parse-for-header (ts :: <token-stream>)
+ => (clauses :: <stretchy-vector>)
+  ts-advance(ts);   // consume `(`
+  let clauses = make(<stretchy-vector>);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-punct?(ts-peek(ts), #"rparen"))
+      done? := #t;
+    else
+      let before = ts-pos(ts);
+      add!(clauses, parse-for-clause(ts));
+      if (is-punct?(ts-peek(ts), #"comma"))
+        ts-advance(ts);   // separator between clauses
+      elseif (ts-pos(ts) = before)
+        // No progress (unexpected token that starts no clause) — bail so the
+        // closing-paren check below doesn't spin forever.
+        done? := #t;
+      end;
+    end;
+  end;
+  ts-expect-punct(ts, #"rparen", "expected ) to close for header");
+  clauses
+end function;
+
+// for-clause:
+//     WHILE expr | UNTIL expr                         (end-test, no variable)
+//     variable (FOR-CONNECTOR expr)+                  (step / iteration / range)
+//
+// Captured as an optional leading variable plus a sequence of
+// `connector expr` parts; the `for` macro interprets the connectors later.
+define function parse-for-clause (ts :: <token-stream>) => (c :: <ast-for-clause>)
+  let c = make(<ast-for-clause>, parts: make(<stretchy-vector>));
+  let t = ts-peek(ts);
+  if (is-keyword?(t, #"while") | is-keyword?(t, #"until"))
+    // End-test clause: the keyword is the connector, no loop variable.
+    let conn = ts-advance(ts);
+    node-token(c) := conn;
+    add!(for-clause-parts(c),
+         make(<ast-for-part>, conn: conn, expr: parse-expression(ts)));
+  else
+    // Variable-based clause: a loop variable then one or more parts.
+    if (is-name-token?(t))
+      let v = ts-advance(ts);
+      for-clause-var(c) := v;
+      node-token(c) := v;
+    end;
+    let done? = #f;
+    until (done? | ts-at-end?(ts))
+      if (is-for-connector?(ts-peek(ts)))
+        let conn = ts-advance(ts);
+        add!(for-clause-parts(c),
+             make(<ast-for-part>, conn: conn, expr: parse-expression(ts)));
+      else
+        done? := #t;
+      end;
+    end;
+  end;
+  c
 end function;
 
 // ── 14. Parsing: arguments ────────────────────────────────────────────────
@@ -2077,6 +2191,44 @@ define function dump-statement-clause (c :: <ast-statement-clause>,
   dump-node(clause-body(c), acc, depth + 1);
 end function;
 
+// Printable spelling of a token used as an operator/connector: punctuation
+// tokens (e.g. `=`) have no name-like spelling, so use their symbolic form.
+define function connector-spelling (t :: <token>) => (s :: <byte-string>)
+  if (instance?(t, <punctuation-token>))
+    write-to-string(punctuation-token-form(t))
+  else
+    token-name(t)
+  end
+end function;
+
+// Dump one for-clause:
+//   FOR-CLAUSE [<var>]
+//     PART <conn>
+//       <expr subtree>
+//     ...
+define function dump-for-clause (c :: <ast-for-clause>, acc :: <stretchy-vector>,
+                                 depth :: <integer>) => ()
+  acc-indent(acc, depth);
+  acc-string(acc, "FOR-CLAUSE");
+  if (instance?(for-clause-var(c), <token>))
+    acc-string(acc, " ");
+    acc-string(acc, token-name(for-clause-var(c)));
+  end;
+  acc-newline(acc);
+  let parts = for-clause-parts(c);
+  let n = size(parts);
+  let i = 0;
+  until (i >= n)
+    let p = parts[i];
+    acc-indent(acc, depth + 1);
+    acc-string(acc, "PART ");
+    acc-string(acc, connector-spelling(for-part-conn(p)));
+    acc-newline(acc);
+    dump-node(for-part-expr(p), acc, depth + 2);
+    i := i + 1;
+  end;
+end function;
+
 define function dump-node (node :: <ast-node>,
                            acc  :: <stretchy-vector>,
                            depth :: <integer>) => ()
@@ -2267,6 +2419,16 @@ define function dump-node (node :: <ast-node>,
       acc-string(acc, token-name(stmt-method-name(node)));
     end;
     acc-newline(acc);
+    // `for` iteration header (before the body).
+    if (instance?(stmt-for-header(node), <stretchy-vector>))
+      let fcs = stmt-for-header(node);
+      let nf = size(fcs);
+      let iff = 0;
+      until (iff >= nf)
+        dump-for-clause(fcs[iff], acc, depth + 1);
+        iff := iff + 1;
+      end;
+    end;
     if (instance?(stmt-params(node), <ast-param-list>))
       dump-param-list(stmt-params(node), acc, depth + 1);
     end;

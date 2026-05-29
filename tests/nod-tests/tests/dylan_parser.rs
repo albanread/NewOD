@@ -554,3 +554,65 @@ end function;
         ],
     );
 }
+
+/// Numeric `for (i from 1 to n)` header parses into a FOR-CLAUSE with `from`
+/// and `to` connector parts.  Previously the `from`/`to` keywords broke the
+/// parenthesised-head parser with "expected ) after parenthesised expression".
+#[test]
+#[ignore]
+#[serial]
+fn for_header_numeric_range() {
+    let source = "\
+define function sum-to (n :: <integer>) => (total :: <integer>)
+  let total = 0;
+  for (i from 1 to n)
+    total := total + i;
+  end for;
+  total
+end function;
+";
+    assert_dump(
+        "for_header_numeric_range",
+        source,
+        &[
+            "STMT for",
+            "FOR-CLAUSE i",
+            "PART from",
+            "INT 1",
+            "PART to",
+            "NAME n",
+        ],
+    );
+}
+
+/// Multi-clause `for` header: explicit iteration (`item in items`), explicit
+/// step (`count = 0 then count + 1`), and a `until` end-test clause (no loop
+/// variable) — each is its own FOR-CLAUSE with connector parts.
+#[test]
+#[ignore]
+#[serial]
+fn for_header_in_step_and_until() {
+    let source = "\
+define function walk (items :: <object>) => ()
+  for (item in items,
+       count = 0 then count + 1,
+       until count > 100)
+    process(item, count);
+  end for;
+end function;
+";
+    assert_dump(
+        "for_header_in_step_and_until",
+        source,
+        &[
+            "STMT for",
+            "FOR-CLAUSE item",
+            "PART in",
+            "NAME items",
+            "FOR-CLAUSE count",
+            "PART equal",
+            "PART then",
+            "PART until",
+        ],
+    );
+}
