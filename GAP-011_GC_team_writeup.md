@@ -94,30 +94,95 @@ safepoint slab's reload protocol. Across cycle 4 the SSA value is the
 pre-move address; passing it into `add!` → `nod_stretchy_vector_push`
 fails on the wrapper-class check.
 
-## Where to look next
+## Smoking gun located — 2026-05-30 (late afternoon)
 
-The narrowed question: **which load instruction in dump-node /
-acc-string takes its value from a stack address that is NOT a slab
-slot of the surrounding safepoint?** Two concrete approaches:
+Reading `src/nod-llvm/src/codegen.rs` lines 2205-2308 with the trace
+finding in mind:
 
-1. **Slab-snapshot probe at every safepoint enter/exit.** Augment
-   `nod_aot_begin_safepoint` to also dump the calling Dylan
-   function's full alloca map (every stack-address used for any
-   GC-typed value), not just the slots whose indices we passed it.
-   Cross-reference against the slab indices and the dataflow's
-   `safepoint_roots`. Mismatches name the holes.
+```rust
+// Lines 2303-2308 — at the START of EVERY block:
+for (i, p) in func.params.iter().enumerate() {
+    let pv = llvm_fn
+        .get_nth_param(i as u32)
+        .expect("parameter index in range");
+    state.temps.insert(*p, pv);
+}
+```
 
-2. **Bisect via DFM IR.** `dump-dfm` the parser source, focus on
-   `dump-node` blocks 53, 77, 102, 127 (the ones the
-   `NOD_DIAG_ARG_ROOT_COVERAGE` probe surfaced as having
-   freshly-allocated args), look for any SSA temp whose definition is
-   a sub-call's result and whose final-use site is inside a different
-   safepoint scope. The codegen for those would emit an LLVM `load`
-   from an alloca that the current slab doesn't track.
+**Every block-entry resets the SSA binding of every function
+parameter to its original `get_nth_param` value — the pre-GC value
+from the function's prologue.**
 
-(Earlier sections still apply; this section supersedes the previous
-"3 layers of suspects" framing — we're down to one layer: codegen
-slab/reload protocol holes between safepoint scopes.)
+The comment at 2299-2302 acknowledges this:
+> Safepoint reloads intentionally rebind `state.temps[temp]` to a
+> fresh SSA value, but that rebind is only valid within the block
+> that performed the reload. When we move on to a sibling block,
+> restore canonical block-entry bindings so later uses do not pick
+> up a reload defined in a non-dominating predecessor.
+
+It's an SSA-dominance fix, but for function params it's also the
+**bug**: any safepoint reload of a function param that happened in
+block A is thrown away the moment we move to block B. If block B
+then has an allocating call where param `p` is in
+`safepoint_roots`, `begin_safepoint` stores `temp_val(p)` =
+`%fn.argN` (the original, pre-GC) into the slab slot. GC reads that
+stale value out of the slab, tries to evac/follow it — but the page
+was reclaimed by the cycle that moved p — wrapper check fails →
+panic.
+
+The "Cross-block heap-value contract" comment at lines 2205-2219
+says lowering must thread heap-live values through block-arg phis.
+That works for *normal temps* (their phi is dominance-correct), but
+**function params never get phi'd**. They're just the raw LLVM
+function-arg SSA values, accessible from every block. The rebind
+overwrites whatever reload happened with the original.
+
+This matches the trace 1-for-1:
+- Cycles 1-2: dump-node is in a single recursive call. Within that
+  block, safepoint reloads work. Slot 17 of cycle 1's slab holds the
+  buffer, gets rewritten correctly.
+- Between cycles 2 and 3: dump-node hits a block boundary (e.g., the
+  body of an if, the next iteration of an embedded recursion).
+  Rebind resets the buffer-param's binding to `%fn.arg_buf` =
+  `4a34d771` (the cycle-2-reloaded value WAS this address, but
+  `%fn.arg_buf` is the value passed in RCX at function entry, which
+  is whatever the CALLER's slab had at the moment of call — and
+  that's stable through cycles 1-2 by the caller's own slab
+  protection).
+- Cycle 4: dump-node's NEW block's allocating call stores
+  `%fn.arg_buf` to the slab. But cycle 4 has already moved the
+  object to `4a39d771`; `%fn.arg_buf` is still `4a34d771` (the
+  value the caller PASSED, set at function entry). GC tries to follow
+  `4a34d771` to the new address — but `4a34d771`'s page has been
+  reused. Wrapper-class check on next call to `add!` →
+  `nod_stretchy_vector_push` fails on entry.
+
+## Proposed fix
+
+Make function parameters use the same stable-storage protocol as block
+params, so they survive block transitions:
+
+1. At function entry, allocate a Word-sized `alloca` for each
+   GC-typed function param (and load the LLVM arg into it once).
+2. Rebind `state.temps[p]` to `load %p.slot` at every use.
+3. `begin_safepoint` continues to store the current value to the
+   slab slot.
+4. `end_safepoint` reloads from the slab slot AND writes the new
+   value back to `%p.slot` so subsequent block-entry rebinds pick
+   up the post-GC address.
+5. Remove (or repurpose) the unconditional `state.temps.insert(*p,
+   pv)` at lines 2303-2308 — the alloca-load replaces it.
+
+Equivalent to "spill every function param to a stable home in the
+entry block, and treat it as the source of truth across all
+blocks." Cost: one alloca + one extra load per param use at -O0.
+LLVM's mem2reg removes them at higher opt levels.
+
+Static verifier (the alloca tracker the user asked for) sits on top
+of this fix: walk the LLVM IR post-codegen, assert every load from a
+Word-typed alloca is either (a) dominated by a store to the same
+alloca, or (b) is the post-safepoint reload + writeback. Catches
+this class of bug at compile time forever after.
 
 With two front-end hypotheses ruled out, the remaining suspects shift
 toward the runtime / collector layer (and were already listed in the
