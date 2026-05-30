@@ -321,6 +321,43 @@ define function emit-tokens (tokens, source :: <byte-string>) => ()
   end;
 end function;
 
+// ─── dylan-lex-collect — in-process JIT side-load entry ──────────────────
+//
+// Sprint 51b Phase B entry. Same classification + filtering as
+// `emit-tokens` but instead of writing to stdout it accumulates into a
+// `<stretchy-vector>` of integers — three per emitted token:
+// `kind, lo, hi`. The host (`src/nod-driver/src/dylan_lex_jit.rs`) walks
+// the vector pulling out triples and reconstructs `Vec<Token>`.
+//
+// Why three flat ints rather than a `<list>` of triples? Stretchy-
+// vectors of immediate integers are the cheapest readback shape:
+// `nod_stretchy_vector_size` + `nod_stretchy_vector_element` already
+// exist in the runtime ABI, and immediate-tagged integers unbox in
+// O(1) on the Rust side. A list-of-triples would force three pair
+// allocations per token plus a third-level structure walk.
+
+define function dylan-lex-collect (source :: <byte-string>)
+ => (records :: <object>)
+  let pre = preamble-end(source);
+  let tokens = lex(source);
+  let records = %make-stretchy-vector(64);
+  let n = %stretchy-vector-size(tokens);
+  let i = 0;
+  until (i = n)
+    let t = %stretchy-vector-element(tokens, i);
+    let lo = span-start(token-span(t));
+    if (token-emit?(t) & lo >= pre)
+      let hi = span-end(token-span(t));
+      let kind = token-rust-kind(t, source);
+      %stretchy-vector-push(records, kind);
+      %stretchy-vector-push(records, lo);
+      %stretchy-vector-push(records, hi);
+    end;
+    i := i + 1;
+  end;
+  records
+end function;
+
 // ─── main — read argv[1] as a path, lex, emit ────────────────────────────
 
 define function shim-main () => ()
