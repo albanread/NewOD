@@ -1806,6 +1806,41 @@ Two carved-off follow-ups remain (queued, not blocking):
     home-alloca treatment for `if` join values, not just function
     params.
 
+### Sprint 45c — stdlib ASCII byte predicates — landed
+
+Lift the byte-classification predicates the Dylan-side lexer was
+defining locally into `stdlib.dylan` so they're available to every
+Dylan source. Naming follows the Dylan tradition (`?`-suffix
+predicates) with an explicit `ascii-` qualifier so future
+`<character>` overloads (Sprint 42b territory) can sit alongside
+without renaming churn.
+
+New stdlib predicates, all taking `<integer>` (byte, 0..255):
+  `ascii-digit?`, `ascii-hex-digit?`, `ascii-bin-digit?`,
+  `ascii-oct-digit?`, `ascii-alpha?`, `ascii-alphanumeric?`,
+  `ascii-uppercase?`, `ascii-lowercase?`, `ascii-whitespace?`.
+
+The Dylan-side lexer's `is-ascii-digit?`, `is-ascii-alpha?`,
+`is-bin-digit?`, `is-oct-digit?`, `is-hex-digit?`, and
+`is-whitespace-byte?` are now thin aliases that delegate to the
+stdlib predicates. The Dylan-grammar-specific ones (`is-name-start?`,
+`is-name-cont?`, `is-name-cont-not-eq?`, `is-exponent-marker?`) stay
+in `dylan-lexer.dylan` — they encode the language's identifier
+alphabet, not generic ASCII.
+
+End-to-end smoke: `dump-dylan-tokens` over an input mixing
+identifiers, integers, `#xff` hex, `#b1010` binary, `#o755` octal,
+whitespace, comments, and punctuation — every byte-classification
+path through the new predicates fires correctly. Parser corpus still
+37 / 37.
+
+What 45c does NOT do (deferred to follow-ups):
+  * `<character>`-typed overloads — waits on Sprint 42b's
+    `<character>` class.
+  * Sprint 45d (oracle test against the Rust lexer) and 45e (wire
+    the Dylan lexer into IDE syntax colouring) — independent
+    sub-sprints that need their own gates.
+
 ---
 
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)

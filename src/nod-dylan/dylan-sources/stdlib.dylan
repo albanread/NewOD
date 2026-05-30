@@ -394,6 +394,59 @@ define method as-lowercase (s :: <byte-string>) => (out :: <byte-string>)
   out
 end method;
 
+// ─── Sprint 45c: ASCII byte predicates ────────────────────────────────────
+//
+// Shared by the Dylan-side lexer (Sprint 45b) and any future Dylan code
+// that wants to classify bytes (IDE syntax colourer, hand-rolled parsers
+// for config / `.prj` / log formats, etc). Each takes a byte (an
+// <integer> in 0..255) and returns a <boolean>. There is no
+// <character> class yet (Sprint 42b is queued for that) — when it
+// lands these will gain `<character>` overloads alongside.
+//
+// Naming follows the Dylan tradition: predicate-suffix `?`, ASCII
+// qualifier in the head so the same names can later carry full-Unicode
+// twins on `<character>` without renaming churn.
+
+define function ascii-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 48 & b <= 57           // '0'..'9'
+end function;
+
+define function ascii-hex-digit? (b :: <integer>) => (yes? :: <boolean>)
+  (b >= 48 & b <= 57)         // '0'..'9'
+    | (b >= 65 & b <= 70)     // 'A'..'F'
+    | (b >= 97 & b <= 102)    // 'a'..'f'
+end function;
+
+define function ascii-bin-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b = 48 | b = 49             // '0' | '1'
+end function;
+
+define function ascii-oct-digit? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 48 & b <= 55           // '0'..'7'
+end function;
+
+define function ascii-uppercase? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 65 & b <= 90           // 'A'..'Z'
+end function;
+
+define function ascii-lowercase? (b :: <integer>) => (yes? :: <boolean>)
+  b >= 97 & b <= 122          // 'a'..'z'
+end function;
+
+define function ascii-alpha? (b :: <integer>) => (yes? :: <boolean>)
+  (b >= 65 & b <= 90) | (b >= 97 & b <= 122)
+end function;
+
+define function ascii-alphanumeric? (b :: <integer>) => (yes? :: <boolean>)
+  (b >= 48 & b <= 57) | (b >= 65 & b <= 90) | (b >= 97 & b <= 122)
+end function;
+
+// Standard ASCII whitespace: space, tab, LF, CR, FF. Matches the C
+// `isspace` set minus VT (which Dylan source never uses meaningfully).
+define function ascii-whitespace? (b :: <integer>) => (yes? :: <boolean>)
+  b = 32 | b = 9 | b = 10 | b = 13 | b = 12
+end function;
+
 // ─── for-each macro ────────────────────────────────────────────────────────
 //
 // Sugar over the FIP primitives. Expands to a `let state = %fip-init(c);

@@ -696,26 +696,35 @@ end function;
 // lift into stdlib character predicates; the inline form is fine for
 // 45b and lets the lexer stay self-contained.
 
+// Sprint 45c — the bare byte-classification predicates moved to
+// `stdlib.dylan` (`ascii-digit?`, `ascii-alpha?`, `ascii-hex-digit?`,
+// `ascii-bin-digit?`, `ascii-oct-digit?`, `ascii-whitespace?`, etc).
+// The Dylan-grammar-specific predicates below (`is-name-start?`,
+// `is-name-cont?`, `is-exponent-marker?`) stay here — they encode
+// Dylan's identifier alphabet and exponent letters, not generic ASCII.
+//
+// Thin local aliases keep the lexer source diff small and the byte-
+// constant cross-reference (b = 48 etc) co-located with the Dylan
+// scanner code. If you remove a callee, prune its alias too.
+
 define function is-ascii-digit? (b :: <integer>) => (yes? :: <boolean>)
-  b >= 48 & b <= 57           // '0'..'9'
+  ascii-digit?(b)
 end function;
 
 define function is-ascii-alpha? (b :: <integer>) => (yes? :: <boolean>)
-  (b >= 65 & b <= 90) | (b >= 97 & b <= 122)   // A..Z | a..z
+  ascii-alpha?(b)
 end function;
 
 define function is-bin-digit? (b :: <integer>) => (yes? :: <boolean>)
-  b = 48 | b = 49             // '0' | '1'
+  ascii-bin-digit?(b)
 end function;
 
 define function is-oct-digit? (b :: <integer>) => (yes? :: <boolean>)
-  b >= 48 & b <= 55           // '0'..'7'
+  ascii-oct-digit?(b)
 end function;
 
 define function is-hex-digit? (b :: <integer>) => (yes? :: <boolean>)
-  is-ascii-digit?(b)
-    | (b >= 65 & b <= 70)     // 'A'..'F'
-    | (b >= 97 & b <= 102)    // 'a'..'f'
+  ascii-hex-digit?(b)
 end function;
 
 // Dylan's "name-start" alphabet: letters plus the punctuation graphics
@@ -773,7 +782,7 @@ end function;
 // `offset-to-line-col` separately tracks line breaks via its multi-
 // value return.
 define function is-whitespace-byte? (b :: <integer>) => (yes? :: <boolean>)
-  b = 32 | b = 9 | b = 10 | b = 13 | b = 12  // ' ' \t \n \r \f
+  ascii-whitespace?(b)
 end function;
 
 // ─── identifier classification: keyword vs ordinary ───────────────────────
