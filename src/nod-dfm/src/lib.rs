@@ -22,5 +22,8 @@ pub use ir::{
     Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp, SlotTypeKind,
     SafepointLocation, SafepointRootLocation, Temporary, TempId, Terminator, TypeEstimate,
 };
-pub use liveness::{SafepointError, populate_safepoint_roots, verify_safepoint_roots};
+pub use liveness::{
+    ArgRootCoverageGap, SafepointError, diagnose_arg_root_coverage, populate_safepoint_roots,
+    verify_safepoint_roots,
+};
 pub use verify::{VerifyError, verify};

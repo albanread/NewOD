@@ -290,6 +290,90 @@ pub enum SafepointError {
     TempDoesNotNeedProtection { call_dst: TempId, temp: TempId },
 }
 
+/// One per (function, block, computation-index, missing-arg) record.
+/// The `NOD_DIAG_ARG_ROOT_COVERAGE` probe (GAP-011 hypothesis) yields
+/// these for every call where a GC-typed argument is not in
+/// `safepoint_roots`. If non-empty after `populate_safepoint_roots`,
+/// the agent's hypothesis holds for those sites: the arg flows as a
+/// register/SSA value, the callee receives it before its own first
+/// safepoint, and if the callee allocates and triggers a moving GC,
+/// the arg becomes stale.
+#[derive(Clone, Debug)]
+pub struct ArgRootCoverageGap {
+    pub function: String,
+    pub block: BlockId,
+    pub computation_index: usize,
+    pub callee_label: String,
+    pub call_dst: TempId,
+    pub gc_typed_arg: TempId,
+    pub arg_type: crate::ir::TypeEstimate,
+    pub arg_position: usize,
+}
+
+/// Scan every potentially-allocating call in `f` and report each
+/// GC-typed argument that is NOT present in the call's
+/// `safepoint_roots`. Returns the gap list — empty means coverage is
+/// complete. Call AFTER `populate_safepoint_roots` so the roots
+/// reflect the final dataflow.
+///
+/// GAP-011 hypothesis (agent review, 2026-05-29): liveness correctly
+/// excludes args that are dead-after-call from `safepoint_roots` —
+/// the value is needed only as an operand TO the call and isn't used
+/// after the call returns. But if the callee is allocating and the
+/// arg is a GC pointer, the caller's slab doesn't track it; the
+/// value flows in a register; if a moving GC fires inside the
+/// callee before its first safepoint, the register-held arg goes
+/// stale. This probe enumerates those sites so we can decide whether
+/// the fix is (a) extend `populate_safepoint_roots` to always
+/// include GC-typed args, or (b) something callee-side.
+pub fn diagnose_arg_root_coverage(f: &Function) -> Vec<ArgRootCoverageGap> {
+    let temp_types: HashMap<TempId, crate::ir::TypeEstimate> =
+        f.temps.iter().map(|t| (t.id, t.type_estimate)).collect();
+    let mut out = Vec::new();
+    for block in &f.blocks {
+        for (c_idx, c) in block.computations.iter().enumerate() {
+            if !c.is_potentially_allocating_call() {
+                continue;
+            }
+            let Some(args) = c.call_args() else { continue };
+            let Some(roots) = c.safepoint_roots() else { continue };
+            let root_set: HashSet<TempId> = roots.iter().copied().collect();
+            let callee_label = match c {
+                Computation::DirectCall { callee, .. } => callee.clone(),
+                Computation::Call { callee, .. } => format!("<indirect t{}>", callee.0),
+                Computation::Dispatch { generic_name, .. } => format!("dispatch {generic_name}"),
+                Computation::SealedDirectCall { method, generic_name, .. } => {
+                    format!("sealed {method} (gf {generic_name})")
+                }
+                _ => "?".into(),
+            };
+            for (i, &arg) in args.iter().enumerate() {
+                let ty = temp_types
+                    .get(&arg)
+                    .copied()
+                    .unwrap_or(crate::ir::TypeEstimate::Top);
+                if !ty.needs_gc_protection() {
+                    continue;
+                }
+                if root_set.contains(&arg) {
+                    continue;
+                }
+                out.push(ArgRootCoverageGap {
+                    function: f.name.clone(),
+                    block: block.id,
+                    computation_index: c_idx,
+                    callee_label: callee_label.clone(),
+                    call_dst: c.dst(),
+                    gc_typed_arg: arg,
+                    arg_type: ty,
+                    arg_position: i,
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

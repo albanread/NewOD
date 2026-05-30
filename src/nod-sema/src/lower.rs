@@ -2225,6 +2225,56 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         nod_dfm::populate_safepoint_roots(f);
     }
 
+    // GAP-011 hypothesis probe (env-gated). Set
+    // `NOD_DIAG_ARG_ROOT_COVERAGE=1` to enumerate every call site
+    // where a GC-typed argument is NOT in `safepoint_roots`. The
+    // theory under test: liveness correctly omits args that are
+    // dead-after-call, but the value still flows in a register; a
+    // callee that allocates before its first safepoint can let GC
+    // move the object and leave the register stale. If the probe
+    // lights up inside `dump-node` / `acc-string` / their call chain,
+    // the fix is to extend `populate_safepoint_roots` to include all
+    // heap-typed call arguments regardless of post-call liveness.
+    // Set `NOD_DIAG_ARG_ROOT_COVERAGE=summary` to print only a
+    // function-level count, or `=full` (or `=1`) for one line per gap.
+    if let Ok(mode) = std::env::var("NOD_DIAG_ARG_ROOT_COVERAGE") {
+        let want_full = matches!(mode.as_str(), "1" | "full" | "true");
+        let mut total_gaps: usize = 0;
+        let mut funcs_with_gaps: usize = 0;
+        for f in &out {
+            let gaps = nod_dfm::diagnose_arg_root_coverage(f);
+            if gaps.is_empty() {
+                continue;
+            }
+            funcs_with_gaps += 1;
+            total_gaps += gaps.len();
+            eprintln!(
+                "[ARG-ROOT-COV] fn={} gaps={}",
+                f.name,
+                gaps.len()
+            );
+            if want_full {
+                for g in &gaps {
+                    eprintln!(
+                        "[ARG-ROOT-COV]   block=b{} c[{}] callee={} \
+                         dst=t{} arg=t{} arg_pos={} arg_type={:?}",
+                        g.block.0,
+                        g.computation_index,
+                        g.callee_label,
+                        g.call_dst.0,
+                        g.gc_typed_arg.0,
+                        g.arg_position,
+                        g.arg_type,
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[ARG-ROOT-COV] TOTAL functions_with_gaps={} gaps={}",
+            funcs_with_gaps, total_gaps,
+        );
+    }
+
     // Sprint 28: scan the AST for any call expression whose callee
     // is the name of a `define c-function` WHOSE signature couldn't
     // be derived (unsupported c-type, multi-value return, etc.). The

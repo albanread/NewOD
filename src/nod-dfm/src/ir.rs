@@ -690,6 +690,26 @@ impl Computation {
         }
     }
 
+    /// Returns the call argument list for call-shaped computations.
+    /// `None` for non-call computations. Used by the
+    /// `NOD_DIAG_ARG_ROOT_COVERAGE` probe to detect GAP-011-style
+    /// staleness: a GC-typed argument that's passed to a potentially
+    /// allocating callee but isn't tracked in `safepoint_roots`
+    /// (because liveness only sees it as dead-after-call).
+    ///
+    /// Note: the `callee` of `Computation::Call` is NOT included here;
+    /// that variant's callee is a TempId, not an arg. Callers who need
+    /// the callee should special-case it.
+    pub fn call_args(&self) -> Option<&[TempId]> {
+        match self {
+            Computation::DirectCall { args, .. }
+            | Computation::Call { args, .. }
+            | Computation::Dispatch { args, .. }
+            | Computation::SealedDirectCall { args, .. } => Some(args),
+            _ => None,
+        }
+    }
+
     /// True if this computation is a potentially-allocating call that
     /// needs GC root protection bracketing. Sprint 11b: `DirectCall`,
     /// `Call`, `Dispatch`, and Sprint 15's `SealedDirectCall` are the

@@ -1,12 +1,64 @@
 # GAP-011 — stale precise root: status & action list
 
-**Owner:** NewOpenDylan compiler side — but the front-end is now exonerated by
-measurement (see P0). The residual is in the runtime/collector layer.
-**Status:** OPEN. The liveness layer is fixed and front-end roots are complete;
-something downstream strands a registered vector root. Layer not yet located.
+**Owner:** NewOpenDylan compiler side — front-end **NOT** exonerated after all.
+The agent-review hypothesis was right: liveness omits GC-typed *arguments* that
+are dead-after-call, the value flows as a register/SSA operand into the callee,
+and a moving GC before the callee's first safepoint can leave it stale.
+**Status:** ROOT CAUSE IDENTIFIED (2026-05-30). The probe
+`NOD_DIAG_ARG_ROOT_COVERAGE=full` reports **104 gap sites in `dump-node`** and 1
+in `acc-string` against the parser source. The fix is to extend
+`populate_safepoint_roots` to include every heap-typed call argument regardless
+of post-call liveness.
 **Gating test:** `nod-driver parse-dylan F:\scratch\jcs-40.dylan` must exit **0**
 (today: exit 9, panic at `nod-runtime/src/collections.rs:1028`,
 `stretchy_vector_push: not a <stretchy-vector>`, zeroed/non-forwarded wrapper).
+
+## ROOT CAUSE — confirmed 2026-05-30
+
+The agent-review hypothesis is **proven**. The probe
+`NOD_DIAG_ARG_ROOT_COVERAGE` (env-gated diagnostic in
+`src/nod-sema/src/lower.rs` calling `nod_dfm::diagnose_arg_root_coverage`)
+enumerates every call site where a GC-typed argument is NOT in
+`safepoint_roots`. Run against the in-tree parser source
+(`dylan-parser.dylan` + `dylan-lexer.dylan`):
+
+```
+[ARG-ROOT-COV] TOTAL functions_with_gaps=137 gaps=1378
+[ARG-ROOT-COV] fn=dump-node gaps=104
+[ARG-ROOT-COV] fn=acc-string gaps=1
+[ARG-ROOT-COV] fn=main gaps=6
+```
+
+The most diagnostic example (`dump-node` block 53):
+```
+c[1] callee=dispatch punctuation-token-form  dst=t239 arg=t238 arg_pos=0 arg_type=Top
+c[2] callee=write-to-string                  dst=t240 arg=t239 arg_pos=0 arg_type=Top
+c[3] callee=acc-string                       dst=t241 arg=t240 arg_pos=1 arg_type=Top
+```
+
+`t240` is the freshly-allocated result of `write-to-string`; on the very next
+instruction it flows as `acc-string`'s second argument. `t240` is **not** in
+the call's `safepoint_roots` (liveness sees it dead-after-call, since the
+String-typed `t241` produced by `acc-string` supersedes it). The value flows
+as a register operand into `acc-string`; if a moving GC fires inside
+`acc-string` before its own first safepoint protects the register, the
+register holds a vacated address. `acc-string` is a hot path — every parser
+output byte goes through it. That's the stale pointer the crash sees on
+re-entry of `stretchy_vector_push`.
+
+Full per-site list saved to `GAP-011_arg_root_coverage_findings.log`.
+
+**Fix direction:** extend `populate_safepoint_roots` in
+`src/nod-dfm/src/liveness.rs` so that for every call computation whose
+`is_potentially_allocating_call()` is true, the GC-typed members of `args`
+are unconditionally added to `safepoint_roots`, *regardless of post-call
+liveness*. This keeps the caller's spill slab alive across the call so the
+GC sees and rewrites the arg slot; the codegen reload pattern then hands the
+callee the updated address through the register-spill round-trip.
+
+Liveness as it stands today (the pass introduced in commit `37e1f69`) is
+still correct for live-through preservation; this is an **additional**
+inclusion rule on top, narrowly targeting call arguments specifically.
 
 Repro in one command (from workspace root):
 ```sh

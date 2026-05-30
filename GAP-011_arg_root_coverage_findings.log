@@ -1,0 +1,1775 @@
+[ARG-ROOT-COV] fn=size$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_collection_size dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=concatenate$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_collection_concatenate dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_collection_concatenate dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=reduce$0_0_0 gaps=2
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_funcall2 dst=t11 arg=t4 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_funcall2 dst=t11 arg=t10 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=map$0_0 gaps=2
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_funcall1 dst=t13 arg=t12 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[2] callee=nod_sov_element_setter dst=t14 arg=t13 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=do$0_0 gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_funcall1 dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=size$1045 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_size dst=t1 arg=t0 arg_pos=0 arg_type=Class(1045)
+[ARG-ROOT-COV] fn=element$1045_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_table_element_or_default dst=t3 arg=t0 arg_pos=0 arg_type=Class(1045)
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_table_element_or_default dst=t3 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=element-setter$0_1045_0 gaps=3
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_element_setter dst=t3 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_element_setter dst=t3 arg=t1 arg_pos=1 arg_type=Class(1045)
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_element_setter dst=t3 arg=t2 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=remove-key!$1045_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_remove_key dst=t2 arg=t0 arg_pos=0 arg_type=Class(1045)
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_remove_key dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=keys$1045 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_keys dst=t1 arg=t0 arg_pos=0 arg_type=Class(1045)
+[ARG-ROOT-COV] fn=values$1045 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_table_values dst=t1 arg=t0 arg_pos=0 arg_type=Class(1045)
+[ARG-ROOT-COV] fn=object-hash$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_object_hash dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=object-equal?$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_object_equal_p dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_object_equal_p dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=size$8 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_byte_string_size dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=element$8_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_byte_string_element dst=t2 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_byte_string_element dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=element-setter$0_8_0 gaps=3
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_byte_string_element_setter dst=t3 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_byte_string_element_setter dst=t3 arg=t1 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_byte_string_element_setter dst=t3 arg=t2 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=concatenate$8_8 gaps=2
+[ARG-ROOT-COV]   block=b0 c[6] callee=nod_byte_string_copy_bytes dst=t8 arg=t0 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[8] callee=nod_byte_string_copy_bytes dst=t10 arg=t1 arg_pos=2 arg_type=String
+[ARG-ROOT-COV] fn=copy-sequence$8 gaps=1
+[ARG-ROOT-COV]   block=b0 c[4] callee=nod_byte_string_copy_bytes dst=t5 arg=t0 arg_pos=2 arg_type=String
+[ARG-ROOT-COV] fn=copy-sequence$8_0_0 gaps=2
+[ARG-ROOT-COV]   block=b12 c[3] callee=nod_byte_string_copy_bytes dst=t31 arg=t27 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[3] callee=nod_byte_string_copy_bytes dst=t31 arg=t26 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV] fn=subsequence$8 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=copy-sequence$8 dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=subsequence$8_0_0 gaps=3
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch copy-sequence dst=t3 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch copy-sequence dst=t3 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch copy-sequence dst=t3 arg=t2 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=find-substring$8_8 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=find-substring$8_8_1 dst=t3 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[1] callee=find-substring$8_8_1 dst=t3 arg=t1 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=as-wndproc-callback$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_register_wndproc dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=as-wndenumproc-callback$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_register_wndenumproc dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=point-x$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=point-x-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=point-y$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=point-y-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=rect-left$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=rect-left-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=rect-top$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=rect-top-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=rect-right$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=rect-right-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=rect-bottom$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=rect-bottom-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=size-cx$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=size-cx-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=size-cy$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=size-cy-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=filetime-low$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=filetime-low-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=filetime-high$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=filetime-high-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-year$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-year-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-month$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-month-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-day-of-week$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-day-of-week-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-day$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-day-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-hour$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-hour-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-minute$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-minute-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-second$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-second-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-milliseconds$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u16 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=systemtime-milliseconds-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u16 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-hwnd$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_pointer dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-hwnd-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-message$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-message-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-wparam$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u64 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-wparam-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u64 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u64 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-lparam$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i64 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-lparam-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i64 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i64 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-time$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-time-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-pt-x$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-pt-x-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-pt-y$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-pt-y-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=msg-lprivate$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=msg-lprivate-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-cbSize$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-cbSize-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-style$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_u32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-style-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_u32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-lpfnWndProc$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_pointer dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-lpfnWndProc-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-hInstance$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_pointer dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-hInstance-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-lpszClassName$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_pointer dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=wndclassexw-lpszClassName-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-hdc$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_pointer dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-hdc-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_pointer dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-fErase$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-fErase-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-left$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-left-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-top$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-top-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-right$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-right-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-bottom$0 gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_get_i32 dst=t2 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=paintstruct-rc-bottom-setter$0_0 gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_struct_set_i32 dst=t3 arg=t0 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-string-stream gaps=3
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t4 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t4 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t4 arg=t3 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=write-byte$1080_1 gaps=2
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch string-stream-bytes dst=t2 arg=t0 arg_pos=0 arg_type=Class(1080)
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_stretchy_vector_push dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=as-byte-string$1080 gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_byte_string_element_setter dst=t12 arg=t11 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] TOTAL functions_with_gaps=101 gaps=157
+[ARG-ROOT-COV] fn=span-text$1081_8 gaps=4
+[ARG-ROOT-COV]   block=b0 c[1] callee=dispatch span-end dst=t3 arg=t0 arg_pos=0 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch copy-sequence dst=t4 arg=t1 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch copy-sequence dst=t4 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch copy-sequence dst=t4 arg=t3 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=token-source-text$1082_8 gaps=3
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch token-span dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=dispatch span-text dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[1] callee=dispatch span-text dst=t3 arg=t1 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=print-token$1082_8_1080 gaps=10
+[ARG-ROOT-COV]   block=b0 c[3] callee=offset-to-line-col dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[8] callee=offset-to-line-col dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[14] callee=dispatch write-byte dst=t17 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[18] callee=dispatch write-string dst=t21 arg=t19 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[18] callee=dispatch write-string dst=t21 arg=t20 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[21] callee=dispatch write-string dst=t24 arg=t22 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[21] callee=dispatch write-string dst=t24 arg=t23 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[2] callee=dispatch write-string dst=t29 arg=t27 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[2] callee=dispatch write-string dst=t29 arg=t28 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b1 c[4] callee=write-escaped-source-text-to-dump-stream dst=t31 arg=t30 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=write-line-col gaps=3
+[ARG-ROOT-COV]   block=b0 c[1] callee=dispatch write-string dst=t4 arg=t3 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[5] callee=dispatch write-string dst=t8 arg=t0 arg_pos=0 arg_type=Class(1080)
+[ARG-ROOT-COV]   block=b0 c[5] callee=dispatch write-string dst=t8 arg=t7 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=write-line-col-to-dump-stream gaps=5
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch write-string dst=t4 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch write-string dst=t4 arg=t3 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[5] callee=dispatch write-byte dst=t7 arg=t5 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[8] callee=dispatch write-string dst=t10 arg=t8 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[8] callee=dispatch write-string dst=t10 arg=t9 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=write-escaped-source-text gaps=5
+[ARG-ROOT-COV]   block=b4 c[1] callee=dispatch write-string dst=t13 arg=t12 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[1] callee=dispatch write-string dst=t17 arg=t16 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[1] callee=dispatch write-string dst=t21 arg=t20 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[1] callee=dispatch write-string dst=t25 arg=t24 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[1] callee=dispatch write-string dst=t29 arg=t28 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=write-escaped-source-text-to-dump-stream gaps=11
+[ARG-ROOT-COV]   block=b4 c[2] callee=dispatch write-string dst=t12 arg=t10 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[2] callee=dispatch write-string dst=t12 arg=t11 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[2] callee=dispatch write-string dst=t17 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=dispatch write-string dst=t17 arg=t16 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[2] callee=dispatch write-string dst=t22 arg=t20 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[2] callee=dispatch write-string dst=t22 arg=t21 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[2] callee=dispatch write-string dst=t27 arg=t25 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[2] callee=dispatch write-string dst=t27 arg=t26 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[2] callee=dispatch write-string dst=t32 arg=t30 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[2] callee=dispatch write-string dst=t32 arg=t31 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b13 c[1] callee=dispatch write-byte dst=t34 arg=t33 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=print-token-to-string gaps=6
+[ARG-ROOT-COV]   block=b0 c[2] callee=nod_var_set_by_name dst=t4 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=nod_var_set_by_name dst=t4 arg=t3 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch print-token dst=t6 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch print-token dst=t6 arg=t1 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch print-token dst=t6 arg=t5 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[6] callee=dispatch as-byte-string dst=t8 arg=t7 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=dump-tokens gaps=8
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_set_by_name dst=t3 arg=t2 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[3] callee=nod_stretchy_vector_size dst=t5 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_stretchy_vector_element dst=t15 arg=t14 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[2] callee=print-token-to-string dst=t16 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[3] callee=sealed concatenate$8_8 (gf concatenate) dst=t17 arg=t8 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b2 c[3] callee=sealed concatenate$8_8 (gf concatenate) dst=t17 arg=t16 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b2 c[5] callee=dispatch concatenate dst=t19 arg=t17 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[5] callee=dispatch concatenate dst=t19 arg=t18 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=*src* gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_get_by_name dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=*pos* gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_get_by_name dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=*tokens* gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_get_by_name dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=*dump-stream* gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_get_by_name dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=at-end? gaps=1
+[ARG-ROOT-COV]   block=b0 c[2] callee=nod_byte_string_size dst=t2 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=peek-at gaps=2
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_byte_string_size dst=t6 arg=t5 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_byte_string_element dst=t10 arg=t9 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=advance gaps=1
+[ARG-ROOT-COV]   block=b0 c[3] callee=nod_var_set_by_name dst=t4 arg=t3 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=classify-keyword gaps=63
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_object_equal_p dst=t2 arg=t1 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_object_equal_p dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t8 arg=t7 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[1] callee=nod_object_equal_p dst=t14 arg=t13 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t17 arg=t16 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[1] callee=nod_object_equal_p dst=t20 arg=t19 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b14 c[1] callee=nod_object_equal_p dst=t23 arg=t22 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b16 c[1] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b18 c[1] callee=nod_object_equal_p dst=t29 arg=t28 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b20 c[1] callee=nod_object_equal_p dst=t32 arg=t31 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b22 c[1] callee=nod_object_equal_p dst=t35 arg=t34 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b24 c[1] callee=nod_object_equal_p dst=t38 arg=t37 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b26 c[1] callee=nod_object_equal_p dst=t41 arg=t40 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b28 c[1] callee=nod_object_equal_p dst=t44 arg=t43 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b30 c[1] callee=nod_object_equal_p dst=t47 arg=t46 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b32 c[1] callee=nod_object_equal_p dst=t50 arg=t49 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b34 c[1] callee=nod_object_equal_p dst=t53 arg=t52 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b36 c[1] callee=nod_object_equal_p dst=t56 arg=t55 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b38 c[1] callee=nod_object_equal_p dst=t59 arg=t58 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b40 c[1] callee=nod_object_equal_p dst=t62 arg=t61 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b42 c[1] callee=nod_object_equal_p dst=t65 arg=t64 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b44 c[1] callee=nod_object_equal_p dst=t68 arg=t67 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b46 c[1] callee=nod_object_equal_p dst=t71 arg=t70 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b48 c[1] callee=nod_object_equal_p dst=t74 arg=t73 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b50 c[1] callee=nod_object_equal_p dst=t77 arg=t76 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b52 c[1] callee=nod_object_equal_p dst=t80 arg=t79 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b54 c[1] callee=nod_object_equal_p dst=t83 arg=t82 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b56 c[1] callee=nod_object_equal_p dst=t86 arg=t85 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b58 c[1] callee=nod_object_equal_p dst=t89 arg=t88 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b60 c[1] callee=nod_object_equal_p dst=t92 arg=t91 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b62 c[1] callee=nod_object_equal_p dst=t95 arg=t94 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b64 c[1] callee=nod_object_equal_p dst=t98 arg=t97 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b66 c[1] callee=nod_object_equal_p dst=t101 arg=t100 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b68 c[1] callee=nod_object_equal_p dst=t104 arg=t103 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b70 c[1] callee=nod_object_equal_p dst=t107 arg=t106 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b72 c[1] callee=nod_object_equal_p dst=t110 arg=t109 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b74 c[1] callee=nod_object_equal_p dst=t113 arg=t112 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b76 c[1] callee=nod_object_equal_p dst=t116 arg=t115 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b78 c[1] callee=nod_object_equal_p dst=t119 arg=t118 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b80 c[1] callee=nod_object_equal_p dst=t122 arg=t121 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b82 c[1] callee=nod_object_equal_p dst=t125 arg=t124 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b84 c[1] callee=nod_object_equal_p dst=t128 arg=t127 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b86 c[1] callee=nod_object_equal_p dst=t131 arg=t130 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b88 c[1] callee=nod_object_equal_p dst=t134 arg=t133 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b90 c[1] callee=nod_object_equal_p dst=t137 arg=t136 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b92 c[1] callee=nod_object_equal_p dst=t140 arg=t139 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b94 c[1] callee=nod_object_equal_p dst=t143 arg=t142 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b96 c[1] callee=nod_object_equal_p dst=t146 arg=t145 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b98 c[1] callee=nod_object_equal_p dst=t149 arg=t148 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b100 c[1] callee=nod_object_equal_p dst=t152 arg=t151 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b102 c[1] callee=nod_object_equal_p dst=t155 arg=t154 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b104 c[1] callee=nod_object_equal_p dst=t158 arg=t157 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b106 c[1] callee=nod_object_equal_p dst=t161 arg=t160 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b108 c[1] callee=nod_object_equal_p dst=t164 arg=t163 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b110 c[1] callee=nod_object_equal_p dst=t167 arg=t166 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b112 c[1] callee=nod_object_equal_p dst=t170 arg=t169 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b114 c[1] callee=nod_object_equal_p dst=t173 arg=t172 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b116 c[1] callee=nod_object_equal_p dst=t176 arg=t175 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b118 c[1] callee=nod_object_equal_p dst=t179 arg=t178 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b120 c[1] callee=nod_object_equal_p dst=t182 arg=t181 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b122 c[1] callee=nod_object_equal_p dst=t185 arg=t184 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b124 c[1] callee=nod_object_equal_p dst=t188 arg=t187 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=span-here gaps=4
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t3 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t4 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV] fn=slice-from gaps=2
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch copy-sequence dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=dispatch copy-sequence dst=t3 arg=t2 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=scan-whitespace gaps=3
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t11 arg=t8 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t11 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t11 arg=t10 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV] fn=scan-line-comment gaps=6
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t15 arg=t8 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t15 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t15 arg=t10 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t15 arg=t11 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t15 arg=t12 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t15 arg=t13 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV] fn=scan-block-comment gaps=11
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t29 arg=t22 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t29 arg=t23 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t29 arg=t24 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t29 arg=t25 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t29 arg=t26 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t29 arg=t27 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t35 arg=t30 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t35 arg=t31 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t35 arg=t32 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t35 arg=t33 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t35 arg=t34 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-string gaps=23
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t12 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t14 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t15 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t16 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b9 c[1] callee=nod_byte_string_element_setter dst=t33 arg=t32 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t37 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t38 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t39 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t40 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t41 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t42 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[7] callee=%make dst=t43 arg=t27 arg_pos=6 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t52 arg=t47 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t52 arg=t48 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t52 arg=t49 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t52 arg=t50 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t52 arg=t51 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t64 arg=t59 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t64 arg=t60 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t64 arg=t61 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t64 arg=t62 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t64 arg=t63 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-character gaps=15
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t6 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t7 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t8 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t16 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t17 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t18 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t19 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t20 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t32 arg=t27 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t32 arg=t28 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t32 arg=t29 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t32 arg=t30 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t32 arg=t31 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-character-close gaps=9
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t12 arg=t7 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t12 arg=t8 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t12 arg=t9 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t12 arg=t10 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t12 arg=t11 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[6] callee=%make dst=t19 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[6] callee=%make dst=t19 arg=t16 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[6] callee=%make dst=t19 arg=t17 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b5 c[6] callee=%make dst=t19 arg=t18 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV] fn=scan-float-suffix gaps=15
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t70 arg=t65 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t70 arg=t66 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t70 arg=t67 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t70 arg=t68 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[5] callee=%make dst=t70 arg=t69 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b27 c[5] callee=%make dst=t45 arg=t40 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b27 c[5] callee=%make dst=t45 arg=t41 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b27 c[5] callee=%make dst=t45 arg=t42 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b27 c[5] callee=%make dst=t45 arg=t43 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b27 c[5] callee=%make dst=t45 arg=t44 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b37 c[6] callee=%make dst=t63 arg=t58 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b37 c[6] callee=%make dst=t63 arg=t59 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b37 c[6] callee=%make dst=t63 arg=t60 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b37 c[6] callee=%make dst=t63 arg=t61 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b37 c[6] callee=%make dst=t63 arg=t62 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-integer gaps=20
+[ARG-ROOT-COV]   block=b83 c[6] callee=%make dst=t141 arg=t136 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b83 c[6] callee=%make dst=t141 arg=t137 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b83 c[6] callee=%make dst=t141 arg=t138 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b83 c[6] callee=%make dst=t141 arg=t139 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b83 c[6] callee=%make dst=t141 arg=t140 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b94 c[6] callee=%make dst=t160 arg=t155 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b94 c[6] callee=%make dst=t160 arg=t156 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b94 c[6] callee=%make dst=t160 arg=t157 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b94 c[6] callee=%make dst=t160 arg=t158 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b94 c[6] callee=%make dst=t160 arg=t159 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b95 c[5] callee=%make dst=t166 arg=t161 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b95 c[5] callee=%make dst=t166 arg=t162 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b95 c[5] callee=%make dst=t166 arg=t163 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b95 c[5] callee=%make dst=t166 arg=t164 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b95 c[5] callee=%make dst=t166 arg=t165 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b96 c[6] callee=%make dst=t173 arg=t167 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[6] callee=%make dst=t173 arg=t168 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[6] callee=%make dst=t173 arg=t169 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b96 c[6] callee=%make dst=t173 arg=t170 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[6] callee=%make dst=t173 arg=t171 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV] fn=scan-radix-integer gaps=10
+[ARG-ROOT-COV]   block=b40 c[5] callee=%make dst=t79 arg=t74 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[5] callee=%make dst=t79 arg=t75 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[5] callee=%make dst=t79 arg=t76 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b40 c[5] callee=%make dst=t79 arg=t77 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[5] callee=%make dst=t79 arg=t78 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[5] callee=%make dst=t85 arg=t80 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[5] callee=%make dst=t85 arg=t81 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[5] callee=%make dst=t85 arg=t82 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b41 c[5] callee=%make dst=t85 arg=t83 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[5] callee=%make dst=t85 arg=t84 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-identifier gaps=14
+[ARG-ROOT-COV]   block=b16 c[6] callee=dispatch copy-sequence dst=t30 arg=t26 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[11] callee=%make dst=t35 arg=t31 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[11] callee=%make dst=t35 arg=t32 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[11] callee=%make dst=t35 arg=t33 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b16 c[11] callee=%make dst=t35 arg=t34 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[11] callee=%make dst=t35 arg=t30 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[4] callee=%make dst=t42 arg=t38 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[4] callee=%make dst=t42 arg=t39 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[4] callee=%make dst=t42 arg=t40 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b18 c[4] callee=%make dst=t42 arg=t41 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t47 arg=t43 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t47 arg=t44 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t47 arg=t45 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t47 arg=t46 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV] fn=scan-hash gaps=67
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t6 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t7 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t9 arg=t8 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t23 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t23 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t23 arg=t20 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t23 arg=t21 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t36 arg=t31 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t36 arg=t32 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t36 arg=t33 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t36 arg=t34 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t44 arg=t41 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t44 arg=t42 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t44 arg=t43 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t52 arg=t49 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t52 arg=t50 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[5] callee=%make dst=t52 arg=t51 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b34 c[7] callee=%make dst=t92 arg=t87 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[7] callee=%make dst=t92 arg=t88 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[7] callee=%make dst=t92 arg=t89 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b34 c[7] callee=%make dst=t92 arg=t90 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[7] callee=%make dst=t92 arg=t91 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b36 c[7] callee=%make dst=t102 arg=t97 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b36 c[7] callee=%make dst=t102 arg=t98 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b36 c[7] callee=%make dst=t102 arg=t99 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b36 c[7] callee=%make dst=t102 arg=t100 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b36 c[7] callee=%make dst=t102 arg=t101 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t185 arg=t180 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t185 arg=t181 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t185 arg=t182 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t185 arg=t183 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t185 arg=t184 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b47 c[3] callee=nod_object_equal_p dst=t120 arg=t119 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b48 c[5] callee=%make dst=t126 arg=t121 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[5] callee=%make dst=t126 arg=t122 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[5] callee=%make dst=t126 arg=t123 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b48 c[5] callee=%make dst=t126 arg=t124 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[5] callee=%make dst=t126 arg=t125 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b49 c[1] callee=nod_object_equal_p dst=t128 arg=t127 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b50 c[5] callee=%make dst=t134 arg=t129 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[5] callee=%make dst=t134 arg=t130 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[5] callee=%make dst=t134 arg=t131 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b50 c[5] callee=%make dst=t134 arg=t132 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[5] callee=%make dst=t134 arg=t133 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b51 c[1] callee=nod_object_equal_p dst=t136 arg=t135 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b52 c[5] callee=%make dst=t142 arg=t137 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b52 c[5] callee=%make dst=t142 arg=t138 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b52 c[5] callee=%make dst=t142 arg=t139 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b52 c[5] callee=%make dst=t142 arg=t140 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b52 c[5] callee=%make dst=t142 arg=t141 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b53 c[1] callee=nod_object_equal_p dst=t144 arg=t143 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b54 c[5] callee=%make dst=t150 arg=t145 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[5] callee=%make dst=t150 arg=t146 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[5] callee=%make dst=t150 arg=t147 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b54 c[5] callee=%make dst=t150 arg=t148 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[5] callee=%make dst=t150 arg=t149 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b55 c[1] callee=nod_object_equal_p dst=t152 arg=t151 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b56 c[3] callee=%make dst=t156 arg=t153 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b56 c[3] callee=%make dst=t156 arg=t154 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b56 c[3] callee=%make dst=t156 arg=t155 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b57 c[5] callee=%make dst=t162 arg=t157 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b57 c[5] callee=%make dst=t162 arg=t158 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b57 c[5] callee=%make dst=t162 arg=t159 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b57 c[5] callee=%make dst=t162 arg=t160 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b57 c[5] callee=%make dst=t162 arg=t161 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-hash-symbol gaps=16
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t12 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t14 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t15 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t17 arg=t16 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b9 c[1] callee=nod_byte_string_element_setter dst=t33 arg=t32 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[5] callee=%make dst=t41 arg=t37 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[5] callee=%make dst=t41 arg=t38 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[5] callee=%make dst=t41 arg=t39 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b10 c[5] callee=%make dst=t41 arg=t40 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[5] callee=%make dst=t41 arg=t29 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t50 arg=t45 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t50 arg=t46 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t50 arg=t47 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t50 arg=t48 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=%make dst=t50 arg=t49 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-hash-colon-symbol gaps=11
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t13 arg=t8 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t13 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t13 arg=t10 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t13 arg=t11 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[5] callee=%make dst=t13 arg=t12 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b11 c[1] callee=slice-from dst=t25 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[6] callee=%make dst=t30 arg=t26 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[6] callee=%make dst=t30 arg=t27 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[6] callee=%make dst=t30 arg=t28 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b11 c[6] callee=%make dst=t30 arg=t29 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[6] callee=%make dst=t30 arg=t25 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=scan-tilde gaps=15
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t21 arg=t16 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t21 arg=t17 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t21 arg=t18 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t21 arg=t19 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t21 arg=t20 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[7] callee=%make dst=t35 arg=t30 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[7] callee=%make dst=t35 arg=t31 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[7] callee=%make dst=t35 arg=t32 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b12 c[7] callee=%make dst=t35 arg=t33 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[7] callee=%make dst=t35 arg=t34 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t41 arg=t36 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t41 arg=t37 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t41 arg=t38 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t41 arg=t39 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t41 arg=t40 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV] fn=scan-less-or-ident gaps=10
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t16 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t17 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t18 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t19 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t21 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t22 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t23 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t24 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t25 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV] fn=scan-greater-or-ident gaps=10
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t16 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t17 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t18 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[7] callee=%make dst=t20 arg=t19 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t21 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t22 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t23 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t24 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=%make dst=t26 arg=t25 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV] fn=scan-punctuation gaps=105
+[ARG-ROOT-COV]   block=b1 c[7] callee=%make dst=t11 arg=t6 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[7] callee=%make dst=t11 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[7] callee=%make dst=t11 arg=t8 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b1 c[7] callee=%make dst=t11 arg=t9 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[7] callee=%make dst=t11 arg=t10 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t16 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t17 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t18 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t19 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[7] callee=%make dst=t21 arg=t20 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[7] callee=%make dst=t31 arg=t26 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[7] callee=%make dst=t31 arg=t27 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[7] callee=%make dst=t31 arg=t28 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b5 c[7] callee=%make dst=t31 arg=t29 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[7] callee=%make dst=t31 arg=t30 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t41 arg=t36 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t41 arg=t37 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t41 arg=t38 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t41 arg=t39 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[7] callee=%make dst=t41 arg=t40 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[7] callee=%make dst=t51 arg=t46 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[7] callee=%make dst=t51 arg=t47 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[7] callee=%make dst=t51 arg=t48 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b9 c[7] callee=%make dst=t51 arg=t49 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[7] callee=%make dst=t51 arg=t50 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t61 arg=t56 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t61 arg=t57 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t61 arg=t58 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t61 arg=t59 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[7] callee=%make dst=t61 arg=t60 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t71 arg=t66 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t71 arg=t67 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t71 arg=t68 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t71 arg=t69 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[7] callee=%make dst=t71 arg=t70 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[7] callee=%make dst=t81 arg=t76 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[7] callee=%make dst=t81 arg=t77 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[7] callee=%make dst=t81 arg=t78 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b15 c[7] callee=%make dst=t81 arg=t79 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[7] callee=%make dst=t81 arg=t80 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[7] callee=%make dst=t100 arg=t95 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[7] callee=%make dst=t100 arg=t96 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[7] callee=%make dst=t100 arg=t97 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b22 c[7] callee=%make dst=t100 arg=t98 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[7] callee=%make dst=t100 arg=t99 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[7] callee=%make dst=t112 arg=t107 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[7] callee=%make dst=t112 arg=t108 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[7] callee=%make dst=t112 arg=t109 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b25 c[7] callee=%make dst=t112 arg=t110 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[7] callee=%make dst=t112 arg=t111 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[7] callee=%make dst=t128 arg=t123 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[7] callee=%make dst=t128 arg=t124 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[7] callee=%make dst=t128 arg=t125 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b30 c[7] callee=%make dst=t128 arg=t126 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[7] callee=%make dst=t128 arg=t127 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[7] callee=%make dst=t140 arg=t135 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[7] callee=%make dst=t140 arg=t136 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[7] callee=%make dst=t140 arg=t137 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b32 c[7] callee=%make dst=t140 arg=t138 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[7] callee=%make dst=t140 arg=t139 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b33 c[7] callee=%make dst=t148 arg=t143 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b33 c[7] callee=%make dst=t148 arg=t144 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b33 c[7] callee=%make dst=t148 arg=t145 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b33 c[7] callee=%make dst=t148 arg=t146 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b33 c[7] callee=%make dst=t148 arg=t147 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[7] callee=%make dst=t164 arg=t159 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[7] callee=%make dst=t164 arg=t160 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[7] callee=%make dst=t164 arg=t161 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b38 c[7] callee=%make dst=t164 arg=t162 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[7] callee=%make dst=t164 arg=t163 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[7] callee=%make dst=t176 arg=t171 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[7] callee=%make dst=t176 arg=t172 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[7] callee=%make dst=t176 arg=t173 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b40 c[7] callee=%make dst=t176 arg=t174 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[7] callee=%make dst=t176 arg=t175 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t184 arg=t179 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t184 arg=t180 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t184 arg=t181 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t184 arg=t182 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b41 c[7] callee=%make dst=t184 arg=t183 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b45 c[7] callee=%make dst=t243 arg=t238 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b45 c[7] callee=%make dst=t243 arg=t239 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b45 c[7] callee=%make dst=t243 arg=t240 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b45 c[7] callee=%make dst=t243 arg=t241 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b45 c[7] callee=%make dst=t243 arg=t242 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b46 c[7] callee=%make dst=t200 arg=t195 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b46 c[7] callee=%make dst=t200 arg=t196 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b46 c[7] callee=%make dst=t200 arg=t197 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b46 c[7] callee=%make dst=t200 arg=t198 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b46 c[7] callee=%make dst=t200 arg=t199 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[7] callee=%make dst=t212 arg=t207 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[7] callee=%make dst=t212 arg=t208 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[7] callee=%make dst=t212 arg=t209 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b48 c[7] callee=%make dst=t212 arg=t210 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[7] callee=%make dst=t212 arg=t211 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[7] callee=%make dst=t224 arg=t219 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[7] callee=%make dst=t224 arg=t220 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[7] callee=%make dst=t224 arg=t221 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b50 c[7] callee=%make dst=t224 arg=t222 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[7] callee=%make dst=t224 arg=t223 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b51 c[7] callee=%make dst=t232 arg=t227 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b51 c[7] callee=%make dst=t232 arg=t228 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b51 c[7] callee=%make dst=t232 arg=t229 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b51 c[7] callee=%make dst=t232 arg=t230 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b51 c[7] callee=%make dst=t232 arg=t231 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV] fn=next-token gaps=39
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t5 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t5 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t5 arg=t4 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b50 c[4] callee=%make dst=t89 arg=t85 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[4] callee=%make dst=t89 arg=t86 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[4] callee=%make dst=t89 arg=t87 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b50 c[4] callee=%make dst=t89 arg=t88 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[4] callee=%make dst=t89 arg=t83 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b89 c[7] callee=%make dst=t150 arg=t145 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b89 c[7] callee=%make dst=t150 arg=t146 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b89 c[7] callee=%make dst=t150 arg=t147 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b89 c[7] callee=%make dst=t150 arg=t148 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b89 c[7] callee=%make dst=t150 arg=t149 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b91 c[7] callee=%make dst=t160 arg=t155 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b91 c[7] callee=%make dst=t160 arg=t156 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b91 c[7] callee=%make dst=t160 arg=t157 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b91 c[7] callee=%make dst=t160 arg=t158 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b91 c[7] callee=%make dst=t160 arg=t159 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b93 c[7] callee=%make dst=t170 arg=t165 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b93 c[7] callee=%make dst=t170 arg=t166 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b93 c[7] callee=%make dst=t170 arg=t167 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b93 c[7] callee=%make dst=t170 arg=t168 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b93 c[7] callee=%make dst=t170 arg=t169 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[7] callee=%make dst=t215 arg=t210 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[7] callee=%make dst=t215 arg=t211 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[7] callee=%make dst=t215 arg=t212 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b96 c[7] callee=%make dst=t215 arg=t213 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b96 c[7] callee=%make dst=t215 arg=t214 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b100 c[5] callee=%make dst=t186 arg=t181 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b100 c[5] callee=%make dst=t186 arg=t182 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b100 c[5] callee=%make dst=t186 arg=t183 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b100 c[5] callee=%make dst=t186 arg=t184 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b100 c[5] callee=%make dst=t186 arg=t185 arg_pos=4 arg_type=String
+[ARG-ROOT-COV]   block=b107 c[5] callee=slice-from dst=t204 arg=t189 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b107 c[6] callee=%make dst=t205 arg=t200 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b107 c[6] callee=%make dst=t205 arg=t201 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b107 c[6] callee=%make dst=t205 arg=t202 arg_pos=2 arg_type=Class(1081)
+[ARG-ROOT-COV]   block=b107 c[6] callee=%make dst=t205 arg=t203 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b107 c[6] callee=%make dst=t205 arg=t204 arg_pos=4 arg_type=String
+[ARG-ROOT-COV] fn=lex-into gaps=1
+[ARG-ROOT-COV]   block=b2 c[2] callee=nod_stretchy_vector_push dst=t4 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=lex gaps=5
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_set_by_name dst=t2 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[1] callee=nod_var_set_by_name dst=t2 arg=t1 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[4] callee=nod_var_set_by_name dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[8] callee=nod_var_set_by_name dst=t9 arg=t7 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[8] callee=nod_var_set_by_name dst=t9 arg=t8 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=rope-size$1104 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch rope-leaf-len dst=t1 arg=t0 arg_pos=0 arg_type=Class(1104)
+[ARG-ROOT-COV] fn=rope-size$1105 gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=dispatch rope-node-total dst=t1 arg=t0 arg_pos=0 arg_type=Class(1105)
+[ARG-ROOT-COV] fn=rope-concatenate$1103_1103 gaps=5
+[ARG-ROOT-COV]   block=b4 c[6] callee=%make dst=t14 arg=t8 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[6] callee=%make dst=t14 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[6] callee=%make dst=t14 arg=t10 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[6] callee=%make dst=t14 arg=t11 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[6] callee=%make dst=t14 arg=t12 arg_pos=7 arg_type=Top
+[ARG-ROOT-COV] fn=rope-copy-into$1104_1_1_8_1 gaps=1
+[ARG-ROOT-COV]   block=b7 c[2] callee=nod_byte_string_copy_bytes dst=t21 arg=t19 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=rope-copy-into$1105_1_1_8_1 gaps=3
+[ARG-ROOT-COV]   block=b5 c[1] callee=dispatch rope-copy-into dst=t13 arg=t12 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[1] callee=dispatch rope-copy-into dst=t13 arg=t8 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[3] callee=dispatch rope-copy-into dst=t31 arg=t29 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=rope-substring gaps=1
+[ARG-ROOT-COV]   block=b0 c[3] callee=dispatch rope-copy-into dst=t6 arg=t0 arg_pos=0 arg_type=Class(1103)
+[ARG-ROOT-COV] fn=rope->string gaps=2
+[ARG-ROOT-COV]   block=b0 c[2] callee=rope-substring dst=t3 arg=t0 arg_pos=0 arg_type=Class(1103)
+[ARG-ROOT-COV]   block=b0 c[2] callee=rope-substring dst=t3 arg=t2 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=make-rope-from-string gaps=7
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t7 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t7 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t7 arg=t6 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[4] callee=make-rope-from-string dst=t12 arg=t11 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[6] callee=make-rope-from-string dst=t14 arg=t13 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[7] callee=dispatch rope-concatenate dst=t15 arg=t12 arg_pos=0 arg_type=Class(1103)
+[ARG-ROOT-COV]   block=b2 c[7] callee=dispatch rope-concatenate dst=t15 arg=t14 arg_pos=1 arg_type=Class(1103)
+[ARG-ROOT-COV] fn=load-source-via-rope gaps=3
+[ARG-ROOT-COV]   block=b0 c[0] callee=nod_read_file_to_string dst=t1 arg=t0 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[1] callee=make-rope-from-string dst=t2 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=rope->string dst=t3 arg=t2 arg_pos=0 arg_type=Class(1103)
+[ARG-ROOT-COV] fn=make-token-stream gaps=3
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t0 arg_pos=2 arg_type=Class(1043)
+[ARG-ROOT-COV] fn=ts-skip gaps=2
+[ARG-ROOT-COV]   block=b3 c[1] callee=dispatch element dst=t9 arg=t8 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[1] callee=dispatch element dst=t13 arg=t12 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=ts-advance gaps=3
+[ARG-ROOT-COV]   block=b0 c[3] callee=dispatch element dst=t4 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[3] callee=dispatch element dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=dispatch ts-pos-setter dst=t8 arg=t0 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV] fn=ts-at-end? gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=ts-peek dst=t1 arg=t0 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV] fn=ts-expect-keyword gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=ts-expect-punct gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=is-keyword? gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=is-punct? gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=is-define-token? gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-end-token? gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-otherwise-token? gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-begin-word? gaps=12
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=nod_object_equal_p dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[1] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[1] callee=nod_object_equal_p dst=t31 arg=t30 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[1] callee=nod_object_equal_p dst=t36 arg=t35 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[1] callee=nod_object_equal_p dst=t41 arg=t40 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[1] callee=nod_object_equal_p dst=t46 arg=t45 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b31 c[1] callee=nod_object_equal_p dst=t51 arg=t50 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[1] callee=nod_object_equal_p dst=t56 arg=t55 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-function-word? gaps=2
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-define-body-word? gaps=6
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=nod_object_equal_p dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[1] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-define-list-word? gaps=3
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-slot-word? gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-slot-adjective? gaps=6
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=nod_object_equal_p dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[1] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-local-decl-word? gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-local-methods-word? gaps=2
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t0 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-modifier-word? gaps=6
+[ARG-ROOT-COV]   block=b6 c[2] callee=nod_object_equal_p dst=t9 arg=t8 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[1] callee=nod_object_equal_p dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[1] callee=nod_object_equal_p dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[1] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b21 c[1] callee=nod_object_equal_p dst=t31 arg=t30 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-binary-op? gaps=20
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=nod_object_equal_p dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=nod_object_equal_p dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[1] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[1] callee=nod_object_equal_p dst=t31 arg=t30 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[1] callee=nod_object_equal_p dst=t36 arg=t35 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[1] callee=nod_object_equal_p dst=t41 arg=t40 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[1] callee=nod_object_equal_p dst=t46 arg=t45 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b31 c[1] callee=nod_object_equal_p dst=t51 arg=t50 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[1] callee=nod_object_equal_p dst=t56 arg=t55 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b37 c[1] callee=nod_object_equal_p dst=t61 arg=t60 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[1] callee=nod_object_equal_p dst=t66 arg=t65 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b43 c[1] callee=nod_object_equal_p dst=t71 arg=t70 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b46 c[1] callee=nod_object_equal_p dst=t76 arg=t75 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b49 c[1] callee=nod_object_equal_p dst=t81 arg=t80 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b52 c[1] callee=nod_object_equal_p dst=t86 arg=t85 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[2] callee=nod_object_equal_p dst=t93 arg=t92 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b57 c[1] callee=nod_object_equal_p dst=t95 arg=t94 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=is-unary-op? gaps=2
+[ARG-ROOT-COV]   block=b1 c[2] callee=nod_object_equal_p dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=nod_object_equal_p dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-body-terminator? gaps=8
+[ARG-ROOT-COV]   block=b2 c[1] callee=is-keyword? dst=t3 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[1] callee=is-keyword? dst=t7 arg=t6 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-keyword? dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[1] callee=is-keyword? dst=t15 arg=t14 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=is-keyword? dst=t19 arg=t18 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b20 c[1] callee=is-punct? dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b23 c[1] callee=is-punct? dst=t30 arg=t29 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b26 c[1] callee=is-punct? dst=t34 arg=t33 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-clause-separator? gaps=5
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[1] callee=is-keyword? dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[1] callee=is-keyword? dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-keyword? dst=t12 arg=t11 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[1] callee=is-keyword? dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=is-for-connector? gaps=10
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-keyword? dst=t2 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[1] callee=is-keyword? dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[1] callee=is-keyword? dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-keyword? dst=t12 arg=t11 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[1] callee=is-keyword? dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=is-punct? dst=t20 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[2] callee=nod_object_equal_p dst=t26 arg=t24 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[2] callee=nod_object_equal_p dst=t26 arg=t25 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b21 c[2] callee=nod_object_equal_p dst=t29 arg=t27 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b21 c[2] callee=nod_object_equal_p dst=t29 arg=t28 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=make-ast-body gaps=3
+[ARG-ROOT-COV]   block=b0 c[1] callee=%make dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch body-constituents-setter dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-call gaps=5
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t0 arg_pos=2 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=dispatch call-args-setter dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-subscript gaps=5
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t0 arg_pos=2 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=dispatch sub-args-setter dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-body-definition gaps=7
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t0 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t3 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t4 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t6 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=dispatch defn-modifiers-setter dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-list-definition gaps=7
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t0 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t3 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t4 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t6 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=dispatch defn-modifiers-setter dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-local-methods gaps=3
+[ARG-ROOT-COV]   block=b0 c[1] callee=%make dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch lmethods-items-setter dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-list-lit gaps=3
+[ARG-ROOT-COV]   block=b0 c[1] callee=%make dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch lit-elems-setter dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-vector-lit gaps=3
+[ARG-ROOT-COV]   block=b0 c[1] callee=%make dst=t1 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=dispatch lit-elems-setter dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-param-list gaps=11
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t6 arg=t5 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t3 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t4 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t6 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t7 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t9 arg_pos=7 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t11 arg_pos=9 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[15] callee=%make dst=t15 arg=t13 arg_pos=11 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-return-spec gaps=7
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t5 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=%make dst=t10 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=%make dst=t10 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=%make dst=t10 arg=t3 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=%make dst=t10 arg=t5 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=%make dst=t10 arg=t6 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=%make dst=t10 arg=t8 arg_pos=7 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-key-spec gaps=5
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t0 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t3 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[6] callee=%make dst=t7 arg=t5 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-slot-spec gaps=10
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t0 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t3 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t4 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t6 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t8 arg_pos=7 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t10 arg_pos=9 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t12 arg_pos=11 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[16] callee=%make dst=t16 arg=t14 arg_pos=13 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-class-definition gaps=15
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t4 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[9] callee=%make dst=t10 arg=t9 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[12] callee=%make dst=t13 arg=t12 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t4 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t5 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t0 arg_pos=4 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t6 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t8 arg_pos=7 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t10 arg_pos=8 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t11 arg_pos=9 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t13 arg_pos=10 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t14 arg_pos=11 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[17] callee=%make dst=t18 arg=t16 arg_pos=13 arg_type=Top
+[ARG-ROOT-COV] fn=make-ast-generic-definition gaps=6
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t4 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t4 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t5 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t0 arg_pos=4 arg_type=Class(1082)
+[ARG-ROOT-COV] fn=token-name gaps=43
+[ARG-ROOT-COV]   block=b7 c[2] callee=nod_object_equal_p dst=t10 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t13 arg=t12 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[1] callee=nod_object_equal_p dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=nod_object_equal_p dst=t19 arg=t18 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[1] callee=nod_object_equal_p dst=t22 arg=t21 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[1] callee=nod_object_equal_p dst=t25 arg=t24 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b20 c[1] callee=nod_object_equal_p dst=t28 arg=t27 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[1] callee=nod_object_equal_p dst=t31 arg=t30 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b24 c[1] callee=nod_object_equal_p dst=t34 arg=t33 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b26 c[1] callee=nod_object_equal_p dst=t37 arg=t36 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[1] callee=nod_object_equal_p dst=t40 arg=t39 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[1] callee=nod_object_equal_p dst=t43 arg=t42 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[1] callee=nod_object_equal_p dst=t46 arg=t45 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[1] callee=nod_object_equal_p dst=t49 arg=t48 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b36 c[1] callee=nod_object_equal_p dst=t52 arg=t51 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[1] callee=nod_object_equal_p dst=t55 arg=t54 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b40 c[1] callee=nod_object_equal_p dst=t58 arg=t57 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b42 c[1] callee=nod_object_equal_p dst=t61 arg=t60 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b44 c[1] callee=nod_object_equal_p dst=t64 arg=t63 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b46 c[1] callee=nod_object_equal_p dst=t67 arg=t66 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b48 c[1] callee=nod_object_equal_p dst=t70 arg=t69 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b50 c[1] callee=nod_object_equal_p dst=t73 arg=t72 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b52 c[1] callee=nod_object_equal_p dst=t76 arg=t75 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[1] callee=nod_object_equal_p dst=t79 arg=t78 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b56 c[1] callee=nod_object_equal_p dst=t82 arg=t81 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b58 c[1] callee=nod_object_equal_p dst=t85 arg=t84 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b60 c[1] callee=nod_object_equal_p dst=t88 arg=t87 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b62 c[1] callee=nod_object_equal_p dst=t91 arg=t90 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b64 c[1] callee=nod_object_equal_p dst=t94 arg=t93 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b66 c[1] callee=nod_object_equal_p dst=t97 arg=t96 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b68 c[1] callee=nod_object_equal_p dst=t100 arg=t99 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b70 c[1] callee=nod_object_equal_p dst=t103 arg=t102 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b72 c[1] callee=nod_object_equal_p dst=t106 arg=t105 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b74 c[1] callee=nod_object_equal_p dst=t109 arg=t108 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b76 c[1] callee=nod_object_equal_p dst=t112 arg=t111 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b78 c[1] callee=nod_object_equal_p dst=t115 arg=t114 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b80 c[1] callee=nod_object_equal_p dst=t118 arg=t117 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b82 c[1] callee=nod_object_equal_p dst=t121 arg=t120 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b84 c[1] callee=nod_object_equal_p dst=t124 arg=t123 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b86 c[1] callee=nod_object_equal_p dst=t127 arg=t126 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b88 c[1] callee=nod_object_equal_p dst=t130 arg=t129 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b90 c[1] callee=nod_object_equal_p dst=t133 arg=t132 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b92 c[1] callee=nod_object_equal_p dst=t136 arg=t135 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-error gaps=4
+[ARG-ROOT-COV]   block=b0 c[1] callee=format-out dst=t2 arg=t1 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t0 arg_pos=2 arg_type=String
+[ARG-ROOT-COV] fn=parse-dylan gaps=2
+[ARG-ROOT-COV]   block=b0 c[0] callee=make-token-stream dst=t1 arg=t0 arg_pos=0 arg_type=Class(1043)
+[ARG-ROOT-COV]   block=b0 c[1] callee=parse-body dst=t2 arg=t1 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV] fn=parse-body gaps=3
+[ARG-ROOT-COV]   block=b8 c[2] callee=add! dst=t15 arg=t14 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[5] callee=is-punct? dst=t18 arg=t16 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b8 c[5] callee=is-punct? dst=t18 arg=t17 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-definition gaps=15
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=is-keyword? dst=t36 arg=t35 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=add! dst=t27 arg=t26 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b17 c[1] callee=is-keyword? dst=t40 arg=t39 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[1] callee=is-name-token? dst=t49 arg=t48 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b25 c[2] callee=is-punct? dst=t52 arg=t50 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b25 c[2] callee=is-punct? dst=t52 arg=t51 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b27 c[1] callee=dispatch defn-method-name-setter dst=t60 arg=t59 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b29 c[2] callee=is-punct? dst=t69 arg=t67 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b29 c[2] callee=is-punct? dst=t69 arg=t68 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[1] callee=dispatch defn-params-setter dst=t71 arg=t70 arg_pos=1 arg_type=Class(1139)
+[ARG-ROOT-COV]   block=b32 c[1] callee=dispatch defn-return-setter dst=t79 arg=t78 arg_pos=1 arg_type=Class(1140)
+[ARG-ROOT-COV]   block=b33 c[1] callee=dispatch defn-body-setter dst=t87 arg=t86 arg_pos=1 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b34 c[4] callee=dispatch defn-list-setter dst=t94 arg=t93 arg_pos=1 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b35 c[1] callee=parse-error dst=t96 arg=t95 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=parse-definition-tail gaps=4
+[ARG-ROOT-COV]   block=b0 c[1] callee=is-end-token? dst=t3 arg=t2 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b4 c[1] callee=is-punct? dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[1] callee=is-punct? dst=t19 arg=t18 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[1] callee=dispatch defn-end-name-setter dst=t28 arg=t27 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV] fn=parse-class-definition gaps=10
+[ARG-ROOT-COV]   block=b0 c[4] callee=is-name-token? dst=t7 arg=t6 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b1 c[1] callee=dispatch class-name-setter dst=t9 arg=t8 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b2 c[1] callee=parse-error dst=t11 arg=t10 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b3 c[1] callee=parse-super-list dst=t18 arg=t17 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[3] callee=parse-class-clauses dst=t20 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[4] callee=make-ast-body-definition dst=t21 arg=t16 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b3 c[5] callee=parse-definition-tail dst=t22 arg=t15 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b3 c[7] callee=dispatch defn-end-word-setter dst=t24 arg=t23 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[8] callee=dispatch defn-end-name dst=t25 arg=t21 arg_pos=0 arg_type=Class(1110)
+[ARG-ROOT-COV]   block=b3 c[9] callee=dispatch defn-end-name-setter dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-generic-definition gaps=10
+[ARG-ROOT-COV]   block=b0 c[4] callee=is-name-token? dst=t7 arg=t6 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b2 c[2] callee=is-punct? dst=t10 arg=t8 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b2 c[2] callee=is-punct? dst=t10 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=dispatch gen-name-setter dst=t18 arg=t17 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b5 c[1] callee=parse-error dst=t20 arg=t19 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[2] callee=is-punct? dst=t28 arg=t26 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b6 c[2] callee=is-punct? dst=t28 arg=t27 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=dispatch gen-params-setter dst=t30 arg=t29 arg_pos=1 arg_type=Class(1139)
+[ARG-ROOT-COV]   block=b9 c[0] callee=parse-return-spec dst=t37 arg=t35 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b9 c[1] callee=dispatch gen-return-setter dst=t38 arg=t37 arg_pos=1 arg_type=Class(1140)
+[ARG-ROOT-COV] fn=parse-super-list gaps=9
+[ARG-ROOT-COV]   block=b0 c[2] callee=is-punct? dst=t4 arg=t2 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[2] callee=is-punct? dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[2] callee=is-punct? dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[3] callee=ts-expect-punct dst=t44 arg=t42 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[3] callee=ts-expect-punct dst=t44 arg=t43 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[1] callee=is-punct? dst=t19 arg=t18 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[1] callee=add! dst=t22 arg=t21 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b12 c[4] callee=is-punct? dst=t25 arg=t23 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b12 c[4] callee=is-punct? dst=t25 arg=t24 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-class-clauses gaps=2
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-punct? dst=t14 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=is-punct? dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=skip-class-clause gaps=1
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-punct? dst=t10 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-slot-spec gaps=17
+[ARG-ROOT-COV]   block=b6 c[1] callee=is-slot-word? dst=t29 arg=t28 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b9 c[2] callee=add! dst=t16 arg=t14 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[2] callee=add! dst=t16 arg=t15 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b13 c[4] callee=is-name-token? dst=t34 arg=t33 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b14 c[3] callee=%make dst=t97 arg=t94 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[3] callee=%make dst=t97 arg=t95 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[3] callee=%make dst=t97 arg=t96 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b15 c[1] callee=dispatch slot-name-tok-setter dst=t36 arg=t35 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b16 c[1] callee=parse-error dst=t38 arg=t37 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b17 c[2] callee=is-punct? dst=t45 arg=t43 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b17 c[2] callee=is-punct? dst=t45 arg=t44 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[2] callee=dispatch slot-type-setter dst=t48 arg=t47 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b20 c[2] callee=is-punct? dst=t56 arg=t54 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b20 c[2] callee=is-punct? dst=t56 arg=t55 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b21 c[2] callee=dispatch slot-init-setter dst=t59 arg=t58 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b28 c[2] callee=is-punct? dst=t78 arg=t76 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b28 c[2] callee=is-punct? dst=t78 arg=t77 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=ts-peek-after-comma gaps=4
+[ARG-ROOT-COV]   block=b0 c[3] callee=is-punct? dst=t4 arg=t2 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[3] callee=is-punct? dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[1] callee=dispatch ts-pos-setter dst=t11 arg=t9 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b3 c[1] callee=dispatch ts-pos-setter dst=t11 arg=t8 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-slot-init-option gaps=10
+[ARG-ROOT-COV]   block=b0 c[3] callee=nod_object_equal_p dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b2 c[1] callee=nod_object_equal_p dst=t18 arg=t17 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b3 c[1] callee=dispatch slot-init-kw-setter dst=t9 arg=t8 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b4 c[1] callee=dispatch slot-init-kw-setter dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[1] callee=nod_object_equal_p dst=t33 arg=t32 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[1] callee=dispatch slot-init-kw-setter dst=t24 arg=t23 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b9 c[1] callee=dispatch slot-init-kw-setter dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[1] callee=dispatch slot-init-setter dst=t35 arg=t34 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b12 c[1] callee=nod_object_equal_p dst=t37 arg=t36 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b13 c[1] callee=dispatch slot-init-setter dst=t39 arg=t38 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV] fn=%extract-symbol-value gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=parse-expression dst=t1 arg=t0 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV] fn=parse-list-fragment gaps=4
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-punct? dst=t13 arg=t12 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[2] callee=add! dst=t21 arg=t20 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[5] callee=is-punct? dst=t24 arg=t22 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b11 c[5] callee=is-punct? dst=t24 arg=t23 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-local-decl gaps=6
+[ARG-ROOT-COV]   block=b0 c[1] callee=parse-list-fragment dst=t2 arg=t0 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t4 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t1 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t5 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t2 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV] fn=parse-local-methods gaps=3
+[ARG-ROOT-COV]   block=b5 c[2] callee=add! dst=t16 arg=t15 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[5] callee=is-punct? dst=t19 arg=t17 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b5 c[5] callee=is-punct? dst=t19 arg=t18 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-local-method-item gaps=31
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t8 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t8 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t8 arg=t6 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[5] callee=%make dst=t8 arg=t7 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b1 c[8] callee=is-name-token? dst=t11 arg=t10 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b4 c[2] callee=is-punct? dst=t14 arg=t12 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b4 c[2] callee=is-punct? dst=t14 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[1] callee=dispatch stmt-method-name-setter dst=t22 arg=t21 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b8 c[2] callee=is-punct? dst=t31 arg=t29 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b8 c[2] callee=is-punct? dst=t31 arg=t30 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[1] callee=dispatch stmt-params-setter dst=t33 arg=t32 arg_pos=1 arg_type=Class(1139)
+[ARG-ROOT-COV]   block=b11 c[1] callee=dispatch stmt-return-setter dst=t41 arg=t40 arg_pos=1 arg_type=Class(1140)
+[ARG-ROOT-COV]   block=b11 c[3] callee=dispatch stmt-body-setter dst=t43 arg=t42 arg_pos=1 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b11 c[4] callee=make-ast-body-definition dst=t44 arg=t39 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b11 c[7] callee=dispatch stmt-end-word-setter dst=t47 arg=t46 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[8] callee=dispatch defn-end-name dst=t48 arg=t44 arg_pos=0 arg_type=Class(1110)
+[ARG-ROOT-COV]   block=b11 c[9] callee=dispatch stmt-end-name-setter dst=t49 arg=t48 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[5] callee=%make dst=t56 arg=t52 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[5] callee=%make dst=t56 arg=t53 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[5] callee=%make dst=t56 arg=t54 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[5] callee=%make dst=t56 arg=t55 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b12 c[10] callee=is-punct? dst=t61 arg=t59 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b12 c[10] callee=is-punct? dst=t61 arg=t60 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=parse-error dst=t81 arg=t80 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b14 c[1] callee=dispatch stmt-params-setter dst=t63 arg=t62 arg_pos=1 arg_type=Class(1139)
+[ARG-ROOT-COV]   block=b16 c[1] callee=dispatch stmt-return-setter dst=t71 arg=t70 arg_pos=1 arg_type=Class(1140)
+[ARG-ROOT-COV]   block=b16 c[3] callee=dispatch stmt-body-setter dst=t73 arg=t72 arg_pos=1 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b16 c[4] callee=make-ast-body-definition dst=t74 arg=t69 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b16 c[7] callee=dispatch stmt-end-word-setter dst=t77 arg=t76 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[8] callee=dispatch defn-end-name dst=t78 arg=t74 arg_pos=0 arg_type=Class(1110)
+[ARG-ROOT-COV]   block=b16 c[9] callee=dispatch stmt-end-name-setter dst=t79 arg=t78 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-expression gaps=7
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t14 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t8 arg_pos=2 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t16 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t12 arg_pos=4 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t17 arg_pos=5 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[6] callee=%make dst=t18 arg=t13 arg_pos=6 arg_type=Class(1107)
+[ARG-ROOT-COV] fn=parse-binary-operand gaps=9
+[ARG-ROOT-COV]   block=b1 c[3] callee=dispatch keyword-name-token-name dst=t6 arg=t3 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b1 c[4] callee=%make dst=t7 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[4] callee=%make dst=t7 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[4] callee=%make dst=t7 arg=t6 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t14 arg=t11 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t14 arg=t12 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t14 arg=t9 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t14 arg=t13 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t14 arg=t10 arg_pos=4 arg_type=Class(1107)
+[ARG-ROOT-COV] fn=parse-operand gaps=17
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t12 arg=t11 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[5] callee=is-punct? dst=t18 arg=t16 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b7 c[5] callee=is-punct? dst=t18 arg=t17 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-punct? dst=t32 arg=t31 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[1] callee=parse-arguments-into dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[2] callee=ts-expect-punct dst=t30 arg=t28 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[2] callee=ts-expect-punct dst=t30 arg=t29 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[5] callee=is-punct? dst=t38 arg=t36 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b12 c[5] callee=is-punct? dst=t38 arg=t37 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=is-punct? dst=t52 arg=t51 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=parse-arguments-into dst=t41 arg=t40 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[2] callee=ts-expect-punct dst=t50 arg=t48 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[2] callee=ts-expect-punct dst=t50 arg=t49 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t60 arg=t57 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t60 arg=t58 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t60 arg=t8 arg_pos=2 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t60 arg=t59 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV] fn=parse-leaf gaps=43
+[ARG-ROOT-COV]   block=b1 c[5] callee=dispatch integer-token-radix dst=t8 arg=t3 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b1 c[6] callee=%make dst=t9 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[6] callee=%make dst=t9 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[6] callee=%make dst=t9 arg=t6 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[6] callee=%make dst=t9 arg=t7 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[6] callee=%make dst=t9 arg=t8 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[3] callee=dispatch float-token-raw-text dst=t14 arg=t11 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b3 c[4] callee=%make dst=t15 arg=t12 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[4] callee=%make dst=t15 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[4] callee=%make dst=t15 arg=t14 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[3] callee=dispatch ratio-token-raw-text dst=t20 arg=t17 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b5 c[4] callee=%make dst=t21 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[4] callee=%make dst=t21 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[4] callee=%make dst=t21 arg=t20 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[3] callee=dispatch character-literal-token-codepoint dst=t28 arg=t25 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b9 c[4] callee=%make dst=t29 arg=t26 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[4] callee=%make dst=t29 arg=t27 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[4] callee=%make dst=t29 arg=t28 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[3] callee=dispatch boolean-literal-token-value dst=t34 arg=t31 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b11 c[4] callee=%make dst=t35 arg=t32 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[4] callee=%make dst=t35 arg=t33 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[4] callee=%make dst=t35 arg=t34 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[3] callee=dispatch symbol-literal-token-name dst=t40 arg=t37 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b13 c[4] callee=%make dst=t41 arg=t38 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[4] callee=%make dst=t41 arg=t39 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[4] callee=%make dst=t41 arg=t40 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[3] callee=dispatch keyword-name-token-name dst=t46 arg=t43 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b15 c[4] callee=%make dst=t47 arg=t44 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[4] callee=%make dst=t47 arg=t45 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[4] callee=%make dst=t47 arg=t46 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b20 c[1] callee=is-keyword? dst=t53 arg=t52 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b22 c[1] callee=is-keyword? dst=t55 arg=t54 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b25 c[1] callee=is-keyword? dst=t60 arg=t59 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[1] callee=is-keyword? dst=t65 arg=t64 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[3] callee=token-name dst=t72 arg=t69 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b30 c[4] callee=%make dst=t73 arg=t70 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[4] callee=%make dst=t73 arg=t71 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[4] callee=%make dst=t73 arg=t72 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b31 c[1] callee=is-punct? dst=t75 arg=t74 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[3] callee=%make dst=t86 arg=t84 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[3] callee=%make dst=t86 arg=t85 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b38 c[3] callee=%make dst=t86 arg=t83 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b39 c[2] callee=parse-error dst=t89 arg=t88 arg_pos=0 arg_type=String
+[ARG-ROOT-COV] fn=parse-paren-fragment gaps=14
+[ARG-ROOT-COV]   block=b0 c[1] callee=%make dst=t2 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t15 arg=t13 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t15 arg=t14 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t63 arg=t61 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t63 arg=t62 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[3] callee=is-punct? dst=t20 arg=t18 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b8 c[3] callee=is-punct? dst=t20 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[3] callee=%make dst=t28 arg=t25 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[3] callee=%make dst=t28 arg=t26 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[3] callee=%make dst=t28 arg=t27 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[3] callee=is-punct? dst=t47 arg=t45 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b14 c[3] callee=is-punct? dst=t47 arg=t46 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b23 c[2] callee=%make dst=t75 arg=t73 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b23 c[2] callee=%make dst=t75 arg=t74 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-string-literal gaps=7
+[ARG-ROOT-COV]   block=b2 c[1] callee=dispatch string-literal-token-decoded dst=t10 arg=t9 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b2 c[2] callee=dispatch concatenate dst=t11 arg=t5 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[2] callee=dispatch concatenate dst=t11 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[2] callee=%make dst=t14 arg=t12 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[2] callee=%make dst=t14 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[2] callee=%make dst=t14 arg=t5 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[3] callee=dispatch node-token-setter dst=t15 arg=t3 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV] fn=parse-list-literal gaps=10
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t51 arg=t8 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t51 arg=t49 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t51 arg=t50 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-punct? dst=t19 arg=t18 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[2] callee=dispatch lit-tail-setter dst=t22 arg=t21 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b10 c[2] callee=add! dst=t26 arg=t24 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[2] callee=add! dst=t26 arg=t25 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b10 c[5] callee=is-punct? dst=t29 arg=t27 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b10 c[5] callee=is-punct? dst=t29 arg=t28 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-vector-literal gaps=8
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t16 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t39 arg=t7 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t39 arg=t37 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t39 arg=t38 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[2] callee=add! dst=t20 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[2] callee=add! dst=t20 arg=t19 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b8 c[5] callee=is-punct? dst=t23 arg=t21 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b8 c[5] callee=is-punct? dst=t23 arg=t22 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-constant gaps=6
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t12 arg=t9 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t12 arg=t10 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t12 arg=t11 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[3] callee=%make dst=t16 arg=t13 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[3] callee=%make dst=t16 arg=t14 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b7 c[3] callee=%make dst=t16 arg=t15 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=parse-function-literal gaps=10
+[ARG-ROOT-COV]   block=b0 c[4] callee=is-punct? dst=t5 arg=t3 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[4] callee=is-punct? dst=t5 arg=t4 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t17 arg=t14 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t17 arg=t15 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[5] callee=%make dst=t17 arg=t16 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[10] callee=is-end-token? dst=t22 arg=t21 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b7 c[1] callee=is-punct? dst=t27 arg=t26 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b9 c[1] callee=dispatch stmt-end-word-setter dst=t38 arg=t37 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b12 c[1] callee=is-punct? dst=t42 arg=t41 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=dispatch stmt-end-name-setter dst=t54 arg=t53 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV] fn=parse-statement gaps=20
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t4 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=%make dst=t6 arg=t5 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b0 c[8] callee=is-keyword? dst=t9 arg=t8 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[2] callee=is-punct? dst=t12 arg=t10 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b2 c[2] callee=is-punct? dst=t12 arg=t11 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=dispatch stmt-for-header-setter dst=t18 arg=t17 arg_pos=1 arg_type=Class(1043)
+[ARG-ROOT-COV]   block=b6 c[1] callee=dispatch stmt-body-setter dst=t25 arg=t24 arg_pos=1 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b6 c[3] callee=%make dst=t27 arg=t26 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b11 c[1] callee=is-clause-separator? dst=t41 arg=t40 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t47 arg=t44 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t47 arg=t45 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t47 arg=t42 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t47 arg=t46 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[5] callee=%make dst=t47 arg=t43 arg_pos=4 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b13 c[6] callee=add! dst=t48 arg=t47 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[1] callee=is-end-token? dst=t67 arg=t66 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b22 c[1] callee=is-punct? dst=t72 arg=t71 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b24 c[1] callee=dispatch stmt-end-word-setter dst=t81 arg=t80 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV] fn=parse-for-header gaps=10
+[ARG-ROOT-COV]   block=b0 c[2] callee=%make dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t14 arg=t12 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t14 arg=t13 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t43 arg=t7 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t43 arg=t41 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t43 arg=t42 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[2] callee=add! dst=t18 arg=t17 arg_pos=1 arg_type=Class(1133)
+[ARG-ROOT-COV]   block=b8 c[5] callee=is-punct? dst=t21 arg=t19 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b8 c[5] callee=is-punct? dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=nod_object_equal_p dst=t24 arg=t23 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=parse-for-clause gaps=22
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t4 arg=t3 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t2 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[4] callee=%make dst=t5 arg=t4 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=is-keyword? dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[1] callee=is-keyword? dst=t10 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[7] callee=%make dst=t22 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[7] callee=%make dst=t22 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[7] callee=%make dst=t22 arg=t15 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b4 c[7] callee=%make dst=t22 arg=t20 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[7] callee=%make dst=t22 arg=t21 arg_pos=4 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b4 c[8] callee=add! dst=t23 arg=t17 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[8] callee=add! dst=t23 arg=t22 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=dispatch node-token-setter dst=t27 arg=t25 arg_pos=1 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b13 c[1] callee=is-for-connector? dst=t44 arg=t43 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b15 c[6] callee=%make dst=t51 arg=t47 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[6] callee=%make dst=t51 arg=t48 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[6] callee=%make dst=t51 arg=t45 arg_pos=2 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b15 c[6] callee=%make dst=t51 arg=t49 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[6] callee=%make dst=t51 arg=t50 arg_pos=4 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b15 c[7] callee=add! dst=t52 arg=t46 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[7] callee=add! dst=t52 arg=t51 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-arguments-into gaps=22
+[ARG-ROOT-COV]   block=b7 c[3] callee=is-punct? dst=t15 arg=t14 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[3] callee=%make dst=t63 arg=t61 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[3] callee=%make dst=t63 arg=t62 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[3] callee=%make dst=t63 arg=t60 arg_pos=2 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b8 c[4] callee=add! dst=t64 arg=t63 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=is-punct? dst=t17 arg=t16 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b13 c[1] callee=is-punct? dst=t25 arg=t24 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[6] callee=%make dst=t45 arg=t42 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[6] callee=%make dst=t45 arg=t43 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[6] callee=%make dst=t45 arg=t44 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[7] callee=%make dst=t46 arg=t39 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[7] callee=%make dst=t46 arg=t40 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[7] callee=%make dst=t46 arg=t41 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[7] callee=%make dst=t46 arg=t45 arg_pos=4 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[8] callee=add! dst=t47 arg=t46 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t52 arg=t49 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t52 arg=t50 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t52 arg=t51 arg_pos=3 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=%make dst=t52 arg=t48 arg_pos=4 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b19 c[5] callee=add! dst=t53 arg=t52 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b21 c[2] callee=is-punct? dst=t71 arg=t69 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b21 c[2] callee=is-punct? dst=t71 arg=t70 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-variable gaps=7
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t6 arg=t4 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[3] callee=%make dst=t6 arg=t5 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[6] callee=is-punct? dst=t9 arg=t7 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b1 c[6] callee=is-punct? dst=t9 arg=t8 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[2] callee=%make dst=t20 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[2] callee=%make dst=t20 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b3 c[2] callee=dispatch typed-name-type-setter dst=t12 arg=t11 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV] fn=parse-type-spec gaps=1
+[ARG-ROOT-COV]   block=b0 c[0] callee=parse-operand dst=t1 arg=t0 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV] fn=parse-parameter-list gaps=27
+[ARG-ROOT-COV]   block=b0 c[2] callee=ts-expect-punct dst=t3 arg=t1 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[2] callee=ts-expect-punct dst=t3 arg=t2 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[2] callee=is-punct? dst=t21 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t174 arg=t12 arg_pos=0 arg_type=Class(1106)
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t174 arg=t172 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[2] callee=ts-expect-punct dst=t174 arg=t173 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[1] callee=is-punct? dst=t24 arg=t23 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[1] callee=is-keyword? dst=t27 arg=t26 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[1] callee=is-keyword? dst=t43 arg=t42 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=parse-error dst=t34 arg=t33 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b17 c[1] callee=is-keyword? dst=t49 arg=t48 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[1] callee=is-keyword? dst=t54 arg=t53 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b23 c[1] callee=parse-error dst=t61 arg=t60 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b25 c[1] callee=nod_object_equal_p dst=t71 arg=t70 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b26 c[1] callee=parse-error dst=t117 arg=t116 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b27 c[5] callee=is-punct? dst=t77 arg=t75 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b27 c[5] callee=is-punct? dst=t77 arg=t76 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[2] callee=add! dst=t109 arg=t107 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[2] callee=add! dst=t109 arg=t108 arg_pos=1 arg_type=Class(1137)
+[ARG-ROOT-COV]   block=b29 c[2] callee=dispatch key-spec-type-setter dst=t80 arg=t79 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b31 c[2] callee=is-punct? dst=t92 arg=t90 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b31 c[2] callee=is-punct? dst=t92 arg=t91 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[2] callee=dispatch key-spec-default-setter dst=t95 arg=t94 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b34 c[1] callee=add! dst=t106 arg=t105 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[1] callee=add! dst=t106 arg=t98 arg_pos=1 arg_type=Class(1138)
+[ARG-ROOT-COV]   block=b42 c[2] callee=is-punct? dst=t163 arg=t161 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b42 c[2] callee=is-punct? dst=t163 arg=t162 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=parse-return-spec gaps=21
+[ARG-ROOT-COV]   block=b0 c[3] callee=is-punct? dst=t4 arg=t2 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[3] callee=is-punct? dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[6] callee=is-punct? dst=t12 arg=t10 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b2 c[6] callee=is-punct? dst=t12 arg=t11 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[1] callee=is-name-token? dst=t101 arg=t100 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b9 c[2] callee=is-punct? dst=t26 arg=t25 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[3] callee=ts-expect-punct dst=t99 arg=t97 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[3] callee=ts-expect-punct dst=t99 arg=t98 arg_pos=2 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[1] callee=is-punct? dst=t29 arg=t28 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[1] callee=is-keyword? dst=t32 arg=t31 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b17 c[4] callee=is-punct? dst=t40 arg=t38 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b17 c[4] callee=is-punct? dst=t40 arg=t39 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b18 c[1] callee=parse-error dst=t52 arg=t51 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[2] callee=dispatch ret-rest-type-setter dst=t43 arg=t42 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV]   block=b23 c[2] callee=add! dst=t62 arg=t60 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b23 c[2] callee=add! dst=t62 arg=t61 arg_pos=1 arg_type=Class(1137)
+[ARG-ROOT-COV]   block=b24 c[1] callee=parse-error dst=t64 arg=t63 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b28 c[2] callee=is-punct? dst=t88 arg=t86 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b28 c[2] callee=is-punct? dst=t88 arg=t87 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[2] callee=add! dst=t104 arg=t102 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b32 c[2] callee=add! dst=t104 arg=t103 arg_pos=1 arg_type=Class(1137)
+[ARG-ROOT-COV] fn=parse-value-spec gaps=5
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t4 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[3] callee=%make dst=t4 arg=t3 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=is-punct? dst=t8 arg=t6 arg_pos=0 arg_type=Class(1082)
+[ARG-ROOT-COV]   block=b0 c[7] callee=is-punct? dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[2] callee=dispatch typed-name-type-setter dst=t11 arg=t10 arg_pos=1 arg_type=Class(1107)
+[ARG-ROOT-COV] fn=dump-ast gaps=4
+[ARG-ROOT-COV]   block=b0 c[1] callee=%make dst=t2 arg=t1 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=%make dst=t8 arg=t6 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[7] callee=%make dst=t8 arg=t7 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[1] callee=dispatch element-setter dst=t17 arg=t16 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=acc-string gaps=1
+[ARG-ROOT-COV]   block=b2 c[1] callee=add! dst=t10 arg=t9 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV] fn=acc-newline gaps=1
+[ARG-ROOT-COV]   block=b0 c[1] callee=add! dst=t2 arg=t0 arg_pos=0 arg_type=Class(1043)
+[ARG-ROOT-COV] fn=dump-typed-name gaps=3
+[ARG-ROOT-COV]   block=b0 c[3] callee=acc-string dst=t8 arg=t7 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[5] callee=acc-string dst=t10 arg=t9 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b1 c[4] callee=acc-string dst=t17 arg=t16 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=dump-param-list gaps=18
+[ARG-ROOT-COV]   block=b0 c[2] callee=acc-string dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b2 c[3] callee=dispatch typed-name-type dst=t20 arg=t17 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[6] callee=dump-typed-name dst=t23 arg=t18 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b2 c[6] callee=dump-typed-name dst=t23 arg=t19 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b2 c[6] callee=dump-typed-name dst=t23 arg=t20 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[4] callee=acc-string dst=t32 arg=t31 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[6] callee=token-name dst=t34 arg=t33 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[7] callee=acc-string dst=t35 arg=t34 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b7 c[4] callee=acc-string dst=t48 arg=t47 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[6] callee=dump-typed-name dst=t68 arg=t63 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b10 c[6] callee=dump-typed-name dst=t68 arg=t64 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b10 c[6] callee=dump-typed-name dst=t68 arg=t65 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[4] callee=acc-string dst=t75 arg=t74 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b12 c[9] callee=dump-node dst=t80 arg=t77 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[4] callee=acc-string dst=t104 arg=t103 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[4] callee=acc-string dst=t118 arg=t117 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[6] callee=token-name dst=t120 arg=t119 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[7] callee=acc-string dst=t121 arg=t120 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=dump-return-spec gaps=8
+[ARG-ROOT-COV]   block=b1 c[2] callee=acc-string dst=t6 arg=t5 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[3] callee=dispatch typed-name-type dst=t21 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[6] callee=dump-typed-name dst=t24 arg=t19 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[6] callee=dump-typed-name dst=t24 arg=t20 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[6] callee=dump-typed-name dst=t24 arg=t21 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[5] callee=dump-typed-name dst=t35 arg=t30 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[5] callee=dump-typed-name dst=t35 arg=t31 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[5] callee=dump-typed-name dst=t35 arg=t32 arg_pos=2 arg_type=Top
+[ARG-ROOT-COV] fn=dump-slot-spec gaps=16
+[ARG-ROOT-COV]   block=b0 c[2] callee=acc-string dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b1 c[1] callee=acc-string dst=t9 arg=t8 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b1 c[3] callee=token-name dst=t11 arg=t10 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[4] callee=acc-string dst=t12 arg=t11 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[4] callee=acc-string dst=t32 arg=t31 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[6] callee=token-name dst=t34 arg=t33 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[7] callee=acc-string dst=t35 arg=t34 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b7 c[4] callee=acc-string dst=t45 arg=t44 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b7 c[9] callee=dump-node dst=t50 arg=t47 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b12 c[1] callee=acc-string dst=t64 arg=t63 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b13 c[1] callee=acc-string dst=t66 arg=t65 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b14 c[1] callee=dispatch keyword-name-token-name dst=t73 arg=t72 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[2] callee=acc-string dst=t74 arg=t73 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b15 c[4] callee=acc-string dst=t81 arg=t80 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[4] callee=acc-string dst=t100 arg=t99 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[9] callee=dump-node dst=t105 arg=t102 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=dump-statement-clause gaps=6
+[ARG-ROOT-COV]   block=b0 c[2] callee=acc-string dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[4] callee=token-name dst=t7 arg=t6 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[5] callee=acc-string dst=t8 arg=t7 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b0 c[7] callee=dispatch clause-body dst=t10 arg=t0 arg_pos=0 arg_type=Class(1132)
+[ARG-ROOT-COV]   block=b0 c[10] callee=dump-node dst=t13 arg=t10 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b0 c[10] callee=dump-node dst=t13 arg=t1 arg_pos=1 arg_type=Class(1043)
+[ARG-ROOT-COV] fn=connector-spelling gaps=1
+[ARG-ROOT-COV]   block=b1 c[1] callee=write-to-string dst=t3 arg=t2 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=dump-for-clause gaps=9
+[ARG-ROOT-COV]   block=b0 c[2] callee=acc-string dst=t5 arg=t4 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b1 c[1] callee=acc-string dst=t9 arg=t8 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b1 c[3] callee=token-name dst=t11 arg=t10 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b1 c[4] callee=acc-string dst=t12 arg=t11 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[5] callee=acc-string dst=t33 arg=t32 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[7] callee=connector-spelling dst=t35 arg=t34 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[8] callee=acc-string dst=t36 arg=t35 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b5 c[10] callee=dispatch for-part-expr dst=t38 arg=t28 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b5 c[13] callee=dump-node dst=t41 arg=t38 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV] fn=dump-node gaps=104
+[ARG-ROOT-COV]   block=b1 c[1] callee=acc-string dst=t6 arg=t5 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[3] callee=dump-node dst=t21 arg=t18 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[1] callee=acc-string dst=t27 arg=t26 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b6 c[3] callee=token-name dst=t29 arg=t28 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b6 c[4] callee=acc-string dst=t30 arg=t29 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[1] callee=acc-string dst=t34 arg=t33 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b8 c[3] callee=token-name dst=t36 arg=t35 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b8 c[4] callee=acc-string dst=t37 arg=t36 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b11 c[3] callee=dump-param-list dst=t48 arg=t45 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b14 c[3] callee=dump-return-spec dst=t58 arg=t55 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b16 c[3] callee=dump-node dst=t66 arg=t63 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b17 c[1] callee=acc-string dst=t69 arg=t68 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[1] callee=acc-string dst=t73 arg=t72 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b19 c[3] callee=token-name dst=t75 arg=t74 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b19 c[4] callee=acc-string dst=t76 arg=t75 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b23 c[4] callee=acc-string dst=t96 arg=t95 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b23 c[9] callee=dump-node dst=t101 arg=t98 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b26 c[3] callee=dump-slot-spec dst=t120 arg=t117 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b28 c[1] callee=acc-string dst=t126 arg=t125 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b30 c[1] callee=acc-string dst=t130 arg=t129 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b30 c[3] callee=token-name dst=t132 arg=t131 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b30 c[4] callee=acc-string dst=t133 arg=t132 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b34 c[4] callee=acc-string dst=t153 arg=t152 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b34 c[6] callee=token-name dst=t155 arg=t154 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b34 c[7] callee=acc-string dst=t156 arg=t155 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b36 c[3] callee=dump-param-list dst=t166 arg=t163 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b39 c[3] callee=dump-return-spec dst=t178 arg=t175 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b42 c[1] callee=acc-string dst=t187 arg=t186 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b42 c[3] callee=token-name dst=t189 arg=t188 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b42 c[4] callee=acc-string dst=t190 arg=t189 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b42 c[9] callee=dump-node dst=t195 arg=t192 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b44 c[1] callee=acc-string dst=t198 arg=t197 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b44 c[6] callee=dump-node dst=t203 arg=t200 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b46 c[1] callee=acc-string dst=t206 arg=t205 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b49 c[3] callee=dump-node dst=t221 arg=t218 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b51 c[1] callee=acc-string dst=t227 arg=t226 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b51 c[6] callee=dump-node dst=t232 arg=t229 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b53 c[1] callee=dispatch punctuation-token-form dst=t239 arg=t238 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b53 c[2] callee=write-to-string dst=t240 arg=t239 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b53 c[3] callee=acc-string dst=t241 arg=t240 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[1] callee=token-name dst=t243 arg=t242 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b54 c[2] callee=acc-string dst=t244 arg=t243 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b55 c[4] callee=dump-node dst=t252 arg=t249 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b56 c[1] callee=acc-string dst=t255 arg=t254 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b56 c[6] callee=dump-node dst=t260 arg=t257 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b58 c[1] callee=acc-string dst=t263 arg=t262 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b58 c[6] callee=dump-node dst=t268 arg=t265 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b61 c[3] callee=dump-node dst=t282 arg=t279 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b63 c[1] callee=acc-string dst=t288 arg=t287 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b63 c[3] callee=token-name dst=t290 arg=t289 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b63 c[4] callee=acc-string dst=t291 arg=t290 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b63 c[9] callee=dump-node dst=t296 arg=t293 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b65 c[1] callee=acc-string dst=t299 arg=t298 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b65 c[6] callee=dump-node dst=t304 arg=t301 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b68 c[3] callee=dump-node dst=t318 arg=t315 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b70 c[1] callee=acc-string dst=t324 arg=t323 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b70 c[3] callee=token-name dst=t326 arg=t325 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b70 c[4] callee=acc-string dst=t327 arg=t326 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b72 c[1] callee=acc-string dst=t331 arg=t330 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b75 c[3] callee=dump-node dst=t346 arg=t343 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b77 c[1] callee=acc-string dst=t352 arg=t351 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b77 c[3] callee=integer-to-string dst=t354 arg=t353 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b77 c[4] callee=acc-string dst=t355 arg=t354 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b79 c[1] callee=acc-string dst=t359 arg=t358 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b79 c[3] callee=acc-string dst=t361 arg=t360 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b81 c[1] callee=acc-string dst=t365 arg=t364 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b81 c[3] callee=acc-string dst=t367 arg=t366 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b83 c[1] callee=acc-string dst=t371 arg=t370 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b83 c[3] callee=acc-string dst=t373 arg=t372 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b83 c[5] callee=acc-string dst=t375 arg=t374 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b85 c[1] callee=acc-string dst=t379 arg=t378 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b89 c[1] callee=acc-string dst=t384 arg=t383 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b90 c[1] callee=acc-string dst=t386 arg=t385 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b92 c[1] callee=acc-string dst=t393 arg=t392 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b92 c[3] callee=acc-string dst=t395 arg=t394 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b94 c[1] callee=acc-string dst=t399 arg=t398 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b97 c[3] callee=dump-node dst=t414 arg=t411 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b99 c[1] callee=acc-string dst=t420 arg=t419 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b102 c[3] callee=dump-node dst=t435 arg=t432 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b104 c[1] callee=acc-string dst=t441 arg=t440 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b104 c[3] callee=token-name dst=t443 arg=t442 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b104 c[4] callee=acc-string dst=t444 arg=t443 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b106 c[1] callee=acc-string dst=t448 arg=t447 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b106 c[3] callee=token-name dst=t450 arg=t449 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b106 c[4] callee=acc-string dst=t451 arg=t450 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b112 c[3] callee=dump-for-clause dst=t472 arg=t469 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b115 c[3] callee=dump-param-list dst=t485 arg=t482 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b118 c[3] callee=dump-return-spec dst=t495 arg=t492 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b120 c[3] callee=dump-node dst=t503 arg=t500 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b124 c[3] callee=dump-statement-clause dst=t519 arg=t516 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b127 c[1] callee=acc-string dst=t529 arg=t528 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b127 c[6] callee=dump-node dst=t534 arg=t531 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b129 c[1] callee=acc-string dst=t537 arg=t536 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b129 c[3] callee=dispatch keyword-name-token-name dst=t539 arg=t538 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b129 c[4] callee=acc-string dst=t540 arg=t539 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b129 c[9] callee=dump-node dst=t545 arg=t542 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b131 c[1] callee=acc-string dst=t548 arg=t547 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b131 c[3] callee=token-name dst=t550 arg=t549 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b131 c[4] callee=acc-string dst=t551 arg=t550 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b133 c[4] callee=acc-string dst=t559 arg=t558 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b133 c[9] callee=dump-node dst=t564 arg=t561 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b136 c[1] callee=acc-string dst=t571 arg=t570 arg_pos=1 arg_type=String
+[ARG-ROOT-COV]   block=b136 c[3] callee=acc-string dst=t573 arg=t572 arg_pos=1 arg_type=Top
+[ARG-ROOT-COV]   block=b137 c[1] callee=acc-string dst=t576 arg=t575 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] fn=main gaps=6
+[ARG-ROOT-COV]   block=b1 c[1] callee=format-out dst=t3 arg=t2 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b3 c[1] callee=format-out dst=t7 arg=t6 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[1] callee=parse-dylan dst=t9 arg=t8 arg_pos=0 arg_type=Top
+[ARG-ROOT-COV]   block=b4 c[2] callee=dump-ast dst=t10 arg=t9 arg_pos=0 arg_type=Class(1108)
+[ARG-ROOT-COV]   block=b4 c[4] callee=format-out dst=t12 arg=t11 arg_pos=0 arg_type=String
+[ARG-ROOT-COV]   block=b4 c[4] callee=format-out dst=t12 arg=t10 arg_pos=1 arg_type=String
+[ARG-ROOT-COV] TOTAL functions_with_gaps=137 gaps=1378
