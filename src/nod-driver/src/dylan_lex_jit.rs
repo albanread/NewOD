@@ -1,210 +1,179 @@
-//! Sprint 51b — in-process JIT-strapped Dylan-side lexer.
+//! Sprint 51b — Dylan-side lexer side-load via static linking.
 //!
-//! `--lex-with-dylan` materialises `dylan-lexer.dylan` +
-//! `dylan-lex-shim.dylan` into a temp directory, runs the full
-//! parse → expand → lower pipeline, JITs the result into an isolated
-//! MCJIT engine via [`nod_sema::jit_lowered_module`], looks up
-//! `dylan-lex-collect`, and installs a `nod_reader::lex` override
-//! whose body wraps the raw fn pointer behind a Word-marshalling
-//! shim.
+//! When `nod-driver`'s `build.rs` finds
+//! `tests/nod-tests/fixtures/dylan-lex-shim.lib.obj` it links it into
+//! the `nod-driver` binary AND sets the `dylan_lex_shim_linked` cfg. At
+//! that point this module's externs resolve to the real Dylan-compiled
+//! code; `--lex-with-dylan` installs [`lex`] as the
+//! `nod_reader::set_lex_override` callback and the entire front-end
+//! starts going through Dylan-compiled lex.
 //!
-//! The bridge is the contract from `docs/DYLAN_TOKEN_WIRE.md` plus
-//! one ABI agreement:
+//! Without the cfg (fresh checkout, `.obj` deleted), the externs are
+//! never declared, [`init`] returns an error, and `--lex-with-dylan`
+//! prints a clear "build the shim first" message and falls back to the
+//! Rust lexer.
 //!
-//!   * `dylan-lex-collect(source: <byte-string>) => <stretchy-vector>`
-//!     compiles to a Word-in, Word-out C-callable:
-//!     `extern "C" fn(u64) -> u64`.
-//!   * The returned `<stretchy-vector>` holds `3N` boxed fixnums —
-//!     `(kind, lo, hi)` triples ending at the EOF token.
+//! The bridge is the wire format from `docs/DYLAN_TOKEN_WIRE.md` plus
+//! one ABI agreement: `dylan-lex-collect(source: <byte-string>) =>
+//! <stretchy-vector>` lowers to `extern "C" fn(u64) -> u64`, with the
+//! source byte-string passed as a tagged Word and the return being a
+//! tagged-pointer Word to a stretchy-vector of `3N` boxed fixnums —
+//! `(kind, lo, hi)` per emitted token.
 //!
-//! ## Isolation
+//! ## Why this is simpler than the JIT path we tried first
 //!
-//! Each successful `init` leaks ONE `Context + Jit` pair. The Dylan
-//! runtime's global registries (classes, dispatch caches, stub table)
-//! are shared with any other JIT engine the host process runs — that's
-//! by design: the lex-shim's classes (`<token>`, `<span>`, …) need to
-//! be visible if/when downstream code interrogates them. But the
-//! engine's compiled code is segregated from any user-code JIT engine
-//! the host might spin up later for `eval`-style commands.
-//!
-//! ## Calling overhead
-//!
-//! Per lex call: one O(n) byte-by-byte allocation of a `<byte-string>`
-//! (n FFI calls), one Dylan call, one O(3T) stretchy-vector readback
-//! (T = token count). On corpus fixtures this should be ~100× faster
-//! than spawning a subprocess and ~comparable to or faster than the
-//! Rust path itself (the Dylan lex implementation is in scope of the
-//! same LLVM `-O0` codegen the Rust lex would JIT through).
-//!
-//! ## Failure mode
-//!
-//! If `init` fails (compile error, missing entry, …) the override
-//! never gets installed and `nod_reader::lex` keeps using
-//! `lex_rust`. The init error is surfaced as a stderr message;
-//! callers shouldn't fall over.
+//! There is no JIT engine to spin up, no `register_methods` /
+//! `register_variables` replay (those calls already ran at AOT build
+//! time and are baked into the resolver), no LLVMAddGlobalMapping list
+//! to audit against `nod-runtime` externs. The shim is just code that
+//! is already linked into our process; we point at its symbols.
 
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use nod_reader::{FileId, Span, Token, TokenKind};
 use nod_runtime::Word;
 
-// Shim sources — same `include_str!` pattern the existing
-// `dump-dylan-tokens` infrastructure uses.
+// ─── Externs from the statically-linked shim .obj ─────────────────────────
+//
+// `dylan-lex-collect` is the entry function defined in
+// `tests/nod-tests/fixtures/dylan-lex-shim.dylan`. Its LLVM symbol keeps
+// the source-language name verbatim (dashes and all) because we built
+// the .obj in `AotShape::StaticLibrary` mode, which skips the
+// `nod_user_main` rename. `nod_aot_resolve_relocs` is the resolver
+// that the AOT pipeline injected into the same .obj; it must be called
+// exactly once before any other Dylan-side function fires.
 
-const DYLAN_LEXER_SOURCE: &str =
-    include_str!("../../../tests/nod-tests/fixtures/dylan-lexer.dylan");
-const DYLAN_LEX_SHIM_SOURCE: &str =
-    include_str!("../../../tests/nod-tests/fixtures/dylan-lex-shim.dylan");
+#[cfg(dylan_lex_shim_linked)]
+unsafe extern "C" {
+    /// Sprint 51b — the resolver inside the linked shim .obj. Wires up
+    /// every relocation site the codegen pass emitted: class metadata
+    /// addresses, stub-table entries, string-literal pointers, generic
+    /// dispatch slots. Idempotent in spirit but must run before any
+    /// shim function — calling a Dylan function whose body references
+    /// an unresolved global derefs NULL.
+    fn nod_aot_resolve_relocs();
 
-/// Signature of `dylan-lex-collect`. Word in, Word out.
-type CollectFn = unsafe extern "C" fn(u64) -> u64;
-
-/// Process-wide handle to the side-loaded engine + entry pointer.
-/// Held inside a `OnceLock` keyed by the static `JIT_HANDLE` — first
-/// `init` wins, subsequent calls observe the loaded state.
-struct DylanLexJit {
-    collect: CollectFn,
-    // The `JittedModule` keeps the underlying `Jit` alive (leaked) so
-    // `collect` stays valid for the process lifetime. We hold the
-    // handle even though we never look up another symbol; dropping
-    // it would be undefined-behaviour territory because the fn
-    // pointer aliases JIT-owned memory.
-    _handle: nod_sema::JittedModule,
+    /// Sprint 51b — `define function dylan-lex-collect (source) => …`
+    /// from `dylan-lex-shim.dylan`. Word in, Word out. The source Word
+    /// must be a `<byte-string>` (built via
+    /// `nod_byte_string_allocate` + per-byte
+    /// `nod_byte_string_element_setter`); the return is a pointer to
+    /// a `<stretchy-vector>` whose entries are `3N` boxed fixnums.
+    #[link_name = "dylan-lex-collect"]
+    fn dylan_lex_collect(source: u64) -> u64;
 }
 
-// SAFETY: the leaked MCJIT engine is read-only after init; `CollectFn`
-// is a raw fn pointer (`Send + Sync` by definition). The Dylan side
-// is single-threaded by virtue of the runtime's heap not being
-// thread-safe yet, but the LEX override has to be `Send + Sync`-able
-// for `OnceLock`. Callers must not actually parallel-call `lex`.
-unsafe impl Send for DylanLexJit {}
-unsafe impl Sync for DylanLexJit {}
+// Stub versions for the no-shim build — keep the rest of this module
+// type-checking; `init` reports a clear error and `lex` falls back.
+#[cfg(not(dylan_lex_shim_linked))]
+unsafe extern "C" fn nod_aot_resolve_relocs() {
+    unreachable!("dylan_lex_shim_linked is not set — `init` should have errored");
+}
 
-static JIT_HANDLE: OnceLock<DylanLexJit> = OnceLock::new();
+#[cfg(not(dylan_lex_shim_linked))]
+unsafe extern "C" fn dylan_lex_collect(_source: u64) -> u64 {
+    unreachable!("dylan_lex_shim_linked is not set — `init` should have errored");
+}
 
-/// Materialise the shim sources into a deterministic cache dir,
-/// lower + JIT them, look up `dylan-lex-collect`, and stash the
-/// result in [`JIT_HANDLE`]. Idempotent — repeat calls observe the
-/// already-loaded handle.
+/// Marker recording that [`init`] has run successfully. Set inside the
+/// `OnceLock` so re-installs are no-ops and the no-shim build can't
+/// accidentally fire the resolver.
+static INIT_GUARD: OnceLock<()> = OnceLock::new();
+
+/// Materialise the side-loaded lexer. Calls
+/// `nod_aot_resolve_relocs()` once and records success in
+/// [`INIT_GUARD`]. Subsequent calls observe the recorded state and
+/// return `Ok(())` cheaply.
 ///
-/// Returns `Ok(())` on success or first-cache-hit; `Err(message)`
-/// on any failure (compile error, missing entry function, etc.).
+/// Returns `Err(message)` when the shim wasn't statically linked
+/// (`dylan_lex_shim_linked` cfg unset, i.e. the `.obj` was missing at
+/// `cargo build` time). Callers should treat the error as "fall back
+/// to the Rust lexer".
 pub fn init() -> Result<(), String> {
-    if JIT_HANDLE.get().is_some() {
-        return Ok(());
+    #[cfg(not(dylan_lex_shim_linked))]
+    {
+        return Err(
+            "dylan-lex-shim.lib.obj not statically linked into this nod-driver binary. \
+             Build it first:\n  \
+             ./target/debug/nod-driver.exe build --library \
+             --project tests/nod-tests/fixtures/dylan-lex-shim.prj \
+             -o tests/nod-tests/fixtures/dylan-lex-shim.lib.obj\n\
+             then `cargo build -p nod-driver` to pick it up via build.rs."
+                .to_string(),
+        );
     }
-    let handle = build()?;
-    let _ = JIT_HANDLE.set(handle);
-    Ok(())
+
+    #[cfg(dylan_lex_shim_linked)]
+    {
+        // First-call path runs the resolver. Subsequent calls observe
+        // the OnceLock's stored value and skip the resolver — calling
+        // it twice is at-best wasteful and at-worst confuses the
+        // generic-dispatch cache slots.
+        if INIT_GUARD.get().is_some() {
+            return Ok(());
+        }
+        // SAFETY: nod_aot_resolve_relocs is the codegen-emitted
+        // resolver from the linked .obj. Its preconditions (nod_runtime
+        // initialised, the runtime registries empty of conflicting
+        // entries for the shim's classes) are met because nod-driver's
+        // startup calls `nod_sema::stdlib::ensure_loaded` via earlier
+        // entry points OR (in the bare `--lex-with-dylan` startup case)
+        // by the resolver itself, which is structured to be the first
+        // runtime-touching code.
+        unsafe {
+            nod_aot_resolve_relocs();
+        }
+        let _ = INIT_GUARD.set(());
+        Ok(())
+    }
 }
 
-fn cache_dir() -> Result<PathBuf, String> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    DYLAN_LEXER_SOURCE.hash(&mut h);
-    DYLAN_LEX_SHIM_SOURCE.hash(&mut h);
-    env!("CARGO_PKG_VERSION").hash(&mut h);
-    let digest = h.finish();
-    let dir = std::env::temp_dir().join(format!("nod-dylan-lex-jit-{digest:016x}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create cache dir {}: {e}", dir.display()))?;
-    Ok(dir)
-}
-
-fn build() -> Result<DylanLexJit, String> {
-    let dir = cache_dir()?;
-    let lexer_path = dir.join("dylan-lexer.dylan");
-    let shim_path = dir.join("dylan-lex-shim.dylan");
-    std::fs::write(&lexer_path, DYLAN_LEXER_SOURCE)
-        .map_err(|e| format!("write {}: {e}", lexer_path.display()))?;
-    std::fs::write(&shim_path, DYLAN_LEX_SHIM_SOURCE)
-        .map_err(|e| format!("write {}: {e}", shim_path.display()))?;
-
-    // Reuse the AOT multi-file front-end: parse each file, concat AST,
-    // lower once, merge stdlib. Same `LoweredModule` shape the
-    // AOT pipeline would consume.
-    // Use the AOT-style multi-file front-end: stdlib MUST be merged into
-    // the lowered module so codegen can resolve calls to user-stdlib
-    // functions (e.g. `make-string-stream`, called from
-    // `print-token-to-string` in the lexer). The JIT-friendly sibling
-    // (`compile_files_for_jit`) leaves those out and codegen aborts with
-    // `unknown callee`. The double-registration risk vs. the existing
-    // pre-loaded stdlib is OK in practice: the host process either
-    // (a) only runs this lexer JIT and so the registry mutations are
-    // its only consumer, or (b) was running another JIT engine, in
-    // which case the stdlib addresses in the global registry get
-    // overwritten with our new ones and any subsequent user-code lookup
-    // routes to our copy. The user-code JIT path itself rebinds before
-    // calling, so the swap is invisible at user-call time. A later
-    // sprint can layer in per-engine registries if we ever need real
-    // isolation.
-    let paths: [&std::path::Path; 2] = [&lexer_path, &shim_path];
-    let lm = nod_sema::compile_files_for_aot(&paths)
-        .map_err(|e| format!("compile_files_for_aot: {e}"))?;
-
-    let handle = nod_sema::jit_lowered_module(&lm, "dylan_lex_jit")
-        .map_err(|e| format!("jit_lowered_module: {e}"))?;
-
-
-    // Resolve the entry point. The Dylan name `dylan-lex-collect`
-    // round-trips into the LLVM symbol of the same name (front-end
-    // doesn't sanitise the dash).
-    // SAFETY: `JittedModule::get_function_ptr` returns a raw pointer
-    // into the leaked MCJIT engine; we immediately transmute to the
-    // calling-convention-correct fn type.
-    let ptr = unsafe { handle.get_function_ptr("dylan-lex-collect") }.ok_or_else(|| {
-        "dylan_lex_jit: dylan-lex-collect not found in JIT module (sema must have lowered it \
-         as a top-level function)"
-            .to_string()
-    })?;
-    let collect: CollectFn = unsafe { std::mem::transmute::<*const (), CollectFn>(ptr) };
-
-    Ok(DylanLexJit { collect, _handle: handle })
-}
-
-/// `nod_reader::LexFn`-compatible entry point. Falls back to
-/// `nod_reader::lex_rust` if the JIT never got initialised — should
-/// never happen if the driver registers this only after a successful
-/// `init`, but defensive.
+/// `nod_reader::LexFn`-compatible entry point. Marshals `src.as_bytes()`
+/// into a Dylan `<byte-string>` via the public runtime ABI, calls the
+/// statically-linked `dylan-lex-collect`, walks the returned
+/// `<stretchy-vector>` in strides of 3 (kind, lo, hi), and reconstructs
+/// `Vec<Token>`.
+///
+/// Falls back to [`nod_reader::lex_rust`] if [`init`] hasn't recorded
+/// success — both for the no-shim build (cfg unset) and for the case
+/// where the override got installed without the resolver actually
+/// running (defensive; should not happen in practice).
 pub fn lex(src: &str, file_id: FileId) -> Vec<Token> {
-    let Some(jit) = JIT_HANDLE.get() else {
+    if INIT_GUARD.get().is_none() {
         return nod_reader::lex_rust(src, file_id);
-    };
+    }
 
     // Step 1 — build a Dylan `<byte-string>` from `src.as_bytes()`.
+    // `nod_byte_string_allocate` returns a freshly-allocated buffer of
+    // the requested size; subsequent setters populate it byte by byte.
     let bytes = src.as_bytes();
     let len_word = Word::from_fixnum(bytes.len() as i64).expect("source under fixnum max");
     // SAFETY: `nod_byte_string_allocate` is the runtime's vetted
-    // constructor; it allocates a `<byte-string>` of size `len` and
-    // returns the tagged Word pointer.
+    // constructor.
     let bs_raw = unsafe { nod_runtime::nod_byte_string_allocate(len_word.raw()) };
     for (i, &b) in bytes.iter().enumerate() {
         let byte_word = Word::from_fixnum(b as i64).expect("byte fits");
         let i_word = Word::from_fixnum(i as i64).expect("offset fits");
-        // SAFETY: `bs_raw` is the byte-string we just allocated, still
-        // live and not yet handed to the JIT'd lex.
+        // SAFETY: `bs_raw` was just allocated and isn't reachable from
+        // the GC's mutator yet (we're in single-threaded driver code
+        // between two synchronous runtime calls).
         unsafe {
             nod_runtime::nod_byte_string_element_setter(byte_word.raw(), bs_raw, i_word.raw());
         }
     }
 
     // Step 2 — call `dylan-lex-collect(bs)`. Word in, Word out.
-    // SAFETY: `bs_raw` is a valid `<byte-string>` pointer; the JIT'd
-    // function is the entry installed by `init`. Single-threaded —
-    // no concurrent GC can move `bs_raw` during the call (Dylan's
-    // runtime is STW and the only mutator is the JIT we're calling
-    // into, which threads its own safepoints).
-    let sv_raw = unsafe { (jit.collect)(bs_raw) };
+    // SAFETY: bs_raw is a valid `<byte-string>` pointer; the Dylan-side
+    // function was statically linked into this binary at build time.
+    let sv_raw = unsafe { dylan_lex_collect(bs_raw) };
 
-    // Step 3 — walk the returned stretchy-vector as (kind, lo, hi)
-    // triples.
+    // Step 3 — walk the returned stretchy-vector in strides of 3.
     let size_word_raw = unsafe { nod_runtime::nod_stretchy_vector_size(sv_raw) };
     let size = Word::from_raw(size_word_raw)
         .as_fixnum()
         .expect("size is fixnum") as usize;
     debug_assert!(
-        size % 3 == 0,
+        size.is_multiple_of(3),
         "dylan-lex-collect returned {size} ints — not a multiple of 3 (kind, lo, hi)"
     );
 
@@ -244,7 +213,7 @@ pub fn lex(src: &str, file_id: FileId) -> Vec<Token> {
 }
 
 /// Map the wire-format kind ordinal (`docs/DYLAN_TOKEN_WIRE.md` §3)
-/// back to a [`TokenKind`]. The discriminants ARE the `#[repr(u8)]`
+/// back to a [`TokenKind`]. Discriminants ARE the `#[repr(u8)]`
 /// ordinals of `TokenKind`, but we go through an explicit match so a
 /// future enum reshuffle fails loudly here rather than producing
 /// silently-corrupt tokens via `transmute`.

@@ -340,6 +340,47 @@ pub fn emit_aot_entry_stubs_full<'ctx>(
     safepoint_installs: &[SafepointInstallRecord],
     entry_function: &str,
 ) -> Result<(), AotError> {
+    emit_aot_entry_stubs_full_with_mode(
+        module,
+        manifest,
+        registrations,
+        safepoint_installs,
+        entry_function,
+        AotShape::Executable,
+    )
+}
+
+/// Sprint 51b — the shape of the AOT object the entry-stub pass should
+/// emit. `Executable` is the original "build a Windows EXE" path:
+/// rename the user's entry to `nod_user_main`, emit a synthetic
+/// `i32 @main` that the CRT calls, the works. `StaticLibrary` skips
+/// both — every emitted symbol keeps its source-language name, no
+/// `main` is added — so the resulting `.obj` can be statically linked
+/// into a host EXE (currently `nod-driver` for the `--lex-with-dylan`
+/// path) without colliding with the host's own `main`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum AotShape {
+    /// Sprint 39a — the original EXE shape. Renames the start function
+    /// to `nod_user_main` and injects `i32 @main()` that calls the
+    /// resolver + wrapper.
+    Executable,
+    /// Sprint 51b — library shape. Keep all source-language names
+    /// intact; skip the synthetic `main` so the linker doesn't see a
+    /// duplicate when the `.obj` is bundled into a Rust binary. The
+    /// resolver (`nod_aot_resolve_relocs`) is still emitted with
+    /// external linkage; the host must call it once before invoking
+    /// any of the Dylan-side functions.
+    StaticLibrary,
+}
+
+pub fn emit_aot_entry_stubs_full_with_mode<'ctx>(
+    module: &Module<'ctx>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    safepoint_installs: &[SafepointInstallRecord],
+    entry_function: &str,
+    shape: AotShape,
+) -> Result<(), AotError> {
     // Resist the temptation to rename `<eval-entry>` here — that name
     // is reserved for the JIT path. AOT users write `define function
     // main` (or another name per the project's `start_function`).
@@ -347,48 +388,59 @@ pub fn emit_aot_entry_stubs_full<'ctx>(
         .get_function(entry_function)
         .ok_or(AotError::MissingMain)?;
 
-    // Guard against a pre-existing `nod_user_main` (would be unusual —
-    // user shouldn't pick that name — but a clear error beats silent
-    // overwriting).
-    if module.get_function(NOD_USER_MAIN_SYMBOL).is_some() {
-        return Err(AotError::Conflict(format!(
-            "module already declares a function named `{NOD_USER_MAIN_SYMBOL}` — \
-             user source must not collide with the AOT entry-stub renaming"
-        )));
-    }
+    if matches!(shape, AotShape::Executable) {
+        // Guard against a pre-existing `nod_user_main` (would be unusual —
+        // user shouldn't pick that name — but a clear error beats silent
+        // overwriting).
+        if module.get_function(NOD_USER_MAIN_SYMBOL).is_some() {
+            return Err(AotError::Conflict(format!(
+                "module already declares a function named `{NOD_USER_MAIN_SYMBOL}` — \
+                 user source must not collide with the AOT entry-stub renaming"
+            )));
+        }
 
-    // Step 1+2: rename the user's `main` to `nod_user_main`. inkwell
-    // exposes `set_name` on `FunctionValue` via `LLVMSetValueName2`.
-    user_main.as_global_value().set_name(NOD_USER_MAIN_SYMBOL);
-    // External linkage so the staticlib's extern declaration finds it.
-    user_main.set_linkage(Linkage::External);
+        // Step 1+2: rename the user's `main` to `nod_user_main`. inkwell
+        // exposes `set_name` on `FunctionValue` via `LLVMSetValueName2`.
+        user_main.as_global_value().set_name(NOD_USER_MAIN_SYMBOL);
+        // External linkage so the staticlib's extern declaration finds it.
+        user_main.set_linkage(Linkage::External);
 
-    // Sprint 50c-4 fix — when the user chose a non-`main` entry
-    // function, another source file in the bundle may STILL define a
-    // function named `main` (the canonical example is bundling
-    // `dylan-parser.dylan`, whose CLI entry happens to be named
-    // `main`, with a smoke harness whose entry is `smoke-main`).
-    //
-    // Two problems if we leave that orphan `main` alone:
-    //   1. It steals the C entry point. Windows' `mainCRTStartup` /
-    //      Unix' `_start` find `main` and call it before
-    //      `nod_aot_resolve_relocs` has populated literal-string
-    //      globals — every `format-out` inside that `main` crashes
-    //      with "format string is not a <byte-string> (raw 0x0)".
-    //   2. The synthetic C `main` the AOT pipeline adds below (step
-    //      3a) collides on the symbol name.
-    //
-    // Fix: rename the orphan to a private symbol AND demote linkage
-    // to Internal so the synthetic C `main` can claim the name
-    // unambiguously. Other Dylan code that referred to it via the
-    // dispatch tables already points at the LLVM function value, not
-    // the name, so the rename is transparent to callers.
-    if entry_function != "main"
-        && let Some(orphan) = module.get_function("main")
-        && orphan != user_main
-    {
-        orphan.as_global_value().set_name("nod_orphan_main");
-        orphan.set_linkage(Linkage::Internal);
+        // Sprint 50c-4 fix — when the user chose a non-`main` entry
+        // function, another source file in the bundle may STILL define a
+        // function named `main` (the canonical example is bundling
+        // `dylan-parser.dylan`, whose CLI entry happens to be named
+        // `main`, with a smoke harness whose entry is `smoke-main`).
+        //
+        // Two problems if we leave that orphan `main` alone:
+        //   1. It steals the C entry point. Windows' `mainCRTStartup` /
+        //      Unix' `_start` find `main` and call it before
+        //      `nod_aot_resolve_relocs` has populated literal-string
+        //      globals — every `format-out` inside that `main` crashes
+        //      with "format string is not a <byte-string> (raw 0x0)".
+        //   2. The synthetic C `main` the AOT pipeline adds below (step
+        //      3a) collides on the symbol name.
+        //
+        // Fix: rename the orphan to a private symbol AND demote linkage
+        // to Internal so the synthetic C `main` can claim the name
+        // unambiguously. Other Dylan code that referred to it via the
+        // dispatch tables already points at the LLVM function value, not
+        // the name, so the rename is transparent to callers.
+        if entry_function != "main"
+            && let Some(orphan) = module.get_function("main")
+            && orphan != user_main
+        {
+            orphan.as_global_value().set_name("nod_orphan_main");
+            orphan.set_linkage(Linkage::Internal);
+        }
+    } else {
+        // Library mode — leave user_main, the start function, and any
+        // sibling `main` untouched. The host process supplies its own
+        // C-runtime entry; the .obj just adds named symbols to the
+        // process image.
+        //
+        // `user_main` is unused under this arm; the lookup above stays
+        // as a sanity-check that the named entry function exists.
+        let _ = user_main;
     }
 
     let ctx = module.get_context();
@@ -427,36 +479,46 @@ pub fn emit_aot_entry_stubs_full<'ctx>(
     // function-ref / block registries are populated with the merged
     // stdlib (and user-defined) bodies BEFORE `nod_user_main` runs.
     let resolver_fn =
-        emit_resolve_relocs_function(module, manifest, &stub_entries, registrations)?;
+        emit_resolve_relocs_function(module, manifest, &stub_entries, registrations, shape)?;
 
-    // Step 5: emit `i32 @main()` that calls the resolver, then the
-    // wrapper, then returns the wrapper's rc.
-    let i32_ty = ctx.i32_type();
-    let main_ty = i32_ty.fn_type(&[], false);
+    if matches!(shape, AotShape::Executable) {
+        // Step 5: emit `i32 @main()` that calls the resolver, then the
+        // wrapper, then returns the wrapper's rc.
+        let i32_ty = ctx.i32_type();
+        let main_ty = i32_ty.fn_type(&[], false);
 
-    // Wrapper extern decl. `nod_runtime.lib` provides the definition.
-    let wrapper_fn = match module.get_function(NOD_AOT_MAIN_WRAPPER_SYMBOL) {
-        Some(f) => f,
-        None => module.add_function(NOD_AOT_MAIN_WRAPPER_SYMBOL, main_ty, Some(Linkage::External)),
-    };
+        // Wrapper extern decl. `nod_runtime.lib` provides the definition.
+        let wrapper_fn = match module.get_function(NOD_AOT_MAIN_WRAPPER_SYMBOL) {
+            Some(f) => f,
+            None => {
+                module.add_function(NOD_AOT_MAIN_WRAPPER_SYMBOL, main_ty, Some(Linkage::External))
+            }
+        };
 
-    let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
-    let entry = ctx.append_basic_block(main_fn, "entry");
-    let builder = ctx.create_builder();
-    builder.position_at_end(entry);
-    builder
-        .build_call(resolver_fn, &[], "")
-        .map_err(|e| AotError::Llvm(format!("build_call resolver: {e}")))?;
-    let call = builder
-        .build_call(wrapper_fn, &[], "rc")
-        .map_err(|e| AotError::Llvm(format!("build_call wrapper: {e}")))?;
-    let rc = call
-        .try_as_basic_value()
-        .basic()
-        .ok_or_else(|| AotError::Llvm("wrapper call returned void".into()))?;
-    builder
-        .build_return(Some(&rc))
-        .map_err(|e| AotError::Llvm(format!("build_return: {e}")))?;
+        let main_fn = module.add_function("main", main_ty, Some(Linkage::External));
+        let entry = ctx.append_basic_block(main_fn, "entry");
+        let builder = ctx.create_builder();
+        builder.position_at_end(entry);
+        builder
+            .build_call(resolver_fn, &[], "")
+            .map_err(|e| AotError::Llvm(format!("build_call resolver: {e}")))?;
+        let call = builder
+            .build_call(wrapper_fn, &[], "rc")
+            .map_err(|e| AotError::Llvm(format!("build_call wrapper: {e}")))?;
+        let rc = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| AotError::Llvm("wrapper call returned void".into()))?;
+        builder
+            .build_return(Some(&rc))
+            .map_err(|e| AotError::Llvm(format!("build_return: {e}")))?;
+    } else {
+        // Library mode — no synthetic `main`. The resolver was emitted
+        // above and is callable from the host via its symbol name; the
+        // host is responsible for calling it once before any of the
+        // Dylan-side functions.
+        let _ = resolver_fn;
+    }
 
     // Re-verify so a botched IR change here surfaces early (before the
     // driver hands the module to TargetMachine).
@@ -711,6 +773,7 @@ fn emit_resolve_relocs_function<'ctx>(
     manifest: &ModuleManifest,
     stub_entries: &StubEntryInfoMap<'ctx>,
     registrations: &AotRegistrations,
+    shape: AotShape,
 ) -> Result<inkwell::values::FunctionValue<'ctx>, AotError> {
     let ctx = module.get_context();
     let void_ty = ctx.void_type();
@@ -778,8 +841,18 @@ fn emit_resolve_relocs_function<'ctx>(
         });
 
     let resolver_ty = void_ty.fn_type(&[], false);
+    // Sprint 51b — library-mode .objs need an external resolver so the
+    // host (`nod-driver` for `--lex-with-dylan`) can `extern "C"` it
+    // and run it once at startup. EXE shape keeps internal linkage —
+    // the only caller in that mode is the synthetic `i32 @main()` we
+    // emit a few steps later, and a private resolver doesn't pollute
+    // the EXE's symbol table.
+    let resolver_linkage = match shape {
+        AotShape::Executable => Linkage::Internal,
+        AotShape::StaticLibrary => Linkage::External,
+    };
     let resolver_fn =
-        module.add_function(NOD_AOT_RESOLVE_RELOCS_SYMBOL, resolver_ty, Some(Linkage::Internal));
+        module.add_function(NOD_AOT_RESOLVE_RELOCS_SYMBOL, resolver_ty, Some(resolver_linkage));
     let entry = ctx.append_basic_block(resolver_fn, "entry");
     let builder = ctx.create_builder();
     builder.position_at_end(entry);
@@ -1944,12 +2017,37 @@ pub fn emit_aot_object_full(
     opt_level: OptimizationLevel,
     entry_function: &str,
 ) -> Result<(), AotError> {
-    emit_aot_entry_stubs_full(
+    emit_aot_object_full_with_mode(
+        module,
+        manifest,
+        registrations,
+        safepoint_installs,
+        path,
+        opt_level,
+        entry_function,
+        AotShape::Executable,
+    )
+}
+
+/// Sprint 51b — superset variant that picks the AOT shape. See [`AotShape`]
+/// for the difference between executable and static-library outputs.
+pub fn emit_aot_object_full_with_mode(
+    module: &Module<'_>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    safepoint_installs: &[SafepointInstallRecord],
+    path: &Path,
+    opt_level: OptimizationLevel,
+    entry_function: &str,
+    shape: AotShape,
+) -> Result<(), AotError> {
+    emit_aot_entry_stubs_full_with_mode(
         module,
         manifest,
         registrations,
         safepoint_installs,
         entry_function,
+        shape,
     )?;
     emit_object_file(module, path, opt_level)?;
     Ok(())

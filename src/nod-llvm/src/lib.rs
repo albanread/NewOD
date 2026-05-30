@@ -52,6 +52,6 @@ pub use symbols::{
 // Sprint 40a — extended with user-class registrations.
 pub use aot::{
     AotBlockHandlerRegistration, AotBlockRegistration, AotFunctionRegistration,
-    AotMethodRegistration, AotRegistrations, AotSlotRegistration, AotUserClassRegistration,
-    AotVariableRegistration,
+    AotMethodRegistration, AotRegistrations, AotShape, AotSlotRegistration,
+    AotUserClassRegistration, AotVariableRegistration,
 };

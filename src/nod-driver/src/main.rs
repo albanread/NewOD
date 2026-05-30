@@ -110,6 +110,17 @@ enum Command {
         /// command before invoking it.
         #[arg(long = "verbose")]
         verbose: bool,
+        /// Sprint 51b — emit a statically-linkable `.obj` instead of a
+        /// standalone EXE. Skips the synthetic `i32 @main()` injection
+        /// and the user-entry → `nod_user_main` rename, so the object
+        /// can be linked into a host binary (e.g. `nod-driver` itself,
+        /// for `--lex-with-dylan`) without colliding on `main`. The
+        /// resolver `nod_aot_resolve_relocs` is still emitted; the host
+        /// must call it once before invoking any of the Dylan-side
+        /// functions. `--output` should point at the desired `.obj`
+        /// path; linking is skipped entirely.
+        #[arg(long = "library")]
+        library: bool,
     },
     /// Start an interactive REPL. Not yet implemented.
     Repl,
@@ -259,7 +270,7 @@ fn main() -> ExitCode {
             eprintln!("nod-driver compile: not yet implemented (input: {target})");
             ExitCode::from(2)
         }
-        Some(Command::Build { inputs, output, project, time, verbose }) => {
+        Some(Command::Build { inputs, output, project, time, verbose, library }) => {
             // Sprint 49 — accept inputs from either positional args
             // (Sprint 44 multi-file shape) OR a `.prj` project file.
             // `clap`'s `conflicts_with` on `project` rules out the
@@ -295,7 +306,7 @@ fn main() -> ExitCode {
                 .or(default_out)
                 .unwrap_or_else(|| default_exe_path(&resolved_inputs[0]));
             let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
-            let code = run_build_full(&resolved_inputs, &out, verbose, &entry_function);
+            let code = run_build_full(&resolved_inputs, &out, verbose, &entry_function, library);
             if let Some(start) = stopwatch {
                 let dt = start.elapsed();
                 let what = project_tag
@@ -437,9 +448,15 @@ fn run_build_full(
     output: &std::path::Path,
     verbose: bool,
     entry_function: &str,
+    library: bool,
 ) -> ExitCode {
     use nod_llvm::LlvmContext as Context;
     use nod_llvm::OptimizationLevel;
+    let shape = if library {
+        nod_llvm::AotShape::StaticLibrary
+    } else {
+        nod_llvm::AotShape::Executable
+    };
 
     // Sprint 44 — multi-file front-end. For a single input the
     // pipeline is identical to the Sprint 39 single-file path (the
@@ -529,7 +546,10 @@ fn run_build_full(
     // generic method) resolve at AOT runtime.
     let registrations = nod_sema::build_aot_registrations(&lm);
 
-    if let Err(e) = nod_llvm::aot::emit_aot_object_full(
+    // Sprint 51b — library mode picks `AotShape::StaticLibrary`, which
+    // keeps every source-language symbol name intact and skips the
+    // synthetic `i32 @main()` emission.
+    if let Err(e) = nod_llvm::aot::emit_aot_object_full_with_mode(
         &module,
         &manifest,
         &registrations,
@@ -537,9 +557,29 @@ fn run_build_full(
         &obj_path,
         OptimizationLevel::Default,
         entry_function,
+        shape,
     ) {
         eprintln!("nod build: {e}");
         return ExitCode::from(1);
+    }
+
+    if library {
+        // Library mode — no linking. The `.obj` already sits at
+        // `obj_path` from `emit_aot_object_full_with_mode`. If the
+        // user asked for an output path that differs from
+        // `default_exe_path`'s `.exe`-derived `.obj`, copy it across.
+        if obj_path != output {
+            if let Err(e) = std::fs::copy(&obj_path, output) {
+                eprintln!(
+                    "nod build: copy {} -> {}: {e}",
+                    obj_path.display(),
+                    output.display()
+                );
+                return ExitCode::from(1);
+            }
+        }
+        println!("compiled (library): {}", output.display());
+        return ExitCode::SUCCESS;
     }
 
     // Step 4 — locate the staticlib and `link.exe`.
