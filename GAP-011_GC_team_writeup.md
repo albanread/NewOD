@@ -161,6 +161,52 @@ accumulator should be in there, and isn't. From there:
 Tooling for any of these is now in place. See `docs/tracing_guide.md` for the
 investigation recipe.
 
+### What we learned trying to make a small repro
+
+Three reproducer attempts, saved as fixtures so future investigation can
+iterate without re-deriving them (`tests/nod-tests/fixtures/gap011-*.dylan`):
+
+- **`gap011-repro.dylan`** — recursive function passing a `<stretchy-vector>`
+  through 1000 levels of recursion, each level pushing 64 bytes into the
+  vector twice. **Does NOT crash**, even though it triggers 10 collections
+  and 10 k root rewrites. Pure "recursive call + vector accumulator + many
+  pushes across collections" is not enough.
+- **`gap011-repro2.dylan`** — walks a tree of `<node>` instances (classes
+  with slots, generic dispatch via `instance?` + slot accessors),
+  pushing each node's label into a buffer. **Does NOT crash** either.
+- **`gap011-jcs-min-crash.dylan`** — the smallest *parser-driven* input we
+  found that still crashes: the first 35 `s00…s34` functions from
+  `jit_cache_sample_items.dylan` (38 lines). At **32 functions the parser
+  succeeds; at 35 it crashes** — a 10 %-wide threshold. This is the new
+  gating test (smaller and faster than `jcs-40`).
+
+That threshold tells us the bug isn't "lots of pushes across collections"
+in general — the simple-pattern repros above clear that bar without
+incident. It needs the *specific allocation interleaving* the parser's
+`dump-ast → dump-node → acc-string → add!` chain produces, timed so a
+moving major collection fires at exactly the wrong point. So the next
+session's working hypothesis should be a **codegen/LLVM interaction that
+only manifests under that specific interleaving** (a register-allocation
+choice that survives the spill/reload contract, an `alloca` that LLVM
+treats as non-escaping, or a stdlib runtime path the parser hits at scale
+that the small repros don't).
+
+### Echo from the NewGC side (worth keeping in mind)
+
+The Lisp team's `c500539` ("Move clear_all_pins from per-evac to
+per-logical-cycle") landed while this investigation was in flight. The
+bug there: a per-pass cleanup wiped pin state needed across the **multi-
+pass cascade** of a logical major collection — a G1 pin set at the start
+of the cycle was empty by the cascade boundary and a live page got
+released. The conservative path doesn't affect us (we build
+`default-features = false`), but the **pattern** — state that's correct
+at every individual pass boundary but wrong across the multi-pass cycle —
+is exactly the shape of bug we've been hunting from the other side, and
+worth holding next to our findings: every registered root is correctly
+rewritten on every pass; one reference still ends up stale. We have not
+yet ruled out an analogous "between-pass state loss" on the embedder
+(our) side.
+
 **A2. Make the safepoint verifier able to catch a real stale root.**
 `NOD_AOT_VERIFY_SAFEPOINTS` (`src/nod-runtime/src/aot.rs:294-320`) checks root
 *counts* only — it passed this bug clean. Even a completeness/value-dominance
