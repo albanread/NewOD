@@ -18,6 +18,11 @@ semispace-backend = ["nod-sema/semispace-backend"]
 
 [dependencies]
 clap          = { workspace = true }
+# Sprint 49 — `build --project foo.prj` reads TOML. `serde` derives
+# the `Project` struct from the schema; `toml` parses. Both are tiny
+# pure-Rust crates with no transitive surprises.
+serde         = { workspace = true }
+toml          = { workspace = true }
 nod-reader    = { path = "../nod-reader" }
 nod-namespace = { path = "../nod-namespace" }
 nod-sema      = { path = "../nod-sema", default-features = false }

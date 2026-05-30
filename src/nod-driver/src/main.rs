@@ -16,6 +16,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod project;
+
 /// LLVM major version this driver is targeted against. Read at
 /// `--version` time; the inkwell linkage itself lights up in Sprint 06.
 const LLVM_VERSION: &str = "22.1";
@@ -60,11 +62,26 @@ enum Command {
     Build {
         /// One or more `.dylan` source files. Exactly one of them must
         /// contain `define function main` (the EXE entry point).
-        #[arg(required = true)]
+        /// Either pass positional inputs OR `--project <foo.prj>` —
+        /// never both. `clap` enforces this via the `conflicts_with`
+        /// attribute below.
+        #[arg(required_unless_present = "project", conflicts_with = "project")]
         inputs: Vec<PathBuf>,
-        /// Output EXE path. Defaults to `<first input stem>.exe`.
+        /// Output EXE path. Defaults to `<first input stem>.exe`, or
+        /// the project file's `output` field when `--project` is used.
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
+        /// Sprint 49 — load build inputs from a `.prj` project file.
+        /// Relative paths inside the file are anchored at the project
+        /// file's directory. Mutually exclusive with positional
+        /// `inputs`.
+        #[arg(long = "project")]
+        project: Option<PathBuf>,
+        /// Sprint 49 — print wall-clock stage timings (parse+lower,
+        /// codegen, emit-object, link) to stderr after the build
+        /// finishes. Inert when off.
+        #[arg(long = "time")]
+        time: bool,
         /// Print the chosen target triple, object path, and linker
         /// command before invoking it.
         #[arg(long = "verbose")]
@@ -130,6 +147,11 @@ enum Command {
     ParseDylan {
         /// Path to a `.dylan` source file to parse.
         input: PathBuf,
+        /// Sprint 49 — print wall-clock for the parser-EXE run to
+        /// stderr after the parse finishes. Does NOT include the
+        /// (cached) one-time build of `dylan-parser.exe`.
+        #[arg(long = "time")]
+        time: bool,
     },
     /// Symbolicate a crash dump's raw hex IPs against a linker `.map`.
     ///
@@ -179,12 +201,51 @@ fn main() -> ExitCode {
             eprintln!("nod-driver compile: not yet implemented (input: {target})");
             ExitCode::from(2)
         }
-        Some(Command::Build { inputs, output, verbose }) => {
-            // Sprint 44 — multi-file builds. `clap`'s `required = true`
-            // on `Vec<PathBuf>` guarantees at least one input; the
-            // first drives the default output name.
-            let out = output.unwrap_or_else(|| default_exe_path(&inputs[0]));
-            run_build(&inputs, &out, verbose)
+        Some(Command::Build { inputs, output, project, time, verbose }) => {
+            // Sprint 49 — accept inputs from either positional args
+            // (Sprint 44 multi-file shape) OR a `.prj` project file.
+            // `clap`'s `conflicts_with` on `project` rules out the
+            // both-set case at parse time; `required_unless_present`
+            // rules out both-empty. So at most one of the two is
+            // populated here.
+            let (resolved_inputs, default_out, project_tag) =
+                if let Some(prj_path) = project {
+                    match project::ResolvedProject::load(&prj_path) {
+                        Ok(p) => {
+                            if verbose {
+                                eprintln!(
+                                    "nod build: project={} ({}), {} source file{}",
+                                    p.name,
+                                    p.project_path.display(),
+                                    p.sources.len(),
+                                    if p.sources.len() == 1 { "" } else { "s" },
+                                );
+                            }
+                            let tag = format!("project `{}`", p.name);
+                            (p.sources.clone(), Some(p.output), Some(tag))
+                        }
+                        Err(e) => {
+                            eprintln!("nod build: {e}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                } else {
+                    (inputs.clone(), None, None)
+                };
+            let out = output
+                .or(default_out)
+                .unwrap_or_else(|| default_exe_path(&resolved_inputs[0]));
+            let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
+            let code = run_build(&resolved_inputs, &out, verbose);
+            if let Some(start) = stopwatch {
+                let dt = start.elapsed();
+                let what = project_tag
+                    .unwrap_or_else(|| format!("{} input file{}",
+                        resolved_inputs.len(),
+                        if resolved_inputs.len() == 1 { "" } else { "s" }));
+                eprintln!("nod build: total wall-clock {:.3}s ({what})", dt.as_secs_f64());
+            }
+            code
         }
         Some(Command::Repl) => {
             eprintln!("nod-driver repl: not yet implemented (see Sprint 08).");
@@ -197,7 +258,18 @@ fn main() -> ExitCode {
         Some(Command::DumpLlvm { input }) => run_dump_llvm(&input),
         Some(Command::Eval { expr }) => run_eval(&expr),
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
-        Some(Command::ParseDylan { input }) => run_parse_dylan(&input),
+        Some(Command::ParseDylan { input, time }) => {
+            let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
+            let code = run_parse_dylan(&input);
+            if let Some(start) = stopwatch {
+                let dt = start.elapsed();
+                eprintln!(
+                    "nod parse-dylan: total wall-clock {:.3}s",
+                    dt.as_secs_f64()
+                );
+            }
+            code
+        }
         Some(Command::Symbolicate { map, input, output, runtime_base }) => {
             run_symbolicate(&map, input.as_deref(), output.as_deref(), runtime_base.as_deref())
         }
