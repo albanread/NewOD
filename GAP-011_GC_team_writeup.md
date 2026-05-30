@@ -72,14 +72,94 @@ remaining live suspects, in rough order:
 3. **`nod_make`/`rust_make` don't root the fresh instance across user
    `initialize`** (A4) — only bites classes with a user `initialize`.
 
-### Next decisive step (re-scoped from A1)
+### Runtime ground truth — DONE (vendored GC + `NOD_GC_TRACE` tracer)
 
-Get **runtime ground truth**, not more static analysis: at the
-`stretchy_vector_push` panic, identify (a) which AOT function called it with a
-stale `sv`, and (b) whether that `sv` address was in the collector's root set at
-the last collection. Cheapest path: a one-shot instrument in
-`stretchy_vector_push`'s entry-check + `newgc-core` evacuation diag keyed on the
-faulting address. That disambiguates suspect #1 vs #2/#3 in a single run.
+We vendored `newgc-core` in-tree (`src/newgc-core`, NewGC HEAD `15b50c6`) and
+added an env-gated JSONL collection tracer (`NOD_GC_TRACE=<path>`, commit
+`d2b489d`) plus an evacuator rewrite hook (this round). It records, per
+collection: the full registered root set (provenance + slot addr + Word),
+every **root** rewrite (`visit`), and every **object-field / dirty-card**
+rewrite (`visit_cell`) — the last distinguishes a heap-resident slot (object
+field) from a native-stack slot (root/safepoint slab). `stretchy_vector_push`
+prints the stale `sv` on the failure path so the trace can be correlated.
+Conditional `NOD_GC_TRACE_WATCH`/`_FOLLOW` zoom in on one object.
+
+Findings on `jcs-40` (refreshed GC, byte-identical crash):
+
+1. **The collector is faithful.** The stale vector IS a registered root (≈8
+   slots). As it relocates across the multi-pass majors, the collector rewrites
+   **every** registered slot to the final location (`moved:true` on all). After
+   the cycle, all registered roots agree on the new address.
+2. **The crash uses the *vacated* address**, held by a reference that was NOT in
+   the registered root set at the moving collection.
+3. **That reference is NOT a heap object field.** Across the whole run, the
+   vector-family value appears in **32 rewrite events, every one with a
+   native-stack slot** (`0x71…`, the AOT safepoint slabs); **zero** appear with
+   a heap-resident slot (`0x19…`, object fields). The 20 object-field rewrites
+   in the trace carry *other* objects.
+
+**Conclusion — the residual is a missing/stale STACK-SLOT or REGISTER root, on
+the compiler/runtime side. Refuted by this trace:** (#1) a `newgc-core`
+evacuation bug — it faithfully rewrites every registered root; (#2) a wrong
+`DylanLayout` slot-map / untraced object field — the vector never lives in an
+object field. So the fix is **not** in the GC and **not** in the class layout.
+
+### Bug site located — DONE (`/MAP` + `RtlCaptureStackBackTrace`)
+
+Added two probes:
+
+- **`/MAP` linker flag** in `nod-driver`'s `build` subcommand
+  (`src/nod-driver/src/main.rs`) — every AOT EXE now gets a `dylan-parser.exe.map`
+  symbol-to-RVA listing alongside it.
+- **`RtlCaptureStackBackTrace` probe** at the `stretchy_vector_push` failure
+  path (`src/nod-runtime/src/collections.rs`) — when push panics it dumps the
+  raw frame IPs (the std `Backtrace` API only emits `<unknown>` without a
+  PDB).
+
+Subtracting the ASLR slide (`runtime_IP_in_push - preferred_addr_of_push`
+rounded to the 16 KiB page) and looking each IP up in the `.map` produces the
+clean call chain from the panic site, top-down:
+
+```
+0: stretchy_vector_push + 0x247      [nod_runtime]   ← panic
+1: nod_stretchy_vector_push + 0x57   [nod_runtime]   ← C-ABI shim
+2: acc-string + 0x144                [dylan-parser]  ← Dylan caller of push
+3-7: dump-node + …                   [dylan-parser]  ← recursive AST dump
+8: dump-ast + 0xea                   [dylan-parser]
+9: nod_user_main + 0x252             [dylan-parser]
+10: nod_aot_main_wrapper + 0x18      [nod_runtime]
+11: main + 0xe
+12: __scrt_common_main_seh
+```
+
+**Bug site:** `dump-node` in `tests/nod-tests/fixtures/dylan-parser.dylan`
+holds the stretchy-vector accumulator it passes to `acc-string`, and that
+local is not registered as a precise root across the `acc-string` call. A
+collection fired by `acc-string`'s allocations relocates the vector; the
+collector rewrites every *registered* root, but the unregistered stack slot
+in `dump-node` keeps the vacated address. Next `dump-node → acc-string →
+push` reads that slot and hands push the dead `Word`.
+
+The crash is in the AST *dump* path (after a successful parse of `jcs-40`),
+not the parse path — so a workaround is to skip the dump for files that
+trigger this, but the fix is in `dump-node`'s lowering / safepoint coverage.
+
+### Fix direction
+
+`dump-dfm` of the parser fixture, find the `acc-string` call site inside
+`dump-node`'s IR, inspect its `safepoint_roots` — the stretchy-vector
+accumulator should be in there, and isn't. From there:
+
+- If the IR shows the temp **is** live across `acc-string` but absent from
+  `safepoint_roots` → liveness gap (verify the global fixpoint sees it).
+- If the IR shows the temp is **not** live by liveness's reckoning (e.g.
+  rematerialised, or split through a path the dataflow misses) → lowering
+  gap; the accumulator needs to be threaded through every block where the
+  call can trigger GC.
+- If both look correct → codegen reload after the call.
+
+Tooling for any of these is now in place. See `docs/tracing_guide.md` for the
+investigation recipe.
 
 **A2. Make the safepoint verifier able to catch a real stale root.**
 `NOD_AOT_VERIFY_SAFEPOINTS` (`src/nod-runtime/src/aot.rs:294-320`) checks root

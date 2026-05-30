@@ -1037,6 +1037,41 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
                 sv.raw(),
                 sv.raw() & !1,
             );
+            // GAP-011: capture the AOT call chain that led here, so we can
+            // map the immediate caller's return address back to the Dylan
+            // function whose frame holds the unregistered stale-vector slot.
+            // `force_capture` ignores `RUST_BACKTRACE` and always captures.
+            // GAP-011: capture raw stack-frame IPs via Win32
+            // RtlCaptureStackBackTrace — std::backtrace::Backtrace's
+            // Display/Debug show only `<unknown>` for AOT EXE frames
+            // (no PDB), but the raw IPs are what we actually need to
+            // resolve against the EXE's `.map` file.
+            #[cfg(windows)]
+            {
+                unsafe extern "system" {
+                    fn RtlCaptureStackBackTrace(
+                        frames_to_skip: u32,
+                        frames_to_capture: u32,
+                        back_trace: *mut *mut core::ffi::c_void,
+                        back_trace_hash: *mut u32,
+                    ) -> u16;
+                }
+                const MAX_FRAMES: usize = 64;
+                let mut frames: [*mut core::ffi::c_void; MAX_FRAMES] =
+                    [core::ptr::null_mut(); MAX_FRAMES];
+                let n = unsafe {
+                    RtlCaptureStackBackTrace(
+                        0,
+                        MAX_FRAMES as u32,
+                        frames.as_mut_ptr(),
+                        core::ptr::null_mut(),
+                    )
+                } as usize;
+                eprintln!("[GAP-011] push caller backtrace ({n} frames):");
+                for (i, &ip) in frames.iter().take(n).enumerate() {
+                    eprintln!("  frame {i:>2}: 0x{:016x}", ip as usize);
+                }
+            }
             panic!("stretchy_vector_push: not a <stretchy-vector>");
         }
     };

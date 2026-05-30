@@ -427,6 +427,11 @@ fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> Exi
     link_cmd.arg("/NXCOMPAT");
     link_cmd.arg("/DYNAMICBASE");
     link_cmd.arg("/HIGHENTROPYVA");
+    // GAP-011 diagnostic: emit a linker map file alongside the EXE so a
+    // crash-backtrace IP can be resolved back to the AOT Dylan function it
+    // belongs to. Costs a few seconds of link time + a text file; no effect
+    // on the EXE.
+    link_cmd.arg(format!("/MAP:{}.map", output.display()));
     // Sprint 39b — pass an import lib for every DLL the user's program
     // references via `define c-function` / bare-name Win32 calls. The
     // Windows loader resolves these symbols from the named DLLs at EXE
