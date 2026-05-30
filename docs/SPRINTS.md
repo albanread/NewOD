@@ -2099,14 +2099,56 @@ Verification:
 
 What 50c-2 does NOT do (deferred to 50c-3 / 50d / 50e):
   * Hash-prefixed groups (`#(`, `#[`, `#{`) in the
-    token-to-fragments group-balancer. Smoke source doesn't hit them.
+    token-to-fragments group-balancer. ✅ landed (see 50c-3 below).
+  * Symbol-to-text exhaustiveness — the reverse table is hand-built
+    and covers ~20 common keywords. ✅ landed (50c-3).
   * The walk-and-expand pass over a real `<ast-body>`. Smoke
     still operates on a single hand-shaped call site.
-  * Symbol-to-text exhaustiveness — the reverse table is hand-built
-    and covers ~20 common keywords. A clean approach would teach
-    the lexer to expose its `classify-keyword` inverse.
   * Oracle vs Rust nod-macro (50d's slot).
   * Retire `nod-macro` from the build (50e's slot).
+
+### Sprint 50c-3 — `token-source-text` + hash-prefixed groups — landed
+
+Two small wins that round out the engine before we tackle the
+walk-and-expand pass.
+
+**`token-source-text` replaces the keyword + punct inverse tables.**
+The lexer keeps a span on every token; slicing the source via that
+span recovers the original text directly. We had two hand-enumerated
+tables — `keyword-symbol-to-text` (~20 keywords) and
+`punct-form-to-text` (~10 forms) — both of which would silently drop
+unknown entries (the Sprint 50c-2 bug). Both are gone. The adapter
+is now one `token-source-text(t, source)` call per keyword/punct
+token. Every keyword the lexer recognises round-trips for free; no
+maintenance, no enumeration drift.
+
+**Hash-prefixed groups (`#(`, `#[`, `#{`) in the group-balancer.**
+The lexer emits `<literal-vector-open>` for `#(`,
+`<literal-sequence-open>` for `#[`, and `<punctuation-token>` form
+`#"hash-lbrace"` for `#{`. The adapter surfaces all three as `<tok>`
+kind `#"punct"` with text `"#("` / `"#["` / `"#{"`, and
+`group-open-kind` / `group-close-text` know the new opener glyphs.
+Closers are bare `)` / `]` / `}` — the lexer doesn't emit `#)` etc.
+Emit-frag and emit-template render the new glyphs back.
+
+New fifth phase in the smoke (`PHASE: hash-groups`): lex
+`#(a, b, c)`, group-balance, assert one top-level
+`<group-fragment>` of kind `#"hash-paren"` containing 5 inner frags
+(`a`, `,`, `b`, `,`, `c`). Doesn't run match/substitute — the call
+site doesn't fit the unless pattern; the phase is purely a
+group-balancer probe.
+
+Verification:
+  cargo test -p nod-tests --test macro_engine — passes
+  Parser corpus: 38/38
+
+What 50c-3 does NOT do (deferred to 50d / 50e):
+  * Walk-and-expand pass over a real `<ast-body>` — the chunky
+    one. Needs bundling dylan-lexer + dylan-parser + macro engine
+    + an AST-aware traversal that recognises macro call sites
+    and splices expanded fragments back. Its own sprint.
+  * Oracle vs Rust nod-macro (50d).
+  * Retire nod-macro from the build (50e).
 
 ---
 

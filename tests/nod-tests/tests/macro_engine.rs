@@ -73,12 +73,14 @@ fn macro_engine_unless_expansion() {
     // Normalise CRLF → LF — Windows pipes can transcode.
     let stdout = stdout.replace("\r\n", "\n");
 
-    // Four phases — Sprint 50a hand-built, Sprint 50b parsed-def
+    // Five phases — Sprint 50a hand-built, Sprint 50b parsed-def
     // (fragments → <macro-def>), Sprint 50c-1 from-tokens (flat
     // token stream → group-balanced fragments → <macro-def>),
     // Sprint 50c-2 from-source (real `lex()` from dylan-lexer.dylan
-    // → adapter → fragments → <macro-def>). All four must produce
-    // byte-identical match + substitute output.
+    // → adapter → fragments → <macro-def>), Sprint 50c-3
+    // hash-groups (`#(a, b, c)` lexes + group-balances to a single
+    // hash-paren group). Phases A–D produce byte-identical match +
+    // substitute output; phase E probes hash-group support.
     let expected = "\
 PHASE: hand-built\n\
 MATCH: ok\n\
@@ -103,7 +105,11 @@ LEX: 24 tokens\n\
 MATCH: ok\n\
 BIND cond: 1 frag\n\
 BIND body: 1 frag\n\
-EXPAND: if ( ~ x ) ( foo ) else #f end\n";
+EXPAND: if ( ~ x ) ( foo ) else #f end\n\
+PHASE: hash-groups\n\
+LEX: 7 hash-toks\n\
+FRAGMENT: 1 top-level frags\n\
+HASH-PAREN: ok, 5 inner frags\n";
     assert_eq!(
         stdout, expected,
         "smoke output diverged:\n--- expected ---\n{expected}--- got ---\n{stdout}",

@@ -379,6 +379,12 @@ define function emit-frag (out :: <stretchy-vector>, f :: <fragment>) => ()
       open := "("; close := ")";
     elseif (k = #"bracket")
       open := "["; close := "]";
+    elseif (k = #"hash-paren")
+      open := "#("; close := ")";
+    elseif (k = #"hash-bracket")
+      open := "#["; close := "]";
+    elseif (k = #"hash-brace")
+      open := "#{"; close := "}";
     end;
     add!(out, open);
     let body = gfrag-body(g);
@@ -419,6 +425,12 @@ define function emit-template (template :: <stretchy-vector>,
         open := "("; close := ")";
       elseif (k = #"bracket")
         open := "["; close := "]";
+      elseif (k = #"hash-paren")
+        open := "#("; close := ")";
+      elseif (k = #"hash-bracket")
+        open := "#["; close := "]";
+      elseif (k = #"hash-brace")
+        open := "#{"; close := "}";
       end;
       add!(out, open);
       emit-template(tpl-grp-body(e), bindings, out);
@@ -634,18 +646,27 @@ end function;
 
 define function group-open-kind (text :: <byte-string>) => (kind :: <object>)
   // Returns the <symbol> for an opener token, or #f if not an opener.
+  // Sprint 50c-3 — added hash-prefixed openers `#(`, `#[`, `#{`.
   let result = #f;
-  if (text = "(")      result := #"paren";
-  elseif (text = "[")  result := #"bracket";
-  elseif (text = "{")  result := #"brace";
+  if (text = "(")        result := #"paren";
+  elseif (text = "[")    result := #"bracket";
+  elseif (text = "{")    result := #"brace";
+  elseif (text = "#(")   result := #"hash-paren";
+  elseif (text = "#[")   result := #"hash-bracket";
+  elseif (text = "#{")   result := #"hash-brace";
   end;
   result
 end function;
 
 define function group-close-text (kind :: <symbol>) => (text :: <byte-string>)
+  // Hash-prefixed groups close with the bare close-bracket — the
+  // lexer doesn't emit `#)` / `#]` / `#}`.
   let result = "}";
-  if (kind = #"paren")        result := ")";
-  elseif (kind = #"bracket")  result := "]";
+  if (kind = #"paren")             result := ")";
+  elseif (kind = #"bracket")       result := "]";
+  elseif (kind = #"hash-paren")    result := ")";
+  elseif (kind = #"hash-bracket")  result := "]";
+  elseif (kind = #"hash-brace")    result := "}";
   end;
   result
 end function;
@@ -746,86 +767,34 @@ define function build-call-site-tokens ()
   toks
 end function;
 
-// ─── Sprint 50c-2 — adapt the REAL dylan-lexer's <token> → <tok> ─────────
+// ─── Sprint 50c-2/3 — adapt the REAL dylan-lexer's <token> → <tok> ───────
 //
 // The smoke is bundled with `dylan-lexer.dylan` via the project file
 // `dylan-macro-smoke.prj`, so the lexer's `lex(<byte-string>)`,
-// `<token>` hierarchy, and helpers are in scope. We adapt each
-// lexer token to the engine's local `<tok>` (kind + text). Trivia
-// (whitespace, comments) maps to `#f` and gets filtered.
+// `<token>` hierarchy, and `token-source-text` are in scope.
 //
-// Symbol-to-text for keyword tokens: the lexer's `classify-keyword`
-// maps text → `<symbol>` at lex time but doesn't expose the inverse
-// (Dylan has no built-in symbol-name accessor). We hand-build a tiny
-// inverse table for the keywords the smoke can actually encounter.
-
-define function keyword-symbol-to-text (kw :: <symbol>) => (text :: <object>)
-  let r = #f;
-  if (kw = #"unless")      r := "unless";
-  elseif (kw = #"if")      r := "if";
-  elseif (kw = #"else")    r := "else";
-  elseif (kw = #"elseif")  r := "elseif";
-  elseif (kw = #"when")    r := "when";
-  elseif (kw = #"begin")   r := "begin";
-  elseif (kw = #"let")     r := "let";
-  elseif (kw = #"define")  r := "define";
-  elseif (kw = #"macro")   r := "macro";
-  elseif (kw = #"end")     r := "end";
-  // Lexer keywords that often appear inside macro bodies as
-  // identifier-shaped references — must round-trip back to text or
-  // the macro engine sees a hole in the token stream and parse-rule
-  // / parse-pattern-elem dereferences past the end.
-  elseif (kw = #"cond")    r := "cond";
-  elseif (kw = #"case")    r := "case";
-  elseif (kw = #"select")  r := "select";
-  elseif (kw = #"while")   r := "while";
-  elseif (kw = #"until")   r := "until";
-  elseif (kw = #"for")     r := "for";
-  elseif (kw = #"block")   r := "block";
-  elseif (kw = #"cleanup") r := "cleanup";
-  elseif (kw = #"method")  r := "method";
-  elseif (kw = #"function") r := "function";
-  elseif (kw = #"class")   r := "class";
-  elseif (kw = #"variable") r := "variable";
-  elseif (kw = #"constant") r := "constant";
-  elseif (kw = #"slot")    r := "slot";
-  elseif (kw = #"type")    r := "type";
-  end;
-  r
-end function;
-
-define function punct-form-to-text (form :: <symbol>) => (text :: <object>)
-  let r = #f;
-  if (form = #"lparen")        r := "(";
-  elseif (form = #"rparen")    r := ")";
-  elseif (form = #"lbracket")  r := "[";
-  elseif (form = #"rbracket")  r := "]";
-  elseif (form = #"lbrace")    r := "{";
-  elseif (form = #"rbrace")    r := "}";
-  elseif (form = #"arrow")     r := "=>";
-  elseif (form = #"query")     r := "?";
-  elseif (form = #"tilde")     r := "~";
-  elseif (form = #"semicolon") r := ";";
-  elseif (form = #"comma")     r := ",";
-  end;
-  r
-end function;
+// Sprint 50c-3 — replaced the 50c-2 hand-enumerated keyword + punct
+// inverse tables with `token-source-text(t, source)`. The lexer
+// already keeps a span on every token; slicing the source via that
+// span recovers the original text directly. No more enumeration to
+// keep in sync — every keyword the lexer knows now round-trips for
+// free.
 
 // Convert one lexer token to the engine's <tok> form, or #f if it
-// should be skipped (trivia). Boolean literals `#t` / `#f` map to
-// identifier-shaped tokens so the macro engine's literal-match works
-// against template `#f`.
-define function lex-token-to-tok (t :: <token>) => (r :: <object>)
+// should be skipped (trivia / unsupported). Pass `source` so
+// `token-source-text` can slice it for keyword/punct/etc text.
+define function lex-token-to-tok (t :: <token>, source :: <byte-string>)
+ => (r :: <object>)
   let result = #f;
   if (instance?(t, <whitespace-token>) | instance?(t, <comment-token>))
     result := #f;
   elseif (instance?(t, <keyword-token>))
-    let kw = keyword-token-keyword(t);
+    let kw   = keyword-token-keyword(t);
+    let text = token-source-text(t, source);
     if (kw = #"end")
-      result := make-tok(#"kw-end", "end");
+      result := make-tok(#"kw-end", text);
     else
-      let text = keyword-symbol-to-text(kw);
-      if (text) result := make-tok(#"ident", text); end;
+      result := make-tok(#"ident", text);
     end;
   elseif (instance?(t, <identifier-token>))
     result := make-tok(#"ident", identifier-token-name(t));
@@ -833,9 +802,14 @@ define function lex-token-to-tok (t :: <token>) => (r :: <object>)
     // Lexer already strips the trailing ":"; my parser tolerates that.
     result := make-tok(#"keyword-name", keyword-name-token-name(t));
   elseif (instance?(t, <punctuation-token>))
-    let form = punctuation-token-form(t);
-    let text = punct-form-to-text(form);
-    if (text) result := make-tok(#"punct", text); end;
+    result := make-tok(#"punct", token-source-text(t, source));
+  elseif (instance?(t, <literal-vector-open>))
+    // `#(` opens a literal-vector group. Surfaces as a punct token
+    // with text "#(" so the group-balancer can recognise + match.
+    result := make-tok(#"punct", "#(");
+  elseif (instance?(t, <literal-sequence-open>))
+    // `#[` opens a literal-sequence group.
+    result := make-tok(#"punct", "#[");
   elseif (instance?(t, <boolean-literal-token>))
     let v = boolean-literal-token-value(t);
     let text = "#t";
@@ -856,7 +830,7 @@ define function lex-source-to-toks (source :: <byte-string>)
   let i = 0;
   until (i = n)
     let t = raw[i];
-    let mine = lex-token-to-tok(t);
+    let mine = lex-token-to-tok(t, source);
     if (mine) add!(out, mine); end;
     i := i + 1;
   end;
@@ -1032,4 +1006,26 @@ define function main () => ()
   let call-frags-real = tokens-to-fragments(call-toks-real);
   run-match-substitute(macro-rule-pattern(rule3), macro-rule-template(rule3),
                        call-frags-real);
+  // Phase E — Sprint 50c-3 — hash-prefixed group probe. Lex a small
+  // source containing `#(a, b, c)`, group-balance it, and confirm
+  // the result is one top-level <group-fragment> kind #"hash-paren".
+  // Doesn't run match/substitute (the call site doesn't fit the
+  // unless pattern); it just demonstrates the group-balancer covers
+  // the lexer's `<literal-vector-open>` token.
+  format-out("PHASE: hash-groups\n");
+  let hash-source = "#(a, b, c)";
+  let hash-toks   = lex-source-to-toks(hash-source);
+  let hash-frags  = tokens-to-fragments(hash-toks);
+  format-out("LEX: %d hash-toks\n", size(hash-toks));
+  format-out("FRAGMENT: %d top-level frags\n", size(hash-frags));
+  if (size(hash-frags) = 1 & group-frag?(hash-frags[0]))
+    let g = hash-frags[0];
+    if (gfrag-kind(g) = #"hash-paren")
+      format-out("HASH-PAREN: ok, %d inner frags\n", size(gfrag-body(g)));
+    else
+      format-out("HASH-PAREN: WRONG KIND\n");
+    end;
+  else
+    format-out("HASH-PAREN: WRONG SHAPE\n");
+  end;
 end function;
