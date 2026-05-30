@@ -2668,6 +2668,7 @@ impl<'a> Parser<'a> {
                                 | "while"
                                 | "until"
                                 | "case"
+                                | "cond"   // Sprint 49b: stdlib macro, body-shaped, end-terminated
                                 | "select"
                                 | "begin"
                                 | "block"

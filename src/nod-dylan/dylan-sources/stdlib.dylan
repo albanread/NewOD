@@ -452,6 +452,61 @@ define macro when
     => { if (?cond) ?body else #f end }
 end macro;
 
+// ─── cond macro ────────────────────────────────────────────────────────────
+//
+// Sprint 49b: multi-arm conditional, lowers to nested `if/elseif/else`.
+// The Common-Lisp shape, adapted to Dylan's macro engine. Each clause
+// is `(test) (body)` — a paren-wrapped condition followed by a
+// paren-wrapped body expression. The final clause uses the
+// `otherwise` keyword as the default. Example:
+//
+//   cond
+//     (x < 0)   ("negative")
+//     (x = 0)   ("zero")
+//     (x > 0)   ("positive")
+//     otherwise ("unreachable")
+//   end
+//
+// Expands to a straight `if/elseif/else` chain — the kernel
+// primitive. No new AST variants; this is purely stdlib sugar.
+//
+// **Shape constraint.** Each test and body is a single
+// `:expression` fragment, which means one token, identifier, literal,
+// or grouped form (parens / brackets / braces). Multi-token bodies
+// MUST be wrapped: `(foo(x) + 1)` not `foo(x) + 1`. The paren tax
+// is the price of admission until the macro engine grows `*`
+// repetition (Sprint 49c-ish) — at that point the wrapping can be
+// dropped per clause and N-arm support stops being arity-bounded.
+//
+// **Arity cap.** This rule set supports 1 through 4 test/body pairs
+// + `otherwise`. Beyond 4 arms, nest a second `cond` inside the
+// `otherwise` clause. The cap is purely the number of fixed rules
+// written below — extend by appending more rules in lockstep.
+
+define macro cond
+  // 1 test/body pair + otherwise.
+  { cond ?t1:expression ?b1:expression otherwise ?d:expression end }
+    => { if (?t1) ?b1 else ?d end }
+  // 2 pairs + otherwise.
+  { cond ?t1:expression ?b1:expression
+         ?t2:expression ?b2:expression
+         otherwise ?d:expression end }
+    => { if (?t1) ?b1 elseif (?t2) ?b2 else ?d end }
+  // 3 pairs + otherwise.
+  { cond ?t1:expression ?b1:expression
+         ?t2:expression ?b2:expression
+         ?t3:expression ?b3:expression
+         otherwise ?d:expression end }
+    => { if (?t1) ?b1 elseif (?t2) ?b2 elseif (?t3) ?b3 else ?d end }
+  // 4 pairs + otherwise.
+  { cond ?t1:expression ?b1:expression
+         ?t2:expression ?b2:expression
+         ?t3:expression ?b3:expression
+         ?t4:expression ?b4:expression
+         otherwise ?d:expression end }
+    => { if (?t1) ?b1 elseif (?t2) ?b2 elseif (?t3) ?b3 elseif (?t4) ?b4 else ?d end }
+end macro;
+
 // ─── with-cleanup macro ────────────────────────────────────────────────────
 //
 // Resource-management sugar over `block / cleanup / end`.  The cleanup

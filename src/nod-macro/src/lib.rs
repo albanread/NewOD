@@ -682,6 +682,7 @@ pub fn match_pattern(pattern: &[PatternElem], call: &[Fragment]) -> Option<Bindi
                                             || tok_text_eq(t, "block")
                                             || tok_text_eq(t, "select")
                                             || tok_text_eq(t, "case")
+                                            || tok_text_eq(t, "cond")  // Sprint 49b
                                             || tok_text_eq(t, "begin")
                                             || tok_text_eq(t, "method")
                                             || tok_text_eq(t, "when")
