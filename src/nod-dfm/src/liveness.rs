@@ -72,6 +72,20 @@ pub fn populate_safepoint_roots(f: &mut Function) {
             // A temp is "live across" the call iff it is live immediately
             // after the call — excluding the call's own result (produced BY
             // the call) — and is GC-managed.
+            //
+            // GAP-011 hypothesis-test (2026-05-30): we briefly added
+            // every heap-typed CALL ARG here regardless of post-call
+            // liveness, per the agent-review "register-arg becomes
+            // stale during callee" theory. The change closed 100% of
+            // the `NOD_DIAG_ARG_ROOT_COVERAGE` gaps but did NOT fix the
+            // GAP-011 crash — identical signature in
+            // `stretchy_vector_push: not a <stretchy-vector>` with
+            // `sv=0x...771 ptr=0x...770`. Hypothesis refuted. The
+            // callee already spills incoming args to local slots at
+            // -O0 and re-spills them to its own slab at every internal
+            // safepoint where the arg is live across, so the caller's
+            // slab adding the arg is redundant. The change was
+            // reverted. The probe stays as a permanent diagnostic.
             let mut roots: Vec<TempId> = live_after[c_idx]
                 .iter()
                 .copied()

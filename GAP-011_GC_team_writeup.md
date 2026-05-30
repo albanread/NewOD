@@ -1,64 +1,83 @@
 # GAP-011 — stale precise root: status & action list
 
-**Owner:** NewOpenDylan compiler side — front-end **NOT** exonerated after all.
-The agent-review hypothesis was right: liveness omits GC-typed *arguments* that
-are dead-after-call, the value flows as a register/SSA operand into the callee,
-and a moving GC before the callee's first safepoint can leave it stale.
-**Status:** ROOT CAUSE IDENTIFIED (2026-05-30). The probe
-`NOD_DIAG_ARG_ROOT_COVERAGE=full` reports **104 gap sites in `dump-node`** and 1
-in `acc-string` against the parser source. The fix is to extend
-`populate_safepoint_roots` to include every heap-typed call argument regardless
-of post-call liveness.
+**Owner:** NewOpenDylan compiler side — front-end remains exonerated.
+The agent-review "register-arg staleness" hypothesis was **tested and
+REFUTED** by direct measurement (2026-05-30).
+**Status:** OPEN. Root cause still unknown; two hypotheses now ruled out
+(A1 `note_successor_entry_temps` stale-reload + agent's arg-root
+coverage). The probe `NOD_DIAG_ARG_ROOT_COVERAGE` is now silent on the
+parser source (0 gaps) yet the crash signature is byte-for-byte
+identical.
 **Gating test:** `nod-driver parse-dylan F:\scratch\jcs-40.dylan` must exit **0**
-(today: exit 9, panic at `nod-runtime/src/collections.rs:1028`,
+(today: exit 9, panic at `nod-runtime/src/collections.rs:1075`,
 `stretchy_vector_push: not a <stretchy-vector>`, zeroed/non-forwarded wrapper).
 
-## ROOT CAUSE — confirmed 2026-05-30
+## Agent hypothesis tested & REFUTED — 2026-05-30
 
-The agent-review hypothesis is **proven**. The probe
-`NOD_DIAG_ARG_ROOT_COVERAGE` (env-gated diagnostic in
-`src/nod-sema/src/lower.rs` calling `nod_dfm::diagnose_arg_root_coverage`)
-enumerates every call site where a GC-typed argument is NOT in
-`safepoint_roots`. Run against the in-tree parser source
-(`dylan-parser.dylan` + `dylan-lexer.dylan`):
+The agent-review hypothesis from the previous session:
+> liveness correctly omits args dead-after-call → value flows as a
+> register operand to the callee → if the callee allocates and triggers
+> moving GC before its own first safepoint, the arg becomes stale.
 
-```
-[ARG-ROOT-COV] TOTAL functions_with_gaps=137 gaps=1378
-[ARG-ROOT-COV] fn=dump-node gaps=104
-[ARG-ROOT-COV] fn=acc-string gaps=1
-[ARG-ROOT-COV] fn=main gaps=6
-```
+Tested in three steps:
+1. Built env-gated diagnostic `NOD_DIAG_ARG_ROOT_COVERAGE` (see
+   `nod-dfm::diagnose_arg_root_coverage`, wired in `nod-sema::lower`).
+2. Probe lit up against parser source: **137 functions with 1378
+   gaps**, including `dump-node` (104), `acc-string` (1 false-positive
+   on a Top-typed byte), `main` (6). The "freshly-allocated value flows
+   directly into next call" shape (e.g. `c[2]=write-to-string(...);
+   c[3]=acc-string(buf, that-result)`) repeats dozens of times in
+   `dump-node`.
+3. Implemented the candidate fix: extended `populate_safepoint_roots`
+   to also include every heap-typed call arg regardless of post-call
+   liveness, updated the verifier to accept arg-only entries, ran
+   `cargo clean` + full rebuild + `parse-dylan F:/scratch/gap011-jcs-
+   min-crash.dylan`.
 
-The most diagnostic example (`dump-node` block 53):
-```
-c[1] callee=dispatch punctuation-token-form  dst=t239 arg=t238 arg_pos=0 arg_type=Top
-c[2] callee=write-to-string                  dst=t240 arg=t239 arg_pos=0 arg_type=Top
-c[3] callee=acc-string                       dst=t241 arg=t240 arg_pos=1 arg_type=Top
-```
+**Result:** probe now reports `TOTAL functions_with_gaps=0 gaps=0`.
+Crash signature unchanged: same `stretchy_vector_push: not a
+<stretchy-vector>` with `sv=0x...771 ptr=0x...770`. The fix had **zero
+effect** on the runtime behavior. Hypothesis refuted.
 
-`t240` is the freshly-allocated result of `write-to-string`; on the very next
-instruction it flows as `acc-string`'s second argument. `t240` is **not** in
-the call's `safepoint_roots` (liveness sees it dead-after-call, since the
-String-typed `t241` produced by `acc-string` supersedes it). The value flows
-as a register operand into `acc-string`; if a moving GC fires inside
-`acc-string` before its own first safepoint protects the register, the
-register holds a vacated address. `acc-string` is a hot path — every parser
-output byte goes through it. That's the stale pointer the crash sees on
-re-entry of `stretchy_vector_push`.
+**Why the hypothesis didn't pan out (post-mortem):** at -O0, LLVM
+spills every incoming arg to a local stack slot on entry, and the
+callee's own backward-liveness pass already includes that param in the
+`safepoint_roots` of every internal call where the param is live
+across. So the callee always re-loads its arg from a slot the GC has
+already rewritten — the caller-side "the arg isn't in MY slab" gap
+is closed by the callee's own slab, end-to-end. Adding the arg to the
+caller's slab was redundant.
 
-Full per-site list saved to `GAP-011_arg_root_coverage_findings.log`.
+The liveness fix was **reverted**; the probe + `diagnose_arg_root_coverage`
+stay as permanent diagnostics. Findings preserved in
+`GAP-011_arg_root_coverage_findings.log`.
 
-**Fix direction:** extend `populate_safepoint_roots` in
-`src/nod-dfm/src/liveness.rs` so that for every call computation whose
-`is_potentially_allocating_call()` is true, the GC-typed members of `args`
-are unconditionally added to `safepoint_roots`, *regardless of post-call
-liveness*. This keeps the caller's spill slab alive across the call so the
-GC sees and rewrites the arg slot; the codegen reload pattern then hands the
-callee the updated address through the register-spill round-trip.
+## Where to look next
 
-Liveness as it stands today (the pass introduced in commit `37e1f69`) is
-still correct for live-through preservation; this is an **additional**
-inclusion rule on top, narrowly targeting call arguments specifically.
+With two front-end hypotheses ruled out, the remaining suspects shift
+toward the runtime / collector layer (and were already listed in the
+"Narrowed hypothesis space" section below). Concrete next steps:
+
+1. **`NOD_GC_TRACE` zoomed on the failing vector.** The crash prints
+   `sv=0x...771 ptr=0x...770` — capture that exact `ptr` value at every
+   `NOD_GC_TRACE` cycle and grep for a `root_rewrite old=ptr new=?` or
+   `collect_begin` event. If `ptr` never appears as a root → GC didn't
+   know about this object (a slot-map or class-layout bug);
+   if it appears but never gets a `new` → GC saw the slot but didn't
+   forward it (an evacuator bug). Use `NOD_GC_TRACE_WATCH` to focus on
+   the exact pointer.
+2. **`NOD_AOT_VERIFY_SAFEPOINTS=1` mid-run.** The existing safepoint
+   verifier ran clean at AOT-emit time, but does it run live? If not,
+   add per-frame slab-content checking before each
+   `nod_aot_begin_safepoint` (the slab should hold non-zero `ptr`
+   values that GC can chase). Catch the moment a stale value enters
+   the slab.
+3. **Class-slot-map audit for `<token>` / AST-node classes.** If a node
+   holds the vector in a slot whose `slot-map` doesn't mark it as a
+   heap reference, GC won't trace through the node → vector reclaimed.
+   Walk the parser's class declarations and confirm every
+   `<byte-string>` / `<stretchy-vector>` / `<object>` slot ends up with
+   a heap-tagged slot-map entry.
 
 Repro in one command (from workspace root):
 ```sh
