@@ -366,6 +366,118 @@ fn eval_wrapped_source(wrapped: &str) -> Result<String, EvalError> {
     Ok(call_and_format(ptr, return_type))
 }
 
+/// Sprint 51b — JIT-strap a pre-lowered module into an **isolated**
+/// MCJIT engine and return a handle whose raw symbol addresses the
+/// caller can transmute and invoke. Unlike [`eval_wrapped_source`],
+/// this entry point does **not** synthesise an `<eval-entry>` wrapper;
+/// the caller supplies any function name defined in `lm.functions` and
+/// is responsible for the calling convention (`extern "C" fn(args...)
+/// -> u64` for Word-typed Dylan top-levels — see
+/// [`nod_runtime::Word`]).
+///
+/// **Isolation.** Each call leaks its own `Context` + `Jit` pair. The
+/// returned handle owns the JIT engine for the process lifetime, so a
+/// caller can hold the handle across many `get_function_ptr` calls
+/// without worrying about lifetime. The Dylan runtime's global
+/// registries (class table, dispatch cache, stub table) are still
+/// shared with any other JIT engine the host runs — that's by design:
+/// the side-loaded module's classes need to be visible to subsequent
+/// JIT'd user code if/when the host decides to call into both.
+///
+/// **No `<eval-entry>`-style wrapping.** `module_name` is just the
+/// LLVM module label used for diagnostics + cache-key derivation.
+/// All registration paths (`register_methods`,
+/// `register_top_level_functions`, `register_blocks`,
+/// `register_variables`, `initialize_module_winffi`) run identically
+/// to the eval cold path.
+///
+/// **Sprint 37/38 cache integration is deliberately skipped here.**
+/// The intended caller (the `--lex-with-dylan` flag in `nod-driver`)
+/// JITs the shim exactly once per process; the on-disk replay machinery
+/// is the wrong sweet spot for this scale. A later sprint can swap to
+/// the cached path by deriving a cache key from the LoweredModule's
+/// DFM text and routing through `eval_wrapped_source`'s replay branch.
+pub fn jit_lowered_module(
+    lm: &LoweredModule,
+    module_name: &str,
+) -> Result<JittedModule, EvalError> {
+    // Derive a deterministic cache key from the module name so the
+    // codegen-side per-module symbol prefix is stable across runs
+    // (Sprint 38b — every emitted symbol gets a key-prefix derived
+    // from this). The key itself doesn't reach disk because we skip
+    // the persist path; it's just an input to `codegen_module_with_key`.
+    let cache_key = nod_llvm::cache_key_for_dfm(module_name);
+
+    let ctx_box: Box<Context> = Box::new(Context::create());
+    let ctx_ref: &'static Context = Box::leak(ctx_box);
+
+    let verbose = std::env::var("NOD_JIT_LOWERED_VERBOSE").map(|v| v == "1").unwrap_or(false);
+    if verbose {
+        eprintln!("jit_lowered_module: codegen ({} fns) …", lm.functions.len());
+    }
+    let out = nod_llvm::codegen_module_with_key(ctx_ref, &lm.functions, module_name, cache_key)
+        .map_err(EvalError::Codegen)?;
+
+    if verbose {
+        eprintln!("jit_lowered_module: Jit::new + add_module …");
+    }
+    let mut jit_box: Box<Jit<'static>> = Box::new(Jit::new(ctx_ref).map_err(EvalError::Jit)?);
+    jit_box.add_module(out).map_err(EvalError::Jit)?;
+    if verbose {
+        eprintln!("jit_lowered_module: register_methods ({}) …", lm.methods.len());
+    }
+    register_methods(&jit_box, &lm.methods)?;
+    if verbose {
+        eprintln!("jit_lowered_module: register_blocks ({}) …", lm.blocks.len());
+    }
+    register_blocks(&jit_box, &lm.blocks)?;
+    if verbose {
+        eprintln!(
+            "jit_lowered_module: register_top_level_functions ({} fns) …",
+            lm.functions.len()
+        );
+    }
+    register_top_level_functions(&jit_box, &lm)?;
+    if verbose {
+        eprintln!("jit_lowered_module: initialize_module_winffi …");
+    }
+    initialize_module_winffi(lm)?;
+    if verbose {
+        eprintln!("jit_lowered_module: register_variables ({}) …", lm.variables.len());
+    }
+    register_variables(&jit_box, &lm.variables)?;
+
+    if verbose {
+        eprintln!("jit_lowered_module: done");
+    }
+    let jit_static: &'static Jit<'static> = Box::leak(jit_box);
+    Ok(JittedModule { jit: jit_static })
+}
+
+/// Sprint 51b — handle to a JIT engine populated by
+/// [`jit_lowered_module`]. The MCJIT engine and its module are kept
+/// alive for the process lifetime (matches the cold-eval lifetime
+/// discipline); callers can hold this for arbitrarily many lookups.
+pub struct JittedModule {
+    jit: &'static Jit<'static>,
+}
+
+impl JittedModule {
+    /// Resolve a JIT'd symbol to its raw function pointer. The caller
+    /// is responsible for transmuting to the correct signature.
+    ///
+    /// # Safety
+    /// The returned pointer is only valid while the host process lives
+    /// (the underlying [`Jit`] is leaked-by-design). The caller's
+    /// transmuted signature MUST match the Dylan-side function's
+    /// calling convention — typically
+    /// `extern "C" fn(arg0_word: u64, arg1_word: u64, ...) -> u64`
+    /// for a Word-typed top-level Dylan function.
+    pub unsafe fn get_function_ptr(&self, name: &str) -> Option<*const ()> {
+        unsafe { self.jit.get_function_ptr(name) }
+    }
+}
+
 /// Sprint 38f — on-disk cross-process replay path. The headline of
 /// Sprint 38 was supposed to be ≥10× subprocess speedup; Sprint 38a–38e
 /// shipped the relocation infrastructure (manifest, slot allocators,
@@ -713,7 +825,7 @@ pub fn eval_expr_to_string(expr_src: &str) -> Result<String, EvalError> {
 /// expected error class. (The signal-handler path inside Dylan code
 /// would catch it through `block/exception` instead; the eval
 /// helper's caller doesn't have one of those.)
-fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
+pub fn initialize_module_winffi(lm: &LoweredModule) -> Result<(), EvalError> {
     if lm.c_function_stub_table.is_empty() {
         return Ok(());
     }
@@ -982,6 +1094,80 @@ pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError
     expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
     let mut lm = lower_module_full(&module).map_err(EvalError::Lower)?;
     merge_stdlib_into_user_module(&mut lm);
+    Ok(lm)
+}
+
+/// Sprint 51b — JIT-pipeline sibling of [`compile_files_for_aot`].
+/// Runs the same parse → concat-AST → expand → lower pipeline but
+/// **does NOT** merge the stdlib into the result. The eval / JIT
+/// pipeline depends on stdlib methods + functions being resolved
+/// against the **globally-registered** registry that `stdlib::ensure_loaded`
+/// populates at process startup, not against an in-module
+/// duplication: a merge would re-register every stdlib method with
+/// uninitialised JIT-link addresses (the in-module copies don't have
+/// JIT-resolvable bodies yet at `register_methods` time), and the
+/// global table would crash on first dispatch because Sprint 39c's
+/// AOT-shaped resolver gets confused by the duplicate registrations.
+///
+/// The output `LoweredModule`'s `functions` / `methods` / `blocks`
+/// contain ONLY user-defined items; calls to stdlib methods (e.g.
+/// `format-out`, `<byte-string>` arithmetic) are codegen-emitted as
+/// references to externally-linked symbols which the JIT resolves
+/// via the runtime's global tables.
+pub fn compile_files_for_jit(paths: &[&Path]) -> Result<LoweredModule, EvalError> {
+    if paths.is_empty() {
+        return Err(EvalError::Lower(vec![]));
+    }
+
+    nod_runtime::nod_runtime_init();
+    stdlib::ensure_loaded();
+
+    let mut sm = nod_reader::SourceMap::new();
+    let mut declared_modules: Vec<(std::path::PathBuf, String)> =
+        Vec::with_capacity(paths.len());
+    let mut merged: Option<nod_reader::Module> = None;
+
+    for path in paths {
+        let src = std::fs::read_to_string(path).map_err(EvalError::Io)?;
+        let file_id = sm
+            .add(path.to_path_buf(), src.clone())
+            .map_err(EvalError::SourceMap)?;
+        let toks = nod_reader::lex(&src, file_id);
+        let pre = nod_reader::scan_preamble(&src);
+        let mut parsed =
+            parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
+
+        let mod_name = parsed
+            .header
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("module"))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        declared_modules.push((path.to_path_buf(), mod_name));
+
+        match &mut merged {
+            None => merged = Some(parsed),
+            Some(m) => m.items.append(&mut parsed.items),
+        }
+    }
+
+    let reference = declared_modules
+        .iter()
+        .map(|(_, m)| m.as_str())
+        .find(|m| !m.is_empty())
+        .unwrap_or("");
+    if declared_modules
+        .iter()
+        .any(|(_, m)| !m.is_empty() && m != reference)
+    {
+        return Err(EvalError::ModuleMismatch {
+            files: declared_modules,
+        });
+    }
+
+    let mut module = merged.expect("at least one file (checked at fn entry)");
+    expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
+    let lm = lower_module_full(&module).map_err(EvalError::Lower)?;
     Ok(lm)
 }
 

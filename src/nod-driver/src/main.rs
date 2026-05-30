@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod dylan_lex_jit;
 mod project;
 
 /// LLVM major version this driver is targeted against. Read at
@@ -35,6 +36,29 @@ const LLVM_VERSION: &str = "22.1";
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Sprint 51b — JIT-strap the Dylan-side lexer
+    /// (`tests/nod-tests/fixtures/dylan-lexer.dylan` +
+    /// `dylan-lex-shim.dylan`) into an isolated MCJIT engine and
+    /// install it as `nod_reader::lex`'s override.
+    ///
+    /// Effect: every subsequent lex call inside this driver process
+    /// (build, dump-ast, eval, dump-dfm, dump-llvm — anything that
+    /// runs the front-end) dispatches through Dylan-compiled code
+    /// instead of the Rust `lex` in `nod-reader`. The Rust lexer
+    /// stays compiled in — it's the canonical fallback if init fails
+    /// and the reference path the oracle test compares against.
+    ///
+    /// Cost: ~3 s one-shot for the JIT compile on first call;
+    /// subsequent lex calls run from the leaked MCJIT engine. There's
+    /// no on-disk cache yet (the shim sources are small enough that
+    /// the in-process JIT is the sweet spot for v1 — a future sprint
+    /// can wire Sprint 37's bitcode cache into this path).
+    ///
+    /// Also settable via the `NOD_LEX_WITH_DYLAN=1` environment
+    /// variable, for use from `cargo test` etc.
+    #[arg(long = "lex-with-dylan", global = true)]
+    lex_with_dylan: bool,
 }
 
 #[derive(Subcommand)]
@@ -185,6 +209,40 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Sprint 51b — JIT-strap the Dylan-side lexer if the flag or the
+    // `NOD_LEX_WITH_DYLAN=1` env var is set. Wire it through BEFORE
+    // dispatching to the subcommand so the first lex call in
+    // `compile_file_for_aot` / `dump_tokens` / `eval` sees the
+    // override.
+    let want_dylan_lex = cli.lex_with_dylan
+        || std::env::var("NOD_LEX_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
+    if want_dylan_lex {
+        eprintln!("nod-driver: --lex-with-dylan: JIT-strapping the Dylan-side lexer …");
+        match dylan_lex_jit::init() {
+            Ok(()) => {
+                // Install the override. Result is ignored — a second
+                // `set_lex_override` (e.g. on a retry) returns Err
+                // with the already-installed fn, which is fine.
+                let _ = nod_reader::set_lex_override(dylan_lex_jit::lex);
+                if nod_reader::has_lex_override() {
+                    eprintln!("nod-driver: --lex-with-dylan: Dylan lex active");
+                } else {
+                    eprintln!(
+                        "nod-driver: --lex-with-dylan: WARNING — override slot already \
+                         occupied; nod_reader::lex will use whatever was installed first"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "nod-driver: --lex-with-dylan: init failed: {e}\n\
+                     falling back to the Rust lexer"
+                );
+            }
+        }
+    }
+
     match cli.command {
         None => {
             println!(
