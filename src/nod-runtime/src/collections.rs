@@ -1055,7 +1055,13 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
                         back_trace: *mut *mut core::ffi::c_void,
                         back_trace_hash: *mut u32,
                     ) -> u16;
+                    fn GetModuleHandleW(lp: *const u16) -> *mut core::ffi::c_void;
                 }
+                // EXE base needed to compute the ASLR slide against the
+                // `.map`'s preferred load address. `nod-driver symbolicate
+                // --runtime-base <hex>` consumes it.
+                let exe_base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+                eprintln!("[GAP-011] EXE base (GetModuleHandle NULL): 0x{exe_base:016x}");
                 const MAX_FRAMES: usize = 64;
                 let mut frames: [*mut core::ffi::c_void; MAX_FRAMES] =
                     [core::ptr::null_mut(); MAX_FRAMES];
@@ -1071,6 +1077,10 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
                 for (i, &ip) in frames.iter().take(n).enumerate() {
                     eprintln!("  frame {i:>2}: 0x{:016x}", ip as usize);
                 }
+                eprintln!(
+                    "[GAP-011] hint: symbolicate with `nod-driver symbolicate \
+                     --map <exe>.map --runtime-base 0x{exe_base:016x} < this-stderr`"
+                );
             }
             panic!("stretchy_vector_push: not a <stretchy-vector>");
         }

@@ -131,6 +131,34 @@ enum Command {
         /// Path to a `.dylan` source file to parse.
         input: PathBuf,
     },
+    /// Symbolicate a crash dump's raw hex IPs against a linker `.map`.
+    ///
+    /// Reads stderr / saved-log text from stdin or `--in <file>`, finds
+    /// `0x` 16-hex tokens, and replaces them with `name+0xNN (0xIP)`
+    /// rewriting the file to stdout (or `--out`). Designed for the
+    /// `[GAP-011] push caller backtrace` style output the runtime
+    /// emits, but works on any backtrace shape — it just rewrites
+    /// every 16-hex `0x...` token it sees.
+    ///
+    /// Default base: the EXE's preferred load address from the `.map`.
+    /// Override with `--runtime-base <hex>` if the crash log captured
+    /// a different ASLR slide (it usually didn't — Windows EXEs
+    /// commonly map at the preferred base).
+    Symbolicate {
+        /// `.map` file emitted by `link.exe /MAP` next to the EXE.
+        #[arg(long)]
+        map: PathBuf,
+        /// Input file (default: stdin).
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+        /// Output file (default: stdout).
+        #[arg(long = "out")]
+        output: Option<PathBuf>,
+        /// Runtime EXE base address in hex (override the .map's
+        /// `Preferred load address`). Rarely needed.
+        #[arg(long = "runtime-base")]
+        runtime_base: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -170,6 +198,9 @@ fn main() -> ExitCode {
         Some(Command::Eval { expr }) => run_eval(&expr),
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
         Some(Command::ParseDylan { input }) => run_parse_dylan(&input),
+        Some(Command::Symbolicate { map, input, output, runtime_base }) => {
+            run_symbolicate(&map, input.as_deref(), output.as_deref(), runtime_base.as_deref())
+        }
     }
 }
 
@@ -867,3 +898,255 @@ fn run_dump_graph(input: &std::path::Path) -> ExitCode {
     print!("{}", dump_graph(&g));
     ExitCode::SUCCESS
 }
+
+// ─── `symbolicate` subcommand ─────────────────────────────────────────
+//
+// Lives in nod-driver (not nod-runtime) so adding it doesn't shift the
+// CGU layout of nod-runtime — the production `.lib` that AOT EXEs link
+// against has a fragile archive-extraction rule (see
+// `aot_user_main_stub.rs`) that breaks whenever Cargo rearranges
+// CGUs. Keeping crash-time helpers OUT of nod-runtime is the rule;
+// post-mortem helpers like this one belong here.
+
+fn run_symbolicate(
+    map_path: &std::path::Path,
+    input: Option<&std::path::Path>,
+    output: Option<&std::path::Path>,
+    runtime_base_override: Option<&str>,
+) -> ExitCode {
+    use std::io::{Read, Write};
+
+    let map_raw = match std::fs::read_to_string(map_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nod-driver symbolicate: read {}: {e}", map_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let (preferred_base, syms) = match parse_link_map(&map_raw) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "nod-driver symbolicate: failed to parse {} (no `Preferred load address` or no symbol rows)",
+                map_path.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let runtime_base = match runtime_base_override {
+        Some(s) => {
+            let trimmed = s.trim_start_matches("0x");
+            match u64::from_str_radix(trimmed, 16) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "nod-driver symbolicate: --runtime-base `{s}` not hex: {e}"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        None => preferred_base,
+    };
+    let slide = runtime_base as i64 - preferred_base as i64;
+
+    // Read input.
+    let text = match input {
+        None => {
+            let mut s = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                eprintln!("nod-driver symbolicate: stdin: {e}");
+                return ExitCode::from(2);
+            }
+            s
+        }
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("nod-driver symbolicate: read {}: {e}", p.display());
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let rewritten = rewrite_hex_ips(&text, &syms, slide);
+
+    // Write output.
+    match output {
+        None => {
+            if let Err(e) = std::io::stdout().write_all(rewritten.as_bytes()) {
+                eprintln!("nod-driver symbolicate: stdout: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        Some(p) => {
+            if let Err(e) = std::fs::write(p, rewritten) {
+                eprintln!("nod-driver symbolicate: write {}: {e}", p.display());
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// One parsed symbol from a `.map`. Sorted by `rva_plus_base` after
+/// parsing.
+#[derive(Debug)]
+struct LinkMapSym {
+    rva_plus_base: u64,
+    name: String,
+}
+
+/// Parse the MSVC `.map` text format. Returns
+/// `(preferred_base, sorted_symbols)`. Tolerates malformed lines —
+/// only rows whose first token is `NNNN:NNNN` are taken as symbol
+/// definitions.
+fn parse_link_map(raw: &str) -> Option<(u64, Vec<LinkMapSym>)> {
+    let mut preferred_base: Option<u64> = None;
+    let mut syms: Vec<LinkMapSym> = Vec::with_capacity(16384);
+    let mut past_header = false;
+    for line in raw.lines() {
+        if preferred_base.is_none() {
+            if let Some(rest) = line.trim_start().strip_prefix("Preferred load address is ") {
+                preferred_base = u64::from_str_radix(rest.trim(), 16).ok();
+                continue;
+            }
+        }
+        if !past_header {
+            if line.trim_start().starts_with("Address ") && line.contains("Rva+Base") {
+                past_header = true;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        if !is_section_offset(first) {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let rva_plus_base = tokens
+            .iter()
+            .skip(2)
+            .rev()
+            .find_map(|t| {
+                if t.len() == 16 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    u64::from_str_radix(t, 16).ok()
+                } else {
+                    None
+                }
+            })?;
+        let name = tokens.get(1)?.to_string();
+        syms.push(LinkMapSym { rva_plus_base, name });
+    }
+    let base = preferred_base?;
+    if syms.is_empty() {
+        return None;
+    }
+    syms.sort_by_key(|s| s.rva_plus_base);
+    syms.dedup_by(|a, b| a.rva_plus_base == b.rva_plus_base);
+    Some((base, syms))
+}
+
+fn is_section_offset(s: &str) -> bool {
+    let mut parts = s.split(':');
+    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !a.is_empty()
+        && a.len() <= 8
+        && a.chars().all(|c| c.is_ascii_hexdigit())
+        && !b.is_empty()
+        && b.len() <= 8
+        && b.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Find every `0x` followed by 16 hex digits in `text` and rewrite
+/// each as `name+0xNN (0x...)`. Anything that doesn't resolve to a
+/// symbol stays as-is.
+fn rewrite_hex_ips(text: &str, syms: &[LinkMapSym], slide: i64) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find `0x`.
+        if i + 18 <= bytes.len() && &bytes[i..i + 2] == b"0x" {
+            let hex = &bytes[i + 2..i + 18];
+            if hex.iter().all(|b| b.is_ascii_hexdigit()) {
+                let s = std::str::from_utf8(hex).unwrap();
+                if let Ok(ip) = u64::from_str_radix(s, 16) {
+                    if let Some((name, off)) = lookup_symbol(syms, ip, slide) {
+                        // Only emit symbolicated form if the offset is small
+                        // (heuristic: < 4MB) — otherwise the IP is more
+                        // likely an unrelated random hex value (e.g. a tag
+                        // bit pattern from the log).
+                        if off < 4 * 1024 * 1024 {
+                            out.push_str(&format!("{name}+0x{off:x} (0x{ip:016x})"));
+                            i += 18;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn lookup_symbol(syms: &[LinkMapSym], ip: u64, slide: i64) -> Option<(String, usize)> {
+    let lookup = (ip as i64).checked_sub(slide)? as u64;
+    let idx = match syms.binary_search_by_key(&lookup, |s| s.rva_plus_base) {
+        Ok(i) => i,
+        Err(0) => return None,
+        Err(i) => i - 1,
+    };
+    Some((syms[idx].name.clone(), (lookup - syms[idx].rva_plus_base) as usize))
+}
+
+#[cfg(test)]
+mod symbolicate_tests {
+    use super::*;
+
+    const SAMPLE: &str = "\
+ my-exe
+
+ Preferred load address is 0000000140000000
+
+  Address         Publics by Value              Rva+Base               Lib:Object
+
+ 0001:00066ae0       nod_stretchy_vector_push   0000000140067ae0 f   nod_runtime:foo.o
+ 0001:00067000       another_function           0000000140068000 f   nod_runtime:foo.o
+";
+
+    #[test]
+    fn parses_map() {
+        let (base, syms) = parse_link_map(SAMPLE).expect("parse");
+        assert_eq!(base, 0x0000000140000000);
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "nod_stretchy_vector_push");
+    }
+
+    #[test]
+    fn rewrites_known_ip() {
+        let (base, syms) = parse_link_map(SAMPLE).expect("parse");
+        // 0x140067b00 is +0x20 into nod_stretchy_vector_push.
+        let inp = "  frame  0: 0x0000000140067b00";
+        let out = rewrite_hex_ips(inp, &syms, 0_i64 - base as i64 + base as i64);
+        assert!(out.contains("nod_stretchy_vector_push+0x20"));
+        assert!(out.contains("0x0000000140067b00"));
+    }
+
+    #[test]
+    fn leaves_unknown_ip_alone() {
+        let (_base, syms) = parse_link_map(SAMPLE).expect("parse");
+        // Way past any symbol → unchanged.
+        let inp = "0xdeadbeefdeadbeef";
+        let out = rewrite_hex_ips(inp, &syms, 0);
+        assert_eq!(out, "0xdeadbeefdeadbeef");
+    }
+}
+

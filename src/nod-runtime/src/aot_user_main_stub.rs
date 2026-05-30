@@ -31,6 +31,19 @@
 //! already defined`. The translation-unit split is what makes the
 //! "weak default" trick robust under MSVC's archive-member resolution.
 //!
+//! ## CGU coupling is the hidden fragility (fixed via per-package profile)
+//!
+//! The 1-file=1-`.obj` premise only holds if Cargo doesn't merge `.rs`
+//! files into one CGU. The default 16-CGU layout can merge
+//! `aot_user_main_stub.rs` into the same `.obj` as `aot.rs` (or any
+//! other always-referenced module), at which point pulling
+//! `nod_aot_main_wrapper` forces pulling the stub too — and the user
+//! EXE's own `nod_user_main` collides. We pin nod-runtime to
+//! `codegen-units = 1` in the workspace `Cargo.toml`'s per-package
+//! profile, which means one CGU PER ARCHIVE MEMBER — every `.rs` file
+//! ends up in its own `.obj` and the on-demand extraction works as
+//! designed.
+//!
 //! ## When this file's symbol is unused (the default Sprint 39a flow)
 //!
 //! Compiling this file always produces an `.obj` and contributes it to
