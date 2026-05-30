@@ -2705,6 +2705,15 @@ define function main () => ()
   end;
 end function main;
 
-main();
+// Sprint 50d — removed the top-level `main();` invocation. The AOT
+// pipeline's C wrapper (`nod_aot_main_wrapper`) calls `nod_user_main`
+// after `nod_aot_resolve_relocs` has registered every literal +
+// dispatch entry, so the user-source entry function runs at the right
+// time. Keeping the top-level call here doubled the invocation when
+// the AOT pipeline did pick it up (rare) and crashed during the
+// init-phase before resolve_relocs ran (string literals not yet
+// registered) when this file was bundled alongside `dylan-macro-smoke.dylan`
+// (Sprint 50c-4). The standalone parse-dylan EXE still runs `main`
+// because the AOT entry-stub injection wires it as the program entry.
 
 // eof

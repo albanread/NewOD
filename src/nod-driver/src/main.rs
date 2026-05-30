@@ -208,21 +208,22 @@ fn main() -> ExitCode {
             // both-set case at parse time; `required_unless_present`
             // rules out both-empty. So at most one of the two is
             // populated here.
-            let (resolved_inputs, default_out, project_tag) =
+            let (resolved_inputs, default_out, project_tag, entry_function) =
                 if let Some(prj_path) = project {
                     match project::ResolvedProject::load(&prj_path) {
                         Ok(p) => {
                             if verbose {
                                 eprintln!(
-                                    "nod build: project={} ({}), {} source file{}",
+                                    "nod build: project={} ({}), {} source file{}, entry=`{}`",
                                     p.name,
                                     p.project_path.display(),
                                     p.sources.len(),
                                     if p.sources.len() == 1 { "" } else { "s" },
+                                    p.start_function,
                                 );
                             }
                             let tag = format!("project `{}`", p.name);
-                            (p.sources.clone(), Some(p.output), Some(tag))
+                            (p.sources.clone(), Some(p.output), Some(tag), p.start_function)
                         }
                         Err(e) => {
                             eprintln!("nod build: {e}");
@@ -230,13 +231,13 @@ fn main() -> ExitCode {
                         }
                     }
                 } else {
-                    (inputs.clone(), None, None)
+                    (inputs.clone(), None, None, "main".to_string())
                 };
             let out = output
                 .or(default_out)
                 .unwrap_or_else(|| default_exe_path(&resolved_inputs[0]));
             let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
-            let code = run_build(&resolved_inputs, &out, verbose);
+            let code = run_build_full(&resolved_inputs, &out, verbose, &entry_function);
             if let Some(start) = stopwatch {
                 let dt = start.elapsed();
                 let what = project_tag
@@ -373,7 +374,12 @@ fn locate_runtime_staticlib() -> Result<PathBuf, String> {
     ))
 }
 
-fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> ExitCode {
+fn run_build_full(
+    inputs: &[PathBuf],
+    output: &std::path::Path,
+    verbose: bool,
+    entry_function: &str,
+) -> ExitCode {
     use nod_llvm::LlvmContext as Context;
     use nod_llvm::OptimizationLevel;
 
@@ -398,13 +404,15 @@ fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> Exi
     // we collect the DLLs from the manifest after codegen and pass
     // the matching import libraries to `link.exe`.
 
-    // Sprint 39a: the user's `define function main` must be present
-    // for `nod-llvm::aot::emit_aot_entry_stubs` to find it. Surface a
-    // clear error before we kick off codegen if it's missing.
-    if !lm.functions.iter().any(|f| f.name == "main") {
+    // Sprint 39a / 50d: the user's entry function (default `main`,
+    // overridable via the project file's `start_function`) must be
+    // present for `nod-llvm::aot::emit_aot_entry_stubs_full` to find
+    // it. Surface a clear error before we kick off codegen if it's
+    // missing.
+    if !lm.functions.iter().any(|f| f.name == entry_function) {
         eprintln!(
-            "nod build: input file does not define `main` — Sprint 39a EXEs need \
-             `define function main () => () ... end` as the entry point."
+            "nod build: input file does not define `{entry_function}` — Sprint 39a EXEs need \
+             `define function {entry_function} () => () ... end` as the entry point."
         );
         return ExitCode::from(1);
     }
@@ -463,13 +471,14 @@ fn run_build(inputs: &[PathBuf], output: &std::path::Path, verbose: bool) -> Exi
     // generic method) resolve at AOT runtime.
     let registrations = nod_sema::build_aot_registrations(&lm);
 
-    if let Err(e) = nod_llvm::aot::emit_aot_object_with_registrations_and_safepoints(
+    if let Err(e) = nod_llvm::aot::emit_aot_object_full(
         &module,
         &manifest,
         &registrations,
         &safepoint_installs,
         &obj_path,
         OptimizationLevel::Default,
+        entry_function,
     ) {
         eprintln!("nod build: {e}");
         return ExitCode::from(1);

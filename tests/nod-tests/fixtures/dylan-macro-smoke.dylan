@@ -958,7 +958,12 @@ define function run-match-substitute (pattern :: <stretchy-vector>,
   end;
 end function;
 
-define function main () => ()
+// Sprint 50d — renamed from `main` to `smoke-main` so this fixture
+// can be bundled with `dylan-parser.dylan` (which defines its own
+// `main`). The `.prj`'s `start_function = "smoke-main"` field names
+// this function as the EXE entry; the AOT pipeline renames it to
+// `nod_user_main` regardless of source-side name.
+define function smoke-main () => ()
   let call = build-call-site();
   // Phase A — Sprint 50a — hand-built rule.
   format-out("PHASE: hand-built\n");

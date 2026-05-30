@@ -2150,42 +2150,73 @@ What 50c-3 does NOT do (deferred to 50c-4 / 50d / 50e):
   * Oracle vs Rust nod-macro (50d).
   * Retire nod-macro from the build (50e).
 
-### Sprint 50c-4 — prerequisite blocker discovered, not started
+### Sprint 50d — `.prj` `start_function` schema field — landed
 
-Attempted to bundle `dylan-parser.dylan` into `dylan-macro-smoke.prj`
-so the smoke could use the real `parse-dylan(tokens) → <ast-body>`
-entry point. Build failed cleanly:
+The duplicate-`main` collision that blocked Sprint 50c-4 was a
+tooling choice, not a Dylan-language constraint. Open Dylan lets a
+library configure its entry function via `*main-function:*`; the
+nod tooling was just hardcoding `"main"`. Sprint 50d ports the
+configurable-entry idea to the `.prj` schema:
+
+```toml
+name           = "dylan-macro-smoke"
+sources        = [..., "dylan-parser.dylan", "dylan-macro-smoke.dylan"]
+start_function = "smoke-main"   # default "main", back-compat
+```
+
+Code changes:
+  * `src/nod-driver/src/project.rs` — new `start_function: Option<String>`
+    field on `RawProject`, surfaces as `pub start_function: String`
+    (defaulted to `"main"`) on `ResolvedProject`. Two unit tests
+    cover default + explicit override.
+  * `src/nod-llvm/src/aot.rs` — new public functions
+    `emit_aot_entry_stubs_full` and `emit_aot_object_full` accept an
+    `entry_function: &str` parameter. Older signatures stay as
+    `"main"`-passing wrappers (back-compat for every existing call
+    site and test).
+  * `src/nod-driver/src/main.rs` — pipes the project's
+    `start_function` through to `run_build_full`, uses it in the
+    pre-flight "missing entry" check, and threads it into
+    `emit_aot_object_full`.
+  * `tests/nod-tests/fixtures/dylan-parser.dylan` — removed a
+    redundant top-level `main();` invocation. Confirmed the
+    standalone `parse-dylan` EXE still works because the AOT entry
+    stub already wires the user's `main` as `nod_user_main` (called
+    from the runtime C wrapper). Parser corpus: 38/38.
+  * `tests/nod-tests/fixtures/dylan-macro-smoke.dylan` — renamed
+    `main` to `smoke-main` and set `start_function = "smoke-main"`
+    in `dylan-macro-smoke.prj`.
+
+Verification:
+  cargo test -p nod-tests --test macro_engine — passes
+  cargo test -p nod-driver project — 8 passed (incl. 2 new)
+  Parser corpus: 38/38
+  Smoke EXE (built via `.prj` with start_function="smoke-main")
+    runs all five phases byte-for-byte identically to before.
+
+### Sprint 50c-4 — registration-order blocker in 3-file bundle
+
+With `start_function` in place, the duplicate-`main` collision is
+gone, but adding `dylan-parser.dylan` to the smoke bundle still
+fails at runtime — before `smoke-main` can print its first phase
+header:
 
 ```
-nod build: duplicate top-level definition `main` in both
-  dylan-lexer.dylan        ← attribution is fuzzy; real collision is
-  dylan-macro-smoke.dylan  ← parser vs. smoke
-(user-vs-user collisions are not allowed; stdlib overrides are still permitted)
+format-out: format string is not a <byte-string> (raw 0x0)
 ```
 
-Root cause: both `dylan-parser.dylan` (line 2691) and
-`dylan-macro-smoke.dylan` (line 961) define `define function main`.
-The Dylan-side parser's `main` is wired as the entry point of the
-existing `nod-driver parse-dylan` EXE (which bundles
-`dylan-lexer + dylan-parser` — only one `main`, no collision). Adding
-the smoke as a third file in any prj forces a collision and the
-AOT pipeline rejects user-vs-user duplicates.
+The format string is NULL — a literal global hasn't been registered
+yet when format-out is called. This is a fresh AOT init-order bug
+specific to the 3-file bundle; the 2-file bundle works perfectly.
+Hypothesis: when N files contribute literals, the registration index
+expected by codegen and the slot actually populated by
+`nod_aot_resolve_relocs` drift for some specific literal. Needs
+investigation in `nod-sema::build_aot_registrations` +
+`nod-llvm::aot::convert_externals_to_defining_storage`.
 
-**Prerequisite refactor for 50c-4 proper:**
-  1. Extract the parser's CLI main + top-level `main();` call from
-     `dylan-parser.dylan` into a new `dylan-parser-cli.dylan`.
-  2. Update `src/nod-driver/src/main.rs::ensure_dylan_parser_exe`
-     to bundle `[dylan-lexer, dylan-parser, dylan-parser-cli]` for
-     the parse-dylan EXE.
-  3. Re-verify the parser corpus is 38/38 with the refactor.
-  4. THEN: add `dylan-parser.dylan` (no main now) to
-     `dylan-macro-smoke.prj` and proceed with the walk-and-expand
-     phase.
-
-Held off on the refactor this session — it touches a stable corpus
-fixture and the driver's parser-EXE wiring, which is bigger scope
-than the macro-engine increments we've been landing. Clean stop on
-50c-3, the wall is documented.
+Held this fresh blocker as a separate sprint because it's an
+AOT-pipeline correctness bug, not a project-schema or refactor
+issue. The walk-and-expand pass waits on 50c-4's fix.
 
 ---
 

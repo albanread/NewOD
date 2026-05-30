@@ -56,6 +56,13 @@ struct RawProject {
     name: String,
     sources: Vec<String>,
     output: Option<String>,
+    /// Sprint 50d — name of the Dylan-source function that should
+    /// serve as the program's entry point. Defaults to `"main"` for
+    /// back-compat with every existing `.prj`. Set to something else
+    /// when bundling files that all happen to define `main` (e.g.
+    /// bundling `dylan-parser.dylan` — whose entry is `main` — with
+    /// a smoke test that wants its own entry name).
+    start_function: Option<String>,
 }
 
 /// Loaded + path-resolved project. Field semantics:
@@ -78,6 +85,13 @@ pub struct ResolvedProject {
     pub sources: Vec<PathBuf>,
     pub output: PathBuf,
     pub project_path: PathBuf,
+    /// Sprint 50d — Dylan-source function name that becomes the EXE
+    /// entry. Always populated; defaults to `"main"` when the .prj
+    /// omits the field. The AOT pipeline renames this LLVM-side
+    /// function to `nod_user_main` (the symbol the runtime wrapper
+    /// `extern`s); choosing a different value lets a bundle resolve
+    /// duplicate-`main` collisions between source files.
+    pub start_function: String,
 }
 
 #[derive(Debug)]
@@ -167,11 +181,16 @@ impl ResolvedProject {
             Some(o) if !o.trim().is_empty() => resolve(&anchor, &o),
             _ => anchor.join(format!("{}.exe", raw.name)),
         };
+        let start_function = match raw.start_function {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => "main".to_string(),
+        };
         Ok(Self {
             name: raw.name,
             sources,
             output,
             project_path: canon,
+            start_function,
         })
     }
 }
@@ -214,6 +233,37 @@ sources = ["foo.dylan"]
         assert_eq!(p.sources.len(), 1);
         assert!(p.sources[0].ends_with("foo.dylan"));
         assert!(p.output.ends_with("foo.exe"));
+    }
+
+    #[test]
+    fn start_function_defaults_to_main() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("foo.dylan"), "").unwrap();
+        let path = write_prj(
+            dir.path(),
+            r#"
+name = "foo"
+sources = ["foo.dylan"]
+"#,
+        );
+        let p = ResolvedProject::load(&path).expect("load");
+        assert_eq!(p.start_function, "main");
+    }
+
+    #[test]
+    fn explicit_start_function_honored() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("foo.dylan"), "").unwrap();
+        let path = write_prj(
+            dir.path(),
+            r#"
+name = "foo"
+sources = ["foo.dylan"]
+start_function = "my-entry"
+"#,
+        );
+        let p = ResolvedProject::load(&path).expect("load");
+        assert_eq!(p.start_function, "my-entry");
     }
 
     #[test]

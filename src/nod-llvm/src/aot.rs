@@ -316,10 +316,36 @@ pub fn emit_aot_entry_stubs_with_registrations_and_safepoints<'ctx>(
     registrations: &AotRegistrations,
     safepoint_installs: &[SafepointInstallRecord],
 ) -> Result<(), AotError> {
+    emit_aot_entry_stubs_full(
+        module,
+        manifest,
+        registrations,
+        safepoint_installs,
+        "main",
+    )
+}
+
+/// Sprint 50d — superset variant that accepts the Dylan-source entry
+/// function name. The traditional pipeline uses `"main"` (and every
+/// public wrapper above defaults to it); `.prj` files can override via
+/// `start_function = "..."` so a bundle whose source files all happen
+/// to define `main` can pick a non-colliding entry. The behaviour is
+/// otherwise identical: the named function gets renamed to
+/// `nod_user_main` and the runtime C wrapper extern-decls against
+/// that symbol regardless of the source-language name.
+pub fn emit_aot_entry_stubs_full<'ctx>(
+    module: &Module<'ctx>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    safepoint_installs: &[SafepointInstallRecord],
+    entry_function: &str,
+) -> Result<(), AotError> {
     // Resist the temptation to rename `<eval-entry>` here — that name
     // is reserved for the JIT path. AOT users write `define function
-    // main`.
-    let user_main = module.get_function("main").ok_or(AotError::MissingMain)?;
+    // main` (or another name per the project's `start_function`).
+    let user_main = module
+        .get_function(entry_function)
+        .ok_or(AotError::MissingMain)?;
 
     // Guard against a pre-existing `nod_user_main` (would be unusual —
     // user shouldn't pick that name — but a clear error beats silent
@@ -1863,11 +1889,39 @@ pub fn emit_aot_object_with_registrations_and_safepoints(
     path: &Path,
     opt_level: OptimizationLevel,
 ) -> Result<(), AotError> {
-    emit_aot_entry_stubs_with_registrations_and_safepoints(
+    emit_aot_object_full(
         module,
         manifest,
         registrations,
         safepoint_installs,
+        path,
+        opt_level,
+        "main",
+    )
+}
+
+/// Sprint 50d — superset of
+/// [`emit_aot_object_with_registrations_and_safepoints`] that accepts
+/// the Dylan-source entry-function name. The Rust runtime wrapper's
+/// extern symbol is always `nod_user_main`; this name is what we look
+/// up in the LLVM module before renaming. Defaulting to `"main"` keeps
+/// every existing caller working unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_aot_object_full(
+    module: &Module<'_>,
+    manifest: &ModuleManifest,
+    registrations: &AotRegistrations,
+    safepoint_installs: &[SafepointInstallRecord],
+    path: &Path,
+    opt_level: OptimizationLevel,
+    entry_function: &str,
+) -> Result<(), AotError> {
+    emit_aot_entry_stubs_full(
+        module,
+        manifest,
+        registrations,
+        safepoint_installs,
+        entry_function,
     )?;
     emit_object_file(module, path, opt_level)?;
     Ok(())
