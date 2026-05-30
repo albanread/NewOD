@@ -52,7 +52,72 @@ The liveness fix was **reverted**; the probe + `diagnose_arg_root_coverage`
 stay as permanent diagnostics. Findings preserved in
 `GAP-011_arg_root_coverage_findings.log`.
 
+## Trace inspection nails the staleness pattern — 2026-05-30 (afternoon)
+
+Once `nod-driver symbolicate` made the backtrace readable, ran the
+gating crash with `NOD_GC_TRACE=/tmp/gc-trace.jsonl` and answered the
+"did GC ever see this pointer?" question by grepping. **It did.**
+Pattern (4 cycles, 393 events total):
+
+- Crash: `sv=0x000002254a34d771 ptr=0x000002254a34d770`.
+- Tagged form `4a34d771` appears 80× in the trace (16 `root`, 64
+  `root_rewrite`). My first grep was for the untagged `770` — 0
+  matches. Lesson: **the trace records the tagged Word**, search both
+  forms.
+- Cycle 2's multi-pass major collection rewrote the vector through
+  `38d → 34d → 37d → 34d` (G0→G1, G1→Tenured, Tenured→Tenured
+  defrag). End state: 11 distinct slots hold `4a34d771`.
+- Cycle 4 (a later major) moved the vector again: `4a34d771 →
+  4a39d771`. Of the 11 slots that held the value, only **8 got
+  rewritten**. The remaining **3 forgotten slots** are:
+  - `0x000000962bfef3b8` — cycle 1 src=stack, i=5
+  - `0x000000962bfef648` — cycle 1 src=aot,   i=18
+  - `0x000000962bfef710` — cycle 1 src=aot,   i=17
+  None of them appear in cycle 3 or 4's root set. They were
+  deregistered between cycles 2 and 3.
+- After cycle 4: heap object is at `4a39d771`; those 3 stack
+  addresses still hold `4a34d771`. **stretchy_vector_push panics
+  with `sv=0x...4a34d771`.**
+
+The killer side-by-side: cycle 4's AOT slab covers slot addresses
+`f3e0 < f470 < f478 < f5b0 < f5b8 < f6f0 < f6f8 < f700 < f708` —
+and the forgotten `f648` and `f710` **sit physically between those
+addresses, in active stack memory the slab doesn't claim**. So this
+isn't "the slab's gone, the memory's freed" — these are stack
+words inside a live Dylan call's frame that the current safepoint's
+slab doesn't include, but earlier cycle 2 did include.
+
+That is a **codegen / IR bug**, not a collector bug. Some SSA temp
+gets reloaded from one of those forgotten stack addresses (or a value
+flows from one of them via an LLVM load) without going through the
+safepoint slab's reload protocol. Across cycle 4 the SSA value is the
+pre-move address; passing it into `add!` → `nod_stretchy_vector_push`
+fails on the wrapper-class check.
+
 ## Where to look next
+
+The narrowed question: **which load instruction in dump-node /
+acc-string takes its value from a stack address that is NOT a slab
+slot of the surrounding safepoint?** Two concrete approaches:
+
+1. **Slab-snapshot probe at every safepoint enter/exit.** Augment
+   `nod_aot_begin_safepoint` to also dump the calling Dylan
+   function's full alloca map (every stack-address used for any
+   GC-typed value), not just the slots whose indices we passed it.
+   Cross-reference against the slab indices and the dataflow's
+   `safepoint_roots`. Mismatches name the holes.
+
+2. **Bisect via DFM IR.** `dump-dfm` the parser source, focus on
+   `dump-node` blocks 53, 77, 102, 127 (the ones the
+   `NOD_DIAG_ARG_ROOT_COVERAGE` probe surfaced as having
+   freshly-allocated args), look for any SSA temp whose definition is
+   a sub-call's result and whose final-use site is inside a different
+   safepoint scope. The codegen for those would emit an LLVM `load`
+   from an alloca that the current slab doesn't track.
+
+(Earlier sections still apply; this section supersedes the previous
+"3 layers of suspects" framing — we're down to one layer: codegen
+slab/reload protocol holes between safepoint scopes.)
 
 With two front-end hypotheses ruled out, the remaining suspects shift
 toward the runtime / collector layer (and were already listed in the
