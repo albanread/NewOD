@@ -1541,6 +1541,55 @@ A cold-compile of `"hello"` produces:
 > tracked as a documentation-debt task; the gap doesn't block forward
 > work.
 
+### Sprint 46 — Dylan-in-Dylan parser, self-host milestone — landed
+
+Year-3 self-hosting first step: a Dylan-side parser that consumes
+the same fixture corpus the Rust reader does. Built incrementally
+over Sprints 46-A (define class with superclasses + slot specs),
+46-B (multi-clause statements: `if/elseif/else`, `block/cleanup`,
+`select/otherwise`), 46-C (for iteration headers), 46-D (define
+generic), 46-E (method signatures), and a polish task for infix
+word-operators (`mod`, `rem`).
+
+**The gating milestone** — task #298, "parse the whole corpus,
+then GC-stress with heavy parsing" — was the use case that
+surfaced GAP-011 in the first place (`dump-node` recursion +
+`acc-string` push loop = GC pressure that exposed the function-
+param stale-reload bug). Pre-Sprint-48b, any fixture beyond ~35
+functions panicked with `stretchy_vector_push: not a
+<stretchy-vector>` in cycle 4 or 5. Post-fix, the gating run
+produces:
+
+  * Headline: `dylan-parser.dylan` (**100,186 bytes** — the
+    Dylan-side parser's own source) parses to **10,948 AST lines**
+    in 26 seconds wall-clock.
+  * **Corpus pass rate: 30 / 37 fixtures** (81%). All seven
+    failures are the same shape: `define macro …` not yet
+    implemented in the Dylan-side parser (six fixtures), plus one
+    token-shape issue in `dylan-lexer.dylan`. None are GC crashes;
+    none are regressions.
+  * **GC stress run** (`NOD_GC_TRACE` over the heaviest fixture):
+    22 cycles — 11 minor + 11 major — with 570 root snapshots
+    (380 AOT slab + 190 thread stack) and **1,696 root rewrites**.
+    Genuine fragmentation pressure, real evacuation, zero panics,
+    zero stale-pointer traces.
+
+The corpus runner script (`/tmp/run-corpus.sh` shape — kept ad-hoc,
+not committed) tallies pass/fail/byte-size/AST-line-count per
+fixture; it's the seed of what could become a CI gate once the
+remaining `define macro` parsing lands.
+
+**What's queued, not done.**
+
+  * Teach the Dylan-side parser to parse `define macro` (closes
+    six of the seven failures).
+  * Diagnose the `dylan-lexer.dylan` "unexpected token in
+    expression" failure (the seventh).
+  * Promote the corpus runner to a `nod-driver` subcommand or a
+    cargo integration test so it runs automatically.
+  * Sprint 45c-e — character predicates in stdlib + oracle test
+    against the Rust lexer + IDE syntax-highlighter consumption.
+
 ### Sprint 47 — multi-value return + multi-binder `let` (GAP-003 fix) — landed
 
 Closed GAP-003: `values(a, b)` lowering + `let (a, b) = expr` destructuring.
