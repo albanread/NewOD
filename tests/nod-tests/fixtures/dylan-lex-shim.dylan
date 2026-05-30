@@ -400,6 +400,183 @@ define function dylan-parse-collect (source :: <byte-string>)
   count-top-level-errors(ast)
 end function;
 
+// ─── dylan-parse-emit — Sprint 51d AST wire emitter ──────────────────────
+//
+// Per docs/DYLAN_AST_WIRE.md, pre-order walk of the parser's output
+// emitting 4-int records into a flat stretchy-vector:
+//   (kind, span_lo, span_hi, subtree_size)
+//
+// Sprint 51d v1 handles: Body, DefineFunction, Call, VariableRef,
+// StringLit, IntegerLit, BinaryOp. Anything else lowers to Error
+// (kind 7) with the span covering the unrecognised constituent.
+// The host falls back to the Rust parser for the whole file on Error.
+
+define constant $ast-kind-body            = 0;
+define constant $ast-kind-define-function = 1;
+define constant $ast-kind-call            = 2;
+define constant $ast-kind-variable-ref    = 3;
+define constant $ast-kind-string-lit      = 4;
+define constant $ast-kind-integer-lit     = 5;
+define constant $ast-kind-binary-op       = 6;
+define constant $ast-kind-error           = 7;
+
+// Emit one record (kind, lo, hi, subtree_size). subtree_size patched
+// later — initial push is 1 (just self).
+define function emit-record (out :: <stretchy-vector>,
+                             kind :: <integer>,
+                             lo :: <integer>,
+                             hi :: <integer>)
+ => (record-index :: <integer>)
+  let idx = %stretchy-vector-size(out);
+  %stretchy-vector-push(out, kind);
+  %stretchy-vector-push(out, lo);
+  %stretchy-vector-push(out, hi);
+  %stretchy-vector-push(out, 1);   // subtree_size placeholder
+  idx
+end function;
+
+// After children are emitted, patch the subtree_size = (current_size
+// - record_index) / 4.
+define function patch-subtree-size (out :: <stretchy-vector>,
+                                    record-index :: <integer>)
+ => ()
+  let total-ints = %stretchy-vector-size(out);
+  let subtree-records = (total-ints - record-index) / 4;
+  %stretchy-vector-element-setter(subtree-records, out, record-index + 3);
+end function;
+
+define function span-of (node :: <ast-node>) => (lo :: <integer>, hi :: <integer>)
+  let tok = node-token(node);
+  if (instance?(tok, <token>))
+    let s = token-span(tok);
+    values(span-start(s), span-end(s))
+  else
+    values(0, 0)
+  end
+end function;
+
+// Forward declared via define generic semantics — each method below
+// emits one record (plus children) and returns nothing. The caller is
+// responsible for patching the parent's subtree size if it cares.
+
+define method emit-node (node :: <ast-node>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(node);
+  emit-record(out, $ast-kind-error, lo, hi);
+end method;
+
+define method emit-node (b :: <ast-body>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(b);
+  let idx = emit-record(out, $ast-kind-body, lo, hi);
+  let constituents = body-constituents(b);
+  let n = %stretchy-vector-size(constituents);
+  let i = 0;
+  until (i = n)
+    let c = %stretchy-vector-element(constituents, i);
+    emit-node(c, source, out);
+    i := i + 1;
+  end;
+  patch-subtree-size(out, idx);
+end method;
+
+define method emit-node (d :: <ast-body-definition>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  // v1 only handles `define function`. Anything else is Error.
+  let word-tok = defn-word(d);
+  let word-name = token-name(word-tok);
+  if (word-name = "function")
+    let word-span = token-span(word-tok);
+    let lo = span-start(word-span);
+    let hi = span-end(word-span);
+    // Stretch the span to cover the whole definition (best-effort:
+    // use the body's end if present).
+    let body = defn-body(d);
+    let (body-lo, body-hi) = span-of(body);
+    let outer-hi = if (body-hi > hi) body-hi else hi end;
+    let body-lo-unused = body-lo; // discard explicitly
+    let idx = emit-record(out, $ast-kind-define-function, lo, outer-hi);
+    emit-node(body, source, out);
+    patch-subtree-size(out, idx);
+  else
+    let (lo, hi) = span-of(d);
+    emit-record(out, $ast-kind-error, lo, hi);
+  end
+end method;
+
+define method emit-node (c :: <ast-call>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(c);
+  let idx = emit-record(out, $ast-kind-call, lo, hi);
+  // First child: callee.
+  emit-node(call-fn(c), source, out);
+  // Remaining children: each arg.
+  let args = call-args(c);
+  let n = %stretchy-vector-size(args);
+  let i = 0;
+  until (i = n)
+    let a = %stretchy-vector-element(args, i);
+    emit-node(a, source, out);
+    i := i + 1;
+  end;
+  patch-subtree-size(out, idx);
+end method;
+
+define method emit-node (v :: <ast-variable-ref>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let tok = varref-tok(v);
+  let s = token-span(tok);
+  let lo = span-start(s);
+  let hi = span-end(s);
+  emit-record(out, $ast-kind-variable-ref, lo, hi);
+end method;
+
+define method emit-node (s :: <ast-string-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(s);
+  emit-record(out, $ast-kind-string-lit, lo, hi);
+end method;
+
+define method emit-node (i :: <ast-integer-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(i);
+  emit-record(out, $ast-kind-integer-lit, lo, hi);
+end method;
+
+define method emit-node (b :: <ast-binary-op>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(b);
+  let idx = emit-record(out, $ast-kind-binary-op, lo, hi);
+  emit-node(binop-left(b), source, out);
+  emit-node(binop-right(b), source, out);
+  patch-subtree-size(out, idx);
+end method;
+
+define method emit-node (e :: <ast-error-node>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(e);
+  emit-record(out, $ast-kind-error, lo, hi);
+end method;
+
+// <ast-pos-arg> is the parser's wrapper for "this is a positional
+// call argument." Wire-format-wise it's transparent — we don't emit
+// a record for it, just recurse into the wrapped value. That keeps
+// the host's tree free of a wrapper kind that wouldn't translate to
+// anything in `ast::Expr`.
+define method emit-node (p :: <ast-pos-arg>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  emit-node(pos-arg-value(p), source, out);
+end method;
+
+define function dylan-parse-emit (source :: <byte-string>)
+ => (records :: <object>)
+  let tokens = lex(source);
+  let ast = parse-dylan(tokens);
+  let out = %make-stretchy-vector(64);
+  emit-node(ast, source, out);
+  out
+end function;
+
 // ─── main — read argv[1] as a path, lex, emit ────────────────────────────
 
 define function shim-main () => ()

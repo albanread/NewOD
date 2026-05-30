@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 
 mod dylan_lex_jit;
 mod dylan_parse_check;
+mod dylan_parse_wire;
 mod project;
 
 /// LLVM major version this driver is targeted against. Read at
@@ -193,6 +194,18 @@ enum Command {
         #[arg(long = "gc-stats")]
         gc_stats: bool,
     },
+    /// Sprint 51d — Dylan-side parser side-load: lex + parse the input
+    /// through the statically-linked shim, decode the AST wire format
+    /// (`docs/DYLAN_AST_WIRE.md`), print the resulting tree as an
+    /// indented S-expression. v1 supports a small subset of node
+    /// kinds (`Body`, `DefineFunction`, `Call`, `VariableRef`,
+    /// `StringLit`, `IntegerLit`, `BinaryOp`); anything unrecognised
+    /// appears as `Error` and the host falls back to the Rust parser
+    /// for that part. Implies `--lex-with-dylan` (shared resolver).
+    DumpDylanAst {
+        /// Path to a `.dylan` source file.
+        input: PathBuf,
+    },
     /// Run the Dylan-in-Dylan parser over a source file and print the AST dump.
     ///
     /// Builds [dylan-lexer.dylan, dylan-parser.dylan] into a cached EXE,
@@ -360,6 +373,7 @@ fn main() -> ExitCode {
         Some(Command::DumpLlvm { input }) => run_dump_llvm(&input),
         Some(Command::Eval { expr }) => run_eval(&expr),
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
+        Some(Command::DumpDylanAst { input }) => run_dump_dylan_ast(&input),
         Some(Command::ParseDylan { input, time }) => {
             let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
             let code = run_parse_dylan(&input);
@@ -992,6 +1006,33 @@ fn ensure_dylan_lexer_exe() -> Result<PathBuf, String> {
         ));
     }
     Ok(exe)
+}
+
+fn run_dump_dylan_ast(input: &std::path::Path) -> ExitCode {
+    // Sprint 51d — exercise the AST wire format end-to-end. Fire the
+    // shim's resolver if it hasn't already, then call
+    // `dylan-parse-emit` and walk the records.
+    if let Err(e) = dylan_lex_jit::init() {
+        eprintln!("nod-driver dump-dylan-ast: shim init failed: {e}");
+        return ExitCode::from(1);
+    }
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-ast: read {}: {e}", input.display());
+            return ExitCode::from(2);
+        }
+    };
+    match dylan_parse_wire::parse_to_tree(&src) {
+        Ok(tree) => {
+            print!("{}", dylan_parse_wire::format_tree(&tree, &src));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-ast: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run_dump_dylan_tokens(input: &std::path::Path, gc_stats: bool) -> ExitCode {

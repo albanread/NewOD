@@ -1,0 +1,240 @@
+//! Sprint 51d — Dylan AST wire format reader.
+//!
+//! Contract: `docs/DYLAN_AST_WIRE.md`. The Dylan-side
+//! `dylan-parse-emit` produces a `<stretchy-vector>` of `4N` fixnums;
+//! each 4-int record is `(kind, span_lo, span_hi, subtree_size)` and
+//! children pack pre-order after their parent.
+//!
+//! v1 produces a [`DylanAst`] tree — a Rust mirror of the Dylan
+//! parser's output, NOT yet a `nod_reader::ast::Module`. The
+//! `dump-dylan-ast` subcommand uses this tree to print a textual
+//! representation. Sprint 51e converts the mirror tree into the
+//! canonical `ast::Module` so `--parse-with-dylan` can replace
+//! `parse_module` outright.
+
+use nod_runtime::Word;
+
+#[cfg(dylan_lex_shim_linked)]
+unsafe extern "C" {
+    /// Sprint 51d — `define function dylan-parse-emit (source) =>
+    /// (records :: <stretchy-vector>)` from `dylan-lex-shim.dylan`.
+    /// Word in (a `<byte-string>`), Word out (a tagged-pointer to a
+    /// `<stretchy-vector>` of `4N` boxed fixnums).
+    #[link_name = "dylan-parse-emit"]
+    fn dylan_parse_emit(source: u64) -> u64;
+}
+
+#[cfg(not(dylan_lex_shim_linked))]
+unsafe extern "C" fn dylan_parse_emit(_source: u64) -> u64 {
+    unreachable!("dylan_lex_shim_linked is not set")
+}
+
+/// AST kind codes — must match `docs/DYLAN_AST_WIRE.md` §3 and the
+/// `$ast-kind-*` constants in `dylan-lex-shim.dylan`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[repr(u8)]
+pub enum Kind {
+    Body = 0,
+    DefineFunction = 1,
+    Call = 2,
+    VariableRef = 3,
+    StringLit = 4,
+    IntegerLit = 5,
+    BinaryOp = 6,
+    Error = 7,
+}
+
+impl Kind {
+    fn from_i64(n: i64) -> Option<Kind> {
+        Some(match n {
+            0 => Kind::Body,
+            1 => Kind::DefineFunction,
+            2 => Kind::Call,
+            3 => Kind::VariableRef,
+            4 => Kind::StringLit,
+            5 => Kind::IntegerLit,
+            6 => Kind::BinaryOp,
+            7 => Kind::Error,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Body => "Body",
+            Kind::DefineFunction => "DefineFunction",
+            Kind::Call => "Call",
+            Kind::VariableRef => "VariableRef",
+            Kind::StringLit => "StringLit",
+            Kind::IntegerLit => "IntegerLit",
+            Kind::BinaryOp => "BinaryOp",
+            Kind::Error => "Error",
+        }
+    }
+}
+
+/// One AST node as decoded from the wire. Children are in source
+/// (pre-)order. Spans are byte offsets into the source the caller
+/// passed to [`parse_to_tree`].
+#[derive(Debug, Clone)]
+pub struct DylanAst {
+    pub kind: Kind,
+    pub span_lo: u32,
+    pub span_hi: u32,
+    pub children: Vec<DylanAst>,
+}
+
+/// Parse `src` through the statically-linked Dylan parser and decode
+/// the wire-format result. Returns `Err` if the shim isn't linked
+/// (caller should fall back to the Rust parser).
+pub fn parse_to_tree(src: &str) -> Result<DylanAst, String> {
+    #[cfg(not(dylan_lex_shim_linked))]
+    {
+        let _ = src;
+        return Err("dylan-lex-shim not statically linked".to_string());
+    }
+
+    #[cfg(dylan_lex_shim_linked)]
+    {
+        // Build a Dylan `<byte-string>` from the source bytes (same
+        // marshalling as the lex + verify-parse paths).
+        let bytes = src.as_bytes();
+        let len_word = Word::from_fixnum(bytes.len() as i64)
+            .map_err(|_| "source longer than fixnum range".to_string())?;
+        // SAFETY: nod_byte_string_allocate is the vetted constructor.
+        let bs_raw = unsafe { nod_runtime::nod_byte_string_allocate(len_word.raw()) };
+        for (i, &b) in bytes.iter().enumerate() {
+            let byte_word = Word::from_fixnum(b as i64).expect("byte fits");
+            let i_word = Word::from_fixnum(i as i64).expect("offset fits");
+            // SAFETY: bs_raw just allocated, single-threaded.
+            unsafe {
+                nod_runtime::nod_byte_string_element_setter(
+                    byte_word.raw(),
+                    bs_raw,
+                    i_word.raw(),
+                );
+            }
+        }
+
+        // SAFETY: bs_raw is a live <byte-string>; the entry is the
+        // statically-linked emitter.
+        let sv_raw = unsafe { dylan_parse_emit(bs_raw) };
+
+        // Read the stretchy-vector into a flat Vec<i64>.
+        let size_word_raw = unsafe { nod_runtime::nod_stretchy_vector_size(sv_raw) };
+        let size = Word::from_raw(size_word_raw)
+            .as_fixnum()
+            .ok_or_else(|| "vector size not a fixnum".to_string())? as usize;
+        if !size.is_multiple_of(4) {
+            return Err(format!(
+                "dylan-parse-emit produced {size} ints, not a multiple of 4"
+            ));
+        }
+        let mut flat = Vec::with_capacity(size);
+        for i in 0..size {
+            let elem_raw = unsafe {
+                nod_runtime::nod_stretchy_vector_element(
+                    sv_raw,
+                    Word::from_fixnum(i as i64).unwrap().raw(),
+                )
+            };
+            let n = Word::from_raw(elem_raw)
+                .as_fixnum()
+                .ok_or_else(|| format!("record element [{i}] is not a fixnum"))?;
+            flat.push(n);
+        }
+
+        // Recursive descent over the flat records.
+        let (tree, consumed) = decode_record(&flat, 0)?;
+        if consumed != flat.len() / 4 {
+            return Err(format!(
+                "wire format consumed {consumed} records of {} — trailing data",
+                flat.len() / 4
+            ));
+        }
+        Ok(tree)
+    }
+}
+
+#[cfg(dylan_lex_shim_linked)]
+fn decode_record(flat: &[i64], rec_idx: usize) -> Result<(DylanAst, usize), String> {
+    let base = rec_idx * 4;
+    if base + 3 >= flat.len() {
+        return Err(format!("record {rec_idx} out of bounds"));
+    }
+    let kind_n = flat[base];
+    let span_lo = flat[base + 1];
+    let span_hi = flat[base + 2];
+    let subtree_size = flat[base + 3] as usize;
+    if subtree_size == 0 {
+        return Err(format!("record {rec_idx} has zero subtree_size"));
+    }
+    let kind = Kind::from_i64(kind_n).ok_or_else(|| {
+        format!("record {rec_idx}: unknown kind ordinal {kind_n}")
+    })?;
+    let mut children = Vec::new();
+    let mut child_idx = rec_idx + 1;
+    let end_idx = rec_idx + subtree_size;
+    while child_idx < end_idx {
+        let (child, consumed) = decode_record(flat, child_idx)?;
+        child_idx += consumed;
+        children.push(child);
+    }
+    if child_idx != end_idx {
+        return Err(format!(
+            "record {rec_idx} subtree_size mismatch: claimed {subtree_size}, walked {}",
+            child_idx - rec_idx
+        ));
+    }
+    Ok((
+        DylanAst {
+            kind,
+            span_lo: span_lo as u32,
+            span_hi: span_hi as u32,
+            children,
+        },
+        subtree_size,
+    ))
+}
+
+/// Render a [`DylanAst`] as an indented Lisp-y tree. Spans resolve
+/// against `src` for leaf payloads.
+pub fn format_tree(node: &DylanAst, src: &str) -> String {
+    let mut out = String::new();
+    format_node(node, src, 0, &mut out);
+    out
+}
+
+fn format_node(node: &DylanAst, src: &str, depth: usize, out: &mut String) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+    out.push('(');
+    out.push_str(node.kind.name());
+    out.push_str(&format!(" {}..{}", node.span_lo, node.span_hi));
+    // Leaf payload preview from the span.
+    if matches!(
+        node.kind,
+        Kind::VariableRef | Kind::StringLit | Kind::IntegerLit
+    ) {
+        let lo = node.span_lo as usize;
+        let hi = node.span_hi as usize;
+        if lo <= hi && hi <= src.len() {
+            out.push_str(&format!(" {:?}", &src[lo..hi]));
+        }
+    }
+    if node.children.is_empty() {
+        out.push(')');
+        out.push('\n');
+    } else {
+        out.push('\n');
+        for c in &node.children {
+            format_node(c, src, depth + 1, out);
+        }
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+        out.push(')');
+        out.push('\n');
+    }
+}
