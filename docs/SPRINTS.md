@@ -2042,10 +2042,71 @@ matches byte-for-byte. Parser corpus: **38 / 38**.
 
 What 50c-1 does NOT do (deferred to 50c-2):
   * Plug in the real `<token>` from `dylan-lexer.dylan` (still uses
-    local `<tok>`).
+    local `<tok>`). ✅ landed (see below).
   * Lex actual source text — the token stream is still hand-built.
+    ✅ landed.
   * Hash-prefixed groups (`#(`, `#[`, `#{`).
   * The walk-and-expand pass over `<ast-body>`.
+
+### Sprint 50c-2 — bundle dylan-lexer + macro engine via .prj, lex real source — landed
+
+The smoke now uses the **real Dylan-side lexer** to produce its token
+stream. End-to-end:
+  **source text → `lex(<byte-string>)` → adapter → fragments →
+  `parse-macro-def` → `match-pattern` → `substitute` → text**
+100% Dylan, no Rust nod-macro involved.
+
+Mechanics:
+  * `dylan-macro-smoke.dylan` changes its module declaration from
+    `Module: dylan-macro-smoke` → `Module: dylan-lexer` so the two
+    files compile into the same module — same trick
+    `dylan-parser.dylan` uses today. Standalone build still works
+    (a single-file module of that name).
+  * New `dylan-macro-smoke.prj` (Sprint 49a project-file infra)
+    bundles `dylan-lexer.dylan` + `dylan-macro-smoke.dylan` into
+    one EXE. Sources order matches the parser EXE's convention.
+  * New adapter `lex-token-to-tok` translates each lexer
+    `<token>` subclass (`<keyword-token>`, `<identifier-token>`,
+    `<keyword-name-token>`, `<punctuation-token>`,
+    `<boolean-literal-token>`) into the engine's `<tok>` shape,
+    or `#f` for trivia (whitespace / comments).
+  * `lex-source-to-toks(source)` calls the real `lex`, filters
+    `#f`s, returns a flat `<stretchy-vector>`.
+  * Symbol-to-text reverse table for keywords. Hit a real bug:
+    `cond` is a lexer keyword (Sprint 49b), so `?cond` in the
+    template lexed as `?` + `<keyword-token>` and got silently
+    dropped by the adapter, leaving a hole in the token stream
+    that crashed `parse-pattern-elem`'s peek-ahead. Fix: enumerate
+    all keywords that can plausibly appear as identifier-shaped
+    references inside macro bodies — `cond`, `case`, `select`,
+    `while`, `for`, `block`, `method`, etc.
+
+Smoke now runs FOUR phases on the same fixture:
+  PHASE: hand-built  — Sprint 50a
+  PHASE: parsed-def  — Sprint 50b
+  PHASE: from-tokens — Sprint 50c-1
+  PHASE: from-source — Sprint 50c-2  (LEX: 24 tokens)
+All four produce byte-identical `EXPAND` lines.
+
+Multi-file compilation flex: bundling `dylan-lexer.dylan` (~1700
+lines) + `dylan-macro-smoke.dylan` (~900 lines) into one module
+just works. That's a real stress test of the AOT pipeline at a
+reasonable line count, and it landed without a single compiler bug.
+
+Verification:
+  cargo test -p nod-tests --test macro_engine — passes
+  Parser corpus: 38/38
+
+What 50c-2 does NOT do (deferred to 50c-3 / 50d / 50e):
+  * Hash-prefixed groups (`#(`, `#[`, `#{`) in the
+    token-to-fragments group-balancer. Smoke source doesn't hit them.
+  * The walk-and-expand pass over a real `<ast-body>`. Smoke
+    still operates on a single hand-shaped call site.
+  * Symbol-to-text exhaustiveness — the reverse table is hand-built
+    and covers ~20 common keywords. A clean approach would teach
+    the lexer to expose its `classify-keyword` inverse.
+  * Oracle vs Rust nod-macro (50d's slot).
+  * Retire `nod-macro` from the build (50e's slot).
 
 ---
 

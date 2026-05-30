@@ -1,0 +1,11 @@
+# Sprint 50c-2 — bundle the Dylan-side lexer + the macro engine smoke
+# into one module (`dylan-lexer`). Lets the smoke call the real lexer's
+# `<token>` machinery so a future `from-source` phase can lex an actual
+# `define macro` text and feed it through the engine.
+#
+# `nod-driver build --project dylan-macro-smoke.prj` produces
+# `dylan-macro-smoke.exe` alongside this file.
+
+name    = "dylan-macro-smoke"
+sources = ["dylan-lexer.dylan", "dylan-macro-smoke.dylan"]
+output  = "dylan-macro-smoke.exe"

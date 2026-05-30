@@ -35,18 +35,23 @@ fn macro_engine_unless_expansion() {
     );
 
     let workspace = workspace_root();
-    let fixture = workspace
+    let prj = workspace
         .join("tests")
         .join("nod-tests")
         .join("fixtures")
-        .join("dylan-macro-smoke.dylan");
-    let exe = std::env::temp_dir().join("dylan-macro-smoke.exe");
+        .join("dylan-macro-smoke.prj");
+    // Sprint 50c-2: build via the `.prj` so the smoke is bundled
+    // with `dylan-lexer.dylan`. The EXE lands next to the .prj as
+    // `dylan-macro-smoke.exe`.
+    let exe = workspace
+        .join("tests")
+        .join("nod-tests")
+        .join("fixtures")
+        .join("dylan-macro-smoke.exe");
 
     let aot = Command::new(workspace.join("target").join("debug").join("nod-driver.exe"))
-        .args(["build"])
-        .arg(&fixture)
-        .arg("-o")
-        .arg(&exe)
+        .args(["build", "--project"])
+        .arg(&prj)
         .output()
         .expect("spawn nod-driver build");
     assert!(
@@ -68,10 +73,12 @@ fn macro_engine_unless_expansion() {
     // Normalise CRLF → LF — Windows pipes can transcode.
     let stdout = stdout.replace("\r\n", "\n");
 
-    // Three phases — Sprint 50a hand-built, Sprint 50b parsed-def
+    // Four phases — Sprint 50a hand-built, Sprint 50b parsed-def
     // (fragments → <macro-def>), Sprint 50c-1 from-tokens (flat
-    // token stream → group-balanced fragments → <macro-def>). All
-    // three must produce byte-identical match + substitute output.
+    // token stream → group-balanced fragments → <macro-def>),
+    // Sprint 50c-2 from-source (real `lex()` from dylan-lexer.dylan
+    // → adapter → fragments → <macro-def>). All four must produce
+    // byte-identical match + substitute output.
     let expected = "\
 PHASE: hand-built\n\
 MATCH: ok\n\
@@ -87,6 +94,12 @@ EXPAND: if ( ~ x ) ( foo ) else #f end\n\
 PHASE: from-tokens\n\
 TOKENIZE: 24 def-tokens\n\
 FRAGMENT: 3 top-level frags\n\
+MATCH: ok\n\
+BIND cond: 1 frag\n\
+BIND body: 1 frag\n\
+EXPAND: if ( ~ x ) ( foo ) else #f end\n\
+PHASE: from-source\n\
+LEX: 24 tokens\n\
 MATCH: ok\n\
 BIND cond: 1 frag\n\
 BIND body: 1 frag\n\

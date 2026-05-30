@@ -1,6 +1,13 @@
-Module: dylan-macro-smoke
+Module: dylan-lexer
 
-// Sprint 50a — Dylan-side macro engine smoke test.
+// Sprint 50a/b/c — Dylan-side macro engine smoke test.
+//
+// Sprint 50c-2 changed the Module: declaration from `dylan-macro-smoke`
+// to `dylan-lexer` so the smoke can be bundled with `dylan-lexer.dylan`
+// (the Dylan-side lexer) via a `.prj` project file and call the real
+// lexer's `<token>` machinery. Building this file standalone still
+// works — the compiler just sees a module declaration with no other
+// files in it.
 //
 // First step on the "retire nod-macro" track of the year-3
 // self-hosting plan. The Rust nod-macro crate (~1900 lines) implements
@@ -739,6 +746,123 @@ define function build-call-site-tokens ()
   toks
 end function;
 
+// ─── Sprint 50c-2 — adapt the REAL dylan-lexer's <token> → <tok> ─────────
+//
+// The smoke is bundled with `dylan-lexer.dylan` via the project file
+// `dylan-macro-smoke.prj`, so the lexer's `lex(<byte-string>)`,
+// `<token>` hierarchy, and helpers are in scope. We adapt each
+// lexer token to the engine's local `<tok>` (kind + text). Trivia
+// (whitespace, comments) maps to `#f` and gets filtered.
+//
+// Symbol-to-text for keyword tokens: the lexer's `classify-keyword`
+// maps text → `<symbol>` at lex time but doesn't expose the inverse
+// (Dylan has no built-in symbol-name accessor). We hand-build a tiny
+// inverse table for the keywords the smoke can actually encounter.
+
+define function keyword-symbol-to-text (kw :: <symbol>) => (text :: <object>)
+  let r = #f;
+  if (kw = #"unless")      r := "unless";
+  elseif (kw = #"if")      r := "if";
+  elseif (kw = #"else")    r := "else";
+  elseif (kw = #"elseif")  r := "elseif";
+  elseif (kw = #"when")    r := "when";
+  elseif (kw = #"begin")   r := "begin";
+  elseif (kw = #"let")     r := "let";
+  elseif (kw = #"define")  r := "define";
+  elseif (kw = #"macro")   r := "macro";
+  elseif (kw = #"end")     r := "end";
+  // Lexer keywords that often appear inside macro bodies as
+  // identifier-shaped references — must round-trip back to text or
+  // the macro engine sees a hole in the token stream and parse-rule
+  // / parse-pattern-elem dereferences past the end.
+  elseif (kw = #"cond")    r := "cond";
+  elseif (kw = #"case")    r := "case";
+  elseif (kw = #"select")  r := "select";
+  elseif (kw = #"while")   r := "while";
+  elseif (kw = #"until")   r := "until";
+  elseif (kw = #"for")     r := "for";
+  elseif (kw = #"block")   r := "block";
+  elseif (kw = #"cleanup") r := "cleanup";
+  elseif (kw = #"method")  r := "method";
+  elseif (kw = #"function") r := "function";
+  elseif (kw = #"class")   r := "class";
+  elseif (kw = #"variable") r := "variable";
+  elseif (kw = #"constant") r := "constant";
+  elseif (kw = #"slot")    r := "slot";
+  elseif (kw = #"type")    r := "type";
+  end;
+  r
+end function;
+
+define function punct-form-to-text (form :: <symbol>) => (text :: <object>)
+  let r = #f;
+  if (form = #"lparen")        r := "(";
+  elseif (form = #"rparen")    r := ")";
+  elseif (form = #"lbracket")  r := "[";
+  elseif (form = #"rbracket")  r := "]";
+  elseif (form = #"lbrace")    r := "{";
+  elseif (form = #"rbrace")    r := "}";
+  elseif (form = #"arrow")     r := "=>";
+  elseif (form = #"query")     r := "?";
+  elseif (form = #"tilde")     r := "~";
+  elseif (form = #"semicolon") r := ";";
+  elseif (form = #"comma")     r := ",";
+  end;
+  r
+end function;
+
+// Convert one lexer token to the engine's <tok> form, or #f if it
+// should be skipped (trivia). Boolean literals `#t` / `#f` map to
+// identifier-shaped tokens so the macro engine's literal-match works
+// against template `#f`.
+define function lex-token-to-tok (t :: <token>) => (r :: <object>)
+  let result = #f;
+  if (instance?(t, <whitespace-token>) | instance?(t, <comment-token>))
+    result := #f;
+  elseif (instance?(t, <keyword-token>))
+    let kw = keyword-token-keyword(t);
+    if (kw = #"end")
+      result := make-tok(#"kw-end", "end");
+    else
+      let text = keyword-symbol-to-text(kw);
+      if (text) result := make-tok(#"ident", text); end;
+    end;
+  elseif (instance?(t, <identifier-token>))
+    result := make-tok(#"ident", identifier-token-name(t));
+  elseif (instance?(t, <keyword-name-token>))
+    // Lexer already strips the trailing ":"; my parser tolerates that.
+    result := make-tok(#"keyword-name", keyword-name-token-name(t));
+  elseif (instance?(t, <punctuation-token>))
+    let form = punctuation-token-form(t);
+    let text = punct-form-to-text(form);
+    if (text) result := make-tok(#"punct", text); end;
+  elseif (instance?(t, <boolean-literal-token>))
+    let v = boolean-literal-token-value(t);
+    let text = "#t";
+    if (~ v) text := "#f"; end;
+    result := make-tok(#"ident", text);
+  end;
+  result
+end function;
+
+// Lex `source`, filter trivia / unsupported tokens, return a flat
+// <stretchy-vector> of <tok>. Designed to drive `tokens-to-fragments`
+// directly.
+define function lex-source-to-toks (source :: <byte-string>)
+ => (toks :: <stretchy-vector>)
+  let raw = lex(source);
+  let out = make(<stretchy-vector>);
+  let n = size(raw);
+  let i = 0;
+  until (i = n)
+    let t = raw[i];
+    let mine = lex-token-to-tok(t);
+    if (mine) add!(out, mine); end;
+    i := i + 1;
+  end;
+  out
+end function;
+
 // ─── Hand-built unless rule + call-site smoke ────────────────────────────
 //
 // The stdlib `unless` macro is:
@@ -891,4 +1015,21 @@ define function main () => ()
   let call-frags  = tokens-to-fragments(call-tokens);
   run-match-substitute(macro-rule-pattern(rule2), macro-rule-template(rule2),
                        call-frags);
+  // Phase D — Sprint 50c-2 — feed the REAL Dylan-side lexer with
+  // actual Dylan source text. The lexer's tokens get adapted to
+  // <tok>, group-balanced into fragments, parsed into a <macro-def>,
+  // and matched against a call site that's ALSO lexed from source.
+  // End-to-end source-to-expansion through the Dylan-side stack.
+  format-out("PHASE: from-source\n");
+  let def-source = "{ unless ?cond:expression ?body:body end } => { if (~ ?cond) ?body else #f end }";
+  let def-toks-real  = lex-source-to-toks(def-source);
+  format-out("LEX: %d tokens\n", size(def-toks-real));
+  let def-frags-real = tokens-to-fragments(def-toks-real);
+  let def3   = parse-macro-def("unless", def-frags-real);
+  let rule3  = macro-def-rules(def3)[0];
+  let call-source     = "unless x (foo) end";
+  let call-toks-real  = lex-source-to-toks(call-source);
+  let call-frags-real = tokens-to-fragments(call-toks-real);
+  run-match-substitute(macro-rule-pattern(rule3), macro-rule-template(rule3),
+                       call-frags-real);
 end function;
