@@ -1913,6 +1913,65 @@ What 45d does NOT do (deferred):
   * Performance — the test shells out, building the Dylan-lexer EXE
     is cached but per-test overhead is ~1s.
 
+### Sprint 50a — Dylan-side macro engine smoke — landed
+
+First step on the "retire `nod-macro`" track of year-3 self-hosting.
+`nod-macro` is ~1900 lines of Rust doing pattern-matching + template
+substitution over `Fragment`s (a token-grouping structure between raw
+tokens and parsed AST). Sprint 50a ports enough of that to expand
+ONE rule — the stdlib `unless` macro — and prove the algorithm and
+data shape work in Dylan.
+
+New: `tests/nod-tests/fixtures/dylan-macro-smoke.dylan` (~350 lines)
++ `tests/nod-tests/tests/macro_engine.rs` (integration test).
+
+Dylan-side classes mirroring nod-macro's Rust types:
+  `<tok>` — minimal `(kind, text)` token (decoupled from
+    `dylan-lexer.dylan`'s `<token>` for now; 50c wires the real one).
+  `<fragment>` → `<token-fragment>`, `<group-fragment>`.
+  `<pattern-elem>` → `<pat-literal>`, `<pat-variable>`, `<pat-group>`.
+  `<template-elem>` → `<tpl-literal>`, `<tpl-substitution>`, `<tpl-group>`.
+  `<binding>` + linear-list `<bindings>` (small tables, hash overhead
+    not worth it).
+
+Engine:
+  * `match-pattern(pattern, call) => false-or(<bindings>)` — greedy
+    left-to-right, no backtracking; same algorithm as Rust
+    `match_pattern` at Sprint-17 level. Supports `#"expression"` and
+    `#"body"` pattern-variable kinds. Body matcher is depth-aware on
+    `end` — `if … end` inside `unless … end` doesn't claim the outer
+    terminator. Mirrors Rust's `opens-end-form?` set verbatim.
+  * `substitute(template, bindings) => <byte-string>` — emits text,
+    same shape as Rust's `substitute` (text out; caller re-lexes).
+
+Smoke: hand-build the `unless` rule structure + a call site
+`unless x (foo) end`, run match → bindings → substitute, get
+`if ( ~ x ) ( foo ) else #f end`. The slightly-loose group spacing
+is a join-chunks heuristic to refine in 50b; the algorithm is
+correct.
+
+Verification:
+  * `cargo test -p nod-tests --test macro_engine` — passes.
+  * Parser corpus: **38 / 38** (the new fixture self-parses through
+    the Dylan-side parser too).
+
+Cost surprise: the GAP-011-family LLVM SSA-dominance issue on
+heap-typed `if`-as-expression bit twice during write-up — once for
+the open/close glyph picker (`let open = if (k = #"paren") "(" …`),
+once for the body-end position calc. Both fixed with statement-form
+rewrites. The same workaround we've used since Sprint 49d. Real fix
+(home-alloca pattern at `if` joins) still queued.
+
+What 50a does NOT do (deferred, in order):
+  * **50b** — Parse real `define macro` source into the rule
+    structures. Currently the unless rule is hand-built.
+  * **50c** — Walk-and-expand pass over a parsed `<ast-body>`;
+    wire to the parser's known-macros set; use the real `<token>`.
+  * **50d** — Oracle test: Dylan-expanded vs Rust-expanded
+    byte-compare, same shape as 45d.
+  * **50e** — Switch AOT pipeline to consume Dylan-expanded AST.
+    `cargo rm -p nod-macro` at the end.
+
 ---
 
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
