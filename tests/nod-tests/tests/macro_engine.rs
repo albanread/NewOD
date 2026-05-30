@@ -68,24 +68,22 @@ fn macro_engine_unless_expansion() {
     // Normalise CRLF → LF — Windows pipes can transcode.
     let stdout = stdout.replace("\r\n", "\n");
 
-    // Match: pattern matched.
-    assert!(
-        stdout.contains("MATCH: ok"),
-        "missing MATCH line, stdout was:\n{stdout}"
-    );
-    // Bindings: ?cond captured 1 fragment, ?body captured 1 fragment.
-    assert!(
-        stdout.contains("BIND cond: 1 frag"),
-        "missing cond binding line, stdout was:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("BIND body: 1 frag"),
-        "missing body binding line, stdout was:\n{stdout}"
-    );
-    // Substitution: emits `if ( ~ x ) ( foo ) else #f end`.
-    // (Loose spacing around groups is a Sprint-50b refinement.)
-    assert!(
-        stdout.contains("EXPAND: if ( ~ x ) ( foo ) else #f end"),
-        "wrong EXPAND line, stdout was:\n{stdout}"
+    // Sprint 50a hand-built phase + Sprint 50b parsed-def phase. Both
+    // produce identical match + substitute output for the same call site.
+    let expected = "\
+PHASE: hand-built\n\
+MATCH: ok\n\
+BIND cond: 1 frag\n\
+BIND body: 1 frag\n\
+EXPAND: if ( ~ x ) ( foo ) else #f end\n\
+PHASE: parsed-def\n\
+PARSE-DEF: ok, rules=1\n\
+MATCH: ok\n\
+BIND cond: 1 frag\n\
+BIND body: 1 frag\n\
+EXPAND: if ( ~ x ) ( foo ) else #f end\n";
+    assert_eq!(
+        stdout, expected,
+        "smoke output diverged:\n--- expected ---\n{expected}--- got ---\n{stdout}",
     );
 }

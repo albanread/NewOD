@@ -447,6 +447,167 @@ define function substitute (template :: <stretchy-vector>,
   join-chunks(out)
 end function;
 
+// ─── Sprint 50b — parse `define macro` body fragments → <macro-def> ──────
+//
+// The Rust nod-macro grammar for a definition body is:
+//   macro-body : rule (';' rule)*
+//   rule       : '{' pattern '}' '=>' '{' template '}'
+//   pattern    : pattern-elem*
+//   template   : template-elem*
+//   pat-elem   : literal | '?' name ':' kind | group   (group recursive)
+//   tpl-elem   : literal | '?' name             | group   (group recursive)
+//
+// In tokenised form the lexer glues `name:` into a single
+// `#"keyword-name"` token. So the common physical shape for
+// `?cond:expression` is three tokens: `?`, `cond:`, `expression`.
+// Sprint 50b accepts that form (mirrors nod-macro's parse_pattern_var_head
+// common arm). The explicit-spaces form `? cond : expression` is rare
+// and deferred to 50c when we plug the real lexer in.
+
+// Sprint 50b: a rule wraps one (pattern, template) pair so a single
+// def can carry multiple. Sprint 50a's match/substitute happily took
+// the two halves separately; the wrapper is just an organisational
+// convenience for the def-level parser.
+define class <macro-rule> (<object>)
+  slot macro-rule-pattern  :: <stretchy-vector>, init-keyword: pattern:;
+  slot macro-rule-template :: <stretchy-vector>, init-keyword: template:;
+end class;
+
+define class <macro-def> (<object>)
+  slot macro-def-name  :: <byte-string>,    init-keyword: name:;
+  slot macro-def-rules :: <stretchy-vector>, init-keyword: rules:;
+end class;
+
+// Predicate: is `f` a single-token fragment whose token has `kind` and `text`?
+define function tok-is? (f :: <fragment>, kind :: <symbol>, text :: <byte-string>)
+ => (yes? :: <boolean>)
+  if (tok-frag?(f))
+    let t = tfrag-tok(f);
+    tok-kind(t) = kind & tok-text(t) = text
+  else
+    #f
+  end
+end function;
+
+// Strip a trailing `:` from `s` (used to unglue the keyword-name's name).
+define function strip-trailing-colon (s :: <byte-string>) => (r :: <byte-string>)
+  let n = size(s);
+  if (n > 0 & %byte-string-element(s, n - 1) = 58)
+    copy-sequence(s, 0, n - 1)
+  else
+    s
+  end
+end function;
+
+// Parse one pattern-elem from `body[i]`, return (elem, consumed-count).
+define function parse-pattern-elem (body :: <stretchy-vector>, i :: <integer>)
+ => (elem :: <pattern-elem>, consumed :: <integer>)
+  let f = body[i];
+  let result :: <pattern-elem> = make(<pat-literal>, tok: make-tok(#"ident", "?"));
+  let consumed = 1;
+  if (group-frag?(f))
+    let g = f;
+    let inner-pattern = parse-pattern-body(gfrag-body(g));
+    result := make(<pat-group>, kind: gfrag-kind(g), body: inner-pattern);
+  elseif (tok-is?(f, #"punct", "?"))
+    // Expect: ?  keyword-name(name:)  ident(kind)
+    let name-frag = body[i + 1];
+    let kind-frag = body[i + 2];
+    let name-tok  = tfrag-tok(name-frag);
+    let kind-tok  = tfrag-tok(kind-frag);
+    let name      = strip-trailing-colon(tok-text(name-tok));
+    let kind-text = tok-text(kind-tok);
+    let kind-sym  = #"expression";
+    if (kind-text = "body")       kind-sym := #"body";
+    elseif (kind-text = "expression") kind-sym := #"expression";
+    end;
+    result := make(<pat-variable>, name: name, kind: kind-sym);
+    consumed := 3;
+  else
+    result := make(<pat-literal>, tok: tfrag-tok(f));
+  end;
+  values(result, consumed)
+end function;
+
+define function parse-pattern-body (body :: <stretchy-vector>)
+ => (pat :: <stretchy-vector>)
+  let out = make(<stretchy-vector>);
+  let n = size(body);
+  let i = 0;
+  until (i = n)
+    let (elem, consumed) = parse-pattern-elem(body, i);
+    add!(out, elem);
+    i := i + consumed;
+  end;
+  out
+end function;
+
+// Parse one template-elem. Templates only have `?name` (no kind).
+define function parse-template-elem (body :: <stretchy-vector>, i :: <integer>)
+ => (elem :: <template-elem>, consumed :: <integer>)
+  let f = body[i];
+  let result :: <template-elem> = make(<tpl-literal>, tok: make-tok(#"ident", "?"));
+  let consumed = 1;
+  if (group-frag?(f))
+    let g = f;
+    let inner-tpl = parse-template-body(gfrag-body(g));
+    result := make(<tpl-group>, kind: gfrag-kind(g), body: inner-tpl);
+  elseif (tok-is?(f, #"punct", "?"))
+    let name-frag = body[i + 1];
+    let name-tok  = tfrag-tok(name-frag);
+    result := make(<tpl-substitution>, name: tok-text(name-tok));
+    consumed := 2;
+  else
+    result := make(<tpl-literal>, tok: tfrag-tok(f));
+  end;
+  values(result, consumed)
+end function;
+
+define function parse-template-body (body :: <stretchy-vector>)
+ => (tpl :: <stretchy-vector>)
+  let out = make(<stretchy-vector>);
+  let n = size(body);
+  let i = 0;
+  until (i = n)
+    let (elem, consumed) = parse-template-elem(body, i);
+    add!(out, elem);
+    i := i + consumed;
+  end;
+  out
+end function;
+
+// Parse one rule starting at `frags[i]`: expects `{ pattern } => { template }`.
+// Returns (rule, next-i).
+define function parse-rule (frags :: <stretchy-vector>, start :: <integer>)
+ => (rule :: <macro-rule>, next :: <integer>)
+  let pat-group  = frags[start];
+  let arrow-frag = frags[start + 1];
+  let tpl-group  = frags[start + 2];
+  let pattern  = parse-pattern-body(gfrag-body(pat-group));
+  let template = parse-template-body(gfrag-body(tpl-group));
+  let rule = make(<macro-rule>, pattern: pattern, template: template);
+  values(rule, start + 3)
+end function;
+
+// Parse a complete `define macro NAME` body: 1+ rules separated by `;`.
+define function parse-macro-def (name :: <byte-string>, body :: <stretchy-vector>)
+ => (def :: <macro-def>)
+  let rules = make(<stretchy-vector>);
+  let n = size(body);
+  let i = 0;
+  until (i >= n)
+    // Skip a leading `;` between rules.
+    if (i < n & tok-is?(body[i], #"punct", ";"))
+      i := i + 1;
+    else
+      let (rule, next) = parse-rule(body, i);
+      add!(rules, rule);
+      i := next;
+    end;
+  end;
+  make(<macro-def>, name: name, rules: rules)
+end function;
+
 // ─── Hand-built unless rule + call-site smoke ────────────────────────────
 //
 // The stdlib `unless` macro is:
@@ -499,15 +660,56 @@ define function build-call-site ()
   frags
 end function;
 
-define function main () => ()
-  let (pattern, template) = build-unless-rule();
-  let call = build-call-site();
+// Build the fragment stream the lexer would produce for the BODY of
+// `define macro unless`:
+//
+//   { unless ?cond:expression ?body:body end }
+//     => { if (~ ?cond) ?body else #f end }
+//
+// Two brace groups separated by a `=>` token. Lexer convention:
+// `name:` is a single `#"keyword-name"` token (so `cond:` is one token,
+// not two — see Sprint 50b note above).
+define function build-unless-def-body ()
+ => (frags :: <stretchy-vector>)
+  let frags = make(<stretchy-vector>);
+  // Pattern brace: { unless ?cond:expression ?body:body end }
+  let pat = make(<stretchy-vector>);
+  add!(pat, make-token-frag(make-tok(#"ident", "unless")));
+  add!(pat, make-token-frag(make-tok(#"punct", "?")));
+  add!(pat, make-token-frag(make-tok(#"keyword-name", "cond:")));
+  add!(pat, make-token-frag(make-tok(#"ident", "expression")));
+  add!(pat, make-token-frag(make-tok(#"punct", "?")));
+  add!(pat, make-token-frag(make-tok(#"keyword-name", "body:")));
+  add!(pat, make-token-frag(make-tok(#"ident", "body")));
+  add!(pat, make-token-frag(make-tok(#"kw-end", "end")));
+  add!(frags, make-group-frag(#"brace", pat));
+  // Arrow
+  add!(frags, make-token-frag(make-tok(#"punct", "=>")));
+  // Template brace: { if (~ ?cond) ?body else #f end }
+  let tpl = make(<stretchy-vector>);
+  add!(tpl, make-token-frag(make-tok(#"ident", "if")));
+  let paren = make(<stretchy-vector>);
+  add!(paren, make-token-frag(make-tok(#"punct", "~")));
+  add!(paren, make-token-frag(make-tok(#"punct", "?")));
+  add!(paren, make-token-frag(make-tok(#"ident", "cond")));
+  add!(tpl, make-group-frag(#"paren", paren));
+  add!(tpl, make-token-frag(make-tok(#"punct", "?")));
+  add!(tpl, make-token-frag(make-tok(#"ident", "body")));
+  add!(tpl, make-token-frag(make-tok(#"ident", "else")));
+  add!(tpl, make-token-frag(make-tok(#"ident", "#f")));
+  add!(tpl, make-token-frag(make-tok(#"kw-end", "end")));
+  add!(frags, make-group-frag(#"brace", tpl));
+  frags
+end function;
+
+define function run-match-substitute (pattern :: <stretchy-vector>,
+                                      template :: <stretchy-vector>,
+                                      call :: <stretchy-vector>) => ()
   let b = match-pattern(pattern, call);
   if (~ b)
     format-out("FAIL: unless pattern did not match\n");
   else
     format-out("MATCH: ok\n");
-    // Sanity-check the two expected bindings.
     let cond-frags = bindings-get(b, "cond");
     let body-frags = bindings-get(b, "body");
     if (cond-frags & size(cond-frags) = 1)
@@ -525,4 +727,21 @@ define function main () => ()
     let text = substitute(template, b);
     format-out("EXPAND: %s\n", text);
   end;
+end function;
+
+define function main () => ()
+  let call = build-call-site();
+  // Phase A — Sprint 50a — hand-built rule.
+  format-out("PHASE: hand-built\n");
+  let (pattern, template) = build-unless-rule();
+  run-match-substitute(pattern, template, call);
+  // Phase B — Sprint 50b — parse `define macro unless`'s body into the
+  // same rule, then run the same match + substitute on the same call
+  // site. The output should be byte-for-byte identical.
+  format-out("PHASE: parsed-def\n");
+  let body = build-unless-def-body();
+  let def = parse-macro-def("unless", body);
+  format-out("PARSE-DEF: ok, rules=%d\n", size(macro-def-rules(def)));
+  let rule = macro-def-rules(def)[0];
+  run-match-substitute(macro-rule-pattern(rule), macro-rule-template(rule), call);
 end function;

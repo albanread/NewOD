@@ -1964,13 +1964,52 @@ rewrites. The same workaround we've used since Sprint 49d. Real fix
 
 What 50a does NOT do (deferred, in order):
   * **50b** — Parse real `define macro` source into the rule
-    structures. Currently the unless rule is hand-built.
+    structures. ✅ landed (see below).
   * **50c** — Walk-and-expand pass over a parsed `<ast-body>`;
     wire to the parser's known-macros set; use the real `<token>`.
   * **50d** — Oracle test: Dylan-expanded vs Rust-expanded
     byte-compare, same shape as 45d.
   * **50e** — Switch AOT pipeline to consume Dylan-expanded AST.
     `cargo rm -p nod-macro` at the end.
+
+### Sprint 50b — parse `define macro` body fragments → `<macro-def>` — landed
+
+Replaces 50a's hand-built `unless` rule with a fragment-stream parser
+that walks the same shape `nod-macro::parse_macro_def` accepts. Same
+fixture, same `<macro-rule>` shape, same `unless` rule structure, but
+now built from a representation closer to what a real Dylan lexer
+would emit.
+
+New classes:
+  `<macro-rule>` { pattern, template } — 50a didn't need the wrapper.
+  `<macro-def>`  { name, rules } — supports multi-rule defs.
+
+New parsers in `dylan-macro-smoke.dylan`:
+  `parse-pattern-elem(body, i)`  → (`<pattern-elem>`, consumed)
+  `parse-template-elem(body, i)` → (`<template-elem>`, consumed)
+  `parse-pattern-body` / `parse-template-body`
+  `parse-rule(frags, start)`     → expects `{ … } => { … }`
+  `parse-macro-def(name, body)`  → 1+ rules separated by `;`
+
+Pattern-variable recognition mirrors `nod-macro::parse_pattern_var_head`
+common arm: a `?` followed by a `#"keyword-name"` token (the lexer
+glues `name:` into one token) followed by a kind ident
+(`expression`, `body`, …). The explicit-spaces form `? cond : expression`
+is deferred to 50c when we plug in the real lexer.
+
+Verification: the smoke now runs TWO phases — `hand-built` (50a)
+and `parsed-def` (50b) — and the integration test asserts the FULL
+stdout matches byte-for-byte. Both phases produce the same expansion
+(`if ( ~ x ) ( foo ) else #f end`). Parser corpus: **38 / 38**.
+
+What 50b does NOT do (deferred to 50c+):
+  * Use the real `<token>` from `dylan-lexer.dylan` (still uses local
+    `<tok>`).
+  * Lex source text into fragments (still hand-builds the fragment
+    stream).
+  * Walk a real `<ast-body>` and expand macro calls in place.
+  * Multi-rule defs (the def-parser handles them but no fixture
+    exercises that path yet).
 
 ---
 
