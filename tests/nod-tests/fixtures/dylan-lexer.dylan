@@ -427,17 +427,49 @@ end function;
 // secondary values. Replaces the earlier `line * 1_000_000 + col`
 // packing workaround: the compiler now lowers `values(a, b)` and
 // multi-binder `let (a, b) = …`, so the natural shape is the right
-// shape. The packed-into-one workaround (and the `$line-col-shift`
-// constant plus `unpack-line` / `unpack-col` accessors) is retired.
+// shape.
+//
+// O(N) sliding-cursor optimization (issue #291): tokens come out of
+// the lexer in monotonically increasing source-offset order, so
+// `dump-tokens` calls this 2× per token with offsets that never
+// regress. Rather than rescanning from byte 0 each call (O(N²) over
+// the whole dump), we cache the last `(pos, line, col)` in module-
+// level state and walk forward from there. Each source byte is
+// visited at most once per `dump-tokens` invocation; for a 100 K-byte
+// fixture the dump goes from "noticeable pause" to "instant".
+//
+// Defensiveness:
+//   * Backwards seek (offset < cache pos) → reset to byte 0. Handles
+//     any non-monotonic caller without producing wrong answers.
+//   * Different source buffer → caller must `reset-line-col-cache()`
+//     before switching sources (`dump-tokens` does so at entry). If
+//     they don't, the defensive reset still kicks in the first time
+//     the new source's tokens land before the stale cache position.
+
+define variable *line-col-cache-pos*  :: <integer> = 0;
+define variable *line-col-cache-line* :: <integer> = 1;
+define variable *line-col-cache-col*  :: <integer> = 1;
+
+define function reset-line-col-cache () => ()
+  *line-col-cache-pos*  := 0;
+  *line-col-cache-line* := 1;
+  *line-col-cache-col*  := 1;
+end function;
 
 define function offset-to-line-col
     (source :: <byte-string>, offset :: <integer>)
  => (line :: <integer>, col :: <integer>)
   let n = %byte-string-size(source);
   let stop = if (offset > n) n elseif (offset < 0) 0 else offset end;
-  let line = 1;
-  let col = 1;
-  let i = 0;
+  // Defensive: if the caller seeks backwards from where the cache
+  // sits, restart from byte 0. The common (and intended) case is
+  // forwards from `*line-col-cache-pos*`, no reset needed.
+  if (*line-col-cache-pos* > stop)
+    reset-line-col-cache();
+  end;
+  let line = *line-col-cache-line*;
+  let col = *line-col-cache-col*;
+  let i = *line-col-cache-pos*;
   // Shaped to mirror `count-newlines-in` in ide_rope.dylan: the `else`
   // arm of every assignment-flavoured `if` returns `#f` so the loop
   // body's join point sees no SSA disagreement (the Sprint 42-pre
@@ -453,6 +485,10 @@ define function offset-to-line-col
     end;
     i := i + 1;
   end;
+  // Save the new high-water mark for the next monotonic call.
+  *line-col-cache-pos*  := i;
+  *line-col-cache-line* := line;
+  *line-col-cache-col*  := col;
   values(line, col)
 end function;
 
@@ -561,6 +597,12 @@ end function;
 define function dump-tokens
     (tokens, source :: <byte-string>) => (text :: <byte-string>)
   *tokens* := tokens;
+  // O(N) fix (issue #291): the offset-to-line-col cache is module-
+  // state; whatever the previous caller did is irrelevant to us.
+  // Reset so the first token's `span-start` walks from byte 0 with a
+  // (line=1, col=1) seed, and every subsequent call benefits from
+  // the monotonic forward walk.
+  reset-line-col-cache();
   let n = %stretchy-vector-size(*tokens*);
   let acc = "";
   let i = 0;
