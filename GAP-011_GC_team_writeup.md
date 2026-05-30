@@ -94,13 +94,15 @@ safepoint slab's reload protocol. Across cycle 4 the SSA value is the
 pre-move address; passing it into `add!` → `nod_stretchy_vector_push`
 fails on the wrapper-class check.
 
-## Smoking gun located — 2026-05-30 (late afternoon)
+## Smoking gun located — 2026-05-30 (late afternoon, peer-reviewed)
 
-Reading `src/nod-llvm/src/codegen.rs` lines 2205-2308 with the trace
-finding in mind:
+Reading `src/nod-llvm/src/codegen.rs` with the trace finding in mind,
+and **scoping the impact carefully** (peer-review note: this is
+parameter-specific, not "all temps" — block params take a separate,
+working path):
 
 ```rust
-// Lines 2303-2308 — at the START of EVERY block:
+// codegen.rs:2303-2308 — at the START of EVERY block:
 for (i, p) in func.params.iter().enumerate() {
     let pv = llvm_fn
         .get_nth_param(i as u32)
@@ -130,12 +132,29 @@ stale value out of the slab, tries to evac/follow it — but the page
 was reclaimed by the cycle that moved p — wrapper check fails →
 panic.
 
-The "Cross-block heap-value contract" comment at lines 2205-2219
-says lowering must thread heap-live values through block-arg phis.
-That works for *normal temps* (their phi is dominance-correct), but
-**function params never get phi'd**. They're just the raw LLVM
-function-arg SSA values, accessible from every block. The rebind
-overwrites whatever reload happened with the original.
+**Scope (peer-reviewed correction).** The bug is specifically the
+**function-parameter** path:
+
+- **Block params**: handled correctly. Lines 2310-2312 rebind them
+  to their phi values; lines 2331-2338 wire predecessors' resolved
+  `BasicValueEnum`s into the phis using snapshots from
+  `pending_incoming` (deliberately NOT re-consulting `state.temps`).
+  GAP-007's commentary at lines 2167-2171 explains exactly why this
+  has to be a snapshot.
+- **Function params**: NOT phi'd. They're the raw LLVM function-arg
+  SSA values, accessible from every block, rebound unconditionally
+  at every block entry by lines 2303-2308.
+- **Other temps derived from function params**: also at risk —
+  anything whose dataflow chain reads a function param post-GC will
+  see the pre-GC value once the block boundary is crossed.
+
+So: **parameter-centric stale-value clobber, with downstream
+corruption impact on any value derived from a function param after
+the first block transition.** The GAP-007 / merge-divergence
+diagnostic at lines 2340-2370 already documents the general
+"non-dominating-predecessor reload leakage" shape; this is the same
+class of bug, narrowly specific to function params because they
+bypass the phi machinery the diagnostic was written to protect.
 
 This matches the trace 1-for-1:
 - Cycles 1-2: dump-node is in a single recursive call. Within that
@@ -157,32 +176,86 @@ This matches the trace 1-for-1:
   reused. Wrapper-class check on next call to `add!` →
   `nod_stretchy_vector_push` fails on entry.
 
-## Proposed fix
+## Proposed fix — with non-negotiable invariants
 
-Make function parameters use the same stable-storage protocol as block
-params, so they survive block transitions:
+Make function parameters use a stable per-param home alloca, so they
+survive block transitions. Fits the existing entry-block-only alloca
+discipline (codegen.rs:2390 GAP-010 guard) and the `build_entry_alloca`
+helper at codegen.rs:4547.
 
-1. At function entry, allocate a Word-sized `alloca` for each
-   GC-typed function param (and load the LLVM arg into it once).
-2. Rebind `state.temps[p]` to `load %p.slot` at every use.
-3. `begin_safepoint` continues to store the current value to the
-   slab slot.
-4. `end_safepoint` reloads from the slab slot AND writes the new
-   value back to `%p.slot` so subsequent block-entry rebinds pick
-   up the post-GC address.
-5. Remove (or repurpose) the unconditional `state.temps.insert(*p,
-   pv)` at lines 2303-2308 — the alloca-load replaces it.
+Steps:
 
-Equivalent to "spill every function param to a stable home in the
-entry block, and treat it as the source of truth across all
-blocks." Cost: one alloca + one extra load per param use at -O0.
-LLVM's mem2reg removes them at higher opt levels.
+1. **Entry-block prelude.** For each GC-typed function param `p`,
+   allocate a Word-sized alloca `%p.home` in the entry block and
+   `store %fn.argN, %p.home` once.
+2. **Every read of `p` loads from `%p.home`.** No code path may
+   reach for `get_nth_param` again (or for a previously-cached SSA
+   value) — this is **invariant A** and must be enforceable, not
+   just intentional.
+3. `begin_safepoint` keeps its current shape — it stores
+   `temp_val(p)` to the slab slot. Since `temp_val(p)` now resolves
+   to `load %p.home` (per step 2), it sees the current value.
+4. **`end_safepoint` writes the reloaded value back to `%p.home`,
+   not just to `state.temps`.** This is **invariant B**: the home
+   alloca is the source of truth across block boundaries, so it
+   MUST be refreshed by every safepoint reload that returns a moved
+   address. Updating only `state.temps` reintroduces the bug we
+   just fixed.
+5. **Delete the unconditional `state.temps.insert(*p, pv)` at
+   codegen.rs:2303-2308.** With the home alloca, there's nothing
+   to "restore" — every block-entry use reads from the alloca,
+   which already holds the freshest value.
 
-Static verifier (the alloca tracker the user asked for) sits on top
-of this fix: walk the LLVM IR post-codegen, assert every load from a
-Word-typed alloca is either (a) dominated by a store to the same
-alloca, or (b) is the post-safepoint reload + writeback. Catches
-this class of bug at compile time forever after.
+Cost: one alloca + one store at entry + one load per param read at
+-O0. mem2reg eliminates the home for non-relocating params at
+higher opt levels.
+
+**Open question** (the peer review flagged this): block params'
+phi route is correct for SSA-style temps, but anything *derived*
+from a function param via a chain that survives a block boundary
+needs the same property. If the lowering emits an intermediate temp
+`t = p` (assignment, alias) that gets used cross-block, today that
+inherits the same bug through the same mechanism. The fix above
+breaks the chain at the param itself; the verifier (below) catches
+the rest.
+
+## The alloca tracker — the "verifier" that closes this off
+
+Post-codegen pass over the emitted LLVM module. For each function:
+
+- Identify every Word-typed alloca in the entry block (excluding
+  the safepoint slab itself).
+- For each load from such an alloca, walk backward through the CFG
+  to the most-recent dominating store to that alloca. On every
+  potentially-allocating call between the store and the load,
+  assert the alloca was either (a) reachable through a safepoint
+  slab slot whose post-call reload also stored back to the alloca,
+  or (b) we cross a fresh store first.
+- Failure = name the function, the load instruction, and the
+  unprotected call in between.
+
+This makes the invariant **structural**: any future codegen change
+that reintroduces the bug shape fails the gate at compile time.
+For the fix above, the verifier should report zero violations on
+the entire stdlib + parser corpus after invariants A and B are
+honored.
+
+## Open dependencies (peer-review notes)
+
+- All moving / relocating opportunities are safepoint-mediated in
+  this pipeline — newgc's evacuation runs only at allocation
+  failure, which only happens inside the bracketed call. No
+  background relocation, no signal-driven safepoints.
+- No hidden direct uses of `%fn.argN` after the fix. The verifier
+  enforces this — but during the transition, the rebind delete on
+  line 2303-2308 needs careful audit: any code path that previously
+  relied on `state.temps[p]` being the LLVM function-arg value
+  (e.g., for non-GC scalar params, or for ABI thunks) needs to
+  either share the alloca pattern or stay explicit.
+- `end_safepoint` reaches every relocating call path — verified by
+  the existing safepoint-roots dataflow already producing the slab
+  for each `is_potentially_allocating_call`. The fix doesn't add
+  new call shapes; it just makes the existing protocol persistent.
 
 With two front-end hypotheses ruled out, the remaining suspects shift
 toward the runtime / collector layer (and were already listed in the
