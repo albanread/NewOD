@@ -3,20 +3,19 @@
 # lexer's `<token>` machinery, group-balance hash-prefixed groups,
 # and use `token-source-text` to round-trip every keyword.
 #
-# `nod-driver build --project dylan-macro-smoke.prj` produces
-# `dylan-macro-smoke.exe` alongside this file.
+# Sprint 50d added `start_function` to the .prj schema so the smoke
+# can use `smoke-main` and not collide with the parser's `main`.
+# Sprint 50c-4 then fixed the AOT pipeline's orphan-`main`-as-C-entry
+# bug — when `entry_function != "main"`, any other source-defined
+# `main` gets renamed to `nod_orphan_main` + Internal linkage so
+# Windows' `mainCRTStartup` calls the synthetic C `main` (which runs
+# `nod_aot_resolve_relocs` first) instead of the orphan.
 #
-# Sprint 50d unblocked the duplicate-main collision by adding
-# `start_function` to the .prj schema (smoke uses `smoke-main` so the
-# parser's `main` doesn't collide). Adding `dylan-parser.dylan` to
-# `sources` still surfaces a runtime "format-out: format string is not
-# a <byte-string> (raw 0x0)" before `smoke-main` runs — likely a
-# global-registration ordering bug specific to the 3-file bundle. The
-# entry-name plumbing is correct (2-file `smoke-main` runs perfectly);
-# the new blocker is a separate AOT init-order issue. See SPRINTS.md
-# "Sprint 50c-4 — registration-order blocker in 3-file bundle".
+# `nod-driver build --project dylan-macro-smoke.prj` produces
+# `dylan-macro-smoke.exe` alongside this file — end-to-end macro
+# engine over the real Dylan-side lexer + parser source.
 
 name           = "dylan-macro-smoke"
-sources        = ["dylan-lexer.dylan", "dylan-macro-smoke.dylan"]
+sources        = ["dylan-lexer.dylan", "dylan-parser.dylan", "dylan-macro-smoke.dylan"]
 output         = "dylan-macro-smoke.exe"
 start_function = "smoke-main"

@@ -2194,29 +2194,59 @@ Verification:
   Smoke EXE (built via `.prj` with start_function="smoke-main")
     runs all five phases byte-for-byte identically to before.
 
-### Sprint 50c-4 — registration-order blocker in 3-file bundle
+### Sprint 50c-4 — orphan-`main`-as-C-entry bug — landed
 
-With `start_function` in place, the duplicate-`main` collision is
-gone, but adding `dylan-parser.dylan` to the smoke bundle still
-fails at runtime — before `smoke-main` can print its first phase
-header:
+**Root cause was a one-line linkage bug, not the init-order red
+herring my first hypothesis pointed at.** When `start_function != "main"`,
+some other source in the bundle may still define a function named
+`main` (the canonical example: bundling `dylan-parser.dylan`,
+whose CLI entry happens to be `main`, with a harness whose entry
+is `smoke-main`). The AOT pipeline correctly renamed `smoke-main`
+to `nod_user_main`, but left the parser's `main` untouched with
+External linkage.
 
-```
-format-out: format string is not a <byte-string> (raw 0x0)
-```
+Windows' `mainCRTStartup` (in `msvcrt.lib` / `ucrt.lib`) walks
+the symbol table at startup looking for an external `main`. It
+found the parser's orphan `main` and called it — BEFORE
+`nod_aot_main_wrapper` got a chance to run
+`nod_aot_resolve_relocs`. So every literal-string global was
+still NULL, and the first `format-out` inside that orphan crashed
+with "format string is not a <byte-string> (raw 0x0)".
 
-The format string is NULL — a literal global hasn't been registered
-yet when format-out is called. This is a fresh AOT init-order bug
-specific to the 3-file bundle; the 2-file bundle works perfectly.
-Hypothesis: when N files contribute literals, the registration index
-expected by codegen and the slot actually populated by
-`nod_aot_resolve_relocs` drift for some specific literal. Needs
-investigation in `nod-sema::build_aot_registrations` +
-`nod-llvm::aot::convert_externals_to_defining_storage`.
+Fix in `nod-llvm/src/aot.rs::emit_aot_entry_stubs_full`: after
+renaming the chosen entry function to `nod_user_main`, scan the
+module for any leftover `main` function; rename it to
+`nod_orphan_main` and demote its linkage to Internal. The
+synthetic C `main` the AOT pipeline emits in step 3 can then
+claim the symbol name cleanly, and the C runtime finds OUR
+`main` (which calls `nod_aot_resolve_relocs` then
+`nod_user_main`).
 
-Held this fresh blocker as a separate sprint because it's an
-AOT-pipeline correctness bug, not a project-schema or refactor
-issue. The walk-and-expand pass waits on 50c-4's fix.
+Found via two probes (both behind env vars, both removed after
+the fix landed):
+  * `NOD_DIAG_AOT_FUNCS` in `emit_aot_entry_stubs_full` — dumped
+    every defined function's name. Showed both `main` and
+    `smoke-main` in the module simultaneously.
+  * `NOD_DIAG_FORMAT_OUT_BT` in `nod_format_out` — would have
+    given a backtrace at the bad call but the AOT EXE's symbols
+    are stripped, so the trace was `<unknown>` frames. Probe
+    confirmed the call WAS reached and not e.g. a static init.
+
+Diagnosis path: bisect first (trivial 3-file bundle works → the
+bug is parser-content-specific, not "any third file"), then list
+functions in the module (showed the orphan `main`), then try the
+fix (rename + Internal linkage), then verify Windows linker error
+that confirms `mainCRTStartup` *did* expect a `main` symbol
+externally and only stopped complaining once we let the synthetic
+C `main` reclaim the name.
+
+Verification:
+  cargo test -p nod-tests --test macro_engine — passes
+  cargo test -p nod-driver project — 8 passed (incl. the 2 from 50d)
+  Parser corpus: 38/38
+  **3-file bundle** (`dylan-lexer + dylan-parser + dylan-macro-smoke`)
+    runs the full 5-phase smoke end-to-end. The walk-and-expand
+    sprint is now unblocked.
 
 ---
 

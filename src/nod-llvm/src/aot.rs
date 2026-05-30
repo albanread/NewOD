@@ -363,6 +363,34 @@ pub fn emit_aot_entry_stubs_full<'ctx>(
     // External linkage so the staticlib's extern declaration finds it.
     user_main.set_linkage(Linkage::External);
 
+    // Sprint 50c-4 fix — when the user chose a non-`main` entry
+    // function, another source file in the bundle may STILL define a
+    // function named `main` (the canonical example is bundling
+    // `dylan-parser.dylan`, whose CLI entry happens to be named
+    // `main`, with a smoke harness whose entry is `smoke-main`).
+    //
+    // Two problems if we leave that orphan `main` alone:
+    //   1. It steals the C entry point. Windows' `mainCRTStartup` /
+    //      Unix' `_start` find `main` and call it before
+    //      `nod_aot_resolve_relocs` has populated literal-string
+    //      globals — every `format-out` inside that `main` crashes
+    //      with "format string is not a <byte-string> (raw 0x0)".
+    //   2. The synthetic C `main` the AOT pipeline adds below (step
+    //      3a) collides on the symbol name.
+    //
+    // Fix: rename the orphan to a private symbol AND demote linkage
+    // to Internal so the synthetic C `main` can claim the name
+    // unambiguously. Other Dylan code that referred to it via the
+    // dispatch tables already points at the LLVM function value, not
+    // the name, so the rename is transparent to callers.
+    if entry_function != "main"
+        && let Some(orphan) = module.get_function("main")
+        && orphan != user_main
+    {
+        orphan.as_global_value().set_name("nod_orphan_main");
+        orphan.set_linkage(Linkage::Internal);
+    }
+
     let ctx = module.get_context();
 
     // Step 3a: emit dllimport externs + static `ApiStubEntry` globals
