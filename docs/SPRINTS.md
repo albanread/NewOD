@@ -1756,6 +1756,56 @@ quality-of-life that GAP-011 left us with energy to pick up.
 "Sprint 49", "Sprint 49b", and "dylan-lexer: O(N) fix" respectively;
 codifying them all under 49 cleans up the freelance label.)
 
+### Sprint 49d — Dylan-side parser: corpus to 37/37 — landed
+
+Closed out the Sprint 46 milestone follow-ups. Three small Dylan-only
+edits push the Dylan-in-Dylan parser's corpus pass rate from 30/37
+(81%, Sprint 46 close) to **37/37 (100%)**:
+
+* **`macro` and `c-function` keyword classification.** Teach
+  `dylan-lexer.dylan::classify-keyword` about both, then add them to
+  the parser's `is-define-body-word?` predicate. Without this they
+  hit a generic "expected a define-body or define-list word" path.
+
+* **`c-function` parameter / return-spec parsing.** Add `#"c-function"`
+  to `is-function-word?` so its `(params)` / `=> (returns)` signature
+  parses the same way a `function` head does — closes the
+  `define c-function` Rust panic at `conditions.rs:904` that was
+  swallowing five fixtures.
+
+* **`parse-tolerant-body` for `macro` and `c-function`.** Their bodies
+  contain pattern templates and FFI specs that are NOT structured
+  Dylan expressions — group-balance over `(){}[]#{` and gobble tokens
+  to top-level `end` instead. Dispatched via a **statement-form**
+  `if` in the body slot (one setter per arm) — the earlier
+  expression-form `defn-body(d) := if (…) … else … end;` triggered an
+  LLVM SSA-dominance verifier failure (same family as GAP-011: the
+  heap-typed `if` join had a reload that didn't dominate the use).
+
+* **`define variable` typed-name binding.** Teach
+  `parse-list-fragment` to recognise `name :: type [= expr]` after an
+  expression parse, promoting the `<ast-variable-ref>` into an
+  `<ast-typed-name>` and folding the optional `= rhs` into a binary
+  `=` node. Closes the last failing fixture (`dylan-lexer.dylan` —
+  was tripping over `define variable *line-col-cache-pos* :: <integer>
+  = 0`).
+
+Corpus runner: `for f in tests/nod-tests/fixtures/*.dylan; do
+nod-driver parse-dylan "$f"; done` — **37 / 37 pass**. Every legit
+Dylan in the tree now parses through the Dylan-side parser. Closes
+the "remaining `define macro` parsing" and "diagnose
+`dylan-lexer.dylan` token-shape failure" follow-ups noted in the
+Sprint 46 retro.
+
+Two carved-off follow-ups remain (queued, not blocking):
+  * Promote the corpus runner to a `nod-driver` subcommand /
+    cargo integration test (still ad-hoc).
+  * Investigate the LLVM dominance failure on heap-typed
+    if-as-expression — current workaround is statement-form; root
+    cause is the same shape as GAP-011 and likely needs the same
+    home-alloca treatment for `if` join values, not just function
+    params.
+
 ---
 
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)

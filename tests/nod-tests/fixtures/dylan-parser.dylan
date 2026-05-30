@@ -145,21 +145,40 @@ define function is-begin-word? (t :: <token>) => (yes? :: <boolean>)
 end function;
 
 // FUNCTION-WORD: `method` and `function` begin an anonymous function body.
+//
+// Sprint 46b — added `c-function`. The c-function definition shape
+//   define c-function NAME (params) => (returns); property: value; end;
+// matches the function-word's param-list + return-spec parse exactly,
+// minus the body block (which is empty save for property lines like
+// `library:` / `c-name:` that parse-body collects as plain body
+// fragments). Routing c-function through the function-word path
+// keeps a single param-list / return-spec parser for both shapes.
 define function is-function-word? (t :: <token>) => (yes? :: <boolean>)
   if (instance?(t, <keyword-token>))
     let kw = keyword-token-keyword(t);
-    kw = #"method" | kw = #"function"
+    kw = #"method" | kw = #"function" | kw = #"c-function"
   else
     #f
   end
 end function;
 
 // DEFINE-BODY-WORD: word after `define` that takes a body ending with `end`.
+//
+// Sprint 46b — added `macro` and `c-function`. Both terminate at `end`
+// and slot into the existing generic body-parser dispatch (the body
+// fragments inside aren't semantically interpreted by the parser; sema
+// reads them later). The `is-function-word?` short-circuit for params +
+// returns intentionally does NOT match `macro` / `c-function` — macro
+// rule bodies don't have Dylan parameter lists, and `c-function`'s
+// signature shape (`(p :: <c-type>, …) => (r :: <c-type>);` followed
+// by `library:` / `c-name:` property lines) is a syntactic subset of
+// the body fragments parse-body will collect.
 define function is-define-body-word? (t :: <token>) => (yes? :: <boolean>)
   if (instance?(t, <keyword-token>))
     let kw = keyword-token-keyword(t);
     kw = #"class" | kw = #"generic" | kw = #"module" | kw = #"library"
       | kw = #"method" | kw = #"function"
+      | kw = #"macro" | kw = #"c-function"
   else
     #f
   end
@@ -882,6 +901,53 @@ define function parse-body (ts :: <token-stream>) => (b :: <ast-body>)
   b
 end function;
 
+// Sprint 46b — tolerant body consumer for definition shapes whose
+// internal syntax the structured constituent parser doesn't model
+// today:
+//
+//   * `define macro NAME { pattern } => { template } end macro`
+//     — rule-pattern braces aren't recognised as expression-start
+//     tokens by parse-constituent.
+//   * `define c-function NAME (params) => (ret); library: "str"; end`
+//     — property lines like `library: "user32.dll"` are
+//     keyword-name-tokens at body position, also not modelled.
+//
+// Strategy: count nested `()`, `[]`, `{}`, `#{...}` groups; consume
+// every token until a top-level `end` keyword (group depth zero).
+// The body AST that gets returned is empty — semantic structure is
+// intentionally lost. The Rust front end handles macro expansion +
+// c-function lowering downstream of this parser anyway; the
+// Dylan-side parser only has to *recognise* these shapes for the
+// corpus-coverage milestone.
+define function parse-tolerant-body (ts :: <token-stream>) => (b :: <ast-body>)
+  let b = make-ast-body();
+  let group = 0;   // ( [ { #{ nesting depth
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (group = 0 & is-end-token?(t))
+      done? := #t;
+    elseif (is-punct?(t, #"lparen") | is-punct?(t, #"lbracket")
+              | is-punct?(t, #"lbrace") | is-punct?(t, #"hash-lbrace"))
+      group := group + 1;
+      ts-advance(ts);
+    elseif (is-punct?(t, #"rparen") | is-punct?(t, #"rbracket")
+              | is-punct?(t, #"rbrace"))
+      group := group - 1;
+      ts-advance(ts);
+    else
+      ts-advance(ts);
+    end;
+  end;
+  b
+end function;
+
+// Sprint 46b — predicate: this definition shape gets the tolerant
+// body parser (see parse-tolerant-body's docstring).
+define function is-tolerant-body-word? (t :: <token>) => (yes? :: <boolean>)
+  is-keyword?(t, #"macro") | is-keyword?(t, #"c-function")
+end function;
+
 // constituent:
 //     definition
 //     local-declaration
@@ -957,8 +1023,25 @@ define function parse-definition (ts :: <token-stream>) => (n :: <ast-node>)
       end;
       defn-return(d) := parse-return-spec(ts);
     end;
-    // Parse body-fragment until `end` (or EOF).
-    defn-body(d) := parse-body(ts);
+    // Parse body-fragment until `end` (or EOF).  Sprint 46b — for
+    // `define macro` / `define c-function`, the body interior uses
+    // syntax (rule braces, property lines) that the structured
+    // constituent parser doesn't model; use the tolerant gobbler so
+    // those definitions parse cleanly without losing the rest of
+    // the file.
+    //
+    // Branch shape: statement-form (each arm assigns directly) rather
+    // than `defn-body(d) := if (cond) … else … end`. The expression
+    // form trips an LLVM-codegen SSA-dominance bug for heap-typed
+    // join values in this position — the reload from the safepoint
+    // slab in one arm doesn't dominate the post-join store. Same
+    // shape as the GAP-011 family. The statement form sidesteps it
+    // by having each branch perform its own setter call independently.
+    if (is-tolerant-body-word?(word))
+      defn-body(d) := parse-tolerant-body(ts);
+    else
+      defn-body(d) := parse-body(ts);
+    end;
     // Parse definition-tail.
     parse-definition-tail(ts, d);
     d
@@ -1282,6 +1365,23 @@ define function parse-list-fragment (ts :: <token-stream>) => (b :: <ast-body>)
       done? := #t;
     else
       let node = parse-expression(ts);
+      // `define variable NAME :: TYPE = EXPR` — promote a bare variable-ref
+      // followed by `::` into an <ast-typed-name>, then optionally fold in
+      // the `= rhs` initialiser as a binary-op so the list-form's downstream
+      // lowering sees a familiar shape.
+      if (is-punct?(ts-peek(ts), #"colon-colon")
+            & instance?(node, <ast-variable-ref>))
+        ts-advance(ts);                         // consume `::`
+        let ty = parse-operand(ts);             // type spec; stops before `=`
+        let tn = make(<ast-typed-name>, tok: varref-tok(node));
+        typed-name-type(tn) := ty;
+        node := tn;
+        if (is-punct?(ts-peek(ts), #"equal"))
+          let eq  = ts-advance(ts);
+          let rhs = parse-expression(ts);
+          node := make(<ast-binary-op>, left: node, operator: eq, right: rhs);
+        end;
+      end;
       add!(body-constituents(b), node);
       // Commas inside list-fragment (multiple declarators).
       if (is-punct?(ts-peek(ts), #"comma"))

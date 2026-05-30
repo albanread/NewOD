@@ -832,6 +832,14 @@ define function classify-keyword (name :: <byte-string>)
   elseif (name = "handler") #"handler"
   elseif (name = "generic") #"generic"
   elseif (name = "domain") #"domain"
+  // Sprint 46b — `define macro` and `define c-function`.
+  // Both are body-word shapes (terminate at `end`) the Rust
+  // reader already handles; teaching the Dylan-side lexer the
+  // keyword classification + the Dylan-side parser's body-word
+  // predicate (see is-define-body-word?) closes six of the seven
+  // failing fixtures in the Sprint-46-closure corpus run.
+  elseif (name = "macro") #"macro"
+  elseif (name = "c-function") #"c-function"
   elseif (name = "sealed") #"sealed"
   elseif (name = "open") #"open"
   elseif (name = "abstract") #"abstract"
