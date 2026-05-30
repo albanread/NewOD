@@ -2194,6 +2194,65 @@ Verification:
   Smoke EXE (built via `.prj` with start_function="smoke-main")
     runs all five phases byte-for-byte identically to before.
 
+### Sprint 51a — first sema piece in Dylan: C3 linearisation — landed
+
+The very first port of `nod-sema` to Dylan. C3 (`src/nod-sema/src/c3.rs`,
+317 lines) is the right starting move — pure function, self-contained,
+no dependencies on other sema passes, with the Rust tests already
+asserting canonical outputs for every interesting shape.
+
+New `tests/nod-tests/fixtures/dylan-c3-smoke.dylan`: a Dylan
+translation of the same algorithm, oracle-tested against the values
+the Rust `c3.rs` tests assert. Six shapes match byte-for-byte:
+
+```
+T1 empty class               <x>
+T2 SI chain two deep         <b> <a> <object>
+T3 SI chain four deep        <d> <c> <b> <a> <object>
+T4 diamond                   <e> <b> <c> <a>           (= Python's E.__mro__)
+T5 MI with shared grandparent <c> <a> <b> <x>          (= Python's [C, A, B, X])
+T6 cycle                     ERROR inconsistent-merge for <child>
+```
+
+Implementation notes:
+  * Stdlib's `<stretchy-vector>` exposes push but no pop or size
+    shrink, so a "queue" is a small `<queue>` class wrapping a
+    `<stretchy-vector>` plus a `head :: <integer>` index.
+    `pop-front!` is O(1) — just `head := head + 1`. Cleaner than the
+    Rust `VecDeque` shape and exercises Dylan's class system end-to-end.
+  * Two bugs found while writing it:
+    1. The pop loop combined `~ queue-empty?(q) & queue-front(q) = picked`
+       — but Dylan's `&` is currently eager (the standing short-circuit
+       task), so the call to `queue-front` ran even when the queue was
+       empty. Nested the conditional.
+    2. `queue-has-in-tail?` used `until (i = n | ...)` but when `head`
+       was already at `size`, `i = head + 1 > n` and the equality
+       never fired — infinite loop + out-of-bounds read. Switched to
+       `>=`.
+    Both are general lessons (eager-`&` and off-by-one boundary)
+    rather than Dylan or compiler bugs.
+  * Uses the Sprint 50d `start_function` field so the entry name is
+    `c3-main` (no `main` collision with the wider stdlib once we
+    bundle this with more sema pieces in 51b/51c).
+
+New integration test `tests/nod-tests/tests/c3_oracle.rs`: builds the
+`.prj`, runs the EXE, asserts exact stdout.
+
+Verification:
+  cargo test -p nod-tests --test c3_oracle — passes
+  Parser corpus: **39/39** (the new fixture self-parses too)
+
+What 51a does NOT do (deferred to 51b+):
+  * Wire the Dylan-side C3 INTO the Rust sema's pipeline (would need
+    a Rust-callable shim — the Dylan code stays standalone for now).
+  * Port any other sema piece. C3 is the smallest; next candidates
+    by size are `c3.rs` (done), `bench.rs` (skip — harness), `stdlib.rs`
+    (load+parse, not very interesting), `optimise/narrowing.rs`
+    (188 lines, type narrowing), `optimise/facts.rs` (271, type
+    flow facts). After those, the big ones: `sidecar.rs` (904),
+    `lib.rs` (1886, glue + public API), `lower.rs` (7769, AST → DFM).
+  * Run on real (non-canonical) inputs from the parser corpus.
+
 ### Sprint 50c-4 — orphan-`main`-as-C-entry bug — landed
 
 **Root cause was a one-line linkage bug, not the init-order red
