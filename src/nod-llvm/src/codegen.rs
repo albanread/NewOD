@@ -2175,6 +2175,22 @@ struct Emit<'ctx, 'a> {
     /// into this array directly.
     safepoint_slot_capacity: usize,
     safepoint_slot_slab: Option<inkwell::values::PointerValue<'ctx>>,
+    /// GAP-011 fix (2026-05-30): per-function-parameter "home" alloca
+    /// for every GC-typed parameter. The home is the source of truth
+    /// across block boundaries:
+    ///   - Entry block: store `%fn.argN` into the home.
+    ///   - Every block-entry binding of `state.temps[p]` is a fresh
+    ///     `load %p.home`, NOT a stale `get_nth_param` (which would
+    ///     reinstall the pre-GC value).
+    ///   - `end_safepoint` writes every reloaded function-param value
+    ///     back to the home, so the next block's load picks up the
+    ///     post-GC address.
+    ///
+    /// Non-GC params (Integer / Boolean / Character / SingleFloat /
+    /// DoubleFloat / Unit) do not need a home and stay as raw
+    /// `get_nth_param` values — `param_homes` simply doesn't contain
+    /// them.
+    param_homes: HashMap<TempId, inkwell::values::PointerValue<'ctx>>,
     current_block_label: String,
     current_computation_index: usize,
     /// GAP-011 diagnostic (`NOD_DIAG_MERGE_DIVERGENCE`): when set, every
@@ -2234,6 +2250,7 @@ fn emit_function<'ctx, 'a>(
         pending_incoming: Vec::new(),
         safepoint_slot_capacity,
         safepoint_slot_slab: None,
+        param_homes: HashMap::new(),
         current_block_label: String::new(),
         current_computation_index: 0,
         diag_merge: std::env::var_os("NOD_DIAG_MERGE_DIVERGENCE").is_some(),
@@ -2253,12 +2270,45 @@ fn emit_function<'ctx, 'a>(
     // Polls are emitted at these blocks and at the function entry block.
     let loop_headers = find_loop_headers(func);
 
-    // Bind function parameters to the entry block's SSA temps.
-    for (i, p) in func.params.iter().enumerate() {
-        let pv = llvm_fn
-            .get_nth_param(i as u32)
-            .expect("parameter index in range");
-        state.temps.insert(*p, pv);
+    // GAP-011 fix: spill every GC-typed function parameter to a stable
+    // "home" alloca in the entry block. All subsequent reads of that
+    // parameter go through the home, so any safepoint reload that writes
+    // back to the home (see `end_safepoint`) is observed by the *next*
+    // block's load.
+    //
+    // Non-GC params (Integer / Boolean / Character / floats / Unit) skip
+    // the home — their values can't be moved by GC, so the raw
+    // `get_nth_param` SSA value is fine across block boundaries.
+    {
+        let entry_bb = state.blocks[&func.entry];
+        builder.position_at_end(entry_bb);
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        for (i, p) in func.params.iter().enumerate() {
+            let pv = llvm_fn
+                .get_nth_param(i as u32)
+                .expect("parameter index in range");
+            let ty = func.temp_type(*p);
+            if ty.needs_gc_protection() {
+                // Build the home alloca via the standard entry-block helper
+                // (preserves the GAP-010 "no allocas outside entry" guard).
+                let home = state.build_entry_alloca(
+                    ctx.i64_type(),
+                    &format!("p.t{}.home", p.0),
+                )?;
+                // Position back at entry-block insertion point and seed.
+                builder.position_at_end(entry_bb);
+                builder.build_store(home, pv).map_err(map_err)?;
+                state.param_homes.insert(*p, home);
+            }
+        }
+        // Establish the entry block's initial binding for every param via
+        // the same helper the block-restart path uses, so behavior is
+        // identical across all blocks: GC-typed → load from home, plain →
+        // raw arg.
+        for &p in &func.params {
+            let v = state.rebind_param(p)?;
+            state.temps.insert(p, v);
+        }
     }
     state
         .block_entry_temps
@@ -2300,11 +2350,18 @@ fn emit_function<'ctx, 'a>(
         // that performed the reload. When we move on to a sibling block,
         // restore canonical block-entry bindings so later uses do not pick
         // up a reload defined in a non-dominating predecessor.
-        for (i, p) in func.params.iter().enumerate() {
-            let pv = llvm_fn
-                .get_nth_param(i as u32)
-                .expect("parameter index in range");
-            state.temps.insert(*p, pv);
+        //
+        // GAP-011 fix (2026-05-30): for GC-typed function parameters the
+        // "canonical" binding is now `load %p.home`, NOT `get_nth_param`.
+        // The home is the source of truth across block boundaries; reading
+        // raw `get_nth_param` here would reinstall the pre-GC entry value
+        // every time we cross a block boundary, silently undoing every
+        // safepoint reload of a function param performed in a sibling
+        // block. Non-GC params still get the raw `get_nth_param` value
+        // because their values can't be moved.
+        for &p in &func.params {
+            let v = state.rebind_param(p)?;
+            state.temps.insert(p, v);
         }
         if let Some(phis) = state.block_phis.get(&b.id) {
             for (&param, phi) in b.params.iter().zip(phis.iter()) {
@@ -4376,6 +4433,47 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
             .unwrap_or_else(|| panic!("undefined TempId({})", t.0))
     }
 
+    /// Produce the canonical block-entry SSA value for function parameter
+    /// `p`, used by both the entry-block seed and the per-block restart.
+    /// For GC-typed params with a home alloca, emits a fresh `load
+    /// %p.home` at the current insert position (which the caller has
+    /// positioned at the block's start). For non-GC params, returns the
+    /// raw `get_nth_param` LLVM value (no reload needed — these are
+    /// non-relocating).
+    ///
+    /// GAP-011 invariant A: every cross-block use of a GC-typed param
+    /// MUST flow through this load. The previous codegen rebound
+    /// `state.temps[p]` to `get_nth_param` directly, silently undoing
+    /// any in-block safepoint reload at the next block boundary.
+    fn rebind_param(&self, p: TempId) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let map_err = |e: inkwell::builder::BuilderError| CodegenError::Builder(e.to_string());
+        if let Some(&home) = self.param_homes.get(&p) {
+            let v = self
+                .builder
+                .build_load(
+                    self.ctx.i64_type(),
+                    home,
+                    &format!("p.t{}.reload", p.0),
+                )
+                .map_err(map_err)?;
+            return Ok(v);
+        }
+        // Non-GC param (or a `param_homes` miss for a TempId that isn't a
+        // function parameter — the caller should only invoke this for
+        // entries in `func.params`). Recover the LLVM-arg SSA value by
+        // index.
+        let i = self
+            .func
+            .params
+            .iter()
+            .position(|&x| x == p)
+            .expect("rebind_param: TempId is a function parameter");
+        Ok(self
+            .llvm_fn
+            .get_nth_param(i as u32)
+            .expect("parameter index in range"))
+    }
+
     /// Spill each safepoint root temp into an entry-block-resident
     /// `alloca` slot. Both surfaces use the precise per-site safepoint
     /// map exclusively (JIT via `nod_jit_begin_safepoint`, AOT via
@@ -4518,6 +4616,20 @@ impl<'ctx, 'a> Emit<'ctx, 'a> {
                     )
                     .map_err(map_err)?;
                 self.temps.insert(slot_info.temp, reloaded);
+                // GAP-011 invariant B (2026-05-30): if the reloaded temp
+                // is a function parameter with a home alloca, refresh the
+                // home so subsequent block-entry `rebind_param` loads
+                // pick up the post-GC address. Forgetting this would
+                // mean the home stays at its entry-block seed value (the
+                // raw `%fn.argN`) forever, and every block transition
+                // would re-install the pre-GC pointer — the exact GAP-011
+                // crash. Empty hashmap for stdlib functions with no
+                // GC-typed params; no-op.
+                if let Some(&home) = self.param_homes.get(&slot_info.temp) {
+                    self.builder
+                        .build_store(home, reloaded)
+                        .map_err(map_err)?;
+                }
             }
         }
         Ok(())
