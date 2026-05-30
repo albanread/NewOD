@@ -1529,6 +1529,186 @@ A cold-compile of `"hello"` produces:
 - Inline-cache slots + generic-function pointers (Sprint 38e).
 - The cross-process subprocess-spawn headline test (Sprint 38e — depends on all categories converted).
 
+---
+
+> **Sprints 39 – 46 retros pending.** Detailed retros for the AOT-EXE
+> work (39a-c), user-class registration in AOT (40a-d), Win32 message
+> loop + IDE shell + file menu (41a-g), real string support (42a),
+> rope-backed editor + cursor + syntax colouring + gutter (43d-g),
+> multi-file AOT (44), Dylan-lexer-in-Dylan (45a-b), and the
+> Dylan-parser-in-Dylan milestone (46) are still in the commit log
+> and task tracker but never made it into this file. Adding them is
+> tracked as a documentation-debt task; the gap doesn't block forward
+> work.
+
+### Sprint 47 — multi-value return + multi-binder `let` (GAP-003 fix) — landed
+
+Closed GAP-003: `values(a, b)` lowering + `let (a, b) = expr` destructuring.
+Replaces the old SBCL-style "pack two fixnums into one Word" workaround
+the lexer's `offset-to-line-col` used (and the GAP-003 packed-result hack
+that landed before the real multi-value path existed).
+
+* **Phase A (`abc61e3`).** Thread-local secondary-values buffer in
+  `nod-runtime/src/values.rs` — three-slot scratch area registered as a
+  precise GC root via `snapshot_active_values_roots`. Two new primitives
+  (`%values-store`, `%values-load`) read/write it.
+* **Phase B+D (`5181da5`).** Sema lowers `values(...)` to a primary-return
+  + per-extra `%values-store(i, v)` sequence; `let (a, b, ...) = call` to
+  a primary bind + `let b = %values-load(1)` per extra. The IR shape stays
+  flat single-value; the buffer carries the rest.
+* **Phase C + tests (`a2a448b`).** AST-level policy comment + regression
+  tests covering "values returns N, let binds M, M ≤ N", trailing-value
+  ignore, GC-across-store-and-load.
+* **Phase E (`d5f3f43`).** Retired the
+  `offset-to-line-col`-packed-into-one workaround and the
+  `$line-col-shift` constant. The dylan-lexer fixture now uses the
+  natural `values(line, col)` / `let (line, col) = …` shape.
+
+Cost: ~4 commits, single-day work. Unlocks any future stdlib primitive
+that wants to return multiple values without struct allocations.
+
+### Sprint 48 — `is_no_alloc` attribute (Phase A only) — partially landed
+
+`f7867cb`: scaffolded an `is_no_alloc: bool` field on `Computation::DirectCall`
+and `Computation::SealedDirectCall`, with `is_potentially_allocating_call()`
+short-circuiting when it's set. The intent is the obvious one — let the
+liveness pass skip safepoint scaffolding around calls known not to
+allocate, saving slab slots + reload instructions on hot paths.
+
+**Phase B and Phase C remain unshipped** (task #288). The annotation
+pass (mark primitives + a fixed-point analysis over user-defined
+functions) hasn't been written, nor have the corresponding tests, nor
+has the docstring rewrite. The field exists, codegen reads it, but
+nothing ever sets it to `true` in production. The cost is felt every
+time the test crate's `Computation::DirectCall` constructors break
+because they don't supply the new field (it bit me during GAP-011
+verification, surfaced again as a known issue).
+
+### Sprint 48b — GC safepoint / precise-root marathon (the GAP-011 detour) — landed
+
+The unplanned excursion. What started as "Sprint 46's parser-corpus
+milestone should just work now" cascaded into a multi-week GC investigation
+that touched every layer between DFM liveness and the newgc evacuator.
+Several sprints' worth of work, captured here for the record.
+
+**What was wrong.** `nod-driver parse-dylan` on any non-trivial corpus
+crashed with `stretchy_vector_push: not a <stretchy-vector>` deep inside
+`acc-string`'s loop. The vector pointer being handed to push was stale —
+GC had moved the object, the SSA temp still pointed at the pre-move
+address, the page had been reused. Classic stale-precise-root signature,
+but the obvious culprits (missing liveness, slot-map bug, slab miss)
+all ruled out.
+
+**What landed during the hunt** (each one paid back independently, even
+before the bug was found):
+
+* **Global backward live-in/out fixpoint** in `nod-dfm/src/liveness.rs`
+  (`37e1f69`). The pre-existing per-block approximation was unsound for
+  live-through temps; this replaces it with the textbook gen/kill +
+  iterate-to-fixpoint algorithm. Necessary, verified correct, but
+  insufficient on its own.
+* **Vendored `newgc-core`** in-tree at `src/newgc-core` (`d12ee26`), was
+  a git pin against `E:\NewGC`. Refreshed to NewGC HEAD `15b50c6` which
+  carries three Lisp-team fixes past the old pin. Provenance in
+  `src/newgc-core/VENDOR.md`. Vendoring meant we could add a JSONL
+  collection tracer without round-tripping through the NewGC repo.
+* **`NOD_GC_TRACE` JSONL tracer** in `src/nod-runtime/src/gc_trace.rs`
+  (`d2b489d`). Per-cycle `collect_begin` / `root` / `root_rewrite` /
+  `collect_end` events. Two zoom-in features: `NOD_GC_TRACE_WATCH=<csv
+  hex>` filters to specific addresses, `NOD_GC_TRACE_FOLLOW=1`
+  auto-extends the watch set across relocations.
+* **`NOD_DIAG_ARG_ROOT_COVERAGE` probe** (`62f7d41`). Env-gated
+  diagnostic in `nod-dfm::diagnose_arg_root_coverage` that enumerates
+  every call site where a GC-typed argument is NOT in
+  `safepoint_roots`. Used to test a peer-review hypothesis; the
+  hypothesis didn't hold (closing 1378 gaps left the crash identical
+  — `fc2f0cd`), but the probe stays as permanent diagnostic.
+* **`nod-driver symbolicate` subcommand** (`c3e09e2`). Takes raw hex
+  IPs from a crash backtrace and rewrites them as `name+0xNN` against
+  the linker's `.map` file. Replaces ~20 minutes of by-hand `.map`
+  grep with one copy-paste-able command. Lives in `nod-driver` (not
+  `nod-runtime`) per the CGU-fragility rule.
+* **`[GAP-011]` push probe** in `stretchy_vector_push` — `RtlCaptureStackBackTrace`
+  + EXE-base print + symbolicate-hint line. Reusable for any future
+  stale-precise-root crash; change the panic site, leave the shape.
+
+**The actual fix** (`66523e1`). Located in `codegen.rs:2303-2308`: at
+every block entry, function parameters were being unconditionally
+rebound to their original `get_nth_param` LLVM SSA values — the
+pre-GC values from the function prologue. The comment above the
+rebind even acknowledges it ("restore canonical block-entry bindings
+so later uses do not pick up a reload defined in a non-dominating
+predecessor"), but the side effect is that every in-block safepoint
+reload of a function param gets silently undone at the next block
+transition. The fix: spill every GC-typed function param to a stable
+home alloca at function entry (`param_homes` map), have block-entry
+rebinds load from the home (not `get_nth_param`), and have
+`end_safepoint` write the reloaded value BACK to the home so the next
+block sees the post-GC address. Block params were already correct via
+their phi path (per peer-reviewed sharpening in `976f464`).
+
+**Gating tests post-fix**: `parse-dylan` on `jcs-40` exits 0, the full
+`jit_cache_sample_items.dylan` corpus parses to 3307 lines of AST output,
+and `cargo test -p nod-runtime --lib -- --test-threads=1` stays at 144
+passing.
+
+**Documentation.** The full investigation is in
+`GAP-011_GC_team_writeup.md` (hypotheses tried, refutations, final
+fix with non-negotiable invariants A and B). The tooling guide is at
+`docs/tracing_guide.md` and walks through the canonical workflow.
+
+**What was queued, not done.** A static post-codegen verifier (the
+"alloca tracker" — walk every Word-typed alloca, prove every load is
+dominated by either a fresh store or a post-safepoint reload+writeback)
+would catch this class of bug at compile time forever after. The fix
+makes the invariant true today; the verifier would make it enforceable
+across future codegen changes. Worth landing in a focused follow-up
+sprint when there's an hour for it.
+
+### Sprint 49 — post-marathon polish bundle — landed
+
+The fingers-crossed-no-more-GC-issues sprint. Four unrelated bits of
+quality-of-life that GAP-011 left us with energy to pick up.
+
+* **Sprint 49a (`d3a0ac2`) — `.prj` project files + `--time` flag.**
+  TOML schema with three fields: `name`, `sources`, `output` (defaults
+  to `<name>.exe`). Relative paths anchor at the project file's
+  directory, NOT the caller's CWD — non-negotiable. `nod-driver build
+  --project foo.prj` is mutually exclusive with positional inputs via
+  clap's `conflicts_with` + `required_unless_present`. `--time` rides
+  along on both `build` and `parse-dylan`. Lives in
+  `src/nod-driver/src/project.rs` with six unit tests. Example fixture:
+  `tests/nod-tests/fixtures/factorial.prj`.
+
+* **Sprint 49b (`9f14383`) — `cond` macro.** Common-Lisp-style multi-arm
+  conditional, lowers to nested `if/elseif/else`. Joins `unless`,
+  `when`, `for-each`, `with-cleanup` in `stdlib.dylan`. Arities 1
+  through 4 test/body pairs + `otherwise` are supported via fixed-arity
+  rules; beyond 4 arms, nest. The macro engine's lack of `*` repetition
+  is what caps the arity — a real fix waits for Sprint 49c-ish. Also
+  threaded `"cond"` into the parser's nested-form list and the macro
+  engine's depth-aware body-matcher keyword list so other
+  body-shaped forms (e.g. `with-cleanup body cleanup cond ... end end`)
+  parse correctly. Smoke fixture: `tests/nod-tests/fixtures/cond_smoke.dylan`
+  exercising every arity × both arm paths, asserted on stdout.
+
+* **Sprint 49c (`3203c94`) — O(N) sliding cursor in the Dylan-lexer's
+  `offset-to-line-col`.** Closes the long-standing #291: `dump-tokens`
+  called `offset-to-line-col(source, off)` twice per token from byte 0,
+  classic O(N²) over the whole dump. Replaced with three module-level
+  cache variables tracking the last `(pos, line, col)` triple; tokens
+  come out in monotonically increasing order so each source byte is
+  visited at most once per `dump-tokens` invocation. Defensive on
+  backwards seeks (caller bug → restart from byte 0). Pure Dylan
+  change; output verified identical to pre-fix on the smoke + full
+  fixtures.
+
+(The numbering "49a/b/c" is post-hoc — these three commits landed as
+"Sprint 49", "Sprint 49b", and "dylan-lexer: O(N) fix" respectively;
+codifying them all under 49 cleans up the freelance label.)
+
+---
+
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
 Slipped from the old Sprint 27 slot when Sprint 27 absorbed the FFI Phase A work. Port `opendylan-tests/sources/io/tests/format.dylan`, `print.dylan`, `streams.dylan` against ported `io` library code. Removes the `format-out` FFI shim.
 
