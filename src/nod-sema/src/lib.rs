@@ -81,6 +81,21 @@ fn parse_user_module(
 }
 
 fn stdlib_macro_name_set() -> std::collections::HashSet<String> {
+    stdlib_macro_names()
+}
+
+/// Sprint 51c-1 — public accessor for the stdlib's macro name set,
+/// for callers that need to drive `nod_reader::parse_module_with_macros`
+/// directly (e.g. the driver's `dump-ast` subcommand running outside
+/// the full sema pipeline). Without seeding these names, the parser
+/// doesn't recognise stdlib body-shaped macros (`cond`, `case`,
+/// `unless`, `when`, `for-each`, …) and errors out on tokens like
+/// `KwOtherwise` that only appear inside those forms.
+///
+/// Triggers `stdlib::ensure_loaded()` on first call so the macro table
+/// is materialised. Idempotent on subsequent calls (LazyLock-backed).
+pub fn stdlib_macro_names() -> std::collections::HashSet<String> {
+    stdlib::ensure_loaded();
     let table = stdlib::stdlib_macros();
     table.defs.keys().cloned().collect()
 }

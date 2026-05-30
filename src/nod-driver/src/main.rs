@@ -829,7 +829,7 @@ fn run_dump_tokens(input: &std::path::Path) -> ExitCode {
 }
 
 fn run_dump_ast(input: &std::path::Path) -> ExitCode {
-    use nod_reader::{SourceMap, format_ast_module, lex, parse_module, scan_preamble};
+    use nod_reader::{SourceMap, format_ast_module, lex, parse_module_with_macros, scan_preamble};
     let src = match std::fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
@@ -847,7 +847,25 @@ fn run_dump_ast(input: &std::path::Path) -> ExitCode {
     };
     let tokens = lex(&src, id);
     let pre = scan_preamble(&src);
-    let result = parse_module(&src, &tokens, pre.as_ref());
+    // Sprint 51c-1 — seed the parser with the body-shaped macro
+    // names from the stdlib. nod-sema does this implicitly via
+    // `parse_user_module` (which calls
+    // `stdlib::ensure_loaded()` first); dump-ast runs outside sema
+    // and can't load the stdlib at this point because the shim's
+    // AOT resolver (when `--lex-with-dylan` / `--verify-parse` is
+    // set) has already claimed the runtime's class registry. We
+    // hardcode the name list instead — it's small, stable, and
+    // matches `stdlib_macros()` ground truth. New macros added to
+    // the stdlib show up in `parse_user_module` automatically; this
+    // list needs a manual entry so the standalone dump-ast path
+    // sees them too.
+    let macros: std::collections::HashSet<String> = [
+        "case", "cond", "for-each", "iterate", "select", "unless", "when", "while",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let result = parse_module_with_macros(&src, &tokens, pre.as_ref(), &macros);
     let rust_accepted = result.is_ok();
     // Sprint 51c — verify-parse check, when enabled. Runs the
     // Dylan-side parser on the same source and asserts both verdicts
