@@ -2142,13 +2142,50 @@ Verification:
   cargo test -p nod-tests --test macro_engine — passes
   Parser corpus: 38/38
 
-What 50c-3 does NOT do (deferred to 50d / 50e):
+What 50c-3 does NOT do (deferred to 50c-4 / 50d / 50e):
   * Walk-and-expand pass over a real `<ast-body>` — the chunky
     one. Needs bundling dylan-lexer + dylan-parser + macro engine
     + an AST-aware traversal that recognises macro call sites
     and splices expanded fragments back. Its own sprint.
   * Oracle vs Rust nod-macro (50d).
   * Retire nod-macro from the build (50e).
+
+### Sprint 50c-4 — prerequisite blocker discovered, not started
+
+Attempted to bundle `dylan-parser.dylan` into `dylan-macro-smoke.prj`
+so the smoke could use the real `parse-dylan(tokens) → <ast-body>`
+entry point. Build failed cleanly:
+
+```
+nod build: duplicate top-level definition `main` in both
+  dylan-lexer.dylan        ← attribution is fuzzy; real collision is
+  dylan-macro-smoke.dylan  ← parser vs. smoke
+(user-vs-user collisions are not allowed; stdlib overrides are still permitted)
+```
+
+Root cause: both `dylan-parser.dylan` (line 2691) and
+`dylan-macro-smoke.dylan` (line 961) define `define function main`.
+The Dylan-side parser's `main` is wired as the entry point of the
+existing `nod-driver parse-dylan` EXE (which bundles
+`dylan-lexer + dylan-parser` — only one `main`, no collision). Adding
+the smoke as a third file in any prj forces a collision and the
+AOT pipeline rejects user-vs-user duplicates.
+
+**Prerequisite refactor for 50c-4 proper:**
+  1. Extract the parser's CLI main + top-level `main();` call from
+     `dylan-parser.dylan` into a new `dylan-parser-cli.dylan`.
+  2. Update `src/nod-driver/src/main.rs::ensure_dylan_parser_exe`
+     to bundle `[dylan-lexer, dylan-parser, dylan-parser-cli]` for
+     the parse-dylan EXE.
+  3. Re-verify the parser corpus is 38/38 with the refactor.
+  4. THEN: add `dylan-parser.dylan` (no main now) to
+     `dylan-macro-smoke.prj` and proceed with the walk-and-expand
+     phase.
+
+Held off on the refactor this session — it touches a stable corpus
+fixture and the driver's parser-EXE wiring, which is bigger scope
+than the macro-engine increments we've been landing. Clean stop on
+50c-3, the wall is documented.
 
 ---
 

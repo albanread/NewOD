@@ -1,10 +1,18 @@
-# Sprint 50c-2 — bundle the Dylan-side lexer + the macro engine smoke
-# into one module (`dylan-lexer`). Lets the smoke call the real lexer's
-# `<token>` machinery so a future `from-source` phase can lex an actual
-# `define macro` text and feed it through the engine.
+# Sprint 50c-2/3 — bundle the Dylan-side lexer + the macro engine
+# smoke into one module (`dylan-lexer`). Lets the smoke call the real
+# lexer's `<token>` machinery, group-balance hash-prefixed groups,
+# and use `token-source-text` to round-trip every keyword.
 #
 # `nod-driver build --project dylan-macro-smoke.prj` produces
 # `dylan-macro-smoke.exe` alongside this file.
+#
+# Future Sprint 50c-4 will add `dylan-parser.dylan` as a third source
+# so the smoke can call `parse-dylan(tokens) → <ast-body>` and run a
+# walk-and-expand pass. Blocked today by a duplicate-main collision:
+# both `dylan-parser.dylan` (line 2691) and `dylan-macro-smoke.dylan`
+# define `define function main`, and the AOT pipeline rejects
+# user-vs-user duplicate top-levels. See SPRINTS.md "Sprint 50c-4 —
+# prerequisite blocker discovered, not started" for the unblock plan.
 
 name    = "dylan-macro-smoke"
 sources = ["dylan-lexer.dylan", "dylan-macro-smoke.dylan"]
