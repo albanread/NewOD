@@ -1,0 +1,20 @@
+# Sprint 51b — Dylan-side lexer side-load shim.
+#
+# Compiles dylan-lexer.dylan + dylan-lex-shim.dylan into a single EXE
+# whose entry point (`shim-main`) reads argv[1] as a source file path,
+# lexes it via the Dylan-side `lex()`, and prints one wire-format line
+# per emitted (non-trivia, post-preamble) token:
+#
+#   KIND SPAN_LO SPAN_HI\n
+#
+# Kind ordinals match `nod_reader::token::TokenKind` per
+# `docs/DYLAN_TOKEN_WIRE.md` §3.
+#
+# Sprint 50d's `start_function` field lets `shim-main` carry a distinct
+# name so this bundle and `dylan-lexer-main.dylan` (which uses `main`)
+# don't collide at link time when bundled into the same workspace.
+
+name           = "dylan-lex-shim"
+sources        = ["dylan-lexer.dylan", "dylan-lex-shim.dylan"]
+output         = "dylan-lex-shim.exe"
+start_function = "shim-main"
