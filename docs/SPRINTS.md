@@ -2011,6 +2011,42 @@ What 50b does NOT do (deferred to 50c+):
   * Multi-rule defs (the def-parser handles them but no fixture
     exercises that path yet).
 
+### Sprint 50c-1 — token-stream → fragment-tree group-balancer — landed
+
+The bridge between "what a lexer emits" (a FLAT token stream) and
+"what the macro engine consumes" (recursive `<group-fragment>`s). Real
+lexer integration in 50c-2 becomes a one-line swap of the
+token-building function.
+
+New helpers in `dylan-macro-smoke.dylan`:
+  `group-open-kind(text)`  → `<symbol>` or `#f` (opener detection)
+  `group-close-text(kind)` → expected close text
+  `tokens-to-fragments-from(tokens, start, closer)` — recursive
+  `tokens-to-fragments(tokens)` — top-level entry
+
+Mirrors `nod-reader::fragments::Fragmenter` at the basic level —
+supports `(…)`, `[…]`, `{…}`. The hash-prefixed `#(`, `#[`, `#{`
+groups land in 50c-2 alongside the real lexer wiring.
+
+Smoke now runs THREE phases on the same fixture:
+  PHASE: hand-built   — Sprint 50a's path (rule built directly)
+  PHASE: parsed-def   — Sprint 50b's path (fragments → def)
+  PHASE: from-tokens  — Sprint 50c-1's path (tokens → fragments → def)
+All three produce byte-identical `EXPAND` lines. The
+`TOKENIZE: 24 def-tokens / FRAGMENT: 3 top-level frags` diagnostics
+prove the group-balancer collapsed the flat stream into one
+top-level fragment per `{ pattern } / => / { template }`.
+
+Verification: integration test asserts the FULL three-phase stdout
+matches byte-for-byte. Parser corpus: **38 / 38**.
+
+What 50c-1 does NOT do (deferred to 50c-2):
+  * Plug in the real `<token>` from `dylan-lexer.dylan` (still uses
+    local `<tok>`).
+  * Lex actual source text — the token stream is still hand-built.
+  * Hash-prefixed groups (`#(`, `#[`, `#{`).
+  * The walk-and-expand pass over `<ast-body>`.
+
 ---
 
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)

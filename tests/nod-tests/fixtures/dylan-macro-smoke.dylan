@@ -608,6 +608,137 @@ define function parse-macro-def (name :: <byte-string>, body :: <stretchy-vector
   make(<macro-def>, name: name, rules: rules)
 end function;
 
+// ─── Sprint 50c-1 — token-stream → fragment-tree group-balancer ──────────
+//
+// A real lexer emits a FLAT stream of tokens; the macro engine wants
+// fragments — tokens plus recursive `<group-fragment>` nesting for
+// `( … )`, `[ … ]`, `{ … }`. This pass walks tokens left-to-right and
+// builds the tree.
+//
+// Mirrors `nod-reader::fragments::Fragmenter`. Sprint 50c-1 supports
+// the three basic group kinds (paren/bracket/brace); the `#( #[ #{`
+// hash-prefixed groups land alongside the real lexer integration in
+// 50c-2.
+//
+// Returns (frags, next-index). When called at the top level, the
+// caller passes `closer = ""` so the walk runs to end-of-token-stream;
+// recursive calls pass the expected close-text and stop when they see
+// it.
+
+define function group-open-kind (text :: <byte-string>) => (kind :: <object>)
+  // Returns the <symbol> for an opener token, or #f if not an opener.
+  let result = #f;
+  if (text = "(")      result := #"paren";
+  elseif (text = "[")  result := #"bracket";
+  elseif (text = "{")  result := #"brace";
+  end;
+  result
+end function;
+
+define function group-close-text (kind :: <symbol>) => (text :: <byte-string>)
+  let result = "}";
+  if (kind = #"paren")        result := ")";
+  elseif (kind = #"bracket")  result := "]";
+  end;
+  result
+end function;
+
+// Walk `tokens` from index `start`. Build a stretchy-vector of
+// fragments. If `closer` is non-empty, stop when a punct token with
+// that text is seen (and consume it). Returns (frags, next-i).
+define function tokens-to-fragments-from (tokens :: <stretchy-vector>,
+                                          start  :: <integer>,
+                                          closer :: <byte-string>)
+ => (frags :: <stretchy-vector>, next :: <integer>)
+  let frags = make(<stretchy-vector>);
+  let n = size(tokens);
+  let i = start;
+  let done? = #f;
+  until (i = n | done?)
+    let t = tokens[i];
+    let text = tok-text(t);
+    let is-punct? = tok-kind(t) = #"punct";
+    if (is-punct? & size(closer) > 0 & text = closer)
+      // Consume the closer and stop.
+      i := i + 1;
+      done? := #t;
+    else
+      let open-kind = #f;
+      if (is-punct?) open-kind := group-open-kind(text); end;
+      if (open-kind)
+        let close-text = group-close-text(open-kind);
+        let (body, after) =
+          tokens-to-fragments-from(tokens, i + 1, close-text);
+        add!(frags, make-group-frag(open-kind, body));
+        i := after;
+      else
+        add!(frags, make-token-frag(t));
+        i := i + 1;
+      end;
+    end;
+  end;
+  values(frags, i)
+end function;
+
+define function tokens-to-fragments (tokens :: <stretchy-vector>)
+ => (frags :: <stretchy-vector>)
+  let (frags, _next) = tokens-to-fragments-from(tokens, 0, "");
+  frags
+end function;
+
+// Hand-build the TOKEN stream (flat) for `define macro unless`'s body.
+// This is what the Dylan-side lexer would produce for the inside of
+// `define macro unless ... end macro;`, given the source:
+//
+//   { unless ?cond:expression ?body:body end }
+//     => { if (~ ?cond) ?body else #f end }
+//
+// tokens-to-fragments(this) should equal `build-unless-def-body` from
+// Sprint 50b. The macro_engine.rs test asserts both paths yield the
+// same EXPAND.
+define function build-unless-def-tokens ()
+ => (tokens :: <stretchy-vector>)
+  let toks = make(<stretchy-vector>);
+  add!(toks, make-tok(#"punct",        "{"));
+  add!(toks, make-tok(#"ident",        "unless"));
+  add!(toks, make-tok(#"punct",        "?"));
+  add!(toks, make-tok(#"keyword-name", "cond:"));
+  add!(toks, make-tok(#"ident",        "expression"));
+  add!(toks, make-tok(#"punct",        "?"));
+  add!(toks, make-tok(#"keyword-name", "body:"));
+  add!(toks, make-tok(#"ident",        "body"));
+  add!(toks, make-tok(#"kw-end",       "end"));
+  add!(toks, make-tok(#"punct",        "}"));
+  add!(toks, make-tok(#"punct",        "=>"));
+  add!(toks, make-tok(#"punct",        "{"));
+  add!(toks, make-tok(#"ident",        "if"));
+  add!(toks, make-tok(#"punct",        "("));
+  add!(toks, make-tok(#"punct",        "~"));
+  add!(toks, make-tok(#"punct",        "?"));
+  add!(toks, make-tok(#"ident",        "cond"));
+  add!(toks, make-tok(#"punct",        ")"));
+  add!(toks, make-tok(#"punct",        "?"));
+  add!(toks, make-tok(#"ident",        "body"));
+  add!(toks, make-tok(#"ident",        "else"));
+  add!(toks, make-tok(#"ident",        "#f"));
+  add!(toks, make-tok(#"kw-end",       "end"));
+  add!(toks, make-tok(#"punct",        "}"));
+  toks
+end function;
+
+// Hand-build the call-site token stream for `unless x (foo) end`.
+define function build-call-site-tokens ()
+ => (tokens :: <stretchy-vector>)
+  let toks = make(<stretchy-vector>);
+  add!(toks, make-tok(#"ident",   "unless"));
+  add!(toks, make-tok(#"ident",   "x"));
+  add!(toks, make-tok(#"punct",   "("));
+  add!(toks, make-tok(#"ident",   "foo"));
+  add!(toks, make-tok(#"punct",   ")"));
+  add!(toks, make-tok(#"kw-end",  "end"));
+  toks
+end function;
+
 // ─── Hand-built unless rule + call-site smoke ────────────────────────────
 //
 // The stdlib `unless` macro is:
@@ -744,4 +875,20 @@ define function main () => ()
   format-out("PARSE-DEF: ok, rules=%d\n", size(macro-def-rules(def)));
   let rule = macro-def-rules(def)[0];
   run-match-substitute(macro-rule-pattern(rule), macro-rule-template(rule), call);
+  // Phase C — Sprint 50c-1 — start from a flat TOKEN stream (what a
+  // real lexer emits), run tokens-to-fragments to build the grouped
+  // tree, then push through parse-macro-def. Also tokenise the call
+  // site and group-balance it. End-to-end should match the previous
+  // two phases byte-for-byte.
+  format-out("PHASE: from-tokens\n");
+  let def-tokens = build-unless-def-tokens();
+  format-out("TOKENIZE: %d def-tokens\n", size(def-tokens));
+  let def-frags = tokens-to-fragments(def-tokens);
+  format-out("FRAGMENT: %d top-level frags\n", size(def-frags));
+  let def2 = parse-macro-def("unless", def-frags);
+  let rule2 = macro-def-rules(def2)[0];
+  let call-tokens = build-call-site-tokens();
+  let call-frags  = tokens-to-fragments(call-tokens);
+  run-match-substitute(macro-rule-pattern(rule2), macro-rule-template(rule2),
+                       call-frags);
 end function;

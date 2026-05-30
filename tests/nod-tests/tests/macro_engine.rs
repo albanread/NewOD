@@ -68,8 +68,10 @@ fn macro_engine_unless_expansion() {
     // Normalise CRLF → LF — Windows pipes can transcode.
     let stdout = stdout.replace("\r\n", "\n");
 
-    // Sprint 50a hand-built phase + Sprint 50b parsed-def phase. Both
-    // produce identical match + substitute output for the same call site.
+    // Three phases — Sprint 50a hand-built, Sprint 50b parsed-def
+    // (fragments → <macro-def>), Sprint 50c-1 from-tokens (flat
+    // token stream → group-balanced fragments → <macro-def>). All
+    // three must produce byte-identical match + substitute output.
     let expected = "\
 PHASE: hand-built\n\
 MATCH: ok\n\
@@ -78,6 +80,13 @@ BIND body: 1 frag\n\
 EXPAND: if ( ~ x ) ( foo ) else #f end\n\
 PHASE: parsed-def\n\
 PARSE-DEF: ok, rules=1\n\
+MATCH: ok\n\
+BIND cond: 1 frag\n\
+BIND body: 1 frag\n\
+EXPAND: if ( ~ x ) ( foo ) else #f end\n\
+PHASE: from-tokens\n\
+TOKENIZE: 24 def-tokens\n\
+FRAGMENT: 3 top-level frags\n\
 MATCH: ok\n\
 BIND cond: 1 frag\n\
 BIND body: 1 frag\n\
