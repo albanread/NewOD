@@ -1841,6 +1841,78 @@ What 45c does NOT do (deferred to follow-ups):
     the Dylan lexer into IDE syntax colouring) — independent
     sub-sprints that need their own gates.
 
+### Sprint 45d — lexer oracle (Rust vs Dylan) — landed
+
+Cross-check that both lexers segment Dylan source the same way. The
+two were written for different downstream consumers — `nod-reader`
+feeds the parser (drops trivia, uses specific punctuation kinds like
+`LPAREN`/`EQUAL`), `dylan-lexer.dylan` feeds the future IDE colourer
+(keeps trivia, uses a generic `PUNCT` kind). Both shapes are valid;
+the meaty correctness question is whether they *segment the same
+source the same way*.
+
+New: `tests/nod-tests/tests/lexer_oracle.rs`.
+
+Approach: shell out to `nod-driver dump-tokens` (Rust) and `nod-driver
+dump-dylan-tokens` (Dylan), parse each line into
+`(start_line:col, end_line:col, kind, lexeme)`, then:
+  * Drop Dylan trivia (`WS`, `COMMENT_LINE`, `COMMENT_BLOCK`).
+  * Drop the Dylan preamble — Rust's `lex()` calls
+    `skip_preamble()` so its stream starts after `Module: foo\n\n`;
+    mirror by finding the first WS spanning ≥2 source lines and
+    dropping everything before its end-line. (Line-arithmetic rather
+    than lexeme-text inspection so CRLF / LF source line endings
+    don't trip the check.)
+  * Undo the Dylan dump's display escapes (`\s` → space,
+    `\t` → tab, `\r` → CR) so whitespace inside string literals
+    compares against Rust's verbatim rendering. The `\\` and `\"`
+    escapes stay encoded — Rust's dump uses them identically.
+  * Compare element-wise on (span, lexeme). Kind disagreements get
+    counted and reported on `--nocapture` but don't fail the test —
+    they're a keyword-set design conversation.
+
+Initial corpus:
+  * `oracle_hello` — 17 tokens, segmentation identical, 16 kind
+    disagreements (every PUNCT vs LPAREN/RPAREN/etc).
+  * `oracle_factorial` — 50 tokens, segmentation identical, 46 kind
+    disagreements.
+  * `oracle_cond_smoke` — `#[ignore]`d with documented disagreement:
+    Rust merges `-1` into one INTEGER token; Dylan emits `-` then
+    `1` and lets the parser handle the unary minus. Both defensible
+    — Rust is more aggressive at lex time, Dylan is more flexible in
+    subtraction contexts like `x-1`. The Dylan-side parser handles
+    the split via `is-unary-op?`. Sprint-45-followup picks a winner
+    and the test flips to `#[test]` then.
+  * `oracle_corpus_sweep` — `#[ignore]`d informational survey across
+    every `.dylan` fixture (minus the two giants — `dylan-lexer.dylan`
+    and `dylan-parser.dylan` — whose Dylan-side dump takes ~2+ min
+    each at present). Logs divergences to stderr but doesn't fail.
+    **Headline finding:** of the 35 fixtures swept, every single
+    divergence is the SAME pattern — `-N` merged-vs-split. Concrete
+    hits: `cond_smoke.dylan`, `ide_helpers.dylan`, `ide_rope.dylan`.
+    No keyword-set surprises, no segmentation drift, no string-lex
+    differences — the corpus is one design decision away from
+    full agreement. That's exactly the kind of survey result the
+    oracle was built to produce.
+
+Bugs surfaced while writing this:
+  * `str::split_whitespace` treats `\r` (0x0D) as a separator —
+    fatal for WS tokens whose lexeme is `\r\n\r\n` on Windows
+    sources. Rewrote field parsing to only split on space/tab and
+    take the lexeme as the line tail. Took an hour to track down;
+    worth a callout.
+  * `s.lines()` strips trailing CR before `\n` (good) but doesn't
+    split at standalone CR (also good) — so it's safe for the
+    dump format. The CR appears in WS token text and is parsed
+    intact.
+
+What 45d does NOT do (deferred):
+  * Lex-time signed-number policy decision (cond_smoke disagreement).
+  * Kind-equivalence table (PUNCT ↔ specific kinds) — would let the
+    oracle assert kind agreement, not just segmentation.
+  * Performance — the test shells out, building the Dylan-lexer EXE
+    is cached but per-test overhead is ~1s.
+
 ---
 
 ### Sprint 29b — `format` + `print` + `streams` (`io` library kernel)
