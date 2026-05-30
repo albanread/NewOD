@@ -15,7 +15,23 @@ use crate::token::{Token, TokenKind};
 ///
 /// Per spec §7 Q6: a leading header preamble (`Module: foo\nAuthor: …\n\n`)
 /// is **skipped** before the state machine runs. See [`scan_preamble`].
+///
+/// Sprint 51b — if a side-load override has been installed via
+/// [`set_lex_override`], dispatch to it instead. The override is
+/// install-once-for-process and is intended for the Dylan-side lexer
+/// JIT'd in via `--lex-with-dylan` in `nod-driver`. With no override
+/// set, the path is identical to the pre-51b behaviour.
 pub fn lex(src: &str, file_id: FileId) -> Vec<Token> {
+    if let Some(&f) = LEX_OVERRIDE.get() {
+        return f(src, file_id);
+    }
+    lex_rust(src, file_id)
+}
+
+/// The original (Rust) lexer entry point. Always available; `lex` may
+/// dispatch to a Dylan-side override but `lex_rust` is the canonical
+/// fallback and the oracle tests' reference path.
+pub fn lex_rust(src: &str, file_id: FileId) -> Vec<Token> {
     let mut lx = Lexer::new(src, file_id);
     let mut tokens = Vec::new();
     lx.skip_preamble();
@@ -29,6 +45,36 @@ pub fn lex(src: &str, file_id: FileId) -> Vec<Token> {
         }
     }
     tokens
+}
+
+/// Signature of an alternate `lex` implementation that can be installed
+/// at runtime via [`set_lex_override`]. Must match [`lex_rust`] semantically:
+/// must skip the preamble + trivia, must terminate the vector with exactly
+/// one `Eof` token, and the spans of returned tokens MUST be byte-offset
+/// pairs into the original `src`.
+pub type LexFn = fn(&str, FileId) -> Vec<Token>;
+
+static LEX_OVERRIDE: std::sync::OnceLock<LexFn> = std::sync::OnceLock::new();
+
+/// Sprint 51b — install an alternate `lex` implementation. Subsequent
+/// calls to [`lex`] dispatch through it; calls to [`lex_rust`] remain
+/// unaffected (oracle tests use that as the reference path).
+///
+/// **Install-once.** A `OnceLock` backs the slot, so the first caller
+/// wins. Re-installing a different function returns `Err(existing)`
+/// per the standard `OnceLock` semantics. The driver installs at
+/// startup (after parsing `--lex-with-dylan`) and never replaces; this
+/// matches the "load once, redirect from Rust lexer" model — there's
+/// nothing to unload and no need to swap mid-process.
+pub fn set_lex_override(f: LexFn) -> Result<(), LexFn> {
+    LEX_OVERRIDE.set(f)
+}
+
+/// Returns `true` if an alternate `lex` implementation is currently
+/// installed. Used by the driver's `--lex-with-dylan` status line and
+/// the oracle test to assert the override actually took effect.
+pub fn has_lex_override() -> bool {
+    LEX_OVERRIDE.get().is_some()
 }
 
 /// Result of scanning the header preamble at the top of a `.dylan` file.
