@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod dylan_lex_jit;
+mod dylan_parse_check;
 mod project;
 
 /// LLVM major version this driver is targeted against. Read at
@@ -59,6 +60,23 @@ struct Cli {
     /// variable, for use from `cargo test` etc.
     #[arg(long = "lex-with-dylan", global = true)]
     lex_with_dylan: bool,
+
+    /// Sprint 51c — verify-mode parser side-load. For each
+    /// `parse_module` call in this driver process, also run the
+    /// Dylan-side parser (`dylan-parse-collect`) on the same source
+    /// and compare verdicts. Disagreement is a hard error; agreement
+    /// is silent.
+    ///
+    /// Implies `--lex-with-dylan` (the parser shares the lexer's
+    /// resolver). Also settable via `NOD_VERIFY_PARSE=1`.
+    ///
+    /// This is the cheapest way to exercise the Dylan parser in
+    /// production: every build, every dump-ast call, both parsers
+    /// run, and we surface divergence loudly. Once the AST wire
+    /// format lands (Sprint 51d), the Dylan parser becomes the
+    /// authoritative path and this flag retires.
+    #[arg(long = "verify-parse", global = true)]
+    verify_parse: bool,
 }
 
 #[derive(Subcommand)]
@@ -226,7 +244,21 @@ fn main() -> ExitCode {
     // dispatching to the subcommand so the first lex call in
     // `compile_file_for_aot` / `dump_tokens` / `eval` sees the
     // override.
+    // Sprint 51c — `--verify-parse` shares the lexer shim's resolver,
+    // so triggering parse-verify implies running the lex-init path
+    // too. Same env-var fallback as the lexer flag.
+    let want_verify_parse = cli.verify_parse
+        || std::env::var("NOD_VERIFY_PARSE").map(|v| v == "1").unwrap_or(false);
+    // Persist into the env so `run_dump_ast` (and any future parse
+    // call site) picks the flag up uniformly.
+    if want_verify_parse {
+        // SAFETY: single-threaded process startup; no other thread is
+        // reading env yet.
+        unsafe { std::env::set_var("NOD_VERIFY_PARSE", "1"); }
+    }
+
     let want_dylan_lex = cli.lex_with_dylan
+        || want_verify_parse
         || std::env::var("NOD_LEX_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
     if want_dylan_lex {
         eprintln!("nod-driver: --lex-with-dylan: JIT-strapping the Dylan-side lexer …");
@@ -815,7 +847,22 @@ fn run_dump_ast(input: &std::path::Path) -> ExitCode {
     };
     let tokens = lex(&src, id);
     let pre = scan_preamble(&src);
-    match parse_module(&src, &tokens, pre.as_ref()) {
+    let result = parse_module(&src, &tokens, pre.as_ref());
+    let rust_accepted = result.is_ok();
+    // Sprint 51c — verify-parse check, when enabled. Runs the
+    // Dylan-side parser on the same source and asserts both verdicts
+    // agree. Silent on agreement; logs the divergence on disagreement
+    // and demotes the exit code so the user sees it.
+    if std::env::var("NOD_VERIFY_PARSE").map(|v| v == "1").unwrap_or(false) {
+        match dylan_parse_check::verify(&src, id, rust_accepted) {
+            Ok(()) => eprintln!("parse-verify: ok (rust+dylan agree on accept={rust_accepted})"),
+            Err(e) => {
+                eprintln!("parse-verify: DIVERGENCE on {}: {e}", input.display());
+                return ExitCode::from(3);
+            }
+        }
+    }
+    match result {
         Ok(m) => {
             print!("{}", format_ast_module(&m));
             ExitCode::SUCCESS

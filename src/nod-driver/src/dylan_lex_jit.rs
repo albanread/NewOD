@@ -124,6 +124,12 @@ pub fn init() -> Result<(), String> {
             nod_aot_resolve_relocs();
         }
         let _ = INIT_GUARD.set(());
+        // Sprint 51c — the same resolver covered the parser's
+        // relocations (single combined .obj), so the parse-verify
+        // path is now safe to call too. Telling
+        // `dylan_parse_check` directly keeps it from re-running the
+        // resolver.
+        crate::dylan_parse_check::mark_available();
         Ok(())
     }
 }

@@ -433,13 +433,30 @@ pub fn emit_aot_entry_stubs_full_with_mode<'ctx>(
             orphan.set_linkage(Linkage::Internal);
         }
     } else {
-        // Library mode — leave user_main, the start function, and any
-        // sibling `main` untouched. The host process supplies its own
-        // C-runtime entry; the .obj just adds named symbols to the
-        // process image.
+        // Library mode — leave the start function untouched (it stays
+        // callable by its source-language name from the host). BUT we
+        // still need to deal with any `main` symbol that lives in one
+        // of the bundled source files: e.g. bundling
+        // `dylan-parser.dylan` (whose CLI entry is named `main`)
+        // alongside `dylan-lex-shim.dylan` (whose entry is
+        // `shim-main`). If we left that `main` with External linkage,
+        // linking the .obj into the host (`nod-driver`) would collide
+        // with the host's own `main` (Rust's CRT entry).
         //
-        // `user_main` is unused under this arm; the lookup above stays
-        // as a sanity-check that the named entry function exists.
+        // Demote any `main` that ISN'T the user's chosen start
+        // function — same Sprint 50c-4 fix as the EXE path, just for
+        // a different reason (host conflict instead of CRT-finds-the-
+        // wrong-entry).
+        if entry_function != "main"
+            && let Some(orphan) = module.get_function("main")
+            && orphan != user_main
+        {
+            orphan.as_global_value().set_name("nod_orphan_main");
+            orphan.set_linkage(Linkage::Internal);
+        }
+        // `user_main` itself stays at whatever linkage codegen gave
+        // it (External by default for top-level Dylan functions);
+        // the host needs to be able to reach it by name.
         let _ = user_main;
     }
 

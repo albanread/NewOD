@@ -358,6 +358,48 @@ define function dylan-lex-collect (source :: <byte-string>)
   records
 end function;
 
+// ─── dylan-parse-collect — Sprint 51c verify-mode entry ──────────────────
+//
+// Lex + parse `source` end-to-end on the Dylan side, then return the
+// number of `<ast-error-node>`s in the top-level body. The host runs
+// the Rust parser AND this one; agreement on the "did this source
+// parse" verdict (count == 0 vs. count > 0) gates the build under
+// `--verify-parse`. A nonzero divergence means one of the two parsers
+// disagrees with the corpus, and we surface it loudly.
+//
+// Why count only top-level errors: the existing parser's error
+// recovery emits `<ast-error-node>` at the constituent level when it
+// bails on a definition / statement; nested errors propagate up.
+// That's enough to answer the binary question "did the Dylan parser
+// accept this file" — which is the contract this entry is making.
+//
+// Sprint 51d (deferred): a tree-shaped wire format that lets the
+// Rust side actually consume the AST instead of just spot-checking
+// it. This entry stays useful as the verify path even once
+// replacement mode lands.
+
+define function count-top-level-errors (body :: <ast-body>) => (n :: <integer>)
+  let constituents = body-constituents(body);
+  let size = %stretchy-vector-size(constituents);
+  let count = 0;
+  let i = 0;
+  until (i = size)
+    let c = %stretchy-vector-element(constituents, i);
+    if (instance?(c, <ast-error-node>))
+      count := count + 1;
+    end;
+    i := i + 1;
+  end;
+  count
+end function;
+
+define function dylan-parse-collect (source :: <byte-string>)
+ => (error-count :: <integer>)
+  let tokens = lex(source);
+  let ast = parse-dylan(tokens);
+  count-top-level-errors(ast)
+end function;
+
 // ─── main — read argv[1] as a path, lex, emit ────────────────────────────
 
 define function shim-main () => ()

@@ -15,6 +15,15 @@
 # don't collide at link time when bundled into the same workspace.
 
 name           = "dylan-lex-shim"
-sources        = ["dylan-lexer.dylan", "dylan-lex-shim.dylan"]
+# Sprint 51c — `dylan-parser.dylan` is bundled in so the same .obj
+# carries both `dylan-lex-collect` and `dylan-parse-collect` entries
+# under one shared `nod_aot_resolve_relocs`. The parser's own `main`
+# is demoted to internal linkage during AOT entry-stub emission so it
+# doesn't collide with the host driver's `main`.
+sources        = [
+    "dylan-lexer.dylan",
+    "dylan-parser.dylan",
+    "dylan-lex-shim.dylan",
+]
 output         = "dylan-lex-shim.exe"
 start_function = "shim-main"
