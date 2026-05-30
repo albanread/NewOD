@@ -1,25 +1,34 @@
 # NewOpenDylan
 
 > ⚠️ **Work in progress — not a usable Dylan implementation yet.**
-> Sprint 45a has landed (see [docs/SPRINTS.md](docs/SPRINTS.md) for
+> Sprint 49 has landed (see [docs/SPRINTS.md](docs/SPRINTS.md) for
 > the long form). Each sprint is nominally two weeks of effort, but
 > real-world ratios on the sister projects say plan for **several more
 > years** before NewOpenDylan reaches a state a Dylan programmer can
 > actually rely on. Treat this repo as a design diary with running
 > code, not a release.
 >
-> ⚠️ **The GC is not yet correct.** The collector now runs the Sprint
-> 23 page-heap NewGC backend and survives a 200-op random-edit
-> stress walk against a Dylan-side `<rope>` data structure
-> (~thousands of small allocations) — but it's still the Sprint 11
-> "option (b)" design at heart: synchronous, only triggered at
-> Rust-side allocation sites, with **no JIT-side safepoint polls
-> and no precise stack roots via `gc.statepoint`**. That work —
-> Sprint 11d — is queued but not in tree. The implication: any JIT'd
-> Dylan code that holds a tagged reference in a register across a
-> triggering allocation can lose it, and any program large enough to
-> fragment the working set will eventually surface this. Don't put
-> real data through it.
+> ⚠️ **The GC is precise but not yet verified at compile time.**
+> The collector runs the Sprint 23 page-heap NewGC backend and uses
+> a precise-roots client: the AOT/JIT codegen spills live GC roots
+> to per-call-site stack-slot slabs, brackets allocating calls with
+> `nod_aot_begin_safepoint` / `nod_aot_end_safepoint`, and reloads
+> the slabs after the call so GC-driven object relocation is
+> observed. Sprint 48b (the GAP-011 marathon) closed a several-week
+> precise-root staleness bug — function parameters now live in
+> stable home allocas across block boundaries, so safepoint
+> reloads of params survive into sibling blocks. The whole parser
+> corpus now parses without GC crashes; the IDE's rope buffer
+> survives heavy churn.
+>
+> *What's still on the door:* the post-codegen "alloca tracker"
+> verifier that would catch this class of bug at compile time
+> forever after is queued, not built. Today the invariant ("every
+> load from a Word-typed alloca is dominated by either a fresh
+> store or a post-safepoint reload+writeback") is true by
+> construction; a future codegen change could regress it and the
+> first sign would be a stale-pointer panic in a heavy-alloc
+> workload. Don't ship anything you wouldn't be willing to debug.
 >
 > ⚠️ **AOT mode compiles real Win64 EXEs, but the whole stack is new
 > and lightly tested.** `nod-driver build foo.dylan -o foo.exe`
@@ -27,15 +36,19 @@
 > the COM Direct2D / DirectWrite chain, GetOpenFileNameW, …) via
 > linker-resolved IAT. Sprint 44 extended this to multi-file builds:
 > `nod-driver build a.dylan b.dylan … -o foo.exe` merges ASTs before
-> lowering so all definitions are visible across files. The
-> `nod-ide.exe` Windows IDE is written entirely in Dylan across five
-> source files (~2000 lines total) and AOT-builds this way. **Every
-> layer — AOT, user-defined classes, FFI, COM, callbacks, IDE shell,
-> byte-string stdlib — landed in the last thirty-odd sprints and has
-> only been exercised by its own tests.** Expect bugs. Release-mode
-> AOT currently hits an LNK2005 `nod_user_main` collision;
-> debug-mode AOT works. The whole AOT trajectory is documented
-> per-sprint in [docs/SPRINTS.md](docs/SPRINTS.md) (Sprints 39–44).
+> lowering so all definitions are visible across files. Sprint 49
+> added `.prj` project files (TOML, three fields: `name` / `sources`
+> / `output`) so the file list lives next to the sources instead of
+> getting retyped per invocation — `nod-driver build --project
+> foo.prj`. The `nod-ide.exe` Windows IDE is written entirely in
+> Dylan across five source files (~2000 lines total) and AOT-builds
+> this way. **Every layer — AOT, user-defined classes, FFI, COM,
+> callbacks, IDE shell, byte-string stdlib — landed in the last
+> thirty-odd sprints and has only been exercised by its own
+> tests.** Expect bugs. Release-mode AOT currently hits an LNK2005
+> `nod_user_main` collision; debug-mode AOT works. The whole AOT
+> trajectory is documented per-sprint in
+> [docs/SPRINTS.md](docs/SPRINTS.md) (Sprints 39–44, 49).
 
 A from-scratch Rust + LLVM JIT for the [Dylan programming language](https://opendylan.org), with a graphical IDE, live inspection, and live incremental compilation. Windows-first; macOS second. 64-bit only.
 
@@ -128,12 +141,17 @@ NewOpenDylan/
     └── nod-od-suite/       # OpenDylan-compatibility test runner
 ```
 
-## Current status — WIP checkpoint through Sprint 45a
+## Current status — WIP checkpoint through Sprint 49
 
 The workspace is real code, not placeholders — and a lot more of it
 than the original sprint plan anticipated. The compiler JITs and
 AOT-compiles non-trivial Dylan programs, the IDE runs as a native
-Win64 EXE written in Dylan, and multi-file AOT builds work. Headlines:
+Win64 EXE written in Dylan, the **Dylan-in-Dylan parser parses the
+test corpus end-to-end** (Sprint 46, post-GAP-011), multi-file AOT
+builds via `.prj` project files work, and the language surface is
+incrementally migrating into stdlib macros (`unless`, `when`,
+`for-each`, `with-cleanup`, `cond`) instead of growing AST nodes.
+Headlines:
 
 **`nod-ide.exe`** — a Windows source editor written **entirely in
 Dylan**, AOT-built to a ~1 MB EXE via `nod-driver build`. The IDE
@@ -170,16 +188,29 @@ self-tests pass under AOT including a 200-op random-edit GC-stress
 walk — Sprints 43a–c. Sprint 43d wired the rope as the live editor
 buffer in `nod-ide.exe`.
 
-**Dylan lexer in Dylan** (Sprint 45a) — `tests/nod-tests/fixtures/
-dylan-lexer.dylan` (~471 lines) defines the full `<token>` class
-hierarchy (16 concrete subclasses including `<integer-token>`,
-`<string-token>`, `<symbol-token>`, `<keyword-token>`,
-`<operator-token>`, `<eof-token>`, …), `<span>`, and per-class
-generics (`colour-of`, `token-kind-name`, `print-token`). A stub
-`lex` returns `[<eof-token>]` only; real tokenisation lands in
-45b. The new `nod-driver dump-dylan-tokens <path>` subcommand
+**Dylan lexer in Dylan** (Sprints 45a, 45b) —
+`tests/nod-tests/fixtures/dylan-lexer.dylan` defines the full
+`<token>` class hierarchy (16 concrete subclasses including
+`<integer-token>`, `<string-token>`, `<symbol-token>`,
+`<keyword-token>`, `<operator-token>`, `<eof-token>`, …), `<span>`,
+and per-class generics (`colour-of`, `token-kind-name`,
+`print-token`). 45b shipped the real `lex` function; 49c retired the
+O(N²) walk-from-byte-0 anti-pattern in `offset-to-line-col` for an
+O(N) sliding cursor. `nod-driver dump-dylan-tokens <path>`
 AOT-compiles the embedded lexer source and prints a text-diff oracle
-dump.
+dump for any input file.
+
+**Dylan parser in Dylan** (Sprint 46) — adjacent
+`tests/nod-tests/fixtures/dylan-parser.dylan` parses the full
+test corpus to an AST. `define class` (with superclass list +
+slot specs), `define generic`, multi-clause statements
+(`if/elseif/else`, `block/cleanup`, `select/otherwise`),
+`for` iteration headers, infix word-operators `mod` / `rem`,
+and method signatures all parse cleanly. `nod-driver parse-dylan
+<path>` builds + caches the parser EXE and prints the AST dump.
+The parser-self-host milestone (parse the whole corpus + GC-stress
+with heavy parsing) was the gating use case that surfaced GAP-011;
+post-fix, the milestone is unblocked.
 
 Roughly 60+ kLOC of Rust across the crates, plus the Dylan fixtures
 above. What's in tree today, by area:
@@ -188,10 +219,16 @@ above. What's in tree today, by area:
 + AST (Sprint 02), fragment-based infix parser (Sprint 03),
 definition forms + body parser (Sprint 04), LID files + library /
 module dependency graph (Sprint 05), pattern-rule macro expander +
-common macro shapes including `unless` / `for-each` migrated to
-stdlib macros (Sprints 17, 18, 25). Multi-file sema entry point —
-`compile_files_for_aot` parses each file then merges ASTs before
-lowering (Sprint 44A–B; AST-level merge hotfix post-44E).
+common macro shapes (Sprints 17, 18). Stdlib-macro migrations:
+`unless` / `for-each` (Sprint 25), `cond` (Sprint 49b). Multi-file
+sema entry point — `compile_files_for_aot` parses each file then
+merges ASTs before lowering (Sprint 44A–B; AST-level merge hotfix
+post-44E). Sprint 46 added `define class` (superclass list + slot
+specs), `define generic`, multi-clause statements (`if/elseif/else`,
+`block/cleanup`, `select/otherwise`), `for` iteration headers, and
+method signatures — enough for the Dylan-in-Dylan parser to parse
+the full test corpus. Sprint 47 lit up multi-value return /
+multi-binder `let (a, b) = …` (GAP-003 closure).
 
 **Semantic analysis** (`nod-sema`). Classes + slots, single dispatch
 (Sprint 12), multiple-inheritance slot layout (Sprint 14), sealing
@@ -273,18 +310,30 @@ lexer fixture and prints the token dump — Sprint 45a).
 
 **What's still warning-flagged:**
 
-- `gc.statepoint` precise-roots emission (Sprint 11d). The GC has
-  survived real workloads (Richards bench, table churn, the rope
-  stress walk) but the safety story still depends on the mutator
-  not stashing tagged references in registers across allocations.
-- Release-mode AOT (LNK2005 `nod_user_main` collision in the staticlib
-  build). Debug-mode AOT works.
-- `MessageBoxW` from a WNDPROC inside a DirectX-rendered window
+- **Compile-time precise-roots verifier** (the "alloca tracker") not
+  in tree. Sprint 48b's GAP-011 fix makes the invariant true by
+  construction today; the static verifier that would catch a future
+  codegen regression at build time is queued. See
+  `GAP-011_GC_team_writeup.md` for the spec.
+- **Sprint 48 Phase B / C unshipped.** The `is_no_alloc` field on
+  `Computation::DirectCall` and `SealedDirectCall` exists and
+  codegen reads it, but nothing sets it to `true` in production —
+  the annotation pass + tests + docs are queued as task #288. Cost
+  is felt as broken test-crate `Computation::DirectCall`
+  constructors (missing field) that block `cargo test --workspace`.
+- **`*` repetition in the macro engine.** `cond` ships with a
+  fixed arity cap (1–4 test/body pairs + `otherwise`) because the
+  pattern language doesn't yet have a `*` postfix. Adding it
+  unblocks N-arm `case`, `select`, `for`, and removes the cap on
+  `cond`. Queued.
+- **Release-mode AOT** (LNK2005 `nod_user_main` collision in the
+  staticlib build). Debug-mode AOT works.
+- **`MessageBoxW` from a WNDPROC inside a DirectX-rendered window**
   (Sprint 41f investigation). Workaround: `SetWindowTextW` for
   in-app notifications.
-- `empty?` can't be specialised on `<byte-string>` yet — Sprint 16's
-  lower-time list-builtin shortcut intercepts the call before
-  generic dispatch (use `size(s) = 0` for now).
+- **`empty?` can't be specialised on `<byte-string>` yet** —
+  Sprint 16's lower-time list-builtin shortcut intercepts the call
+  before generic dispatch (use `size(s) = 0` for now).
 
 **Test counts:** `cargo test --workspace --tests` runs ~130+ tests
 across the workspace (the bulk are in `nod-tests`). The interactive
@@ -309,6 +358,72 @@ cargo run --bin nod-driver -- build \
 See [docs/SPRINTS.md](docs/SPRINTS.md) for the full per-sprint
 history and [bench/richards.md](bench/richards.md) for the Richards
 sealing-vs-open performance trajectory.
+
+## Where we're going
+
+No fixed schedule — this project moves at whatever cadence is honest
+for a from-scratch language implementation maintained alongside seven
+others. But the *direction* is concrete.
+
+**Next few sprints** (Sprint 50 and adjacent):
+
+- **Close Sprint 46 properly.** Run `parse-dylan` over every fixture
+  in the corpus + a heavy-alloc GC stress pass; declare the
+  parser-self-host milestone done with a one-paragraph headline
+  retro. The GAP-011 fix unblocked it; the work left is mostly
+  bookkeeping.
+- **Sprint 48 follow-up (#288).** Annotate stdlib primitives with
+  `is_no_alloc`, add a fixed-point analysis that propagates it
+  through user-defined functions, write the tests, fix the broken
+  test-crate constructors. Restores `cargo test --workspace` to a
+  clean run and saves a real number of slab slots on hot paths.
+- **The alloca tracker.** Post-codegen LLVM-IR verifier that proves
+  every load from a Word-typed alloca is dominated by either a
+  fresh store or a post-safepoint reload+writeback. Catches the
+  GAP-011 bug class at compile time forever after. Spec is in
+  `GAP-011_GC_team_writeup.md`.
+
+**Year-3 self-hosting trajectory** (Sprints 45c–e and onward):
+
+- **Sprint 45c — stdlib character predicates.** Lift the inlined
+  byte comparisons from the Dylan-lexer into stdlib helpers
+  (`digit?`, `alpha?`, `whitespace?`, `id-start?`, …) that the IDE
+  syntax-colouring engine can also consume.
+- **Sprint 45d — oracle test against the Rust lexer.** Run both
+  lexers over the same corpus and assert byte-for-byte token-stream
+  equivalence. When this passes, the Dylan-side lexer is provably
+  ready to replace the Rust reference.
+- **Sprint 45e — wire the Dylan lexer into the IDE syntax
+  highlighter.** First piece of the IDE actually consuming the
+  self-hosted toolchain.
+- Beyond that: a Dylan-in-Dylan macro expander and a sema pass
+  written in Dylan. The eventual goal is for the compiler to be
+  bootstrapped through itself; the Rust front end becomes the
+  reference oracle.
+
+**Language-surface-in-stdlib direction** (continuing Sprints 25, 49b):
+
+- **Sprint 49e — `*` repetition in the macro engine.** Removes the
+  fixed-arity cap on `cond` and unlocks clean N-arm `case`,
+  `select`, `for`, `with-*`. This is the single biggest unlock for
+  growing the language without growing the AST.
+- After `*` lands: migrate `case`, `select`, and the various `with-*`
+  forms from hardcoded parser arms to stdlib macros. The AST gets
+  smaller; the stdlib gets a few hundred more lines of Dylan
+  source.
+
+**Stretch goals** (named, not committed):
+
+- `gc.statepoint` precise-roots emission via LLVM intrinsics
+  (replaces the current per-call-site slab pattern). Currently the
+  precise-roots machinery is hand-rolled; routing through
+  `gc.statepoint` would let LLVM's register allocator know about
+  GC roots natively. Bigger surgery, much cleaner result.
+- Release-mode AOT (resolve the `nod_user_main` LNK2005).
+- macOS port (`aarch64-apple-darwin`). The non-runtime crates are
+  already platform-clean; the cost is replacing the Win32 surface
+  with a Cocoa one. Same `c-ffi` shape, different `define interface`
+  declarations.
 
 ## Sibling-compiler portfolio
 
