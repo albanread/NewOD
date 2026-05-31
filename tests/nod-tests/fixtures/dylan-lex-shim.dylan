@@ -442,6 +442,12 @@ define constant $ast-kind-local-decl       = 13;
 // word; children are the slot's type expression and init expression,
 // when present.
 define constant $ast-kind-slot-spec        = 14;
+// Sprint 51e — common expression forms.
+define constant $ast-kind-dot-call         = 15;   // receiver.name
+define constant $ast-kind-subscript        = 16;   // receiver[args]
+define constant $ast-kind-unary-op         = 17;   // OP operand
+define constant $ast-kind-kw-arg           = 18;   // key: value
+define constant $ast-kind-paren-list       = 19;   // (a, b) / (e :: <t>)
 
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
@@ -689,6 +695,70 @@ define method emit-node (s :: <ast-slot-spec>, source :: <byte-string>,
   if (instance?(ini, <ast-node>))
     emit-node(ini, source, out);
   end;
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `receiver.name` dot call. Span backfills from the
+// receiver child (the `.name` is a trailing token, not a node).
+define method emit-node (d :: <ast-dot-call>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let idx = emit-record(out, $ast-kind-dot-call, 0, 0);
+  emit-node(dot-receiver(d), source, out);
+  backfill-span-from-children(out, idx);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `receiver[args]` subscript. Children: receiver, then
+// each index arg. Span backfills over the lot.
+define method emit-node (s :: <ast-subscript>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let idx = emit-record(out, $ast-kind-subscript, 0, 0);
+  emit-node(sub-receiver(s), source, out);
+  let args = sub-args(s);
+  let n = %stretchy-vector-size(args);
+  let i = 0;
+  until (i = n)
+    emit-node(%stretchy-vector-element(args, i), source, out);
+    i := i + 1;
+  end;
+  backfill-span-from-children(out, idx);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `OP operand` prefix unary. Span is the operator token.
+define method emit-node (u :: <ast-unary-op>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let op-tok = unary-op(u);
+  let sp = token-span(op-tok);
+  let idx = emit-record(out, $ast-kind-unary-op, span-start(sp), span-end(sp));
+  emit-node(unary-operand(u), source, out);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `key: value` keyword argument. Span is the keyword
+// token; child is the value expression.
+define method emit-node (k :: <ast-kw-arg>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let key-tok = kw-arg-key(k);
+  let sp = token-span(key-tok);
+  let idx = emit-record(out, $ast-kind-kw-arg, span-start(sp), span-end(sp));
+  emit-node(kw-arg-value(k), source, out);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `(a, b)` / `(e :: <type>)` parenthesised list (multi-item
+// or typed head). Children are the items; span backfills over them.
+define method emit-node (p :: <ast-paren-list>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let idx = emit-record(out, $ast-kind-paren-list, 0, 0);
+  let items = paren-list-items(p);
+  let n = %stretchy-vector-size(items);
+  let i = 0;
+  until (i = n)
+    emit-node(%stretchy-vector-element(items, i), source, out);
+    i := i + 1;
+  end;
+  backfill-span-from-children(out, idx);
   patch-subtree-size(out, idx);
 end method;
 

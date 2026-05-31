@@ -98,6 +98,11 @@ fixture.
 |  12 | `StatementClause`| 1 × Body (clause body)                              | Sprint 51e. One trailing clause (`else`/`elseif`/`cleanup`/`exception`/`otherwise`). Span is the clause keyword; for `elseif`, the condition is the clause body's first child. |
 |  13 | `LocalDecl`      | 1 × Body (binding pattern + `= init`)               | Sprint 51e. `let <pattern> = <init>`. Span is the `let` keyword. The body holds the binding (variable-ref, or paren-list for `let (a, b) = …`) then the init expression. |
 |  14 | `SlotSpec`       | 0–2 children: type-expr?, init-expr?                | Sprint 51e. One `slot NAME :: TYPE = INIT` inside a `DefineClass`. Span is the slot word; the type and init expressions are emitted as children when present. Completes the class story (DefineClass → supers + SlotSpecs). |
+|  15 | `DotCall`        | 1 × receiver expr                                   | Sprint 51e. `receiver.name`. Span backfills from the receiver (the `.name` is a trailing token, not a node — host reads it from `&src`). |
+|  16 | `Subscript`      | 1 × receiver, then N × index arg                    | Sprint 51e. `receiver[args]`. Span backfills over receiver + args. |
+|  17 | `UnaryOp`        | 1 × operand                                         | Sprint 51e. Prefix `OP operand`. Span is the operator token. |
+|  18 | `KwArg`          | 1 × value expr                                      | Sprint 51e. `key: value` keyword argument. Span is the keyword token. |
+|  19 | `ParenList`      | N × item                                            | Sprint 51e. `(a, b)` / `(e :: <type>)` — a multi-item or typed parenthesised head (clause heads, etc.). Span backfills over the items. |
 
 v1 deliberately excludes: `DefineMethod`, `DefineConstant`,
 `DefineVariable`, `DefineClass`, `DefineGeneric`, `If`, `Block`,

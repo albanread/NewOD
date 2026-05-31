@@ -49,6 +49,11 @@ pub enum Kind {
     StatementClause = 12,
     LocalDecl = 13,
     SlotSpec = 14,
+    DotCall = 15,
+    Subscript = 16,
+    UnaryOp = 17,
+    KwArg = 18,
+    ParenList = 19,
 }
 
 impl Kind {
@@ -69,6 +74,11 @@ impl Kind {
             12 => Kind::StatementClause,
             13 => Kind::LocalDecl,
             14 => Kind::SlotSpec,
+            15 => Kind::DotCall,
+            16 => Kind::Subscript,
+            17 => Kind::UnaryOp,
+            18 => Kind::KwArg,
+            19 => Kind::ParenList,
             _ => return None,
         })
     }
@@ -90,6 +100,11 @@ impl Kind {
             Kind::StatementClause => "StatementClause",
             Kind::LocalDecl => "LocalDecl",
             Kind::SlotSpec => "SlotSpec",
+            Kind::DotCall => "DotCall",
+            Kind::Subscript => "Subscript",
+            Kind::UnaryOp => "UnaryOp",
+            Kind::KwArg => "KwArg",
+            Kind::ParenList => "ParenList",
         }
     }
 }
