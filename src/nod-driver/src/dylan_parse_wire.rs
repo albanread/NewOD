@@ -45,6 +45,8 @@ pub enum Kind {
     DefineClass = 8,
     DefineMethod = 9,
     DefineGeneric = 10,
+    Statement = 11,
+    StatementClause = 12,
 }
 
 impl Kind {
@@ -61,6 +63,8 @@ impl Kind {
             8 => Kind::DefineClass,
             9 => Kind::DefineMethod,
             10 => Kind::DefineGeneric,
+            11 => Kind::Statement,
+            12 => Kind::StatementClause,
             _ => return None,
         })
     }
@@ -78,6 +82,8 @@ impl Kind {
             Kind::DefineClass => "DefineClass",
             Kind::DefineMethod => "DefineMethod",
             Kind::DefineGeneric => "DefineGeneric",
+            Kind::Statement => "Statement",
+            Kind::StatementClause => "StatementClause",
         }
     }
 }

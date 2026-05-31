@@ -28,6 +28,11 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-05-31 — Parser kind-coverage: the extend-and-test grind begins](2026-05-31-parser-kind-coverage.md)
+  — Sprint 51e. The coverage harness drives kind-by-kind extension:
+  span backfill (and the finding that unspanned Errors are leaves, not
+  containers), then DefineClass/Method/Generic. 77% → 79%; `slot`
+  surfaces as the next target.
 - [2026-05-31 — Front-end self-hosting: the breakthrough session](2026-05-31-front-end-self-hosting.md)
   — Sprints 51b–51e. The Dylan lexer and parser go live inside the
   driver; the architecture is reframed to a Dylan front-end on a

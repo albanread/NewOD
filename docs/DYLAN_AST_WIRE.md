@@ -91,8 +91,11 @@ fixture.
 |   5 | `IntegerLit`     | (leaf)                                              | Span covers the digit run.                       |
 |   6 | `BinaryOp`       | 2 × operand (left, right)                           | Operator is the single token at span_lo of the BinaryOp record's gap between children — host parses from `&src`. |
 |   7 | `Error`          | (leaf)                                              | The Dylan parser bailed on this constituent.    |
-|   8 | `DefineClass`    | 1 × Body (class body — slot specs etc.)             | Sprint 51e. Span is the `class` body-word token; host recovers the name + superclass list from `&src` after the keyword. Body children are largely `Error` until slot-spec kinds land. |
-|   9 | `DefineMethod`   | 1 × Body (method body)                              | Sprint 51e. Same shape as `DefineFunction`; span is the `method` body-word token. |
+|   8 | `DefineClass`    | N × super-expr, then N × slot-spec (`Error` for now)| Sprint 51e. Dedicated `<ast-class-definition>`. Span is the `class` keyword token; host recovers the name from `&src`. Superclass exprs are real children; slot specs are spanned `Error` until the slot kind lands. |
+|   9 | `DefineMethod`   | 1 × Body (method body)                              | Sprint 51e. `<ast-body-definition>` body-word `method`; span is the keyword token. |
+|  10 | `DefineGeneric`  | (leaf)                                              | Sprint 51e. Dedicated `<ast-generic-definition>`; span is the `generic` keyword. Signature recovered from `&src`. |
+|  11 | `Statement`      | 1 × Body (leading body), then N × StatementClause   | Sprint 51e. The whole `<ast-statement>` family — `if`/`until`/`while`/`begin`/`select`/`block`/`for`. Span is the leading keyword; host identifies the statement from `&src`. For `if`, the condition is the leading body's first child. The `for` iteration header is NOT yet emitted (deferred). |
+|  12 | `StatementClause`| 1 × Body (clause body)                              | Sprint 51e. One trailing clause (`else`/`elseif`/`cleanup`/`exception`/`otherwise`). Span is the clause keyword; for `elseif`, the condition is the clause body's first child. |
 
 v1 deliberately excludes: `DefineMethod`, `DefineConstant`,
 `DefineVariable`, `DefineClass`, `DefineGeneric`, `If`, `Block`,

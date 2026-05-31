@@ -427,6 +427,13 @@ define constant $ast-kind-error           = 7;
 define constant $ast-kind-define-class    = 8;
 define constant $ast-kind-define-method   = 9;
 define constant $ast-kind-define-generic  = 10;
+// Sprint 51e — the <ast-statement> family: if / until / while / begin /
+// select / block / for, all one node distinguished by stmt-word. The
+// statement keyword is the span; the host recovers which statement it
+// is from &src. Trailing clauses (elseif/else/cleanup/otherwise) are
+// StatementClause children.
+define constant $ast-kind-statement        = 11;
+define constant $ast-kind-statement-clause = 12;
 
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
@@ -602,6 +609,47 @@ define method emit-node (d :: <ast-generic-definition>, source :: <byte-string>,
   let word-tok = gen-word(d);
   let s = token-span(word-tok);
   emit-record(out, $ast-kind-define-generic, span-start(s), span-end(s));
+end method;
+
+// Sprint 51e — `<ast-statement>`: if / until / while / begin / select /
+// block / for / method-literal, all one node distinguished by the
+// leading `stmt-word` keyword (which is the node's span). Children:
+//   1. the leading body (`stmt-body`) — for `if`, its first
+//      constituent is the condition expression;
+//   2. each trailing clause (`stmt-clauses`: elseif/else/cleanup/
+//      exception/otherwise), as a StatementClause child.
+// The `for` iteration header (`stmt-for-header`) is NOT emitted in v1 —
+// the loop is structured as a Statement with its body, but the
+// iteration spec is left for a later pass (recoverable from &src).
+define method emit-node (s :: <ast-statement>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let word-tok = stmt-word(s);
+  let sp = token-span(word-tok);
+  let idx = emit-record(out, $ast-kind-statement, span-start(sp), span-end(sp));
+  emit-node(stmt-body(s), source, out);
+  let clauses = stmt-clauses(s);
+  if (instance?(clauses, <stretchy-vector>))
+    let n = %stretchy-vector-size(clauses);
+    let i = 0;
+    until (i = n)
+      emit-node(%stretchy-vector-element(clauses, i), source, out);
+      i := i + 1;
+    end;
+  end;
+  patch-subtree-size(out, idx);
+end method;
+
+// One trailing clause of a multi-clause statement (`else`, `elseif`,
+// `cleanup`, `exception`, `otherwise`). Span is the clause keyword; the
+// child is the clause body (for `elseif`, its first constituent is the
+// clause's condition, same shape as the leading `if`).
+define method emit-node (c :: <ast-statement-clause>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let word-tok = clause-word(c);
+  let sp = token-span(word-tok);
+  let idx = emit-record(out, $ast-kind-statement-clause, span-start(sp), span-end(sp));
+  emit-node(clause-body(c), source, out);
+  patch-subtree-size(out, idx);
 end method;
 
 define method emit-node (c :: <ast-call>, source :: <byte-string>,
