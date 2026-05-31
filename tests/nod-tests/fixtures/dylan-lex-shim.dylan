@@ -1,4 +1,5 @@
 Module: dylan-lexer
+Precedence: c
 
 // dylan-lex-shim.dylan — Sprint 51b.
 //

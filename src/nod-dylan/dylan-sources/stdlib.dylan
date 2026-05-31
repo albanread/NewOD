@@ -1,4 +1,5 @@
 Module: dylan
+Precedence: c
 Author: NewOpenDylan stdlib (Sprint 20b)
 
 // ╔══════════════════════════════════════════════════════════════════════════╗

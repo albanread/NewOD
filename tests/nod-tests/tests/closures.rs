@@ -139,9 +139,12 @@ fn curried_addition() {
 #[serial]
 fn reduce_with_captured_state() {
     setup();
+    // Parens are required: Dylan has no operator precedence (flat,
+    // left-associative), so `acc + x * factor` is `(acc + x) * factor`.
+    // The intended reduction is `acc + (x * factor)` ⇒ 18.
     let s = nod_sema::eval_expr_to_string(
         "let factor = 3; \
-         reduce(method (acc, x) acc + x * factor end, 0, #(1, 2, 3))",
+         reduce(method (acc, x) acc + (x * factor) end, 0, #(1, 2, 3))",
     )
     .expect("eval reduce-with-captured");
     assert_eq!(s, "18");

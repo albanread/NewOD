@@ -71,10 +71,12 @@ fn instance_check_boolean_is_false_on_integer() {
 
 #[test]
 fn fixnum_arithmetic_regression() {
-    // The Sprint 07 acceptance case, unchanged in result text, exercises
-    // the tagged-fixnum AddInt + MulInt lowering end-to-end.
+    // Exercises the tagged-fixnum AddInt + MulInt lowering end-to-end.
+    // Dylan has NO operator precedence (flat, left-associative, per the
+    // DRM), so `1 + 2 * 3` is `(1 + 2) * 3 = 9`, not C's `1 + (2*3) = 7`.
+    // (Sprint 51e fixed the parser's precedence.)
     let s = eval_expr_to_string("1 + 2 * 3").expect("eval ok");
-    assert_eq!(s, "7");
+    assert_eq!(s, "9");
 }
 
 #[test]

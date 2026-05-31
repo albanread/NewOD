@@ -65,8 +65,10 @@ fn arity_3_closure_runs() {
 #[serial]
 fn arity_4_closure_runs() {
     setup();
+    // Parens required — Dylan has no operator precedence (flat,
+    // left-associative), so the products must be grouped explicitly.
     let s = nod_sema::eval_expr_to_string(
-        "let f = method (a, b, c, d) a * 1000 + b * 100 + c * 10 + d end; \
+        "let f = method (a, b, c, d) (a * 1000) + (b * 100) + (c * 10) + d end; \
          f(1, 2, 3, 4) end",
     )
     .expect("eval arity-4 closure");
@@ -80,7 +82,7 @@ fn arity_5_closure_runs() {
     setup();
     let s = nod_sema::eval_expr_to_string(
         "let f = method (a, b, c, d, e) \
-            a * 10000 + b * 1000 + c * 100 + d * 10 + e \
+            (a * 10000) + (b * 1000) + (c * 100) + (d * 10) + e \
          end; \
          f(1, 2, 3, 4, 5) end",
     )

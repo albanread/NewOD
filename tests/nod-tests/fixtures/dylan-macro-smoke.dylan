@@ -1,4 +1,5 @@
 Module: dylan-lexer
+Precedence: c
 
 // Sprint 50a/b/c — Dylan-side macro engine smoke test.
 //

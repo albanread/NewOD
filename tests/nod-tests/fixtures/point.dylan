@@ -12,7 +12,12 @@ end class;
 define function distance-squared (p :: <user-point>) => (<integer>)
   let xx = x(p);
   let yy = y(p);
-  xx * xx + yy * yy
+  // Dylan has no operator precedence — all binary operators are flat and
+  // left-associative — so the grouping MUST be explicit. Without the
+  // parens, `xx * xx + yy * yy` is `(((xx * xx) + yy) * yy)`, not the sum
+  // of squares. (This fixture silently relied on C-style precedence until
+  // Sprint 51e fixed the parser; the parens make it correct Dylan.)
+  (xx * xx) + (yy * yy)
 end function distance-squared;
 
 define function main () => (<integer>)

@@ -128,6 +128,18 @@ pub fn parse_module_with_macros(
     };
 
     let mut p = Parser::new(src, tokens, seed_macros);
+    // Sprint 51e — `Precedence:` header pragma. Default is the DRM flat
+    // rule (no precedence, left-associative). A legacy file written
+    // against C-style precedence can opt in with `Precedence: c` in its
+    // module header rather than being rewritten with explicit parens.
+    // (A migration bridge — see docs/journal; the long-term goal is
+    // flat everywhere, dropping the pragma.)
+    if header
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("precedence") && v.trim().eq_ignore_ascii_case("c"))
+    {
+        p.precedence_c = true;
+    }
     let mut items: Vec<Item> = Vec::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
     p.skip_trailing_semis();
@@ -176,6 +188,12 @@ struct Parser<'a> {
     /// in-place as `define macro <name>` items are parsed in the
     /// surrounding module so later items can use the macro.
     known_macros: HashSet<String>,
+    /// Sprint 51e — operator-precedence mode. `false` (the default) is
+    /// the DRM rule: all binary operators are one flat, left-associative
+    /// level. `true` opts a file into legacy C-style precedence
+    /// climbing, set from a `Precedence: c` module header. See
+    /// [`Self::parse_binary`] / [`Self::parse_or`].
+    precedence_c: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -185,6 +203,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             known_macros: seed_macros.clone(),
+            precedence_c: false,
         }
     }
 
@@ -280,9 +299,18 @@ impl<'a> Parser<'a> {
         self.parse_assign()
     }
 
-    /// Assignment (`:=`) — right-assoc, lowest precedence.
+    /// Assignment (`:=`) — right-assoc, lowest precedence. This is the
+    /// only operator that climbs precedence in Dylan; everything below
+    /// is one flat left-associative level (the DRM rule). See
+    /// [`Self::parse_binary`].
     fn parse_assign(&mut self) -> Result<Expr, Diagnostic> {
-        let lhs = self.parse_or()?;
+        // Flat (DRM) by default; legacy `Precedence: c` files climb the
+        // C-style precedence ladder (`parse_or` → … → `parse_pow`).
+        let lhs = if self.precedence_c {
+            self.parse_or()?
+        } else {
+            self.parse_binary()?
+        };
         if matches!(self.peek_kind(), TokenKind::ColonEqual) {
             self.bump();
             let rhs = self.parse_assign()?;
@@ -296,6 +324,66 @@ impl<'a> Parser<'a> {
         }
         Ok(lhs)
     }
+
+    /// All binary operators — ONE flat, left-associative precedence
+    /// level, per the Dylan Reference Manual. Dylan deliberately has no
+    /// precedence among binary operators: `3 + 4 * 5` is `(3 + 4) * 5`
+    /// (= 35), not `3 + (4 * 5)`. So `+ - * / ^ = == ~= ~== < > <= >= &
+    /// | mod rem` all bind equally and group left to right. (`:=` is the
+    /// one exception — right-assoc and looser — handled in
+    /// [`Self::parse_assign`]; unary `-`/`~` bind tighter, in
+    /// [`Self::parse_unary`].)
+    ///
+    /// This matches the Dylan-in-Dylan parser's `is-binary-op?` +
+    /// flat `parse-expression` loop, so `--parse-with-dylan` agrees
+    /// byte-for-byte. (Before Sprint 51e this climbed C-style
+    /// precedence — a real bug that mis-parsed every mixed-operator
+    /// expression.)
+    fn parse_binary(&mut self) -> Result<Expr, Diagnostic> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Bar => BinOp::Or,
+                TokenKind::Amp => BinOp::And,
+                TokenKind::Equal => BinOp::Eq,
+                TokenKind::EqualEqual => BinOp::EqEq,
+                TokenKind::TildeEqual => BinOp::Ne,
+                TokenKind::TildeEqualEqual => BinOp::NeEq,
+                TokenKind::Less => BinOp::Lt,
+                TokenKind::Greater => BinOp::Gt,
+                TokenKind::LessEqual => BinOp::Le,
+                TokenKind::GreaterEqual => BinOp::Ge,
+                TokenKind::Plus => BinOp::Add,
+                TokenKind::Minus => BinOp::Sub,
+                TokenKind::Star => BinOp::Mul,
+                TokenKind::Slash => BinOp::Div,
+                TokenKind::Caret => BinOp::Pow,
+                TokenKind::Ident => {
+                    let t = self.peek();
+                    match self.token_text(t) {
+                        "mod" => BinOp::Mod,
+                        "rem" => BinOp::Rem,
+                        _ => break,
+                    }
+                }
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_unary()?;
+            let span = join(lhs.span(), rhs.span());
+            lhs = Expr::BinOp {
+                span,
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    // ── Legacy C-style precedence ladder (`Precedence: c` files only) ──
+    // Retained so files written before the DRM-flat fix keep parsing
+    // with their original grouping. New code uses `parse_binary` (flat).
 
     fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_and()?;
@@ -406,7 +494,7 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// Exponentiation — right-assoc.
+    /// Exponentiation — right-assoc (legacy C-mode only).
     fn parse_pow(&mut self) -> Result<Expr, Diagnostic> {
         let lhs = self.parse_unary()?;
         if matches!(self.peek_kind(), TokenKind::Caret) {

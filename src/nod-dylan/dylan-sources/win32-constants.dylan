@@ -1,4 +1,5 @@
 Module: dylan
+Precedence: c
 Author: NewOpenDylan Sprint 29 — generated bindings, do not edit by hand.
 
 // Sprint 29 — Win32 integer constants (301 total).

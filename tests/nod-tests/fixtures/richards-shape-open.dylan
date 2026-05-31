@@ -29,7 +29,9 @@ define method run-task (t :: <worker>, packet :: <integer>) => (<integer>)
 end method;
 
 define method run-task (t :: <handler>, packet :: <integer>) => (<integer>)
-  h-state(t) + packet * 3
+  // Parens required: Dylan binary operators are flat / left-associative
+  // (no precedence). See richards-shape.dylan.
+  h-state(t) + (packet * 3)
 end method;
 
 define method run-task (t :: <device>, packet :: <integer>) => (<integer>)

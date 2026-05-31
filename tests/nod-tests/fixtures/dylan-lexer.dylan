@@ -1,4 +1,5 @@
 Module: dylan-lexer
+Precedence: c
 
 // Sprint 45a — Dylan lexer in Dylan, scaffolding phase.
 //

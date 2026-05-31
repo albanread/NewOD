@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-05-31 — DRM flat precedence by default, `Precedence: c` migration bridge](2026-05-31-flat-precedence-pragma.md)
+  — Sprint 51e. The translate gate exposed the Rust parser's C-style
+  precedence as a real bug (Dylan is flat per the DRM). Fixing it broke
+  the whole C-precedence-assuming corpus (incl. the stdlib's char
+  predicates); resolved with a `Precedence:` header pragma — default
+  flat, legacy files opt into `c`.
 - [2026-05-31 — DylanAst → ast::Module: the parser starts replacing parse_module](2026-05-31-dylan-to-ast-translator.md)
   — Sprint 51e, fork #2. Wire enrichment for function signatures
   (kinds 25–30), the `dylan_to_ast` translator, the `--parse-with-dylan`

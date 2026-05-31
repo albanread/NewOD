@@ -1,4 +1,5 @@
 Module: rope
+Precedence: c
 
 // Sprint 43a — immutable read-only rope buffer.
 //

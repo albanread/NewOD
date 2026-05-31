@@ -1,4 +1,5 @@
 Module: nod-ide
+Precedence: c
 
 // Sprint 44 — IDE module split (part 2 of 5: rope buffer).
 //

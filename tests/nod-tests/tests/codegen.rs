@@ -16,8 +16,13 @@ fn eval_literal_integer() {
 
 #[test]
 fn eval_arithmetic_precedence() {
+    // Dylan has NO operator precedence: all binary operators share one
+    // level and are left-associative (DRM). So `1 + 2 * 3` is
+    // `(1 + 2) * 3 = 9`, NOT the C-style `1 + (2 * 3) = 7`. (Sprint 51e
+    // fixed the Rust parser, which had wrongly been climbing C-style
+    // precedence — see docs/journal/2026-05-31-rust-flat-precedence.md.)
     let s = eval_expr_to_string("1 + 2 * 3").expect("eval `1 + 2 * 3`");
-    assert_eq!(s, "7");
+    assert_eq!(s, "9");
 }
 
 #[test]

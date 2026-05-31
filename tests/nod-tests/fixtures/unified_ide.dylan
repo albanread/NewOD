@@ -1,4 +1,5 @@
 Module: nod-ide
+Precedence: c
 
 // Sprint 41g — Save, Save As, Recent files submenu on top of Sprint 41e's
 // File / Help menu bar.

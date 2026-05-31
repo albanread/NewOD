@@ -1,4 +1,5 @@
 Module: nod-ide
+Precedence: c
 
 // Sprint 44 — IDE module split (part 5 of 5: main + handle-wm-message).
 //

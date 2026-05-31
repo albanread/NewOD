@@ -1,4 +1,5 @@
 Module: dylan-lexer
+Precedence: c
 
 // Sprint 46 — Recursive-descent Dylan parser in Dylan.
 //
