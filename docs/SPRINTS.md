@@ -1,7 +1,20 @@
 # NewOpenDylan — Sprint Plan
 
 *Drafted 2026-05-15. Companion to [`PLAN.md`](PLAN.md) (the 12-phase
-roadmap) and [`MANIFESTO.md`](MANIFESTO.md) (the design commitments).*
+roadmap), [`MANIFESTO.md`](MANIFESTO.md) (the design commitments), and
+[`ARCHITECTURE.md`](ARCHITECTURE.md) (the Dylan-front-end / Rust+LLVM-
+back-end split, ratified at Sprint 51).*
+
+> **Architecture pivot (Sprint 51, 2026-05-31):** the sprints below
+> 45 were planned as a pure-Rust compiler that ships a Dylan stdlib.
+> Sprints 45–51 proved the **front-end can be Dylan**: the lexer and
+> parser, written in Dylan, now run inside `nod-driver` itself
+> (`--lex-with-dylan`, `--verify-parse`, `dump-dylan-ast`). The
+> project's permanent shape is now a **Dylan front-end on a Rust+LLVM
+> back-end, split at DFM IR** — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> Sprints 52+ migrate the remaining front-end phases (macros, sema,
+> lowering) to Dylan; the back-end (codegen, GC, JIT, linker) stays
+> Rust forever.
 
 ## Preamble
 

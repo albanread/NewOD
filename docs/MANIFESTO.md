@@ -5,6 +5,16 @@
 The commitments behind NewOpenDylan. The plan in [`PLAN.md`](PLAN.md)
 is the *how*; this is the *what we will not compromise on*.
 
+> **Architecture (ratified 2026-05-31):** NewOpenDylan is a **Dylan
+> front-end on a Rust + LLVM back-end**, split at the DFM IR. The
+> front-end (lexer, parser, macros, sema, AST → DFM lowering) migrates
+> to Dylan and self-hosts; the back-end (DFM → LLVM codegen, GC, JIT,
+> AOT linker, runtime, FFI) stays Rust + LLVM permanently. This
+> supersedes the original "compiler stays in Rust forever" framing in
+> core decision 1 and the Bootstrap section below — see
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full statement and the
+> Sprint 45–51 evidence that drove the change.
+
 ## What this is
 
 NewOpenDylan is a **true revival** of the Dylan programming language —
@@ -49,17 +59,33 @@ NewOpenDylan is **compiler-first**, **Rust-for-the-substrate**,
 **LLVM-based**, **64-bit-first**, **Windows-first**, and
 **IDE-built-by-the-compiler**.
 
-1. **Rust for the native substrate, Dylan for the surface.** The
-   runtime, GC, image loader, reader, macro expander, sealing
-   analyser, IR builder, compiler driver, and the C/Win32 FFI
-   plumbing are written in safe Rust where possible and
-   clearly-scoped `unsafe` where necessary. Workspace lint
-   `unsafe_op_in_unsafe_fn = "deny"` is inherited from our sibling
-   projects. Everything user-facing on top of that substrate — the
-   IDE, the live inspector, the library browser, the sealed-domain
-   visualiser, the REPL surface, every window the user actually
-   touches — is **Dylan code, compiled by our own compiler, calling
-   Win32 directly through `c-ffi`**. See core decision 8.
+1. **Rust + LLVM for the back-end, Dylan for the front-end and the
+   surface — split at the DFM IR.** The back-end — DFM → LLVM
+   codegen, the garbage collector, the JIT, the AOT linker, the
+   runtime (classes, dispatch, conditions), and the C/Win32 FFI
+   plumbing — is written in safe Rust where possible and
+   clearly-scoped `unsafe` where necessary, and **stays Rust + LLVM
+   permanently**. Workspace lint `unsafe_op_in_unsafe_fn = "deny"` is
+   inherited from our sibling projects.
+
+   The **front-end** — lexer, parser, macro expander, semantic
+   analysis / namespace resolution, AST → DFM lowering — was written
+   in Rust to bring the system up, and **migrates to Dylan**,
+   compiled by our own back-end. DFM IR is the contract between the
+   two halves: a Dylan-emitted DFM module and a Rust-emitted DFM
+   module are the same data structure with the same semantics, so the
+   back-end is indifferent to which front-end produced it. Sprints
+   45–51 proved this works — the Dylan lexer and parser run inside the
+   driver today. See [`ARCHITECTURE.md`](ARCHITECTURE.md) and the
+   revised Bootstrap section below.
+
+   Everything user-facing on top of the back-end — the IDE, the live
+   inspector, the library browser, the sealed-domain visualiser, the
+   REPL surface, every window the user actually touches — is **Dylan
+   code, compiled by our own compiler, calling Win32 directly through
+   `c-ffi`**. See core decision 8. The front-end-in-Dylan commitment
+   and the IDE-in-Dylan commitment are the same shape: Dylan hosts
+   everything above the DFM/codegen line.
 
 2. **No hand-written assembly.** Every piece of upstream Open Dylan
    that *had* to be assembly — call frames, GC barriers, multimethod
@@ -341,15 +367,42 @@ plumbing, and the conventions.
 
 ## Bootstrap
 
-NewOpenDylan does **not** self-host. The compiler stays in Rust
-permanently. This is a deliberate departure from upstream Open
-Dylan, where the DFMC compiler is itself a Dylan program and the
-build chain requires a working Dylan compiler to exist.
+*Revised 2026-05-31. The original text here said "NewOpenDylan does
+not self-host; the compiler stays in Rust permanently." Sprints 45–51
+overtook that. The corrected commitment:*
 
-The kernel `dylan` library (`E:\opendylan\sources\dylan\`) is
-ported as *runnable Dylan code* against our Rust compiler — not as
-compiler bootstrap. We accept the cost of writing a substantial
-compiler in Rust to escape the chicken-and-egg cost of self-hosting.
+**The front-end self-hosts; the back-end is permanent Rust + LLVM.**
+NewOpenDylan partially self-hosts at the DFM IR boundary — the same
+division `rustc` (Rust front-end, LLVM back-end) and GHC (Haskell
+front-end, native back-end) draw. The front-end (lexer, parser, macro
+expander, sema, AST → DFM lowering) migrates to Dylan, compiled by our
+own back-end. The back-end (DFM → LLVM codegen, GC, JIT, AOT linker,
+runtime, FFI) stays in Rust + LLVM for the life of the project.
+
+This is **not** the upstream Open Dylan bootstrap, where DFMC is a
+Dylan program *all the way down* and the build chain needs a working
+Dylan compiler to exist. There is no chicken-and-egg: the back-end
+that compiles the Dylan front-end is Rust, always present, never
+itself written in Dylan. We escaped the bootstrap cost by writing the
+*back-end* in Rust — and that cost, once paid, also bought a back-end
+good enough that the front-end could move to Dylan early and cheaply.
+
+How the migration works in practice — write each front-end phase in
+Dylan, AOT-compile it `--library`, static-link it into the driver,
+bridge its output across a committed wire format, gate it behind a
+`--…-with-dylan` flag, validate in verify-mode against the Rust phase,
+then make it the default — is documented in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+The kernel `dylan` library (`E:\opendylan\sources\dylan\`) is still
+ported as *runnable Dylan code* against our compiler. That work is
+unchanged; it now sits alongside the front-end migration rather than
+being the only Dylan-side code the project will ever contain.
+
+**We still do not consume OpenDylan compiler artifacts** — not DFMC
+output, not HARP, not `.img`/`.fasl`. Our Dylan front-end is *our*
+code, written fresh against the DRM and compiled by *our* back-end. We
+are not a downstream consumer of upstream's IR or release schedule.
 
 ## What NewOpenDylan is *not*
 

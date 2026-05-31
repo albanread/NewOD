@@ -687,44 +687,65 @@ conditions before threads) is genuine and we follow it.
 
 ### 2.7 The bootstrap question
 
-OpenDylan is self-hosting. DFMC is written in Dylan. The natural
-bootstrap path therefore looks like: *use OpenDylan to emit something
-that NewOpenDylan can consume.* That is **not** the path we take.
+*Revised 2026-05-31. The original conclusion here was "this is not
+self-hosting and we are not pursuing self-hosting." Sprints 45–51
+overtook it. The corrected position — and the reasons that still
+hold — follow. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full
+statement.*
 
-Reasons:
+OpenDylan is self-hosting *all the way down*: DFMC is written in
+Dylan, and the build chain needs a working Dylan compiler to exist.
+The natural shortcut would be *use OpenDylan to emit something
+NewOpenDylan can consume.* That is **not** the path we take, and that
+much is unchanged:
+
 1. Coupling to upstream's internal IR or back-end output formats
    makes us a downstream consumer of someone else's release
    schedule.
-2. The interesting work — sealing analysis, dispatch optimisation,
-   precise GC under LLVM — happens in our compiler, not theirs. There
-   is no shortcut available.
+2. The interesting back-end work — sealing analysis, dispatch
+   optimisation, precise GC under LLVM — happens in our compiler, not
+   theirs. There is no shortcut available.
 3. NCL took the same line for Common Lisp: NCL does not consume
    Corman's `.img` / `.fasl` artifacts. It re-implements the stdlib
-   in Rust and re-runs the source.
+   in its own front-end and re-runs the source.
 
-**Our bootstrap path:**
+**What changed: we DO self-host the front-end — just not the
+back-end.** NewOpenDylan partially self-hosts at the DFM IR boundary,
+the same division `rustc` and GHC draw:
 
-- **Phase 0–6:** The compiler is pure Rust. It is exercised on
-  hand-written Dylan tests in `tests/nod-tests/` and on small
-  curated `.dylan` files. No Dylan-side compiler code is involved.
-- **Phase 7+:** Once macros land, we begin porting `sources/dylan/`
-  into `nod-dylan/`. This is *running* Dylan source, not bootstrapping
-  the compiler. The compiler stays Rust forever.
-- **Optional future:** A Dylan-side metaobject API that lets Dylan
-  code introspect the compiler at the level the original
-  `dfmc/management/` library does (`define library …` reflectively,
-  REPL `compile-and-load`). This is library code on top of `nod-
-  driver`, not the compiler itself.
+- **Phases 0–6:** The whole compiler is Rust. Exercised on
+  hand-written Dylan tests and curated `.dylan` files. No Dylan-side
+  compiler code yet.
+- **Phases 7–17:** Macros, conditions, collections, FFI, AOT, the
+  Dylan-side IDE. Still a Rust compiler; the Dylan code is *running*
+  programs (stdlib, IDE), not compiler internals.
+- **Sprints 45–51 (the inflection):** The Dylan lexer and parser,
+  written in Dylan as corpus exercises, turned out to work — so we
+  JIT-strapped/static-linked them back into the driver and ran the
+  front-end through them. The lexer is byte-identical to the Rust
+  lexer; the parser agrees with it on the whole corpus. The
+  empirical lesson — *the same DFM produces the same LLVM produces the
+  same machine code* — means the back-end never needs to leave Rust,
+  and the front-end can move to Dylan years earlier than guessed.
+- **Sprints 52+ :** The remaining front-end phases — macro expander,
+  sema/namespace, AST → DFM lowering — migrate to Dylan one at a
+  time, each validated in verify-mode against its Rust counterpart
+  before becoming the default.
 
-This is **not** self-hosting and we are not pursuing self-hosting.
-NewOpenDylan is a Rust compiler for Dylan that ships a Dylan
-standard library. The same arrangement Java has (HotSpot is C++,
-`java.lang` is Java) and the same arrangement NCL has.
+The end state: **the front-end is Dylan, compiled by a Rust + LLVM
+back-end that stays Rust forever.** Codegen, GC, JIT, and the linker
+are the permanent native substrate. This is the arrangement Java has
+at the *runtime* layer (HotSpot is C++, `java.lang` is Java) — but
+NewOpenDylan goes further: the *compiler front-end* is in the language
+too, with only the machine-code generator, the collector, and the
+linker remaining in the systems language.
 
-The risk of this choice is that we lose the eat-our-own-dogfood
-signal that self-hosting gives. We accept that risk: the `nod-od-
-suite` regression battery, run on every CI build against curated
-OpenDylan sample programs, is the substitute.
+We do not lose the eat-our-own-dogfood signal that pure-Rust would
+have cost us — we *gain* it: the Dylan front-end is dogfood, and
+running both front-ends side by side in verify-mode is a stronger
+correctness signal than either alone. The `nod-od-suite` regression
+battery against curated OpenDylan sample programs remains the
+outer gate.
 
 ### 2.8 Closing notes on tractability
 

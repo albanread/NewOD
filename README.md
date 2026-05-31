@@ -52,6 +52,17 @@
 
 A from-scratch Rust + LLVM JIT for the [Dylan programming language](https://opendylan.org), with a graphical IDE, live inspection, and live incremental compilation. Windows-first; macOS second. 64-bit only.
 
+**Architecture: a Dylan front-end on a Rust + LLVM back-end, split at
+the DFM IR.** The front-end — lexer, parser, macros, sema, AST → DFM
+lowering — migrates to Dylan and self-hosts (the lexer and parser run
+inside the driver today, as of Sprint 51). The back-end — DFM → LLVM
+codegen, the garbage collector, the JIT, the AOT linker, the runtime,
+the FFI plumbing — is Rust + LLVM and stays that way permanently. It's
+the division `rustc` and GHC draw: the language hosts everything above
+the IR; the systems substrate hosts codegen and the collector. Full
+statement and migration roadmap in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 This is a **true revival** — not a port, not a fork, not a preservation effort. We keep the language as the Dylan Reference Manual defines it; we replace the implementation, the IDE, the GC, the runtime, and the build chain. See [docs/MANIFESTO.md](docs/MANIFESTO.md) for the design commitments we won't move.
 
 ---
@@ -383,23 +394,32 @@ others. But the *direction* is concrete.
   GAP-011 bug class at compile time forever after. Spec is in
   `GAP-011_GC_team_writeup.md`.
 
-**Year-3 self-hosting trajectory** (Sprints 45c–e and onward):
+**Front-end self-hosting** (the "year-3" trajectory — arrived early,
+at Sprint 51). The plan was a slow march; the lexer and parser turned
+out to work as soon as they were written, so the front-end migration
+is real and shipping. The permanent target is the **Dylan front-end /
+Rust+LLVM back-end split at DFM** ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- **Sprint 45c — stdlib character predicates.** Lift the inlined
-  byte comparisons from the Dylan-lexer into stdlib helpers
-  (`digit?`, `alpha?`, `whitespace?`, `id-start?`, …) that the IDE
-  syntax-colouring engine can also consume.
-- **Sprint 45d — oracle test against the Rust lexer.** Run both
-  lexers over the same corpus and assert byte-for-byte token-stream
-  equivalence. When this passes, the Dylan-side lexer is provably
-  ready to replace the Rust reference.
-- **Sprint 45e — wire the Dylan lexer into the IDE syntax
-  highlighter.** First piece of the IDE actually consuming the
-  self-hosted toolchain.
-- Beyond that: a Dylan-in-Dylan macro expander and a sema pass
-  written in Dylan. The eventual goal is for the compiler to be
-  bootstrapped through itself; the Rust front end becomes the
-  reference oracle.
+- ✅ **Lexer (live).** `nod-driver --lex-with-dylan` runs the
+  Dylan-written lexer (`dylan-lexer.dylan`) for the whole front-end,
+  byte-identical to the Rust lexer on the corpus. Statically linked
+  into the driver as an AOT `.obj`.
+- ✅ **Parser (verify + AST emit).** `--verify-parse` runs the
+  Dylan parser alongside the Rust one and asserts they agree on every
+  fixture (it caught a *Rust* parser gap on its first run).
+  `dump-dylan-ast` has the Dylan parser emit a real AST across a wire
+  format ([docs/DYLAN_AST_WIRE.md](docs/DYLAN_AST_WIRE.md)) that the
+  Rust side decodes.
+- ⏳ **Macro expander, sema, AST → DFM lowering → Dylan** (Sprints
+  52+). Each migrates by the same proven pattern: write in Dylan,
+  AOT-compile `--library`, static-link into the driver, bridge across
+  a committed wire format, validate in verify-mode against the Rust
+  phase, then default.
+- **The back-end never moves.** Codegen, GC, JIT, and the linker are
+  Rust + LLVM for the life of the project. "Front-end in Dylan" is the
+  goal, not a step toward "everything in Dylan" — DFM is the floor.
+  The Rust front-end phases remain as the verify-mode reference oracle
+  until each Dylan phase is the proven default.
 
 **Language-surface-in-stdlib direction** (continuing Sprints 25, 49b):
 
