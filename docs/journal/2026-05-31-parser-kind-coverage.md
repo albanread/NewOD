@@ -84,27 +84,76 @@ below).
    A Dylan-subset gotcha worth remembering: don't write comment-only
    branches.
 
+## The run: 77% → 97%
+
+The loop ran clean through the whole punch-list in one sustained
+session. Each row is one commit (Dylan emit-method + Rust `Kind`
+variant + wire-doc row + harness rerun):
+
+| Commit | Kind(s) added | Coverage | Punch-list effect |
+|--------|---------------|---------:|-------------------|
+| `b86d1de` | DefineClass / DefineMethod / DefineGeneric | 79% | define-class, define-generic cleared; `slot` surfaced |
+| `e74e0e8` | Statement family (`<ast-statement>`) | **88%** | if/until/while/cond/unless all cleared in one node; node count tripled (6697→21086) as bodies opened up |
+| `fbd4fbf` | LocalDecl (`let`) | **95%** | the single biggest leaf contributor; unspanned 2100→1205 |
+| `472caed` | SlotSpec | 96% | class story complete (DefineClass → supers + typed slots); `slot` cleared |
+| `24fd0b3` | DotCall/Subscript/UnaryOp/KwArg/ParenList | **97%** | subscript `[` cleared; unspanned 1226→824 |
+
+The **Statement** node was the standout: one `<ast-statement>` node
+covers if/until/while/begin/select/block/for, so a single emit-method
+cleared three named punch-list items *and* tripled the explored node
+count by descending into every statement body. The "structure a
+container, its children surface as the next target" dynamic compounded
+all the way down.
+
+## Discovered (continued)
+
+5. **The literal long tail is blocked on a parser limitation, not an
+   emitter one — and that's where the mechanical loop ends.** After
+   the expression cluster, the remaining ~824 unspanned `Error`s are
+   the literal subtypes (`<ast-boolean-lit>`, `<ast-symbol-lit>`,
+   `<ast-char-lit>`, `<ast-float-lit>`, `<ast-ratio-lit>`) plus the
+   signature machinery (param-list/return-spec/typed-name). The
+   literals store their *decoded value* (`lit-value`, `lit-name`,
+   `lit-codepoint`, `lit-raw`) but **no source token** —
+   `parse-constant`/`parse-leaf` build them via `make(<ast-…-lit>,
+   value: …)` without `node-token(n) := tok`. So `span-of` returns
+   `(0,0)` and there's no way to recover a span from the node.
+
+   This matters: structuring them now would emit `BooleanLit`/
+   `SymbolLit` with span `0..0` — which raises the coverage % but is
+   **hollow**, because the eventual `DylanAst → ast::Module` build
+   couldn't recover *which* boolean/symbol/char it was. That would be
+   gaming the metric. The honest fix is a small **parser** change:
+   set `node-token` on each literal at parse time, consistent with how
+   every other node works (wire format carries spans, host re-reads
+   source — never values on the wire). It's a different character of
+   work (touches the self-hosting target, deserves its own care) than
+   the mechanical emitter loop, so it's a clean stopping point.
+
 ## Where it leaves us
 
-**Coverage: 79%**, punch-list now:
+**Coverage: 97%** (33641/34466 nodes). All the major structural kinds
+are done: definitions (function/class/method/generic), the statement
+family, `let`, slots, and the core expression forms. Remaining
+punch-list: `824 unspanned` (literal subtypes + signature machinery)
+and `1 hash`.
 
-| Count | Construct | Note |
-|------:|-----------|------|
-| 874 | `<unspanned 0..0>` | leaf bucket — `let`/expr nodes, each needs its own emit-method (span from its own slot) |
-| 218 | `if` | `<ast-statement>` — biggest single spanned win, **next** |
-| 188 | `slot` | newly surfaced from DefineClass children |
-| 87 | `until` | loop statement |
-| ~10 | `define-method`×3, `while`, `cond`, `unless`, punct | tail |
+**The repeatable loop, proven across 5 commits:** pick top punch-list
+item → Dylan emit-method + Rust `Kind` variant + wire-doc row →
+rebuild shim + relink driver → rerun harness → number climbs, next
+target surfaces → commit. ~3 file edits per kind. verify-parse held
+`ok` throughout (emitter changes can't affect the accept/reject
+verdict — that's the untouched `parse-dylan`).
 
-**Next:** `if` (the `<ast-statement>` family — likely covers `until`/
-`while`/`select` too once the statement node is handled, since they
-share `<ast-statement>`). Then `slot` to finish the class story. Then
-chip at the unspanned leaf bucket (`let` first — it's everywhere).
-Eventually: the `DylanAst → ast::Module` translator that makes
-`--parse-with-dylan` replace `parse_module`.
-
-**Repeatable loop, confirmed working:** pick top punch-list item →
-emit-method + Kind variant + wire-doc row → rebuild shim + relink
-driver → rerun harness → number climbs, next target surfaces → commit.
-~3 file edits per kind. The bottleneck is writing Dylan emit-methods,
-which is exactly the right bottleneck.
+**Two genuinely different next steps** (a fork worth a deliberate
+choice, not more grind):
+  1. **Parser change to retain literal source spans** — set
+     `node-token` on the literal nodes in `parse-constant`/`parse-leaf`,
+     then add the literal emit-kinds. Unblocks the last ~824 and
+     completes coverage. Small but touches the parser.
+  2. **The `DylanAst → ast::Module` translator** — the actual
+     `--parse-with-dylan` payoff: turn the wire tree into the canonical
+     Rust AST so the Dylan parser can *replace* `parse_module` for
+     compatible files, with verify-style fallback. This is the
+     bigger-value step and doesn't need 100% kind coverage first
+     (it can fall back on any `Error`).
