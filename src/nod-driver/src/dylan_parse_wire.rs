@@ -47,6 +47,7 @@ pub enum Kind {
     DefineGeneric = 10,
     Statement = 11,
     StatementClause = 12,
+    LocalDecl = 13,
 }
 
 impl Kind {
@@ -65,6 +66,7 @@ impl Kind {
             10 => Kind::DefineGeneric,
             11 => Kind::Statement,
             12 => Kind::StatementClause,
+            13 => Kind::LocalDecl,
             _ => return None,
         })
     }
@@ -84,6 +86,7 @@ impl Kind {
             Kind::DefineGeneric => "DefineGeneric",
             Kind::Statement => "Statement",
             Kind::StatementClause => "StatementClause",
+            Kind::LocalDecl => "LocalDecl",
         }
     }
 }

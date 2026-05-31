@@ -434,6 +434,10 @@ define constant $ast-kind-define-generic  = 10;
 // StatementClause children.
 define constant $ast-kind-statement        = 11;
 define constant $ast-kind-statement-clause = 12;
+// Sprint 51e — `let <pattern> = <init>` local declaration. Span is the
+// `let` keyword; the binding pattern + init expression are the
+// `ldecl-list` body.
+define constant $ast-kind-local-decl       = 13;
 
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
@@ -649,6 +653,19 @@ define method emit-node (c :: <ast-statement-clause>, source :: <byte-string>,
   let sp = token-span(word-tok);
   let idx = emit-record(out, $ast-kind-statement-clause, span-start(sp), span-end(sp));
   emit-node(clause-body(c), source, out);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `let <pattern> = <init>`. Span is the `let` keyword; the
+// single child is the `ldecl-list` body, which holds the binding
+// pattern (a variable-ref or paren-list for `let (a, b) = …`) followed
+// by the `= init` expression.
+define method emit-node (d :: <ast-local-decl>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let word-tok = ldecl-word(d);
+  let sp = token-span(word-tok);
+  let idx = emit-record(out, $ast-kind-local-decl, span-start(sp), span-end(sp));
+  emit-node(ldecl-list(d), source, out);
   patch-subtree-size(out, idx);
 end method;
 
