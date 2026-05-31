@@ -137,3 +137,61 @@ which together flip `factorial.dylan` (and much of the corpus) to
 translated — the operator-from-`&src` recovery is the one genuinely
 new technique. Each is one translator function + (where needed) a wire
 tweak, measured by the translated count climbing.
+
+## Addendum — BinaryOp + `if`: 1/34 → 4/34, and the macro-seeding divergence
+
+Took the next increment immediately. Pure translator work — no wire
+change (all the needed kinds already emit).
+
+1. **`BinaryOp` → `Expr::BinOp`.** The operator token isn't a node — it
+   lives in the source *gap* between the operands. The wrinkle: a
+   node's own span may not cover its children (a `Call`'s record span is
+   just its `(` paren — `110..111` while its subtree is `101..116`), so
+   bounding the gap by the operand *records'* spans reads the wrong
+   bytes. Fix: a `subtree_extent` helper that takes the min-lo/max-hi
+   over each operand's whole subtree, then `&src[lhs.hi .. rhs.lo]`
+   trimmed → the operator string → `parse_binop`. `n * factorial(n-1)`
+   resolves `*` correctly because `rhs`'s leftmost extent is the
+   callee `factorial` (101), not the `Call` record (110).
+
+2. **`Statement(if)` → `Expr::If`.** The wire `if` is a `Statement`
+   whose first child is a leading `Body` of `[cond, then-forms…]` and
+   whose trailing `StatementClause` children are `else`/`elseif`. v1
+   builds `If { cond, then_: Begin(then-forms), else_: Begin(else-body) }`
+   — both arms `Begin`-wrapped, matching the Rust parser exactly. `elseif`
+   (nested-If desugaring) and non-`if` statement keywords fall back.
+
+**Result: 4/34** — `hello`, `factorial`, `gap011-jcs-min-crash`,
+`sprint09-add` all translate byte-identically.
+
+**Discovered — the two parsers disagree on macro calls, and the gate
+caught it.** The increment turned two `macro-when-*` fixtures from
+"fell back" into *divergences*: the translator produced a *different*
+AST than Rust. Root cause is genuinely deep — **the Rust `dump-ast`
+seeds the parser with the stdlib body-macro names
+(`when`/`unless`/`cond`/…), but the Dylan parser has no macro
+knowledge.** So `when (x > 3) 42 end`: Rust folds it into one
+`(MacroCall "when")`; the Dylan parser parses it as a plain *call*
+`when(x>3)` plus a dangling `42`. Both *accept* the file (verify-parse
+is happy), but the trees differ. With `BinaryOp`/`Call` now
+translatable, the translator faithfully rebuilt the Dylan parser's
+*wrong-for-this-purpose* tree — diverging from Rust.
+
+The honest fix (not a metric game): the translator declines any call
+to a known body-macro name (`is_body_macro`, kept in sync with the
+seed list) and falls back. This is correct *because the Dylan parser
+literally cannot represent the form the way Rust does* — the real fix
+is teaching the Dylan parser macro seeding + a `MacroCall` wire kind,
+which is its own increment. Until then, fall back. The lesson reprised:
+the byte-identical gate is the thing that turned "I added BinaryOp and
+4 files translate 🎉" into "…and 2 files now silently lie" — exactly
+the regression a weaker check waves through.
+
+**Now 4/34.** Remaining punch-list: `top-level DefineClass` (13, the
+big one), `Error` nodes (6, emitter-side), `LocalDecl` (4, but the
+`let`-bearing fixtures also hit classes so it won't flip whole files
+until `DefineClass` lands), plus a `cond` statement, a stray
+`binary operator "\""` (safe fall-back), and a top-level `BinaryOp`.
+The highest-leverage next step is **`DefineClass`** — and, the deeper
+structural one, **teaching the Dylan parser the macro set** so
+macro-heavy files stop falling back.

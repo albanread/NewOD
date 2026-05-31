@@ -292,18 +292,190 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
         }
         Kind::Call => {
             let mut it = node.children.iter();
-            let callee = it
+            let callee_node = it
                 .next()
                 .ok_or_else(|| Unsupported("Call with no callee".into()))?;
-            let callee = Box::new(translate_expr(callee, src)?);
+            // The Dylan parser has no body-macro knowledge: it parses
+            // `when (cond) body end` as a plain call `when(cond)` with a
+            // dangling body, whereas the Rust parser (seeded with the
+            // stdlib macro names) folds the whole form into one
+            // `Expr::MacroCall`. The two ASTs genuinely disagree, so we
+            // can't authoritatively translate a call to a known macro —
+            // fall back to the Rust parser for the whole file. (Until the
+            // Dylan parser itself learns macro-call parsing + seeding.)
+            if callee_node.kind == Kind::VariableRef && is_body_macro(slice(src, callee_node)?) {
+                return unsupported(format!(
+                    "call to body-macro {:?} (Dylan parser lacks macro seeding)",
+                    slice(src, callee_node)?
+                ));
+            }
+            let callee = Box::new(translate_expr(callee_node, src)?);
             let mut args = Vec::new();
             for a in it {
                 args.push(translate_expr(a, src)?);
             }
             Ok(Expr::Call { span, callee, args })
         }
+        Kind::BinaryOp => {
+            if node.children.len() != 2 {
+                return unsupported(format!("BinaryOp arity {}", node.children.len()));
+            }
+            let lhs = &node.children[0];
+            let rhs = &node.children[1];
+            // The operator token isn't a node — it lives in the source
+            // gap between the operands. A node's own span may not cover
+            // its children (a `Call`'s span is just its paren), so we
+            // bound the gap by the TRUE subtree extents.
+            let lhs_ext = subtree_extent(lhs)
+                .ok_or_else(|| Unsupported("BinaryOp lhs has no span".into()))?;
+            let rhs_ext = subtree_extent(rhs)
+                .ok_or_else(|| Unsupported("BinaryOp rhs has no span".into()))?;
+            let gap = src
+                .get(lhs_ext.1 as usize..rhs_ext.0 as usize)
+                .ok_or_else(|| Unsupported("BinaryOp operator gap out of bounds".into()))?
+                .trim();
+            let op = parse_binop(gap)
+                .ok_or_else(|| Unsupported(format!("binary operator {gap:?}")))?;
+            let lhs = Box::new(translate_expr(lhs, src)?);
+            let rhs = Box::new(translate_expr(rhs, src)?);
+            Ok(Expr::BinOp { span, op, lhs, rhs })
+        }
+        // A statement at expression position — Dylan's `if`/`while`/… are
+        // value-producing. v1 reconstructs `if` (→ Expr::If with
+        // Begin-wrapped arms); other statement keywords fall back.
+        Kind::Statement => translate_statement_as_expr(node, src),
         other => unsupported(format!("expression {other:?}")),
     }
+}
+
+/// The true byte extent of a subtree: min `span_lo` / max `span_hi`
+/// over the node and all descendants that carry a real span (`hi >
+/// lo`). Unspanned nodes (`0..0`, e.g. a backfill-less `Call` whose own
+/// record is just the paren) contribute only through their children.
+fn subtree_extent(node: &DylanAst) -> Option<(u32, u32)> {
+    let mut acc: Option<(u32, u32)> = if node.span_hi > node.span_lo {
+        Some((node.span_lo, node.span_hi))
+    } else {
+        None
+    };
+    for c in &node.children {
+        if let Some((clo, chi)) = subtree_extent(c) {
+            acc = Some(match acc {
+                Some((lo, hi)) => (lo.min(clo), hi.max(chi)),
+                None => (clo, chi),
+            });
+        }
+    }
+    acc
+}
+
+/// The stdlib body-shaped macro names the Rust `dump-ast` path seeds
+/// the parser with. A call to one of these is a `MacroCall` to the Rust
+/// parser but a plain function call to the (macro-unaware) Dylan parser
+/// — so the translator declines it. Keep in sync with the seed list in
+/// `main.rs::run_dump_ast`.
+fn is_body_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "case" | "cond" | "for-each" | "iterate" | "select" | "unless" | "when" | "while"
+    )
+}
+
+/// Map a Dylan infix-operator token to `ast::BinOp`. The gap is trimmed
+/// to exactly the operator, so exact matching disambiguates `=`/`==`/`:=`.
+fn parse_binop(op: &str) -> Option<nod_reader::ast::BinOp> {
+    use nod_reader::ast::BinOp;
+    Some(match op {
+        "+" => BinOp::Add,
+        "-" => BinOp::Sub,
+        "*" => BinOp::Mul,
+        "/" => BinOp::Div,
+        "mod" => BinOp::Mod,
+        "rem" => BinOp::Rem,
+        "^" => BinOp::Pow,
+        "=" => BinOp::Eq,
+        "==" => BinOp::EqEq,
+        "~=" => BinOp::Ne,
+        "~==" => BinOp::NeEq,
+        "<" => BinOp::Lt,
+        ">" => BinOp::Gt,
+        "<=" => BinOp::Le,
+        ">=" => BinOp::Ge,
+        "&" => BinOp::And,
+        "|" => BinOp::Or,
+        ":=" => BinOp::Assign,
+        _ => return None,
+    })
+}
+
+/// Translate an `if` statement to `Expr::If`. The wire `Statement` node
+/// for `if` is: child[0] = a leading `Body` holding `[cond, then-forms…]`,
+/// then zero-or-more `StatementClause` children (`else`/`elseif`). v1
+/// handles a bare `if` and a single `else`; `elseif` (which desugars to
+/// a nested `If`) and other statement keywords fall back.
+fn translate_statement_as_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
+    let kw = slice(src, node)?;
+    if kw != "if" {
+        return unsupported(format!("statement {kw:?}"));
+    }
+    let mut children = node.children.iter();
+    let head = children
+        .next()
+        .ok_or_else(|| Unsupported("if: no head body".into()))?;
+    if head.kind != Kind::Body {
+        return unsupported("if: head is not a Body");
+    }
+    if head.children.is_empty() {
+        return unsupported("if: empty head body (no condition)");
+    }
+    let cond = Box::new(translate_expr(&head.children[0], src)?);
+    let then_body = head.children[1..]
+        .iter()
+        .map(|c| translate_expr(c, src))
+        .collect::<Result<Vec<_>, _>>()?;
+    let then_ = Box::new(Expr::Begin {
+        span: span_of(head),
+        body: then_body,
+    });
+
+    let mut else_: Option<Box<Expr>> = None;
+    for clause in children {
+        if clause.kind != Kind::StatementClause {
+            return unsupported(format!("if: unexpected child {:?}", clause.kind));
+        }
+        let ckw = slice(src, clause)?;
+        if ckw != "else" {
+            // `elseif`/`finally`/… — the nested-If desugaring is a later
+            // increment; fall back for now.
+            return unsupported(format!("if clause {ckw:?}"));
+        }
+        if else_.is_some() {
+            return unsupported("if: multiple else clauses");
+        }
+        let cbody = clause
+            .children
+            .first()
+            .ok_or_else(|| Unsupported("else: no body".into()))?;
+        if cbody.kind != Kind::Body {
+            return unsupported("else: clause child is not a Body");
+        }
+        let else_body = cbody
+            .children
+            .iter()
+            .map(|c| translate_expr(c, src))
+            .collect::<Result<Vec<_>, _>>()?;
+        else_ = Some(Box::new(Expr::Begin {
+            span: span_of(cbody),
+            body: else_body,
+        }));
+    }
+
+    Ok(Expr::If {
+        span: span_of(node),
+        cond,
+        then_,
+        else_,
+    })
 }
 
 /// Parse a Dylan integer literal text into `i128`. Handles decimal and
