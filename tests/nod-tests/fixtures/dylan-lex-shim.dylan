@@ -457,6 +457,15 @@ define constant $ast-kind-symbol-lit       = 22;   // #"foo" / foo:
 define constant $ast-kind-float-lit        = 23;   // 3.14
 define constant $ast-kind-ratio-lit        = 24;   // 1/3
 
+// Sprint 51e — definition signatures, so the host can rebuild
+// ast::Item::DefineFunction/Method {name, params, return_, body}.
+define constant $ast-kind-param-list        = 25;   // ( ... ) param list
+define constant $ast-kind-return-spec       = 26;   // => ( ... )
+define constant $ast-kind-def-name          = 27;   // the definition's name token
+define constant $ast-kind-param             = 28;   // one required param (name [+ type child])
+define constant $ast-kind-var-marker        = 29;   // #rest/#key/#all-keys/#next present → host bails
+define constant $ast-kind-return-value      = 30;   // one return value (name|type [+ type child])
+
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
 // are NOT here — they are their own node types, not body-definitions.
@@ -585,15 +594,99 @@ define method emit-node (d :: <ast-body-definition>, source :: <byte-string>,
     let word-span = token-span(word-tok);
     let lo = span-start(word-span);
     let hi = span-end(word-span);
-    let body = defn-body(d);
     let idx = emit-record(out, kind, lo, hi);
-    emit-node(body, source, out);
-    // The definition's span is its body-word token; the host recovers
-    // the name from the source after the keyword. A later pass can
-    // widen this to the full extent.
+    // Sprint 51e — emit the signature so the host can rebuild the full
+    // ast::Item {name, params, return_, body}. Children, in order:
+    //   DefName (the name token), ParamList, ReturnSpec (only when an
+    //   `=>` was present), then the Body. The host dispatches children
+    //   by KIND, so an omitted optional child just reads as "absent".
+    let nm = defn-method-name(d);
+    if (instance?(nm, <token>))
+      let ns = token-span(nm);
+      let ni = emit-record(out, $ast-kind-def-name, span-start(ns), span-end(ns));
+      patch-subtree-size(out, ni);
+    end;
+    let ps = defn-params(d);
+    if (instance?(ps, <ast-param-list>))
+      emit-node(ps, source, out);
+    end;
+    let rs = defn-return(d);
+    if (instance?(rs, <ast-return-spec>) & ret-present?(rs) = #t)
+      emit-node(rs, source, out);
+    end;
+    emit-node(defn-body(d), source, out);
     patch-subtree-size(out, idx);
   end
 end method;
+
+// Sprint 51e — parameter list. One <param> child per required
+// parameter (each with an optional type child); plus a single
+// <var-marker> when the list has #rest/#key/#all-keys/#next, which the
+// v1 host translator doesn't model (it falls back to the Rust parser).
+define method emit-node (p :: <ast-param-list>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let idx = emit-record(out, $ast-kind-param-list, 0, 0);
+  let req = params-required(p);
+  let n = %stretchy-vector-size(req);
+  let i = 0;
+  until (i = n)
+    emit-typed-name(%stretchy-vector-element(req, i), $ast-kind-param, source, out);
+    i := i + 1;
+  end;
+  if (variadic-param-list?(p))
+    let mi = emit-record(out, $ast-kind-var-marker, 0, 0);
+    patch-subtree-size(out, mi);
+  end;
+  backfill-span-from-children(out, idx);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — return spec. One <return-value> child per value; a
+// <var-marker> when `#rest` appears (host bails). Span is the `=>`
+// arrow token (the parser sets node-token on the return-spec).
+define method emit-node (r :: <ast-return-spec>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(r);
+  let idx = emit-record(out, $ast-kind-return-spec, lo, hi);
+  let vals = ret-values(r);
+  let n = %stretchy-vector-size(vals);
+  let i = 0;
+  until (i = n)
+    emit-typed-name(%stretchy-vector-element(vals, i), $ast-kind-return-value, source, out);
+    i := i + 1;
+  end;
+  if (instance?(ret-rest(r), <token>))
+    let mi = emit-record(out, $ast-kind-var-marker, 0, 0);
+    patch-subtree-size(out, mi);
+  end;
+  patch-subtree-size(out, idx);
+end method;
+
+// Emit one <ast-typed-name> as `kind` (Param or ReturnValue): the
+// record span is the name token; the optional `:: type` becomes a
+// single child expression. For a bare return type (`=> (<integer>)`)
+// the typed-name's tok IS the type and there is no child — the host
+// reads that as name:None, type:Ident(span).
+define function emit-typed-name (tn :: <ast-typed-name>, kind :: <integer>,
+                                 source :: <byte-string>,
+                                 out :: <stretchy-vector>) => ()
+  let nt = typed-name-tok(tn);
+  let s = token-span(nt);
+  let idx = emit-record(out, kind, span-start(s), span-end(s));
+  let ty = typed-name-type(tn);
+  if (instance?(ty, <ast-node>))
+    emit-node(ty, source, out);
+  end;
+  patch-subtree-size(out, idx);
+end function;
+
+// #rest / #key / #all-keys / #next present?  Then the v1 host bails.
+define function variadic-param-list? (p :: <ast-param-list>) => (v :: <boolean>)
+  instance?(params-rest(p), <token>)
+    | (params-key?(p) = #t)
+    | (params-all-keys?(p) = #t)
+    | instance?(params-next(p), <token>)
+end function;
 
 // Sprint 51e — `define class NAME (supers) slot-spec … end`. Span is
 // the `class` keyword; children are the superclass expressions

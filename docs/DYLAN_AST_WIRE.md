@@ -84,7 +84,7 @@ fixture.
 | Ord | Name             | Children (pre-order, in this slot order)            | Notes                                            |
 |-----|------------------|-----------------------------------------------------|--------------------------------------------------|
 |   0 | `Body`           | N constituents (any kind)                           | Top-level module body OR a function body block. |
-|   1 | `DefineFunction` | 1 × Body (function body)                            | `name` is `&src[span_lo..param_paren_lo]`'s trimmed bareword — host extracts. v1: no params, no return spec yet. |
+|   1 | `DefineFunction` | `DefName`, `ParamList`, `ReturnSpec`?, `Body` — in that order | Sprint 51e: children are dispatched by KIND, not position. `DefName` carries the name token's span; `ReturnSpec` is present only when an `=>` appeared. The function span itself is the `function` keyword token. |
 |   2 | `Call`           | 1 × callee (any expr kind), N × arg (any expr kind) | First child is callee; the rest are args.       |
 |   3 | `VariableRef`    | (leaf)                                              | `name` is `&src[span_lo..span_hi]` verbatim.    |
 |   4 | `StringLit`      | (leaf)                                              | Span covers the quoted form; host strips quotes + decodes escapes. |
@@ -92,7 +92,7 @@ fixture.
 |   6 | `BinaryOp`       | 2 × operand (left, right)                           | Operator is the single token at span_lo of the BinaryOp record's gap between children — host parses from `&src`. |
 |   7 | `Error`          | (leaf)                                              | The Dylan parser bailed on this constituent.    |
 |   8 | `DefineClass`    | N × super-expr, then N × slot-spec (`Error` for now)| Sprint 51e. Dedicated `<ast-class-definition>`. Span is the `class` keyword token; host recovers the name from `&src`. Superclass exprs are real children; slot specs are spanned `Error` until the slot kind lands. |
-|   9 | `DefineMethod`   | 1 × Body (method body)                              | Sprint 51e. `<ast-body-definition>` body-word `method`; span is the keyword token. |
+|   9 | `DefineMethod`   | `DefName`, `ParamList`, `ReturnSpec`?, `Body`       | Sprint 51e. Same signature-child shape as `DefineFunction`. `<ast-body-definition>` body-word `method`; span is the keyword token. |
 |  10 | `DefineGeneric`  | (leaf)                                              | Sprint 51e. Dedicated `<ast-generic-definition>`; span is the `generic` keyword. Signature recovered from `&src`. |
 |  11 | `Statement`      | 1 × Body (leading body), then N × StatementClause   | Sprint 51e. The whole `<ast-statement>` family — `if`/`until`/`while`/`begin`/`select`/`block`/`for`. Span is the leading keyword; host identifies the statement from `&src`. For `if`, the condition is the leading body's first child. The `for` iteration header is NOT yet emitted (deferred). |
 |  12 | `StatementClause`| 1 × Body (clause body)                              | Sprint 51e. One trailing clause (`else`/`elseif`/`cleanup`/`exception`/`otherwise`). Span is the clause keyword; for `elseif`, the condition is the clause body's first child. |
@@ -108,6 +108,12 @@ fixture.
 |  22 | `SymbolLit`      | (leaf)                                              | Sprint 51e. `#"foo"` or `foo:` (keyword-name). Span covers the literal; host recovers the symbol name from `&src`. |
 |  23 | `FloatLit`       | (leaf)                                              | Sprint 51e. `3.14`. Span covers the digit/exponent run; host parses the float from `&src`. |
 |  24 | `RatioLit`       | (leaf)                                              | Sprint 51e. `1/3`. Span covers the `num/den` form; host parses the ratio from `&src`. |
+|  25 | `ParamList`      | N × `Param`, then optional `VarMarker`              | Sprint 51e. A function/method parameter list. Each required parameter is a `Param`; a trailing `VarMarker` signals `#rest`/`#key`/`#all-keys`/`#next` (which the v1 host translator doesn't model → it falls back to the Rust parser for the whole file). |
+|  26 | `ReturnSpec`     | N × `ReturnValue`, then optional `VarMarker`        | Sprint 51e. The `=> (…)` clause. Emitted as a definition child ONLY when an `=>` was present (so a missing `ReturnSpec` ⟺ `return_: None`; an empty `ReturnSpec` ⟺ `Some(ReturnSig { values: [] })`). A trailing `VarMarker` signals `#rest` in the return spec. Span is the `=>` token. |
+|  27 | `DefName`        | (leaf)                                              | Sprint 51e. The definition's name token; host reads `&src[span]` for the name string. |
+|  28 | `Param`          | 0–1 child: the type expr                            | Sprint 51e. One required parameter. Span is the parameter NAME token (always the name). An optional single child is the `:: type` expression. `name = &src[span]`. |
+|  29 | `VarMarker`      | (leaf, span 0..0)                                   | Sprint 51e. Sentinel inside a `ParamList`/`ReturnSpec` meaning "this list has variadic syntax (`#rest`/`#key`/`#all-keys`/`#next`) the v1 host doesn't reconstruct." The host treats any `VarMarker` as Unsupported and falls back to the Rust parser. |
+|  30 | `ReturnValue`    | 0–1 child: the type expr                            | Sprint 51e. One return value. Span is the value's leading token. If a type child is present → `name = Some(&src[span])`, `type = child`. If NO child → `name = None`, `type = Ident(&src[span])` (a bare return type like `=> (<integer>)`, where the Dylan parser stores the type AS the token). |
 
 v1 deliberately excluded `DefineMethod`, `DefineConstant`,
 `DefineVariable`, `DefineClass`, `DefineGeneric`, the `Statement`
@@ -163,8 +169,13 @@ A whole-file `Body` has `span_lo == 0`, `span_hi == source.len()`.
   them with the Rust parser for now. Sprint 51e adds dedicated kinds.
 * **Diagnostics** beyond a single `Error` marker — Sprint 51e adds a
   parallel error-detail stretchy-vector.
-* **`ast::Module` construction** — v1 ships a Rust mirror tree
-  (`DylanAstNode`) and a `dump-dylan-ast` subcommand that prints it.
-  Sprint 51e converts the mirror tree into the canonical
-  `ast::Module` and wires `--parse-with-dylan` to replace
-  `parse_module` outright.
+* **`ast::Module` construction** — **done (Sprint 51e).**
+  `src/nod-driver/src/dylan_to_ast.rs` converts the wire tree into the
+  canonical `ast::Module`, and `--parse-with-dylan` uses it to replace
+  `parse_module` for the files it fully reconstructs (with fall-back to
+  the Rust parser on any `Unsupported`/`Error`). The
+  `dylan_parse_translate` harness gates the two parsers' AST dumps as
+  byte-identical and reports the translated-vs-fell-back tally. v1
+  translates `define function`/`method` whose bodies are expression
+  statements over the cheap expr subset; classes, `BinaryOp`,
+  statement bodies, and `let` are the next increments.

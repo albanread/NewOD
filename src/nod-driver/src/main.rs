@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 mod dylan_lex_jit;
 mod dylan_parse_check;
 mod dylan_parse_wire;
+mod dylan_to_ast;
 mod project;
 
 /// LLVM major version this driver is targeted against. Read at
@@ -78,6 +79,23 @@ struct Cli {
     /// authoritative path and this flag retires.
     #[arg(long = "verify-parse", global = true)]
     verify_parse: bool,
+
+    /// Sprint 51e — authoritative-mode parser side-load. Run the
+    /// Dylan-side parser, translate its AST wire output into the
+    /// canonical `ast::Module` (`dylan_to_ast`), and USE that as the
+    /// parse result — replacing `parse_module` for files the
+    /// translator fully understands. Any construct the translator
+    /// can't yet reconstruct (unknown kind, modifiers, variadic params,
+    /// statement bodies, …) makes the whole file fall back to the Rust
+    /// parser, so the output is never wrong — only "translated" or
+    /// "fell back".
+    ///
+    /// Implies `--lex-with-dylan` (shared resolver). Also settable via
+    /// `NOD_PARSE_WITH_DYLAN=1`. Currently wired into `dump-ast`; the
+    /// translation-coverage harness asserts the Dylan path's AST is
+    /// byte-identical to the Rust parser's on every fixture.
+    #[arg(long = "parse-with-dylan", global = true)]
+    parse_with_dylan: bool,
 }
 
 #[derive(Subcommand)]
@@ -268,6 +286,20 @@ fn main() -> ExitCode {
         // SAFETY: single-threaded process startup; no other thread is
         // reading env yet.
         unsafe { std::env::set_var("NOD_VERIFY_PARSE", "1"); }
+    }
+
+    // Sprint 51e — `--parse-with-dylan` authoritative mode. Persist to
+    // the env so `run_dump_ast` picks it up. Deliberately does NOT imply
+    // `--lex-with-dylan`: the Dylan path uses the statically-linked shim
+    // (its own resolver, fired lazily in `run_dump_ast`), while the Rust
+    // FALLBACK path must keep using the Rust lexer so a fallback's AST is
+    // identical to plain `dump-ast`. That keeps the byte-identical gate
+    // measuring the translator, not the lexer.
+    let want_parse_with_dylan = cli.parse_with_dylan
+        || std::env::var("NOD_PARSE_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
+    if want_parse_with_dylan {
+        // SAFETY: single-threaded process startup.
+        unsafe { std::env::set_var("NOD_PARSE_WITH_DYLAN", "1"); }
     }
 
     let want_dylan_lex = cli.lex_with_dylan
@@ -851,6 +883,38 @@ fn run_dump_ast(input: &std::path::Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Sprint 51e — authoritative mode. Try the Dylan parser + the
+    // `dylan_to_ast` translator first; print its `format_ast_module` and
+    // return on success. On ANY Unsupported/Error, fall through to the
+    // Rust parser below (the output is then identical to plain
+    // `dump-ast`). The stderr note records which path each file took so
+    // the translation-coverage harness can tally it.
+    if std::env::var("NOD_PARSE_WITH_DYLAN").map(|v| v == "1").unwrap_or(false) {
+        match dylan_lex_jit::init() {
+            Err(e) => {
+                eprintln!(
+                    "parse-with-dylan: fell back (shim init: {e}) on {}",
+                    input.display()
+                );
+            }
+            Ok(()) => match dylan_parse_wire::parse_to_tree(&src) {
+                Ok(tree) => match dylan_to_ast::to_ast_module(&tree, &src) {
+                    Ok(m) => {
+                        eprintln!("parse-with-dylan: translated {}", input.display());
+                        print!("{}", format_ast_module(&m));
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(dylan_to_ast::Unsupported(why)) => {
+                        eprintln!("parse-with-dylan: fell back ({why}) on {}", input.display());
+                    }
+                },
+                Err(e) => {
+                    eprintln!("parse-with-dylan: fell back (wire: {e}) on {}", input.display());
+                }
+            },
+        }
+    }
+
     let mut sm = SourceMap::new();
     let id = match sm.add(input.to_path_buf(), src.clone()) {
         Ok(id) => id,

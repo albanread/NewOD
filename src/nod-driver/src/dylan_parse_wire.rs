@@ -59,6 +59,12 @@ pub enum Kind {
     SymbolLit = 22,
     FloatLit = 23,
     RatioLit = 24,
+    ParamList = 25,
+    ReturnSpec = 26,
+    DefName = 27,
+    Param = 28,
+    VarMarker = 29,
+    ReturnValue = 30,
 }
 
 impl Kind {
@@ -89,6 +95,12 @@ impl Kind {
             22 => Kind::SymbolLit,
             23 => Kind::FloatLit,
             24 => Kind::RatioLit,
+            25 => Kind::ParamList,
+            26 => Kind::ReturnSpec,
+            27 => Kind::DefName,
+            28 => Kind::Param,
+            29 => Kind::VarMarker,
+            30 => Kind::ReturnValue,
             _ => return None,
         })
     }
@@ -120,6 +132,12 @@ impl Kind {
             Kind::SymbolLit => "SymbolLit",
             Kind::FloatLit => "FloatLit",
             Kind::RatioLit => "RatioLit",
+            Kind::ParamList => "ParamList",
+            Kind::ReturnSpec => "ReturnSpec",
+            Kind::DefName => "DefName",
+            Kind::Param => "Param",
+            Kind::VarMarker => "VarMarker",
+            Kind::ReturnValue => "ReturnValue",
         }
     }
 }
@@ -274,6 +292,7 @@ fn format_node(node: &DylanAst, src: &str, depth: usize, out: &mut String) {
             | Kind::SymbolLit
             | Kind::FloatLit
             | Kind::RatioLit
+            | Kind::DefName
     ) {
         let lo = node.span_lo as usize;
         let hi = node.span_hi as usize;

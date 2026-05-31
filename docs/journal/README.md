@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-05-31 — DylanAst → ast::Module: the parser starts replacing parse_module](2026-05-31-dylan-to-ast-translator.md)
+  — Sprint 51e, fork #2. Wire enrichment for function signatures
+  (kinds 25–30), the `dylan_to_ast` translator, the `--parse-with-dylan`
+  flag with fall-back, and a byte-identical translation gate. `hello.dylan`
+  translates byte-identically (1/34); the gate immediately caught a
+  too-empty-Module bug from unspanned `Error` nodes.
 - [2026-05-31 — Parser kind-coverage: the extend-and-test grind begins](2026-05-31-parser-kind-coverage.md)
   — Sprint 51e. The coverage harness drives kind-by-kind extension:
   span backfill (and the finding that unspanned Errors are leaves, not
