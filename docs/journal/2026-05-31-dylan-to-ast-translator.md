@@ -259,3 +259,35 @@ macro-seeding `when`/`cond` group. Next levers: **loops**
 (`until`/`while`), **definition modifiers on the wire**, and the two
 deeper structural fixes (**Rust operator precedence**, **Dylan-parser
 macro seeding**).
+
+## Addendum — loops + an operator-extraction bug: 5/35 → 9/36
+
+Two translator-only steps, no wire change:
+
+1. **`while`/`until` → `Statement::While`/`Until`.** Refactored the
+   statement handling into `translate_statement` (statement position)
+   and `translate_statement_as_expr` (expression position, wraps loops
+   in `Expr::Stmt`), with a shared `translate_stmts` helper for body
+   sequences. The wire `while`/`until` is a `Statement` whose leading
+   `Body` is `[cond, body-forms…]` — same shape as `if`. New fixture
+   `translate-loop.dylan` validates it (the existing loop fixtures all
+   hit the precedence fork in their bodies).
+
+2. **Operator-extraction bug — the `") +"` mystery, now fixed.** Seven
+   fixtures fell back on `binary operator "\""`-ish reasons. Root cause:
+   when the left operand is a **call or parenthesised expression**
+   (`f(x) + y`), the closing `)` isn't covered by any child's span, so
+   it landed in the operator gap → the gap was `") + "`, not `" + "`.
+   The old code `gap.trim()` then failed to match a known operator. Fix:
+   `operator_in_gap` strips ALL parens and whitespace from the gap
+   (operators never contain either), recovering just `+`. Same latent
+   bug fixed in `let`'s `=` check. This is a genuine translator bug the
+   gate's fall-back tally surfaced — not a coverage gap.
+
+**Result: 9/36** (+`gc_precise_two_makes` ×2, +`mutual`). The
+`binary operator` bucket is gone. Dominant remaining blocker:
+**`nested binary op` (11)** — entirely the Rust-precedence fork, which
+the spawned parser-fix task unblocks in one shot. The rest:
+`Error` nodes (6, emitter-side / genuinely unparsed), `when`/`cond`
+macros (3), `class has modifiers` (2), and singletons (`elseif`,
+`SymbolLit`, a typed/destructuring `let`, a top-level binop).

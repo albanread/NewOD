@@ -341,10 +341,19 @@ fn translate_return_spec(node: &DylanAst, src: &str) -> Result<ReturnSig, Unsupp
 /// position becomes `Statement::Expr(Expr::If)`, matching the Rust
 /// parser).
 fn translate_body(node: &DylanAst, src: &str) -> Result<Vec<Statement>, Unsupported> {
+    translate_stmts(&node.children, src)
+}
+
+/// A sequence of body constituents → `Vec<Statement>`. `LocalDecl` →
+/// `Statement::Let`; a `Statement` node → the matching statement form
+/// (`while`/`until` → loops, `if` → `Stmt(Expr::If)`); everything else
+/// is a `Statement::Expr`.
+fn translate_stmts(children: &[DylanAst], src: &str) -> Result<Vec<Statement>, Unsupported> {
     let mut stmts = Vec::new();
-    for child in &node.children {
+    for child in children {
         match child.kind {
             Kind::LocalDecl => stmts.push(translate_local_decl(child, src)?),
+            Kind::Statement => stmts.push(translate_statement(child, src)?),
             _ => stmts.push(Statement::Expr(translate_expr(child, src)?)),
         }
     }
@@ -380,10 +389,10 @@ fn translate_local_decl(node: &DylanAst, src: &str) -> Result<Statement, Unsuppo
         .ok_or_else(|| Unsupported("let: init has no span".into()))?;
     let gap = src
         .get(lhs_ext.1 as usize..rhs_ext.0 as usize)
-        .ok_or_else(|| Unsupported("let: binder gap out of bounds".into()))?
-        .trim();
-    if gap != "=" {
-        return unsupported(format!("let binder operator {gap:?}"));
+        .ok_or_else(|| Unsupported("let: binder gap out of bounds".into()))?;
+    let op_str = operator_in_gap(gap);
+    if op_str != "=" {
+        return unsupported(format!("let binder operator {op_str:?}"));
     }
     if lhs.kind != Kind::VariableRef {
         return unsupported("let: non-simple binder (typed or destructuring)");
@@ -486,10 +495,10 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
                 .ok_or_else(|| Unsupported("BinaryOp rhs has no span".into()))?;
             let gap = src
                 .get(lhs_ext.1 as usize..rhs_ext.0 as usize)
-                .ok_or_else(|| Unsupported("BinaryOp operator gap out of bounds".into()))?
-                .trim();
-            let op = parse_binop(gap)
-                .ok_or_else(|| Unsupported(format!("binary operator {gap:?}")))?;
+                .ok_or_else(|| Unsupported("BinaryOp operator gap out of bounds".into()))?;
+            let op_str = operator_in_gap(gap);
+            let op = parse_binop(&op_str)
+                .ok_or_else(|| Unsupported(format!("binary operator {op_str:?}")))?;
             let lhs = Box::new(translate_expr(lhs, src)?);
             let rhs = Box::new(translate_expr(rhs, src)?);
             Ok(Expr::BinOp { span, op, lhs, rhs })
@@ -551,8 +560,20 @@ fn is_body_macro(name: &str) -> bool {
     )
 }
 
-/// Map a Dylan infix-operator token to `ast::BinOp`. The gap is trimmed
-/// to exactly the operator, so exact matching disambiguates `=`/`==`/`:=`.
+/// Extract the operator token from the source gap between two operands.
+/// The gap can carry a closing `)` from the left operand's call/parens
+/// and/or an opening `(` from the right operand's — e.g. `f(x) + y`
+/// yields the gap `") + "`. Strip ALL parens and whitespace; what
+/// remains is the operator (`+`, `<=`, `:=`, `mod`, …). Operators never
+/// contain parens or whitespace, so this is lossless.
+fn operator_in_gap(gap: &str) -> String {
+    gap.chars()
+        .filter(|c| !c.is_whitespace() && *c != '(' && *c != ')')
+        .collect()
+}
+
+/// Map a Dylan infix-operator token to `ast::BinOp`. The operator is
+/// matched exactly, so `=`/`==`/`:=` disambiguate cleanly.
 fn parse_binop(op: &str) -> Option<nod_reader::ast::BinOp> {
     use nod_reader::ast::BinOp;
     Some(match op {
@@ -578,16 +599,34 @@ fn parse_binop(op: &str) -> Option<nod_reader::ast::BinOp> {
     })
 }
 
-/// Translate an `if` statement to `Expr::If`. The wire `Statement` node
-/// for `if` is: child[0] = a leading `Body` holding `[cond, then-forms…]`,
-/// then zero-or-more `StatementClause` children (`else`/`elseif`). v1
-/// handles a bare `if` and a single `else`; `elseif` (which desugars to
-/// a nested `If`) and other statement keywords fall back.
+/// A `Statement` wire node at EXPRESSION position. `if` → `Expr::If`;
+/// `while`/`until` → `Expr::Stmt(Statement::While|Until)` (the Rust
+/// parser wraps a statement form in `Expr::Stmt` when it appears where
+/// a value is expected). Other keywords fall back.
 fn translate_statement_as_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
-    let kw = slice(src, node)?;
-    if kw != "if" {
-        return unsupported(format!("statement {kw:?}"));
+    match slice(src, node)? {
+        "if" => build_if(node, src),
+        "while" | "until" => Ok(Expr::Stmt(Box::new(translate_statement(node, src)?))),
+        other => unsupported(format!("statement {other:?}")),
     }
+}
+
+/// A `Statement` wire node at STATEMENT position → `ast::Statement`.
+/// `if` → `Statement::Expr(Expr::If)`; `while`/`until` → the loop forms.
+fn translate_statement(node: &DylanAst, src: &str) -> Result<Statement, Unsupported> {
+    match slice(src, node)? {
+        "if" => Ok(Statement::Expr(build_if(node, src)?)),
+        "while" => build_loop(node, src, /* is_while */ true),
+        "until" => build_loop(node, src, /* is_while */ false),
+        other => unsupported(format!("statement {other:?}")),
+    }
+}
+
+/// `if` → `Expr::If`. Wire shape: child[0] = leading `Body` holding
+/// `[cond, then-forms…]`, then zero-or-more `StatementClause` children
+/// (`else`/`elseif`). v1 handles a bare `if` and a single `else`;
+/// `elseif` (nested-If desugaring) falls back.
+fn build_if(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
     let mut children = node.children.iter();
     let head = children
         .next()
@@ -645,6 +684,35 @@ fn translate_statement_as_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsup
         cond,
         then_,
         else_,
+    })
+}
+
+/// `while`/`until` → `Statement::While`/`Until`. Wire shape: child[0] =
+/// leading `Body` holding `[cond, body-forms…]`. The body forms are
+/// translated as statements (so a nested `let`/loop is handled too).
+fn build_loop(node: &DylanAst, src: &str, is_while: bool) -> Result<Statement, Unsupported> {
+    let head = node
+        .children
+        .first()
+        .ok_or_else(|| Unsupported("loop: no head body".into()))?;
+    if head.kind != Kind::Body {
+        return unsupported("loop: head is not a Body");
+    }
+    if head.children.is_empty() {
+        return unsupported("loop: empty head body (no condition)");
+    }
+    if node.children.len() != 1 {
+        // A loop has no trailing clauses; extra children mean something
+        // we don't model (e.g. a `for`/`finally` shape).
+        return unsupported("loop: unexpected trailing clause");
+    }
+    let cond = translate_expr(&head.children[0], src)?;
+    let body = translate_stmts(&head.children[1..], src)?;
+    let span = span_of(node);
+    Ok(if is_while {
+        Statement::While { span, cond, body }
+    } else {
+        Statement::Until { span, cond, body }
     })
 }
 
