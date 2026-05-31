@@ -79,6 +79,18 @@ pub fn to_ast_module(tree: &DylanAst, src: &str) -> Result<Module, Unsupported> 
         .unwrap_or_default();
     let body_start = preamble.as_ref().map(|p| p.end).unwrap_or(0);
 
+    // A `Precedence: c` file is parsed C-style by the Rust parser but
+    // flat by the (pragma-unaware) Dylan-in-Dylan parser — the two can't
+    // agree on mixed-operator grouping, so decline the whole file and
+    // let the host fall back to the Rust parser. (Removed once the Dylan
+    // parser learns the pragma; until then this keeps the gate honest.)
+    if header
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("precedence") && v.trim().eq_ignore_ascii_case("c"))
+    {
+        return unsupported("Precedence: c file — Dylan parser is flat-only");
+    }
+
     let mut items = Vec::new();
     for child in &tree.children {
         // Skip the header forms the Dylan parser lexed as ordinary
@@ -472,18 +484,16 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
             }
             let lhs = &node.children[0];
             let rhs = &node.children[1];
-            // PRECEDENCE FORK: the Rust parser climbs C-style precedence
-            // (`*` binds tighter than `+`), while the Dylan-in-Dylan
-            // parser is flat left-associative (the DRM rule: all infix
-            // operators share one precedence). For a chain like
-            // `a * b + c * d` the two build DIFFERENT trees. We can't
-            // reconcile that here, so any nested binary operator falls
-            // back to the Rust parser. A single binop (operands that
-            // aren't themselves binops) is unambiguous and safe.
-            // (Reconciling the two precedence models is its own task —
-            // see docs/journal.)
+            // Flat precedence now agrees on both sides, but a SEPARATE
+            // gap remains: the Rust parser keeps an `Expr::Paren` wrapper
+            // for a parenthesised sub-expression, while the Dylan wire
+            // drops the parens — so `(a * b) + (c * d)` would translate
+            // without the `Paren` nodes and diverge. Until the translator
+            // recovers parens from `&src`, decline any nested binary
+            // operator (operand that is itself a binop). A single binop
+            // (`n = 0`, `n * f(x)`) is unaffected and still translates.
             if lhs.kind == Kind::BinaryOp || rhs.kind == Kind::BinaryOp {
-                return unsupported("nested binary op (Rust precedence vs Dylan flat-assoc)");
+                return unsupported("nested binary op (paren-wrapper recovery not done yet)");
             }
             // The operator token isn't a node — it lives in the source
             // gap between the operands. A node's own span may not cover
