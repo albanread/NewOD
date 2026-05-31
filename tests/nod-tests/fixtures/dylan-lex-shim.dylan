@@ -455,6 +455,44 @@ define function span-of (node :: <ast-node>) => (lo :: <integer>, hi :: <integer
   end
 end function;
 
+// Sprint 51e — span backfill. Container nodes (<ast-body>, <ast-call>,
+// <ast-binary-op>) carry no leading <token>, so `span-of` returns
+// (0,0) for them. After a container's children have been emitted, this
+// recovers the container's span as the union of its descendants'
+// spans. The walk is bottom-up: each child's own `emit-node` already
+// backfilled it before we patch the parent, so descendant spans are
+// final by the time we read them here. Only fires when the node's own
+// span is empty — a real token-derived span is never overwritten.
+define function backfill-span-from-children (out :: <stretchy-vector>,
+                                             idx :: <integer>) => ()
+  let cur-lo = %stretchy-vector-element(out, idx + 1);
+  let cur-hi = %stretchy-vector-element(out, idx + 2);
+  if (cur-lo = 0 & cur-hi = 0)
+    let total = %stretchy-vector-size(out);
+    let min-lo = 0;
+    let max-hi = 0;
+    let seen = #f;
+    let i = idx + 4;
+    until (i >= total)
+      let lo = %stretchy-vector-element(out, i + 1);
+      let hi = %stretchy-vector-element(out, i + 2);
+      // A real span always has hi > lo >= 0, so hi > 0 ⟺ spanned;
+      // (0,0) is the unspanned marker. Positive condition avoids an
+      // empty `if` branch (the lowerer rejects empty `begin` blocks).
+      if (hi > 0)
+        if (seen = #f | lo < min-lo) min-lo := lo end;
+        if (hi > max-hi) max-hi := hi end;
+        seen := #t;
+      end;
+      i := i + 4;
+    end;
+    if (seen)
+      %stretchy-vector-element-setter(min-lo, out, idx + 1);
+      %stretchy-vector-element-setter(max-hi, out, idx + 2);
+    end;
+  end;
+end function;
+
 // Forward declared via define generic semantics — each method below
 // emits one record (plus children) and returns nothing. The caller is
 // responsible for patching the parent's subtree size if it cares.
@@ -477,6 +515,7 @@ define method emit-node (b :: <ast-body>, source :: <byte-string>,
     emit-node(c, source, out);
     i := i + 1;
   end;
+  backfill-span-from-children(out, idx);
   patch-subtree-size(out, idx);
 end method;
 
@@ -519,6 +558,7 @@ define method emit-node (c :: <ast-call>, source :: <byte-string>,
     emit-node(a, source, out);
     i := i + 1;
   end;
+  backfill-span-from-children(out, idx);
   patch-subtree-size(out, idx);
 end method;
 
@@ -549,6 +589,7 @@ define method emit-node (b :: <ast-binary-op>, source :: <byte-string>,
   let idx = emit-record(out, $ast-kind-binary-op, lo, hi);
   emit-node(binop-left(b), source, out);
   emit-node(binop-right(b), source, out);
+  backfill-span-from-children(out, idx);
   patch-subtree-size(out, idx);
 end method;
 
