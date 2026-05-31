@@ -157,3 +157,55 @@ choice, not more grind):
      compatible files, with verify-style fallback. This is the
      bigger-value step and doesn't need 100% kind coverage first
      (it can fall back on any `Error`).
+
+## Addendum — fork #1 taken: literal source spans + kinds 20–24
+
+We took fork #1 first, because it's the keystone the translator
+(fork #2) needs: a literal node with no span is a literal whose
+*value* the host can't recover. Done in one pass:
+
+1. **Parser: retain the literal token (span).** `parse-leaf`,
+   `parse-constant`, `parse-binary-operand`, and the bare-keyword-arg
+   site all built literal nodes via `make(<ast-…-lit>, value: …)`
+   without `node-token(n) := tok`. The literal subtypes store the
+   *decoded value* (`lit-value`/`lit-name`/`lit-codepoint`/`lit-raw`),
+   never the token — so `span-of` returned `(0,0)`. Added
+   `node-token(n) := tok` at **every** literal make-site (integer,
+   float, ratio, char, boolean, symbol, keyword-name-as-symbol, the
+   `#next`/`#rest`/… pseudo-symbols, and the two symbol sites outside
+   `parse-leaf`).
+
+2. **Emitter + decoder + doc: kinds 20–24.** `BoolLit`=20, `CharLit`=21,
+   `SymbolLit`=22, `FloatLit`=23, `RatioLit`=24 — five leaf
+   `emit-node` methods (Dylan), five `Kind` variants + `from_i64` +
+   `name` (Rust, all three sites to dodge E0004), five
+   `DYLAN_AST_WIRE.md` rows, and the `format_node` leaf-payload preview
+   extended so `dump-dylan-ast` shows the source slice.
+
+**Result: coverage 97% → 99%** (34515/34558 nodes), `unspanned`
+**824 → 42**. All literal buckets left the punch-list. Remaining: 42
+unspanned + 1 `punct:'#'` (signature machinery + a hash form), heavily
+concentrated in the FFI fixture `ide_win_calls.dylan` (`define
+c-function`) and `stdlib-min.dylan`.
+
+**Discovered — the metric can lie; the corpus scan doesn't.** The
+coverage harness counts `Error` nodes, so the moment a literal becomes
+a `SymbolLit` (not an `Error`) it leaves the unspanned bucket *even if
+its span is `0..0`*. The first relink showed 99% — but a targeted dump
+of `richards-shape.dylan` surfaced `(SymbolLit 0..0 "")`: a hollow node
+the metric happily counted as "structured." Two parser make-sites
+(`parse-binary-operand`'s standalone keyword-name, and the bare-keyword
+argument) had been missed. The honest check isn't the percentage — it's
+a **whole-corpus scan for `Lit 0..0`**, which went to **0** only after
+both were fixed. Lesson logged: when a metric improves, verify the
+*thing the metric is a proxy for*, not the metric.
+
+verify-parse spot-checked `ok` on hello/factorial/dylan-parser/point/
+richards-shape — the change is span-only and cannot move the
+accept/reject verdict.
+
+**Now genuinely unblocked for fork #2.** Every literal across the
+corpus carries a real span; the translator can recover `i128`/`f64`/
+`String`/`char`/`bool`/symbol from `&src[span]`. Next: the
+`DylanAst → ast::Module` translator + `--parse-with-dylan` with
+fall-back-on-Error.

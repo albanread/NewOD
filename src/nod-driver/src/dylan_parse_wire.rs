@@ -54,6 +54,11 @@ pub enum Kind {
     UnaryOp = 17,
     KwArg = 18,
     ParenList = 19,
+    BoolLit = 20,
+    CharLit = 21,
+    SymbolLit = 22,
+    FloatLit = 23,
+    RatioLit = 24,
 }
 
 impl Kind {
@@ -79,6 +84,11 @@ impl Kind {
             17 => Kind::UnaryOp,
             18 => Kind::KwArg,
             19 => Kind::ParenList,
+            20 => Kind::BoolLit,
+            21 => Kind::CharLit,
+            22 => Kind::SymbolLit,
+            23 => Kind::FloatLit,
+            24 => Kind::RatioLit,
             _ => return None,
         })
     }
@@ -105,6 +115,11 @@ impl Kind {
             Kind::UnaryOp => "UnaryOp",
             Kind::KwArg => "KwArg",
             Kind::ParenList => "ParenList",
+            Kind::BoolLit => "BoolLit",
+            Kind::CharLit => "CharLit",
+            Kind::SymbolLit => "SymbolLit",
+            Kind::FloatLit => "FloatLit",
+            Kind::RatioLit => "RatioLit",
         }
     }
 }
@@ -251,7 +266,14 @@ fn format_node(node: &DylanAst, src: &str, depth: usize, out: &mut String) {
     // Leaf payload preview from the span.
     if matches!(
         node.kind,
-        Kind::VariableRef | Kind::StringLit | Kind::IntegerLit
+        Kind::VariableRef
+            | Kind::StringLit
+            | Kind::IntegerLit
+            | Kind::BoolLit
+            | Kind::CharLit
+            | Kind::SymbolLit
+            | Kind::FloatLit
+            | Kind::RatioLit
     ) {
         let lo = node.span_lo as usize;
         let hi = node.span_hi as usize;

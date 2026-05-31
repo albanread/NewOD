@@ -448,6 +448,14 @@ define constant $ast-kind-subscript        = 16;   // receiver[args]
 define constant $ast-kind-unary-op         = 17;   // OP operand
 define constant $ast-kind-kw-arg           = 18;   // key: value
 define constant $ast-kind-paren-list       = 19;   // (a, b) / (e :: <t>)
+// Sprint 51e — literal subtypes. All leaves; the host recovers the
+// value by re-reading &src[span] (the parser now retains each
+// literal's source token, so the span is real — see parse-leaf).
+define constant $ast-kind-bool-lit         = 20;   // #t / #f
+define constant $ast-kind-char-lit         = 21;   // 'a'
+define constant $ast-kind-symbol-lit       = 22;   // #"foo" / foo:
+define constant $ast-kind-float-lit        = 23;   // 3.14
+define constant $ast-kind-ratio-lit        = 24;   // 1/3
 
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
@@ -800,6 +808,39 @@ define method emit-node (i :: <ast-integer-lit>, source :: <byte-string>,
                          out :: <stretchy-vector>) => ()
   let (lo, hi) = span-of(i);
   emit-record(out, $ast-kind-integer-lit, lo, hi);
+end method;
+
+// Sprint 51e — the remaining literal leaves. Each now carries a real
+// span (parser retains the token); the host re-reads &src[span] for
+// the value (`#t`/`#f`, `'c'`, `#"sym"`/`sym:`, float, ratio text).
+define method emit-node (b :: <ast-boolean-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(b);
+  emit-record(out, $ast-kind-bool-lit, lo, hi);
+end method;
+
+define method emit-node (c :: <ast-char-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(c);
+  emit-record(out, $ast-kind-char-lit, lo, hi);
+end method;
+
+define method emit-node (s :: <ast-symbol-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(s);
+  emit-record(out, $ast-kind-symbol-lit, lo, hi);
+end method;
+
+define method emit-node (f :: <ast-float-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(f);
+  emit-record(out, $ast-kind-float-lit, lo, hi);
+end method;
+
+define method emit-node (r :: <ast-ratio-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(r);
+  emit-record(out, $ast-kind-ratio-lit, lo, hi);
 end method;
 
 define method emit-node (b :: <ast-binary-op>, source :: <byte-string>,

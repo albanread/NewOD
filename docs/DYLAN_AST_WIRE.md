@@ -103,12 +103,21 @@ fixture.
 |  17 | `UnaryOp`        | 1 × operand                                         | Sprint 51e. Prefix `OP operand`. Span is the operator token. |
 |  18 | `KwArg`          | 1 × value expr                                      | Sprint 51e. `key: value` keyword argument. Span is the keyword token. |
 |  19 | `ParenList`      | N × item                                            | Sprint 51e. `(a, b)` / `(e :: <type>)` — a multi-item or typed parenthesised head (clause heads, etc.). Span backfills over the items. |
+|  20 | `BoolLit`        | (leaf)                                              | Sprint 51e. `#t` / `#f`. Span covers the literal; host re-reads `&src[span]` to recover the boolean. The parser now retains the source token (`node-token`) so the span is real, not `0..0`. |
+|  21 | `CharLit`        | (leaf)                                              | Sprint 51e. `'a'`. Span covers the quoted char form; host strips quotes + decodes escapes from `&src`. |
+|  22 | `SymbolLit`      | (leaf)                                              | Sprint 51e. `#"foo"` or `foo:` (keyword-name). Span covers the literal; host recovers the symbol name from `&src`. |
+|  23 | `FloatLit`       | (leaf)                                              | Sprint 51e. `3.14`. Span covers the digit/exponent run; host parses the float from `&src`. |
+|  24 | `RatioLit`       | (leaf)                                              | Sprint 51e. `1/3`. Span covers the `num/den` form; host parses the ratio from `&src`. |
 
-v1 deliberately excludes: `DefineMethod`, `DefineConstant`,
-`DefineVariable`, `DefineClass`, `DefineGeneric`, `If`, `Block`,
-`For`, `Let`, all the `Statement` kinds, and the rich
-`<ast-literal>` subhierarchy beyond `StringLit` + `IntegerLit`.
-Sprint 51e adds these, one kind per micro-PR if needed.
+v1 deliberately excluded `DefineMethod`, `DefineConstant`,
+`DefineVariable`, `DefineClass`, `DefineGeneric`, the `Statement`
+family, `Let`, and the rich `<ast-literal>` subhierarchy beyond
+`StringLit` + `IntegerLit`. Sprint 51e added all of these (kinds
+8–24), one kind per micro-PR. Still outstanding: `DefineConstant` /
+`DefineVariable` as dedicated kinds (currently `DefineFunction`-shaped
+or `Body` constituents), and signature machinery (param-lists,
+return-specs) on the definition kinds — the host parses those from
+`&src` for now.
 
 Fall-back rule: when the Dylan parser produces a node whose kind
 isn't in this table yet, the emitter writes an `Error` record

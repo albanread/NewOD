@@ -1512,7 +1512,9 @@ define function parse-binary-operand (ts :: <token-stream>) => (n :: <ast-node>)
   if (instance?(t, <keyword-name-token>))
     // A keyword-name token in a non-argument context becomes a symbol literal.
     let tok = ts-advance(ts);
-    make(<ast-symbol-lit>, name: keyword-name-token-name(tok))
+    let n = make(<ast-symbol-lit>, name: keyword-name-token-name(tok));
+    node-token(n) := tok;   // Sprint 51e — retain span (see parse-leaf)
+    n
   elseif (is-unary-op?(t))
     let op      = ts-advance(ts);
     let operand = parse-operand(ts);
@@ -1584,30 +1586,49 @@ end function;
 define function parse-leaf (ts :: <token-stream>) => (n :: <ast-node>)
   let t = ts-peek(ts);
   if (instance?(t, <integer-token>))
+    // Sprint 51e — retain the literal's source token as node-token so
+    // the node carries a span. The literal classes store only the
+    // decoded value; without this they had no span, which blocked both
+    // AST-wire structuring and the DylanAst → ast::Module translation
+    // (the host recovers the value by re-reading &src[span]).
     let tok = ts-advance(ts);
-    make(<ast-integer-lit>, value: integer-token-value(tok),
-                            radix: integer-token-radix(tok))
+    let n = make(<ast-integer-lit>, value: integer-token-value(tok),
+                                    radix: integer-token-radix(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <float-token>))
     let tok = ts-advance(ts);
-    make(<ast-float-lit>, raw: float-token-raw-text(tok))
+    let n = make(<ast-float-lit>, raw: float-token-raw-text(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <ratio-token>))
     let tok = ts-advance(ts);
-    make(<ast-ratio-lit>, raw: ratio-token-raw-text(tok))
+    let n = make(<ast-ratio-lit>, raw: ratio-token-raw-text(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <string-literal-token>))
     parse-string-literal(ts)
   elseif (instance?(t, <character-literal-token>))
     let tok = ts-advance(ts);
-    make(<ast-char-lit>, codepoint: character-literal-token-codepoint(tok))
+    let n = make(<ast-char-lit>, codepoint: character-literal-token-codepoint(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <boolean-literal-token>))
     let tok = ts-advance(ts);
-    make(<ast-boolean-lit>, value: boolean-literal-token-value(tok))
+    let n = make(<ast-boolean-lit>, value: boolean-literal-token-value(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <symbol-literal-token>))
     let tok = ts-advance(ts);
-    make(<ast-symbol-lit>, name: symbol-literal-token-name(tok))
+    let n = make(<ast-symbol-lit>, name: symbol-literal-token-name(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <keyword-name-token>))
     // keyword: in expression context → symbol literal
     let tok = ts-advance(ts);
-    make(<ast-symbol-lit>, name: keyword-name-token-name(tok))
+    let n = make(<ast-symbol-lit>, name: keyword-name-token-name(tok));
+    node-token(n) := tok;
+    n
   elseif (instance?(t, <literal-vector-open>))
     // #(  — list literal
     parse-list-literal(ts)
@@ -1618,8 +1639,10 @@ define function parse-leaf (ts :: <token-stream>) => (n :: <ast-node>)
           | is-keyword?(t, #"hash-key") | is-keyword?(t, #"hash-all-keys"))
     // #next, #rest, #key, #all-keys — treat as symbol
     let tok = ts-advance(ts);
-    make(<ast-symbol-lit>,
-         name: token-name(tok))
+    let n = make(<ast-symbol-lit>,
+                 name: token-name(tok));
+    node-token(n) := tok;
+    n
   elseif (is-punct?(t, #"lparen"))
     // Parenthesised fragment: a grouped expression `(e)`, a typed binding
     // `(e :: <error>)`, or a comma list `(a, b)`.  parse-paren-fragment
@@ -1757,11 +1780,13 @@ define function parse-constant (ts :: <token-stream>) => (n :: <ast-node>)
   let t = ts-peek(ts);
   if (instance?(t, <symbol-literal-token>) | instance?(t, <keyword-name-token>))
     let tok = ts-advance(ts);
-    if (instance?(tok, <keyword-name-token>))
-      make(<ast-symbol-lit>, name: keyword-name-token-name(tok))
-    else
-      make(<ast-symbol-lit>, name: symbol-literal-token-name(tok))
-    end
+    let n = if (instance?(tok, <keyword-name-token>))
+              make(<ast-symbol-lit>, name: keyword-name-token-name(tok))
+            else
+              make(<ast-symbol-lit>, name: symbol-literal-token-name(tok))
+            end;
+    node-token(n) := tok;   // Sprint 51e — retain span (see parse-leaf)
+    n
   else
     parse-leaf(ts)
   end
@@ -1935,9 +1960,10 @@ define function parse-arguments-into (ts :: <token-stream>,
       if (is-punct?(next, #"comma") | is-punct?(next, #"rparen")
             | is-punct?(next, #"rbracket") | is-body-terminator?(next))
         // Bare keyword argument (just the keyword, no value)
-        let arg = make(<ast-kw-arg>, key: key-tok,
-                       value: make(<ast-symbol-lit>,
-                                   name: keyword-name-token-name(key-tok)));
+        let sym = make(<ast-symbol-lit>,
+                       name: keyword-name-token-name(key-tok));
+        node-token(sym) := key-tok;   // Sprint 51e — retain span
+        let arg = make(<ast-kw-arg>, key: key-tok, value: sym);
         add!(args, arg);
       else
         let val = parse-expression(ts);
