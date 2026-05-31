@@ -438,6 +438,10 @@ define constant $ast-kind-statement-clause = 12;
 // `let` keyword; the binding pattern + init expression are the
 // `ldecl-list` body.
 define constant $ast-kind-local-decl       = 13;
+// Sprint 51e — one slot spec inside a `define class`. Span is the slot
+// word; children are the slot's type expression and init expression,
+// when present.
+define constant $ast-kind-slot-spec        = 14;
 
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
@@ -666,6 +670,25 @@ define method emit-node (d :: <ast-local-decl>, source :: <byte-string>,
   let sp = token-span(word-tok);
   let idx = emit-record(out, $ast-kind-local-decl, span-start(sp), span-end(sp));
   emit-node(ldecl-list(d), source, out);
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — one `slot NAME :: TYPE = INIT` (etc.) inside a class
+// body. Span is the slot word (`node-token`); children are the type
+// expression and the init expression, each emitted only when present
+// (an unset slot has `#f` there, not an <ast-node>).
+define method emit-node (s :: <ast-slot-spec>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(s);
+  let idx = emit-record(out, $ast-kind-slot-spec, lo, hi);
+  let ty = slot-type(s);
+  if (instance?(ty, <ast-node>))
+    emit-node(ty, source, out);
+  end;
+  let ini = slot-init(s);
+  if (instance?(ini, <ast-node>))
+    emit-node(ini, source, out);
+  end;
   patch-subtree-size(out, idx);
 end method;
 

@@ -48,6 +48,7 @@ pub enum Kind {
     Statement = 11,
     StatementClause = 12,
     LocalDecl = 13,
+    SlotSpec = 14,
 }
 
 impl Kind {
@@ -67,6 +68,7 @@ impl Kind {
             11 => Kind::Statement,
             12 => Kind::StatementClause,
             13 => Kind::LocalDecl,
+            14 => Kind::SlotSpec,
             _ => return None,
         })
     }
@@ -87,6 +89,7 @@ impl Kind {
             Kind::Statement => "Statement",
             Kind::StatementClause => "StatementClause",
             Kind::LocalDecl => "LocalDecl",
+            Kind::SlotSpec => "SlotSpec",
         }
     }
 }
