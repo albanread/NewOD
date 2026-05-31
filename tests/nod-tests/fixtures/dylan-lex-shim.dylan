@@ -466,6 +466,15 @@ define constant $ast-kind-param             = 28;   // one required param (name 
 define constant $ast-kind-var-marker        = 29;   // #rest/#key/#all-keys/#next present → host bails
 define constant $ast-kind-return-value      = 30;   // one return value (name|type [+ type child])
 
+// Sprint 51e — slot metadata, so the host can rebuild ast::SlotDef
+// {name, allocation, init_keyword, required_init_keyword, type_, init}.
+// Children of a SlotSpec, all KIND-tagged (order-independent):
+define constant $ast-kind-slot-alloc        = 31;   // allocation adjective token (omit → Instance)
+define constant $ast-kind-slot-init-kw      = 32;   // init-keyword name token (e.g. `x:`)
+define constant $ast-kind-slot-required     = 33;   // marker: required-init-keyword
+define constant $ast-kind-slot-type         = 34;   // 1 child: the `:: type` expr
+define constant $ast-kind-slot-init         = 35;   // 1 child: the `= init` expr
+
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
 // are NOT here — they are their own node types, not body-definitions.
@@ -698,6 +707,14 @@ define method emit-node (d :: <ast-class-definition>, source :: <byte-string>,
   let word-tok = defn-word(d);
   let s = token-span(word-tok);
   let idx = emit-record(out, $ast-kind-define-class, span-start(s), span-end(s));
+  // Sprint 51e — class name as a DefName child (same kind as a
+  // function's name), so the host needn't re-scan source after `class`.
+  let nm = class-name(d);
+  if (instance?(nm, <token>))
+    let ns = token-span(nm);
+    let ni = emit-record(out, $ast-kind-def-name, span-start(ns), span-end(ns));
+    patch-subtree-size(out, ni);
+  end;
   let supers = class-supers(d);
   let ns = %stretchy-vector-size(supers);
   let i = 0;
@@ -784,17 +801,69 @@ end method;
 // body. Span is the slot word (`node-token`); children are the type
 // expression and the init expression, each emitted only when present
 // (an unset slot has `#f` there, not an <ast-node>).
+// The allocation-bearing adjective token (`class`/`each-subclass`/
+// `virtual`/`constant`), or #f for the default instance allocation.
+// Matches nod-reader's parser: open/sealed/abstract/concrete are
+// ignored for allocation.
+define function slot-alloc-adjective (s :: <ast-slot-spec>) => (tok :: <object>)
+  let adjs = slot-adjectives(s);
+  let n = %stretchy-vector-size(adjs);
+  let result = #f;
+  let i = 0;
+  until (i = n)
+    let t = %stretchy-vector-element(adjs, i);
+    let w = token-name(t);
+    if (w = "class" | w = "each-subclass" | w = "virtual" | w = "constant")
+      result := t;
+    end;
+    i := i + 1;
+  end;
+  result
+end function;
+
+// Sprint 51e — full slot metadata, so the host rebuilds ast::SlotDef.
+// Span stays the `slot` word; children are KIND-tagged and
+// order-independent: DefName (slot name), then optional SlotAlloc,
+// SlotInitKw, SlotRequired, SlotType, SlotInit.
 define method emit-node (s :: <ast-slot-spec>, source :: <byte-string>,
                          out :: <stretchy-vector>) => ()
   let (lo, hi) = span-of(s);
   let idx = emit-record(out, $ast-kind-slot-spec, lo, hi);
+  let nt = slot-name-tok(s);
+  if (instance?(nt, <token>))
+    let ns = token-span(nt);
+    let ni = emit-record(out, $ast-kind-def-name, span-start(ns), span-end(ns));
+    patch-subtree-size(out, ni);
+  end;
+  let alloc = slot-alloc-adjective(s);
+  if (instance?(alloc, <token>))
+    let asp = token-span(alloc);
+    let ai = emit-record(out, $ast-kind-slot-alloc, span-start(asp), span-end(asp));
+    patch-subtree-size(out, ai);
+  end;
+  let ik = slot-init-kw(s);
+  if (instance?(ik, <token>))
+    let ks = token-span(ik);
+    let ki = emit-record(out, $ast-kind-slot-init-kw, span-start(ks), span-end(ks));
+    patch-subtree-size(out, ki);
+  end;
+  if (slot-required?(s) = #t)
+    let ri = emit-record(out, $ast-kind-slot-required, 0, 0);
+    patch-subtree-size(out, ri);
+  end;
   let ty = slot-type(s);
   if (instance?(ty, <ast-node>))
+    let ti = emit-record(out, $ast-kind-slot-type, 0, 0);
     emit-node(ty, source, out);
+    backfill-span-from-children(out, ti);
+    patch-subtree-size(out, ti);
   end;
   let ini = slot-init(s);
   if (instance?(ini, <ast-node>))
+    let ii = emit-record(out, $ast-kind-slot-init, 0, 0);
     emit-node(ini, source, out);
+    backfill-span-from-children(out, ii);
+    patch-subtree-size(out, ii);
   end;
   patch-subtree-size(out, idx);
 end method;

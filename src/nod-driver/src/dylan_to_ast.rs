@@ -33,7 +33,8 @@
 
 use crate::dylan_parse_wire::{DylanAst, Kind};
 use nod_reader::ast::{
-    Expr, Item, Module, Param, ReturnRest, ReturnSig, ReturnValue, Statement,
+    Binder, Expr, Item, Module, Param, ReturnRest, ReturnSig, ReturnValue, SlotAllocation, SlotDef,
+    Statement,
 };
 use nod_reader::span::{FileId, Span};
 
@@ -107,8 +108,93 @@ pub fn to_ast_module(tree: &DylanAst, src: &str) -> Result<Module, Unsupported> 
 fn translate_item(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     match node.kind {
         Kind::DefineFunction | Kind::DefineMethod => translate_def(node, src),
+        Kind::DefineClass => translate_class(node, src),
         other => unsupported(format!("top-level {other:?}")),
     }
+}
+
+/// `define class NAME (supers) slot… end` → `Item::DefineClass`. Wire
+/// children: `DefName` (class name), then super exprs and `SlotSpec`s
+/// (dispatched by kind).
+fn translate_class(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
+    if has_modifiers(src, node.span_lo as usize) {
+        return unsupported("class has modifiers (not on the wire yet)");
+    }
+    let mut name: Option<String> = None;
+    let mut supers: Vec<Expr> = Vec::new();
+    let mut slots: Vec<SlotDef> = Vec::new();
+    for child in &node.children {
+        match child.kind {
+            Kind::DefName => name = Some(slice(src, child)?.to_string()),
+            Kind::SlotSpec => slots.push(translate_slot(child, src)?),
+            _ => supers.push(translate_expr(child, src)?),
+        }
+    }
+    let name = name.ok_or_else(|| Unsupported("class has no DefName".into()))?;
+    Ok(Item::DefineClass {
+        span: span_of(node),
+        modifiers: Vec::new(),
+        name,
+        supers,
+        slots,
+    })
+}
+
+/// One `SlotSpec` → `SlotDef`. Children are kind-tagged: `DefName`
+/// (name), `SlotAlloc` (allocation adjective), `SlotInitKw`
+/// (init-keyword, host strips the trailing `:`), `SlotRequired`
+/// (required-init-keyword marker), `SlotType`/`SlotInit` (wrapped exprs).
+fn translate_slot(node: &DylanAst, src: &str) -> Result<SlotDef, Unsupported> {
+    let mut name: Option<String> = None;
+    let mut allocation = SlotAllocation::Instance;
+    let mut init_keyword: Option<String> = None;
+    let mut required_init_keyword = false;
+    let mut type_: Option<Expr> = None;
+    let mut init_value: Option<Expr> = None;
+    for child in &node.children {
+        match child.kind {
+            Kind::DefName => name = Some(slice(src, child)?.to_string()),
+            Kind::SlotAlloc => {
+                allocation = match slice(src, child)? {
+                    "class" => SlotAllocation::Class,
+                    "each-subclass" => SlotAllocation::EachSubclass,
+                    "virtual" => SlotAllocation::Virtual,
+                    "constant" => SlotAllocation::Constant,
+                    other => return unsupported(format!("slot allocation {other:?}")),
+                };
+            }
+            Kind::SlotInitKw => {
+                init_keyword = Some(slice(src, child)?.trim_end_matches(':').to_string());
+            }
+            Kind::SlotRequired => required_init_keyword = true,
+            Kind::SlotType => {
+                let t = child
+                    .children
+                    .first()
+                    .ok_or_else(|| Unsupported("SlotType has no child".into()))?;
+                type_ = Some(translate_expr(t, src)?);
+            }
+            Kind::SlotInit => {
+                let v = child
+                    .children
+                    .first()
+                    .ok_or_else(|| Unsupported("SlotInit has no child".into()))?;
+                init_value = Some(translate_expr(v, src)?);
+            }
+            other => return unsupported(format!("slot child {other:?}")),
+        }
+    }
+    let name = name.ok_or_else(|| Unsupported("slot has no name".into()))?;
+    Ok(SlotDef {
+        span: span_of(node),
+        name,
+        type_,
+        init_value,
+        init_keyword,
+        required_init_keyword,
+        setter: None,
+        allocation,
+    })
 }
 
 /// Shared translation for `DefineFunction` / `DefineMethod`, whose wire
@@ -249,16 +335,71 @@ fn translate_return_spec(node: &DylanAst, src: &str) -> Result<ReturnSig, Unsupp
     })
 }
 
-/// A function/method body Body → a `Vec<Statement>`. Each constituent
-/// must be a translatable expression (v1 doesn't do `let`/`if`/loops in
-/// a body — those are `LocalDecl`/`Statement` wire kinds → Unsupported).
+/// A function/method body Body → a `Vec<Statement>`. A `LocalDecl`
+/// constituent is a `Statement::Let`; everything else is a translatable
+/// expression wrapped in `Statement::Expr` (an `if` at statement
+/// position becomes `Statement::Expr(Expr::If)`, matching the Rust
+/// parser).
 fn translate_body(node: &DylanAst, src: &str) -> Result<Vec<Statement>, Unsupported> {
     let mut stmts = Vec::new();
     for child in &node.children {
-        let e = translate_expr(child, src)?;
-        stmts.push(Statement::Expr(e));
+        match child.kind {
+            Kind::LocalDecl => stmts.push(translate_local_decl(child, src)?),
+            _ => stmts.push(Statement::Expr(translate_expr(child, src)?)),
+        }
     }
     Ok(stmts)
+}
+
+/// `let <binder> = <init>` → `Statement::Let`. The Dylan parser models
+/// the whole `binder = init` as a single `=`-`BinaryOp` inside the
+/// LocalDecl's body. v1 handles a single, untyped binder
+/// (`let x = e`); a typed binder (`let x :: T = e`), a multi-binder
+/// (`let (a, b) = e`), or a missing init falls back.
+fn translate_local_decl(node: &DylanAst, src: &str) -> Result<Statement, Unsupported> {
+    let body = node
+        .children
+        .first()
+        .ok_or_else(|| Unsupported("let: no body".into()))?;
+    if body.kind != Kind::Body {
+        return unsupported("let: child is not a Body");
+    }
+    if body.children.len() != 1 {
+        return unsupported(format!("let: body has {} forms", body.children.len()));
+    }
+    let binop = &body.children[0];
+    if binop.kind != Kind::BinaryOp || binop.children.len() != 2 {
+        return unsupported("let: body is not a `binder = init` binding");
+    }
+    let lhs = &binop.children[0];
+    let rhs = &binop.children[1];
+    // Confirm the join operator is `=` (the let binder), not something else.
+    let lhs_ext = subtree_extent(lhs)
+        .ok_or_else(|| Unsupported("let: binder has no span".into()))?;
+    let rhs_ext = subtree_extent(rhs)
+        .ok_or_else(|| Unsupported("let: init has no span".into()))?;
+    let gap = src
+        .get(lhs_ext.1 as usize..rhs_ext.0 as usize)
+        .ok_or_else(|| Unsupported("let: binder gap out of bounds".into()))?
+        .trim();
+    if gap != "=" {
+        return unsupported(format!("let binder operator {gap:?}"));
+    }
+    if lhs.kind != Kind::VariableRef {
+        return unsupported("let: non-simple binder (typed or destructuring)");
+    }
+    let name = slice(src, lhs)?.to_string();
+    let value = translate_expr(rhs, src)?;
+    Ok(Statement::Let {
+        span: span_of(node),
+        binders: vec![Binder {
+            span: span_of(lhs),
+            name,
+            type_: None,
+        }],
+        rest: None,
+        value,
+    })
 }
 
 fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
@@ -322,6 +463,19 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
             }
             let lhs = &node.children[0];
             let rhs = &node.children[1];
+            // PRECEDENCE FORK: the Rust parser climbs C-style precedence
+            // (`*` binds tighter than `+`), while the Dylan-in-Dylan
+            // parser is flat left-associative (the DRM rule: all infix
+            // operators share one precedence). For a chain like
+            // `a * b + c * d` the two build DIFFERENT trees. We can't
+            // reconcile that here, so any nested binary operator falls
+            // back to the Rust parser. A single binop (operands that
+            // aren't themselves binops) is unambiguous and safe.
+            // (Reconciling the two precedence models is its own task —
+            // see docs/journal.)
+            if lhs.kind == Kind::BinaryOp || rhs.kind == Kind::BinaryOp {
+                return unsupported("nested binary op (Rust precedence vs Dylan flat-assoc)");
+            }
             // The operator token isn't a node — it lives in the source
             // gap between the operands. A node's own span may not cover
             // its children (a `Call`'s span is just its paren), so we
@@ -344,6 +498,22 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
         // value-producing. v1 reconstructs `if` (→ Expr::If with
         // Begin-wrapped arms); other statement keywords fall back.
         Kind::Statement => translate_statement_as_expr(node, src),
+        // `key: value` keyword argument → the Rust parser's synthetic
+        // `%kw-arg(Symbol("key:"), value)` call. The `key:` symbol keeps
+        // its trailing colon (matches `(Symbol "x:")`).
+        Kind::KwArg => {
+            let key = slice(src, node)?.to_string();
+            let value_node = node
+                .children
+                .first()
+                .ok_or_else(|| Unsupported("KwArg has no value".into()))?;
+            let value = translate_expr(value_node, src)?;
+            Ok(Expr::Call {
+                span,
+                callee: Box::new(Expr::Ident(span, "%kw-arg".to_string())),
+                args: vec![Expr::Symbol(span, key), value],
+            })
+        }
         other => unsupported(format!("expression {other:?}")),
     }
 }

@@ -195,3 +195,67 @@ until `DefineClass` lands), plus a `cond` statement, a stray
 The highest-leverage next step is **`DefineClass`** — and, the deeper
 structural one, **teaching the Dylan parser the macro set** so
 macro-heavy files stop falling back.
+
+## Addendum — DefineClass + LocalDecl + KwArg, and a real Rust precedence bug
+
+Took on `DefineClass` (the 13-fixture lever) plus the `let`/keyword-arg
+support its bodies need. Two translator-only steps then one wire step:
+
+1. **`LocalDecl` → `Statement::Let`, `KwArg` → `%kw-arg`.** The Dylan
+   parser models `let x = e` as a single `=`-`BinaryOp` inside the
+   LocalDecl body (binder=lhs, init=rhs); v1 handles a single untyped
+   binder. A `key: value` arg becomes the Rust parser's synthetic
+   `%kw-arg(Symbol("key:"), value)` call.
+
+2. **Wire-enrich `SlotSpec` (kinds 31–35) + class name `DefName`.** The
+   `Slot` dump needs name/allocation/required/init-keyword — none of
+   which the old `SlotSpec` carried. New KIND-tagged children:
+   `SlotAlloc` (allocation adjective span), `SlotInitKw` (init-keyword
+   token; host strips `:`), `SlotRequired` (marker), `SlotType`/
+   `SlotInit` (wrapped exprs); the slot/class names ride a reused
+   `DefName` child. `translate_class`/`translate_slot` reconstruct
+   `Item::DefineClass`.
+
+**Validation matters more than the count here.** With the precedence
+fork below, every *existing* class fixture falls back before fully
+translating — so the gate never actually checks my class output. That's
+not honest "done." I added `translate-class.dylan`: a class (super,
+`init-keyword:` slot, `required-init-keyword:` slot) + a single-call
+accessor, deliberately free of the blockers, so it **fully translates
+and the gate validates the DefineClass/slot path byte-identically**.
+Lesson: a translator branch no fully-translating fixture exercises is
+unverified, no matter how clean the code looks. **5/35.**
+
+### Discovered — the Rust parser has the wrong Dylan operator precedence
+
+`point.dylan`'s `xx * xx + yy * yy` *diverged* once classes translated:
+  * Rust: `(+ (* xx xx) (* yy yy))` — C-style, `*` binds tighter.
+  * Dylan-in-Dylan: `(* (+ (* xx xx) yy) yy)` — flat, left-associative.
+
+The Dylan parser is **right**. Per the DRM, all Dylan binary operators
+share one precedence and are left-associative (`3 + 4 * 5` is `35`, not
+`23`). The Rust parser (`parse_assign → parse_or → parse_and →
+parse_cmp → parse_add → parse_mul`) climbs C-style precedence — a real
+bug: it mis-parses every mixed-operator expression, and the compiled
+result is wrong (point computes the wrong distance-squared). The gate
+surfaced a latent correctness bug in the *reference* parser — the
+sharpest "two compilers, one truth" moment yet.
+
+Reconciling it (rewrite the Rust expression parser to flat
+left-assoc) has broad blast radius — it changes the AST for every
+mixed-operator expression and the runtime semantics of existing
+programs, and will churn many expected-AST tests. That's its own
+careful, test-heavy task, NOT a DefineClass side-quest. For now the
+translator **conservatively declines any nested binary operator** (the
+exact place the two precedence models can disagree); single binops
+(`n = 0`, `n * f(x)`) still translate, so factorial is unaffected.
+Flagged for a dedicated fix.
+
+**Now 5/35.** New fall-back punch-list leaders: `statement "until"`/
+`"while"` (loops → `Statement::Until`/`While`), `Error` nodes (6,
+emitter-side), `nested binary op` (the precedence fork — blocked on the
+Rust fix), `class has modifiers` (modifiers not on the wire), and the
+macro-seeding `when`/`cond` group. Next levers: **loops**
+(`until`/`while`), **definition modifiers on the wire**, and the two
+deeper structural fixes (**Rust operator precedence**, **Dylan-parser
+macro seeding**).

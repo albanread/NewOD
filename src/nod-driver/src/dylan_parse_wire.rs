@@ -65,6 +65,11 @@ pub enum Kind {
     Param = 28,
     VarMarker = 29,
     ReturnValue = 30,
+    SlotAlloc = 31,
+    SlotInitKw = 32,
+    SlotRequired = 33,
+    SlotType = 34,
+    SlotInit = 35,
 }
 
 impl Kind {
@@ -101,6 +106,11 @@ impl Kind {
             28 => Kind::Param,
             29 => Kind::VarMarker,
             30 => Kind::ReturnValue,
+            31 => Kind::SlotAlloc,
+            32 => Kind::SlotInitKw,
+            33 => Kind::SlotRequired,
+            34 => Kind::SlotType,
+            35 => Kind::SlotInit,
             _ => return None,
         })
     }
@@ -138,6 +148,11 @@ impl Kind {
             Kind::Param => "Param",
             Kind::VarMarker => "VarMarker",
             Kind::ReturnValue => "ReturnValue",
+            Kind::SlotAlloc => "SlotAlloc",
+            Kind::SlotInitKw => "SlotInitKw",
+            Kind::SlotRequired => "SlotRequired",
+            Kind::SlotType => "SlotType",
+            Kind::SlotInit => "SlotInit",
         }
     }
 }
