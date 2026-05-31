@@ -42,6 +42,9 @@ pub enum Kind {
     IntegerLit = 5,
     BinaryOp = 6,
     Error = 7,
+    DefineClass = 8,
+    DefineMethod = 9,
+    DefineGeneric = 10,
 }
 
 impl Kind {
@@ -55,6 +58,9 @@ impl Kind {
             5 => Kind::IntegerLit,
             6 => Kind::BinaryOp,
             7 => Kind::Error,
+            8 => Kind::DefineClass,
+            9 => Kind::DefineMethod,
+            10 => Kind::DefineGeneric,
             _ => return None,
         })
     }
@@ -69,6 +75,9 @@ impl Kind {
             Kind::IntegerLit => "IntegerLit",
             Kind::BinaryOp => "BinaryOp",
             Kind::Error => "Error",
+            Kind::DefineClass => "DefineClass",
+            Kind::DefineMethod => "DefineMethod",
+            Kind::DefineGeneric => "DefineGeneric",
         }
     }
 }

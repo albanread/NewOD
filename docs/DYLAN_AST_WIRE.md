@@ -91,6 +91,8 @@ fixture.
 |   5 | `IntegerLit`     | (leaf)                                              | Span covers the digit run.                       |
 |   6 | `BinaryOp`       | 2 × operand (left, right)                           | Operator is the single token at span_lo of the BinaryOp record's gap between children — host parses from `&src`. |
 |   7 | `Error`          | (leaf)                                              | The Dylan parser bailed on this constituent.    |
+|   8 | `DefineClass`    | 1 × Body (class body — slot specs etc.)             | Sprint 51e. Span is the `class` body-word token; host recovers the name + superclass list from `&src` after the keyword. Body children are largely `Error` until slot-spec kinds land. |
+|   9 | `DefineMethod`   | 1 × Body (method body)                              | Sprint 51e. Same shape as `DefineFunction`; span is the `method` body-word token. |
 
 v1 deliberately excludes: `DefineMethod`, `DefineConstant`,
 `DefineVariable`, `DefineClass`, `DefineGeneric`, `If`, `Block`,

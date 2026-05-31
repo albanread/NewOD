@@ -419,6 +419,28 @@ define constant $ast-kind-string-lit      = 4;
 define constant $ast-kind-integer-lit     = 5;
 define constant $ast-kind-binary-op       = 6;
 define constant $ast-kind-error           = 7;
+// Sprint 51e — definition kinds.
+// `class` and `generic` parse to DEDICATED nodes
+// (<ast-class-definition> / <ast-generic-definition>), each with its
+// own emit-node below. `function` and `method` are <ast-body-definition>
+// distinguished by body-word, handled by `define-kind-for-word`.
+define constant $ast-kind-define-class    = 8;
+define constant $ast-kind-define-method   = 9;
+define constant $ast-kind-define-generic  = 10;
+
+// Map an <ast-body-definition> body-word to its wire kind, or -1 if the
+// emitter doesn't structure that form yet (→ Error). `class`/`generic`
+// are NOT here — they are their own node types, not body-definitions.
+define function define-kind-for-word (word-name :: <byte-string>)
+ => (kind :: <integer>)
+  if (word-name = "function")
+    $ast-kind-define-function
+  elseif (word-name = "method")
+    $ast-kind-define-method
+  else
+    -1
+  end
+end function;
 
 // Emit one record (kind, lo, hi, subtree_size). subtree_size patched
 // later — initial push is 1 (just self).
@@ -521,26 +543,65 @@ end method;
 
 define method emit-node (d :: <ast-body-definition>, source :: <byte-string>,
                          out :: <stretchy-vector>) => ()
-  // v1 only handles `define function`. Anything else is Error.
+  // `define function|class|method … end` → the matching kind, with the
+  // definition body emitted as a child. Other body-words (macro, etc.)
+  // still lower to Error until their kinds land.
   let word-tok = defn-word(d);
   let word-name = token-name(word-tok);
-  if (word-name = "function")
+  let kind = define-kind-for-word(word-name);
+  if (kind < 0)
+    let (lo, hi) = span-of(d);
+    emit-record(out, $ast-kind-error, lo, hi);
+  else
     let word-span = token-span(word-tok);
     let lo = span-start(word-span);
     let hi = span-end(word-span);
-    // Stretch the span to cover the whole definition (best-effort:
-    // use the body's end if present).
     let body = defn-body(d);
-    let (body-lo, body-hi) = span-of(body);
-    let outer-hi = if (body-hi > hi) body-hi else hi end;
-    let body-lo-unused = body-lo; // discard explicitly
-    let idx = emit-record(out, $ast-kind-define-function, lo, outer-hi);
+    let idx = emit-record(out, kind, lo, hi);
     emit-node(body, source, out);
+    // The definition's span is its body-word token; the host recovers
+    // the name from the source after the keyword. A later pass can
+    // widen this to the full extent.
     patch-subtree-size(out, idx);
-  else
-    let (lo, hi) = span-of(d);
-    emit-record(out, $ast-kind-error, lo, hi);
   end
+end method;
+
+// Sprint 51e — `define class NAME (supers) slot-spec … end`. Span is
+// the `class` keyword; children are the superclass expressions
+// (mostly variable-refs → structured) followed by the slot specs
+// (<ast-slot-spec> → Error for now, but spanned + visible in the
+// punch-list). The host recovers the class name from `&src`.
+define method emit-node (d :: <ast-class-definition>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let word-tok = defn-word(d);
+  let s = token-span(word-tok);
+  let idx = emit-record(out, $ast-kind-define-class, span-start(s), span-end(s));
+  let supers = class-supers(d);
+  let ns = %stretchy-vector-size(supers);
+  let i = 0;
+  until (i = ns)
+    emit-node(%stretchy-vector-element(supers, i), source, out);
+    i := i + 1;
+  end;
+  let slots = class-slots(d);
+  let nslots = %stretchy-vector-size(slots);
+  let j = 0;
+  until (j = nslots)
+    emit-node(%stretchy-vector-element(slots, j), source, out);
+    j := j + 1;
+  end;
+  patch-subtree-size(out, idx);
+end method;
+
+// Sprint 51e — `define generic NAME (params) => (returns);`. No body,
+// no `end`. v1 emits a leaf at the `generic` keyword span; the
+// signature is recoverable from `&src` and gets dedicated children in
+// a later pass.
+define method emit-node (d :: <ast-generic-definition>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let word-tok = gen-word(d);
+  let s = token-span(word-tok);
+  emit-record(out, $ast-kind-define-generic, span-start(s), span-end(s));
 end method;
 
 define method emit-node (c :: <ast-call>, source :: <byte-string>,
