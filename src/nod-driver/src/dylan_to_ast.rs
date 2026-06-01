@@ -484,17 +484,15 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
             }
             let lhs = &node.children[0];
             let rhs = &node.children[1];
-            // Flat precedence now agrees on both sides, but a SEPARATE
-            // gap remains: the Rust parser keeps an `Expr::Paren` wrapper
-            // for a parenthesised sub-expression, while the Dylan wire
-            // drops the parens — so `(a * b) + (c * d)` would translate
-            // without the `Paren` nodes and diverge. Until the translator
-            // recovers parens from `&src`, decline any nested binary
-            // operator (operand that is itself a binop). A single binop
-            // (`n = 0`, `n * f(x)`) is unaffected and still translates.
-            if lhs.kind == Kind::BinaryOp || rhs.kind == Kind::BinaryOp {
-                return unsupported("nested binary op (paren-wrapper recovery not done yet)");
-            }
+            // Nested binary operators now translate safely. Both parsers are
+            // flat left-associative for non-pragma files, so `a + b * c`
+            // builds the same `(* (+ a b) c)` tree on both sides; and the
+            // Rust dump prints `Expr::Paren` transparently (see `fmt_expr`),
+            // so a grouped operand like `(a * b) + c` no longer needs the
+            // translator to reproduce a `Paren` wrapper the Dylan wire
+            // dropped. (`Precedence: c` files — where Rust climbs C-style but
+            // the Dylan parser stays flat — are still declined wholesale up
+            // in `to_ast_module`.)
             // The operator token isn't a node — it lives in the source
             // gap between the operands. A node's own span may not cover
             // its children (a `Call`'s span is just its paren), so we

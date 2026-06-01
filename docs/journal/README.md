@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-01 — The translator payoff: Paren-transparent dump, `:=` precedence, 9→14/36](2026-06-01-translator-payoff-paren-and-assign.md)
+  — Sprint 51e. Cashing in the flat-precedence migration by removing the
+  translator's nested-binop guard. Took two more fixes: a `Paren`-transparent
+  dump formatter (grouping is in the tree shape, not the marker) and a real
+  `:=`-precedence bug in the Dylan-in-Dylan parser that the byte-identical
+  gate caught (`i := i + 1` was parsing as `(i := i) + 1`). Plus two stale
+  C-precedence unit tests the migration had missed.
 - [2026-05-31 — DRM flat precedence by default, `Precedence: c` migration bridge](2026-05-31-flat-precedence-pragma.md)
   — Sprint 51e. The translate gate exposed the Rust parser's C-style
   precedence as a real bug (Dylan is flat per the DRM). Fixing it broke

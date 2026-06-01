@@ -227,6 +227,22 @@ fn indent(n: usize, out: &mut String) {
 }
 
 fn fmt_expr(e: &Expr, depth: usize, out: &mut String) {
+    // Peel transparent `Expr::Paren` wrappers BEFORE indenting, so the inner
+    // node prints in this slot with no wrapper line and correct depth. Under
+    // Dylan's flat precedence the tree *shape* already encodes grouping
+    // losslessly (`a + (b + c)` is right-nested, `a + b + c` left-nested —
+    // distinct trees with or without a Paren marker), so `Expr::Paren` is
+    // syntactic provenance, not structure — like a span, which this dump
+    // also omits. This dump is the oracle the `--parse-with-dylan`
+    // translation gate diffs against; the Dylan-in-Dylan parser drops single
+    // grouping parens transparently (parse-paren-fragment), so skipping the
+    // wrapper here lets the two parsers agree on semantic structure without
+    // bolting fragile paren-recovery onto the translator. A genuine misgroup
+    // still shows as a different tree shape, so the gate is not weakened.
+    let mut e = e;
+    while let Expr::Paren { inner, .. } = e {
+        e = inner;
+    }
     indent(depth, out);
     match e {
         Expr::Integer(_, v) => {
@@ -276,12 +292,8 @@ fn fmt_expr(e: &Expr, depth: usize, out: &mut String) {
             indent(depth, out);
             out.push_str(")\n");
         }
-        Expr::Paren { inner, .. } => {
-            out.push_str("(Paren\n");
-            fmt_expr(inner, depth + 1, out);
-            indent(depth, out);
-            out.push_str(")\n");
-        }
+        // Peeled above before indenting — never reached.
+        Expr::Paren { .. } => unreachable!("Expr::Paren is peeled before the match"),
         Expr::If { cond, then_, else_, .. } => {
             out.push_str("(If\n");
             fmt_expr(cond, depth + 1, out);

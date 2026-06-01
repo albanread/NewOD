@@ -268,8 +268,12 @@ define function is-modifier-word? (t :: <token>) => (yes? :: <boolean>)
   end
 end function;
 
-// BINARY-OPERATOR: tokens that appear as infix operators.
-// `:=` (assign) is included here for assignment expressions.
+// BINARY-OPERATOR: tokens that appear as infix operators, all sharing one
+// flat left-associative precedence (DRM).  `:=` (assign) is deliberately NOT
+// here: assignment is lower-precedence and right-associative, handled one
+// level up in parse-expression (mirrors nod-reader parser.rs, where
+// parse_assign sits above the flat parse_binary).  Lumping `:=` in here
+// mis-parses `i := i + 1` as `(i := i) + 1` instead of `i := (i + 1)`.
 define function is-binary-op? (t :: <token>) => (yes? :: <boolean>)
   if (instance?(t, <punctuation-token>))
     let f = punctuation-token-form(t);
@@ -280,7 +284,7 @@ define function is-binary-op? (t :: <token>) => (yes? :: <boolean>)
       | f = #"less"    | f = #"greater"
       | f = #"less-equal"        | f = #"greater-equal"
       | f = #"tilde-equal"       | f = #"tilde-equal-equal"
-      | f = #"dot-dot" | f = #"assign"
+      | f = #"dot-dot"
       // `=>` inside a body is a select/case arm separator (`key => body`).
       // It never reaches expression context elsewhere: method / function /
       // generic return specs consume their `=>` via parse-return-spec before
@@ -1487,7 +1491,27 @@ end function;
 //
 // We build a left-associative <ast-binary-op> tree.
 
+// Assignment is the lowest-precedence operator and is RIGHT-associative:
+//   `a := b := c`   parses as  `a := (b := c)`
+//   `i := i + 1`    parses as  `i := (i + 1)`   (NOT `(i := i) + 1`)
+// It sits above the flat binary chain (mirrors nod-reader parser.rs, where
+// parse_assign wraps parse_binary).  We parse a full binary expression for
+// the left side, then if `:=` follows, recurse on the right for right-assoc.
 define function parse-expression (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-binary-expression(ts);
+  if (~ ts-at-end?(ts) & is-punct?(ts-peek(ts), #"assign"))
+    let op = ts-advance(ts);            // consume `:=`
+    let right = parse-expression(ts);   // right-associative
+    make(<ast-binary-op>, left: left, operator: op, right: right)
+  else
+    left
+  end
+end function;
+
+// The flat left-associative binary-operator chain (DRM: one precedence for
+// all of `=` `+` `*` `<` `&` `|` … `mod` `rem`).  `:=` is handled by
+// parse-expression above, never here.
+define function parse-binary-expression (ts :: <token-stream>) => (n :: <ast-node>)
   let left = parse-binary-operand(ts);
   let done? = #f;
   until (done? | ts-at-end?(ts))

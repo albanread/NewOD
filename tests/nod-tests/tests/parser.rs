@@ -45,15 +45,18 @@ fn identifier() {
 // ─── Precedence ──────────────────────────────────────────────────────
 
 #[test]
-fn precedence_mul_over_add() {
-    // 1 + 2 * 3 must parse as 1 + (2 * 3): * nested under +.
+fn flat_precedence_left_assoc() {
+    // Dylan has FLAT operator precedence (DRM): all binary operators share
+    // one precedence and associate left. So `1 + 2 * 3` is `(1 + 2) * 3` —
+    // Mul at the root with the Add on its lhs — NOT C-style `1 + (2 * 3)`.
+    // (Use explicit parens to force `1 + (2 * 3)`; see parens_override_*.)
     let e = parse("1 + 2 * 3");
     match e {
-        Expr::BinOp { op: BinOp::Add, ref rhs, .. } => match rhs.as_ref() {
-            Expr::BinOp { op: BinOp::Mul, .. } => {}
-            other => panic!("expected Mul on rhs, got {other:?}"),
+        Expr::BinOp { op: BinOp::Mul, ref lhs, .. } => match lhs.as_ref() {
+            Expr::BinOp { op: BinOp::Add, .. } => {}
+            other => panic!("expected Add on lhs, got {other:?}"),
         },
-        other => panic!("expected Add at root, got {other:?}"),
+        other => panic!("expected Mul at root, got {other:?}"),
     }
 }
 
@@ -98,14 +101,18 @@ fn assignment_right_assoc() {
 }
 
 #[test]
-fn mod_rem_are_mul_level() {
+fn mod_rem_are_flat_operators() {
+    // `mod`/`rem` are infix word-operators that share the single flat
+    // precedence with every other binary operator (DRM). So `a + b mod c`
+    // associates left as `(a + b) mod c` — Mod at the root, Add on its lhs —
+    // not the C-style multiplicative `a + (b mod c)`.
     let e = parse("a + b mod c");
     match e {
-        Expr::BinOp { op: BinOp::Add, rhs, .. } => match *rhs {
-            Expr::BinOp { op: BinOp::Mod, .. } => {}
-            other => panic!("expected Mod under +, got {other:?}"),
+        Expr::BinOp { op: BinOp::Mod, lhs, .. } => match *lhs {
+            Expr::BinOp { op: BinOp::Add, .. } => {}
+            other => panic!("expected Add on lhs, got {other:?}"),
         },
-        other => panic!("expected Add at root, got {other:?}"),
+        other => panic!("expected Mod at root, got {other:?}"),
     }
 }
 
