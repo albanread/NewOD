@@ -51,4 +51,9 @@ define function walk-main () => ()
   run-walk("strip-def",
            "define macro u { u ?c:expression ?b:body end } => { if (~ ?c) ?b end } end macro;",
            "define macro u { u ?c:expression ?b:body end } => { if (~ ?c) ?b end } end macro; u x (y) end");
+  // Call-shaped macro `name(args)` (no `end`) — spans the name plus the
+  // immediately-following paren group.
+  run-walk("call-form",
+           "define macro twice { twice(?x:expression) } => { ?x + ?x } end macro;",
+           "twice(5)");
 end function walk-main;

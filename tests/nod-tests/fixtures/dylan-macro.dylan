@@ -833,11 +833,29 @@ define function expand-call (def :: <macro-def>,
   result
 end function;
 
+// A macro is call-shaped (`name(args)`) rather than body-shaped
+// (`name args… end`) when its first rule's pattern is exactly
+// [literal name, paren-group]. Mirrors nod-macro's call-vs-statement
+// macro distinction; at the fragment level the shape is read off the
+// rule pattern.
+define function macro-call-shaped? (def :: <macro-def>) => (yes? :: <boolean>)
+  let rules = macro-def-rules(def);
+  let result = #f;
+  if (size(rules) > 0)
+    let pat = macro-rule-pattern(rules[0]);
+    if (size(pat) = 2 & instance?(pat[1], <pat-group>))
+      result := pat-grp-kind(pat[1]) = #"paren";
+    end;
+  end;
+  result
+end function;
+
 // Locate the `end` that closes a body-shaped macro call beginning at the
 // macro-name fragment `i`. Depth-aware: nested body-opening forms (the
-// `opens-end-form?` keywords plus any other macro name in the table) bump
-// the nesting depth, so only the macro's own terminator is returned.
-// Returns the absolute index of the closing `end`, or #f.
+// `opens-end-form?` keywords plus any BODY-shaped macro name in the
+// table) bump the nesting depth, so only the macro's own terminator is
+// returned. Call-shaped macros do NOT open a body and so do not bump
+// depth. Returns the absolute index of the closing `end`, or #f.
 define function find-macro-call-end (frags :: <stretchy-vector>, i :: <integer>,
                                      table :: <stretchy-vector>) => (pos :: <object>)
   let n = size(frags);
@@ -853,7 +871,8 @@ define function find-macro-call-end (frags :: <stretchy-vector>, i :: <integer>,
         if (depth = 0) found := j; end;
       elseif (tok-kind(t) = #"ident")
         let txt = tok-text(t);
-        if (opens-end-form?(txt) | macro-table-lookup(table, txt) ~= #f)
+        let mdef = macro-table-lookup(table, txt);
+        if (opens-end-form?(txt) | (mdef ~= #f & ~ macro-call-shaped?(mdef)))
           depth := depth + 1;
         end;
       end;
@@ -911,7 +930,18 @@ define function expand-fragments (frags :: <stretchy-vector>,
       let name = tok-text(tfrag-tok(f));
       let def = macro-table-lookup(table, name);
       if (def ~= #f)
-        let call-end = find-macro-call-end(frags, i, table);
+        // Call-shaped macros (`name(args)`) span the name plus the
+        // immediately-following paren group; body-shaped macros span to
+        // their matching `end`.
+        let call-end = #f;
+        if (macro-call-shaped?(def))
+          if (i + 1 < n & group-frag?(frags[i + 1])
+                & gfrag-kind(frags[i + 1]) = #"paren")
+            call-end := i + 1;
+          end;
+        else
+          call-end := find-macro-call-end(frags, i, table);
+        end;
         if (call-end)
           let call-frags = make(<stretchy-vector>);
           let k = i;

@@ -39,6 +39,8 @@ const EXPECTED: &[(&str, &str)] = &[
     // A `define macro` in the input is stripped from the expanded output
     // (compile-time only); the following call still expands.
     ("strip-def", "if ( ~ x ) ( y ) end"),
+    // Call-shaped macro `name(args)` — no `end`.
+    ("call-form", "5 + 5"),
 ];
 
 fn workspace_root() -> PathBuf {
