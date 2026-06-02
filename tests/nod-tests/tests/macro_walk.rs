@@ -36,6 +36,9 @@ const EXPECTED: &[(&str, &str)] = &[
         "siblings",
         "if ( ~ a ) ( p ) else #f end if ( ~ b ) ( q ) else #f end",
     ),
+    // A `define macro` in the input is stripped from the expanded output
+    // (compile-time only); the following call still expands.
+    ("strip-def", "if ( ~ x ) ( y ) end"),
 ];
 
 fn workspace_root() -> PathBuf {

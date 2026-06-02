@@ -46,4 +46,9 @@ define function walk-main () => ()
            "cond (x) (y) otherwise (z) end");
   // Two sibling calls in one stream — both expand independently.
   run-walk("siblings", $unless-def, "unless a (p) end unless b (q) end");
+  // A `define macro` form in the input is STRIPPED (compile-time only,
+  // not losslessly renderable); the following call still expands.
+  run-walk("strip-def",
+           "define macro u { u ?c:expression ?b:body end } => { if (~ ?c) ?b end } end macro;",
+           "define macro u { u ?c:expression ?b:body end } => { if (~ ?c) ?b end } end macro; u x (y) end");
 end function walk-main;

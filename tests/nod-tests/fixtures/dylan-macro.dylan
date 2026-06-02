@@ -863,10 +863,35 @@ define function find-macro-call-end (frags :: <stretchy-vector>, i :: <integer>,
   found
 end function;
 
+// Index just past a `define macro … end macro` form beginning at `i`
+// (the `define` fragment). Mirrors collect-macro-defs' tail skip: scan to
+// the first top-level kw-end after the name, then step over an optional
+// `macro` word and `;`.
+define function define-macro-end-index (frags :: <stretchy-vector>, i :: <integer>)
+ => (idx :: <integer>)
+  let n = size(frags);
+  let j = i + 3;
+  let done? = #f;
+  until (j >= n | done?)
+    if (frag-kw-end?(frags[j])) done? := #t; else j := j + 1; end;
+  end;
+  let k = j;
+  if (k < n & frag-kw-end?(frags[k]))               k := k + 1; end;
+  if (k < n & tok-is?(frags[k], #"ident", "macro"))  k := k + 1; end;
+  if (k < n & tok-is?(frags[k], #"punct", ";"))      k := k + 1; end;
+  k
+end function;
+
 // Module-walk: walk `frags`, expand every macro call to fixpoint, and
 // return the expanded fragment sequence. Non-macro fragments pass through
-// unchanged; group bodies are walked recursively. `depth` bounds runaway
-// expansion (a buggy macro that expands to a call of itself).
+// unchanged; group bodies are walked recursively. `define macro … end
+// macro` forms are STRIPPED — they are compile-time only (lowering
+// ignores them) and cannot be losslessly re-rendered (keyword-name tokens
+// like `?c:expression` drop their colon), so the expanded output omits
+// them; the macro name in the definition header and the pattern literals
+// in its rule bodies are correctly never treated as call sites. `depth`
+// bounds runaway expansion (a buggy macro that expands to a call of
+// itself).
 define function expand-fragments (frags :: <stretchy-vector>,
                                   table :: <stretchy-vector>,
                                   nonce-str :: <byte-string>,
@@ -877,7 +902,12 @@ define function expand-fragments (frags :: <stretchy-vector>,
   until (i = n)
     let f = frags[i];
     let handled = #f;
-    if (tok-frag?(f) & tok-kind(tfrag-tok(f)) = #"ident" & depth < 50)
+    // Strip `define macro … end macro` forms from the expanded output.
+    if (define-macro-head?(frags, i))
+      i := define-macro-end-index(frags, i);
+      handled := #t;
+    end;
+    if (~ handled & tok-frag?(f) & tok-kind(tfrag-tok(f)) = #"ident" & depth < 50)
       let name = tok-text(tfrag-tok(f));
       let def = macro-table-lookup(table, name);
       if (def ~= #f)
