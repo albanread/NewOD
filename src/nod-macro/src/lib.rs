@@ -829,6 +829,21 @@ where
     r
 }
 
+/// Oracle/test helper: run [`match_pattern`] with the call-site source
+/// bound so literal-text comparison (`tok_text_eq`) and `Name`-binding
+/// text extraction (`frag_text`) resolve against `call_src`. The bare
+/// [`match_pattern`] is only meaningful inside `expand_one`, which sets
+/// this binding via the private `with_call_site_source`; this wrapper
+/// exposes the same setup so the Sprint 52.3 Dylan-vs-Rust match parity
+/// gate can drive the Rust engine directly.
+pub fn match_pattern_with_source(
+    pattern: &[PatternElem],
+    call: &[Fragment],
+    call_src: &str,
+) -> Option<Bindings> {
+    with_call_site_source(call_src, || match_pattern(pattern, call))
+}
+
 fn fragment_span(f: &Fragment) -> Span {
     match f {
         Fragment::Token(t) => t.span,

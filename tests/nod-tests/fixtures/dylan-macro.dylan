@@ -280,7 +280,13 @@ define function match-pattern (pattern :: <stretchy-vector>,
       end;
     elseif (instance?(p, <pat-variable>))
       let kind = pat-var-kind(p);
-      if (kind = #"expression")
+      // Sprint 52.3 — full nod-macro PatternKind parity. Expression,
+      // MacroArg, and Constraint all bind exactly one fragment (the Rust
+      // engine aliases the latter two to Expression today). Name binds
+      // one fragment but only if it is an identifier token. Variable
+      // binds an identifier plus an optional `:: <type>`. ParameterList
+      // binds a single paren group. Body is the depth-aware greedy match.
+      if (kind = #"expression" | kind = #"macro-arg" | kind = #"constraint")
         if (ci >= cn)
           fail? := #t;
         else
@@ -289,6 +295,75 @@ define function match-pattern (pattern :: <stretchy-vector>,
           bindings-add!(b, pat-var-name(p), frags);
           ci := ci + 1;
           pi := pi + 1;
+        end;
+      elseif (kind = #"name")
+        // Bind one fragment, but only an identifier token.
+        if (ci >= cn)
+          fail? := #t;
+        else
+          let f = call[ci];
+          if (tok-frag?(f) & tok-kind(tfrag-tok(f)) = #"ident")
+            let frags = make(<stretchy-vector>);
+            add!(frags, f);
+            bindings-add!(b, pat-var-name(p), frags);
+            ci := ci + 1;
+            pi := pi + 1;
+          else
+            fail? := #t;
+          end;
+        end;
+      elseif (kind = #"parameter-list")
+        // Bind a single paren group, contents unvalidated (the template
+        // re-emits verbatim; the expansion-site parser rejects ill-formed
+        // lists). Mirrors nod-macro's ParameterList arm.
+        if (ci >= cn)
+          fail? := #t;
+        else
+          let f = call[ci];
+          if (group-frag?(f) & gfrag-kind(f) = #"paren")
+            let frags = make(<stretchy-vector>);
+            add!(frags, f);
+            bindings-add!(b, pat-var-name(p), frags);
+            ci := ci + 1;
+            pi := pi + 1;
+          else
+            fail? := #t;
+          end;
+        end;
+      elseif (kind = #"variable")
+        // `?x:variable` — an identifier, optionally `:: <type>`. The
+        // type annotation may lex as a single `::` punct or two adjacent
+        // `:` puncts (the Dylan lexer has no dedicated `::`); accept both.
+        if (ci >= cn)
+          fail? := #t;
+        else
+          let head = call[ci];
+          if (~ (tok-frag?(head) & tok-kind(tfrag-tok(head)) = #"ident"))
+            fail? := #t;
+          else
+            let consumed = 1;
+            if (ci + 2 < cn
+                  & tok-is?(call[ci + 1], #"punct", "::")
+                  & tok-frag?(call[ci + 2])
+                  & tok-kind(tfrag-tok(call[ci + 2])) = #"ident")
+              consumed := 3;
+            elseif (ci + 3 < cn
+                      & tok-is?(call[ci + 1], #"punct", ":")
+                      & tok-is?(call[ci + 2], #"punct", ":")
+                      & tok-frag?(call[ci + 3])
+                      & tok-kind(tfrag-tok(call[ci + 3])) = #"ident")
+              consumed := 4;
+            end;
+            let frags = make(<stretchy-vector>);
+            let j = ci;
+            until (j = ci + consumed)
+              add!(frags, call[j]);
+              j := j + 1;
+            end;
+            bindings-add!(b, pat-var-name(p), frags);
+            ci := ci + consumed;
+            pi := pi + 1;
+          end;
         end;
       elseif (kind = #"body")
         // Determine body's end position: scan to the next literal in
@@ -474,6 +549,22 @@ define function substitute (template :: <stretchy-vector>,
   join-chunks(out)
 end function;
 
+// Sprint 52.3 — render a raw fragment sequence (e.g. a binding's
+// captured fragments) to the same canonical, single-space-joined text
+// the substitution emitter produces. Used by the match driver to print
+// each binding's value for the Rust-vs-Dylan parity gate.
+define function render-frags (frags :: <stretchy-vector>)
+ => (s :: <byte-string>)
+  let out = make(<stretchy-vector>);
+  let n = size(frags);
+  let i = 0;
+  until (i = n)
+    emit-frag(out, frags[i]);
+    i := i + 1;
+  end;
+  join-chunks(out)
+end function;
+
 // ─── Sprint 50b — parse `define macro` body fragments → <macro-def> ──────
 //
 // The Rust nod-macro grammar for a definition body is:
@@ -544,9 +635,18 @@ define function parse-pattern-elem (body :: <stretchy-vector>, i :: <integer>)
     let kind-tok  = tfrag-tok(kind-frag);
     let name      = strip-trailing-colon(tok-text(name-tok));
     let kind-text = tok-text(kind-tok);
+    // Sprint 52.3 — recognise all seven nod-macro PatternKind words.
+    // `case-body`/`type`/`case-expression`/`definition` are recognised
+    // names that alias to expression (mirrors parse_kind_word); any
+    // other word also falls through to expression (the corpus never
+    // uses one, and a totalising default keeps the matcher panic-free).
     let kind-sym  = #"expression";
-    if (kind-text = "body")       kind-sym := #"body";
-    elseif (kind-text = "expression") kind-sym := #"expression";
+    if (kind-text = "body")                 kind-sym := #"body";
+    elseif (kind-text = "name")             kind-sym := #"name";
+    elseif (kind-text = "variable")         kind-sym := #"variable";
+    elseif (kind-text = "macro-arg")        kind-sym := #"macro-arg";
+    elseif (kind-text = "parameter-list")   kind-sym := #"parameter-list";
+    elseif (kind-text = "constraint")       kind-sym := #"constraint";
     end;
     result := make(<pat-variable>, name: name, kind: kind-sym);
     consumed := 3;
