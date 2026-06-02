@@ -781,6 +781,154 @@ define function substitute-hyg (template :: <stretchy-vector>,
   join-chunks(out)
 end function;
 
+// ─── Sprint 52.5 — multi-rule selection + module-walk expansion ──────────
+//
+// expand-call mirrors nod-macro::expand_one's rule loop: try each rule's
+// pattern in definition order, first match wins, substitute that rule's
+// template. expand-fragments is the module-walk driver: walk a fragment
+// stream, expand every macro call site (multi-rule), re-lex the result,
+// and recurse to fixpoint. Under locus (B) expansion operates on the
+// Dylan-side token/fragment representation (the seed's pipeline), so the
+// walk is fragment-level — the same shape nod-macro::expand_module has
+// over its AST.
+
+// Linear lookup of a <macro-def> by name in a defs vector, or #f.
+define function macro-table-lookup (table :: <stretchy-vector>, name :: <byte-string>)
+ => (def :: <object>)
+  let n = size(table);
+  let i = 0;
+  let found = #f;
+  until (i = n | found)
+    if (macro-def-name(table[i]) = name)
+      found := table[i];
+    else
+      i := i + 1;
+    end;
+  end;
+  found
+end function;
+
+// Multi-rule selection: try each rule's pattern against call-frags in
+// definition order; on the first match, substitute that rule's template
+// (with hygiene). Returns the expansion text, or #f if no rule matched.
+define function expand-call (def :: <macro-def>,
+                             call-frags :: <stretchy-vector>,
+                             nonce-str :: <byte-string>)
+ => (text :: <object>)
+  let rules = macro-def-rules(def);
+  let n = size(rules);
+  let i = 0;
+  let result = #f;
+  until (i = n | result)
+    let rule    = rules[i];
+    let pattern = macro-rule-pattern(rule);
+    let b = match-pattern(pattern, call-frags);
+    if (b)
+      let pvars = collect-pattern-var-names(pattern);
+      result := substitute-hyg(macro-rule-template(rule), b, pvars, nonce-str);
+    else
+      i := i + 1;
+    end;
+  end;
+  result
+end function;
+
+// Locate the `end` that closes a body-shaped macro call beginning at the
+// macro-name fragment `i`. Depth-aware: nested body-opening forms (the
+// `opens-end-form?` keywords plus any other macro name in the table) bump
+// the nesting depth, so only the macro's own terminator is returned.
+// Returns the absolute index of the closing `end`, or #f.
+define function find-macro-call-end (frags :: <stretchy-vector>, i :: <integer>,
+                                     table :: <stretchy-vector>) => (pos :: <object>)
+  let n = size(frags);
+  let depth = 1;
+  let j = i + 1;
+  let found = #f;
+  until (j = n | found)
+    let f = frags[j];
+    if (tok-frag?(f))
+      let t = tfrag-tok(f);
+      if (tok-kind(t) = #"kw-end")
+        depth := depth - 1;
+        if (depth = 0) found := j; end;
+      elseif (tok-kind(t) = #"ident")
+        let txt = tok-text(t);
+        if (opens-end-form?(txt) | macro-table-lookup(table, txt) ~= #f)
+          depth := depth + 1;
+        end;
+      end;
+    end;
+    if (~ found) j := j + 1; end;
+  end;
+  found
+end function;
+
+// Module-walk: walk `frags`, expand every macro call to fixpoint, and
+// return the expanded fragment sequence. Non-macro fragments pass through
+// unchanged; group bodies are walked recursively. `depth` bounds runaway
+// expansion (a buggy macro that expands to a call of itself).
+define function expand-fragments (frags :: <stretchy-vector>,
+                                  table :: <stretchy-vector>,
+                                  nonce-str :: <byte-string>,
+                                  depth :: <integer>) => (out :: <stretchy-vector>)
+  let out = make(<stretchy-vector>);
+  let n = size(frags);
+  let i = 0;
+  until (i = n)
+    let f = frags[i];
+    let handled = #f;
+    if (tok-frag?(f) & tok-kind(tfrag-tok(f)) = #"ident" & depth < 50)
+      let name = tok-text(tfrag-tok(f));
+      let def = macro-table-lookup(table, name);
+      if (def ~= #f)
+        let call-end = find-macro-call-end(frags, i, table);
+        if (call-end)
+          let call-frags = make(<stretchy-vector>);
+          let k = i;
+          until (k > call-end)
+            add!(call-frags, frags[k]);
+            k := k + 1;
+          end;
+          let text = expand-call(def, call-frags, nonce-str);
+          if (text)
+            let sub-frags = tokens-to-fragments(lex-source-to-toks(text));
+            let expanded  = expand-fragments(sub-frags, table, nonce-str, depth + 1);
+            let m = size(expanded);
+            let q = 0;
+            until (q = m)
+              add!(out, expanded[q]);
+              q := q + 1;
+            end;
+            i := call-end + 1;
+            handled := #t;
+          end;
+        end;
+      end;
+    end;
+    if (~ handled)
+      if (group-frag?(f))
+        let inner = expand-fragments(gfrag-body(f), table, nonce-str, depth);
+        add!(out, make-group-frag(gfrag-kind(f), inner));
+      else
+        add!(out, f);
+      end;
+      i := i + 1;
+    end;
+  end;
+  out
+end function;
+
+// Expand a whole module's source to fixpoint: collect its macro defs,
+// lex+fragment the source, expand all call sites, and render the result.
+define function expand-module-source (source :: <byte-string>,
+                                      table :: <stretchy-vector>,
+                                      nonce-str :: <byte-string>)
+ => (text :: <byte-string>)
+  let frags    = tokens-to-fragments(lex-source-to-toks(source));
+  let expanded = expand-fragments(frags, table, nonce-str, 0);
+  render-frags(expanded)
+end function;
+
 // ─── Sprint 50b — parse `define macro` body fragments → <macro-def> ──────
 //
 // The Rust nod-macro grammar for a definition body is:
@@ -1086,6 +1234,25 @@ define function lex-token-to-tok (t :: <token>, source :: <byte-string>)
     let text = "#t";
     if (~ v) text := "#f"; end;
     result := make-tok(#"ident", text);
+  // Sprint 52.5 — round-trip the remaining literal token kinds as opaque
+  // #"literal" tokens (text recovered from the span). Without this they
+  // were silently dropped, which is harmless when collecting/matching the
+  // corpus (no literals in load-bearing positions) but corrupts re-lexed
+  // expansions that contain literals (e.g. `unless ?x (1) end` would lose
+  // the `1`). <number-token> covers integer/float/ratio via inheritance.
+  elseif (instance?(t, <number-token>))
+    result := make-tok(#"literal", token-source-text(t, source));
+  elseif (instance?(t, <string-literal-token>))
+    result := make-tok(#"literal", token-source-text(t, source));
+  elseif (instance?(t, <character-literal-token>))
+    result := make-tok(#"literal", token-source-text(t, source));
+  elseif (instance?(t, <symbol-literal-token>))
+    result := make-tok(#"literal", token-source-text(t, source));
+  elseif (instance?(t, <nil-literal-token>))
+    result := make-tok(#"literal", token-source-text(t, source));
+  elseif (instance?(t, <escaped-ident-token>))
+    // `\+` and friends — an operator used as an identifier.
+    result := make-tok(#"ident", token-source-text(t, source));
   end;
   result
 end function;

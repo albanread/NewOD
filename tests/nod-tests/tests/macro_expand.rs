@@ -49,6 +49,16 @@ const CASES: &[(&str, &str, &str)] = &[
         "define macro for-each { for-each (?var:name in ?coll:expression) ?body:body end } => { begin let %fip-state = %fip-init(?coll); until (%fip-finished?(%fip-state)) let ?var = %fip-current-element(%fip-state); ?body; %fip-advance!(%fip-state) end end } end macro;",
         "for-each (i in xs) (work) end",
     ),
+    (
+        "cond-1arm",
+        "define macro cond { cond ?t1:expression ?b1:expression otherwise ?d:expression end } => { if (?t1) ?b1 else ?d end } { cond ?t1:expression ?b1:expression ?t2:expression ?b2:expression otherwise ?d:expression end } => { if (?t1) ?b1 elseif (?t2) ?b2 else ?d end } { cond ?t1:expression ?b1:expression ?t2:expression ?b2:expression ?t3:expression ?b3:expression otherwise ?d:expression end } => { if (?t1) ?b1 elseif (?t2) ?b2 elseif (?t3) ?b3 else ?d end } { cond ?t1:expression ?b1:expression ?t2:expression ?b2:expression ?t3:expression ?b3:expression ?t4:expression ?b4:expression otherwise ?d:expression end } => { if (?t1) ?b1 elseif (?t2) ?b2 elseif (?t3) ?b3 elseif (?t4) ?b4 else ?d end } end macro;",
+        "cond (x) (y) otherwise (z) end",
+    ),
+    (
+        "cond-2arm",
+        "define macro cond { cond ?t1:expression ?b1:expression otherwise ?d:expression end } => { if (?t1) ?b1 else ?d end } { cond ?t1:expression ?b1:expression ?t2:expression ?b2:expression otherwise ?d:expression end } => { if (?t1) ?b1 elseif (?t2) ?b2 else ?d end } { cond ?t1:expression ?b1:expression ?t2:expression ?b2:expression ?t3:expression ?b3:expression otherwise ?d:expression end } => { if (?t1) ?b1 elseif (?t2) ?b2 elseif (?t3) ?b3 else ?d end } { cond ?t1:expression ?b1:expression ?t2:expression ?b2:expression ?t3:expression ?b3:expression ?t4:expression ?b4:expression otherwise ?d:expression end } => { if (?t1) ?b1 elseif (?t2) ?b2 elseif (?t3) ?b3 elseif (?t4) ?b4 else ?d end } end macro;",
+        "cond (a) (b) (c) (d) otherwise (e) end",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -104,7 +114,6 @@ fn rust_expand(def_src: &str, call_src: &str) -> String {
     nod_macro::collect_macros(&module, &def_sm, &mut table)
         .unwrap_or_else(|e| panic!("rust collect of `{def_src}` failed: {e:?}"));
     let def = table.defs.values().next().expect("a macro");
-    let rule = &def.rules[0];
 
     let mut call_sm = SourceMap::new();
     let call_file = call_sm
@@ -114,8 +123,15 @@ fn rust_expand(def_src: &str, call_src: &str) -> String {
     let call_frags = nod_reader::build_fragments(&call_toks)
         .unwrap_or_else(|e| panic!("rust fragments of `{call_src}` failed: {e:?}"));
 
+    // Multi-rule selection: first rule whose pattern matches wins
+    // (mirrors expand_one's loop and the Dylan engine's expand-call).
+    let rule = def
+        .rules
+        .iter()
+        .find(|r| nod_macro::match_pattern_with_source(&r.pattern, &call_frags, call_src).is_some())
+        .unwrap_or_else(|| panic!("no rule matched for `{call_src}`"));
     let bindings = nod_macro::match_pattern_with_source(&rule.pattern, &call_frags, call_src)
-        .unwrap_or_else(|| panic!("rust match failed for `{call_src}`"));
+        .expect("matched rule re-matches");
     let pvars = collect_pattern_var_names(&rule.pattern);
     let out = nod_macro::substitute(
         &rule.template,
