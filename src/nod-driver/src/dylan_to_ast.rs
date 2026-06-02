@@ -118,7 +118,15 @@ fn translate_item(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     match node.kind {
         Kind::DefineFunction | Kind::DefineMethod => translate_def(node, src),
         Kind::DefineClass => translate_class(node, src),
-        other => unsupported(format!("top-level {other:?}")),
+        Kind::DefineBinding => translate_binding(node, src),
+        // A free-standing top-level expression (e.g. `s00(1) + t00(0)`)
+        // → `Item::Expr`, exactly as the Rust parser's `parse_top_item`
+        // wraps a non-`define` form. `translate_expr` reconstructs the
+        // BinaryOp / Call / literal; the header forms the Dylan parser
+        // lexed as constituents were already skipped (preamble offset)
+        // and an `Error` node was already rejected, both up in
+        // `to_ast_module`, so reaching here means a genuine expression.
+        _ => Ok(Item::Expr(translate_expr(node, src)?)),
     }
 }
 
@@ -146,6 +154,51 @@ fn translate_class(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
         name,
         supers,
         slots,
+    })
+}
+
+/// `define constant`/`variable NAME [:: TYPE] = INIT` →
+/// `Item::DefineConstant`/`DefineVariable`. The wire node's span is the
+/// `constant`/`variable` keyword (selecting which Item); its single
+/// child is the binding-list `Body` holding a `BinaryOp(binder = init)`,
+/// decoded by the shared [`local_decl_parts`]. Modifiers aren't on the
+/// wire yet (51e.4) → fall back if the source shows one before the
+/// keyword. Only a single, simple/typed binder is reconstructed; a
+/// destructuring `define constant (a, b) = …` falls back.
+fn translate_binding(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
+    // `define constant`/`variable` may carry a modifier (e.g.
+    // `define inline-only constant`); modifier-on-wire is 51e.4, so if
+    // the keyword isn't immediately preceded by `define`, fall back.
+    if has_modifiers(src, node.span_lo as usize) {
+        return unsupported("define binding has modifiers (not on the wire yet)");
+    }
+    let is_constant = match slice(src, node)? {
+        "constant" => true,
+        "variable" => false,
+        other => return unsupported(format!("define-binding word {other:?}")),
+    };
+    let parts = local_decl_parts(node, src)?;
+    if parts.binders.len() != 1 {
+        return unsupported("define binding: destructuring binder");
+    }
+    let binder = parts.binders.into_iter().next().unwrap();
+    let span = span_of(node);
+    Ok(if is_constant {
+        Item::DefineConstant {
+            span,
+            modifiers: Vec::new(),
+            name: binder.name,
+            type_: binder.type_,
+            value: parts.value,
+        }
+    } else {
+        Item::DefineVariable {
+            span,
+            modifiers: Vec::new(),
+            name: binder.name,
+            type_: binder.type_,
+            value: parts.value,
+        }
     })
 }
 
@@ -369,12 +422,24 @@ fn translate_stmts(children: &[DylanAst], src: &str) -> Result<Vec<Statement>, U
     Ok(stmts)
 }
 
-/// `let <binder> = <init>` → `Statement::Let`. The Dylan parser models
-/// the whole `binder = init` as a single `=`-`BinaryOp` inside the
-/// LocalDecl's body. v1 handles a single, untyped binder
-/// (`let x = e`); a typed binder (`let x :: T = e`), a multi-binder
-/// (`let (a, b) = e`), or a missing init falls back.
-fn translate_local_decl(node: &DylanAst, src: &str) -> Result<Statement, Unsupported> {
+/// The decoded LHS/RHS of a `let` binding: the binder list (one for a
+/// simple `let x = …`, several for a destructuring `let (a, b) = …`)
+/// and the init expression. Shared by the statement-position
+/// [`translate_local_decl`] and the expression-position
+/// [`translate_local_decl_as_expr`].
+struct LetParts {
+    binders: Vec<Binder>,
+    value: Expr,
+}
+
+/// Decode the `binder = init` core a `LocalDecl` carries. The Dylan
+/// parser models the whole binding as a single `=`-`BinaryOp` inside
+/// the LocalDecl's body. Handles a single binder (`let x = e`, typed
+/// `let x :: T = e` — the type is recovered onto the `Binder` but the
+/// dump ignores it, matching the Rust parser), and a destructuring
+/// binder (`let (a, b) = e` → a `ParenList` LHS). A `#rest` in the
+/// destructuring or a missing init falls back.
+fn local_decl_parts(node: &DylanAst, src: &str) -> Result<LetParts, Unsupported> {
     let body = node
         .children
         .first()
@@ -403,21 +468,92 @@ fn translate_local_decl(node: &DylanAst, src: &str) -> Result<Statement, Unsuppo
     if op_str != "=" {
         return unsupported(format!("let binder operator {op_str:?}"));
     }
-    if lhs.kind != Kind::VariableRef {
-        return unsupported("let: non-simple binder (typed or destructuring)");
-    }
-    let name = slice(src, lhs)?.to_string();
+    let binders = match lhs.kind {
+        // `let x = e` (untyped) or `let x :: T = e` (typed). A simple
+        // untyped binder is a `VariableRef`; a typed binder is a `Param`
+        // (the Dylan parser wraps `x :: T` in an <ast-typed-name>, emitted
+        // as a Param: name-span + type child).
+        Kind::VariableRef | Kind::Param => vec![binder_from_node(lhs, src)?],
+        // `let (a, b, …) = e` — a destructuring binder. The Dylan parser
+        // emits the binder tuple as a `ParenList` whose items are the
+        // binders (each a `VariableRef`, or a `Param` for `(a :: T, b)`);
+        // the Rust parser produces `Statement::Let` with one `Binder` per
+        // name (and the dump prints `(Binders "a" "b")`). A `#rest`
+        // marker inside the tuple isn't reconstructed yet → fall back.
+        Kind::ParenList => {
+            let mut binders = Vec::new();
+            for b in &lhs.children {
+                binders.push(binder_from_node(b, src)?);
+            }
+            binders
+        }
+        _ => return unsupported("let: non-simple binder (typed or destructuring)"),
+    };
     let value = translate_expr(rhs, src)?;
+    Ok(LetParts { binders, value })
+}
+
+/// One binder of a `let` binding → `Binder`. A `VariableRef` is an
+/// untyped binder (`x`); a `Param` is a typed binder (`x :: T`, span =
+/// the name token, child = the type expr). The Rust `Binder` keeps the
+/// type, but the AST dump prints only the name, so recovering the type
+/// is best-effort (and harmless if present).
+fn binder_from_node(node: &DylanAst, src: &str) -> Result<Binder, Unsupported> {
+    match node.kind {
+        Kind::VariableRef => Ok(Binder {
+            span: span_of(node),
+            name: slice(src, node)?.to_string(),
+            type_: None,
+        }),
+        Kind::Param => {
+            let type_ = match node.children.first() {
+                Some(t) => Some(translate_expr(t, src)?),
+                None => None,
+            };
+            Ok(Binder {
+                span: span_of(node),
+                name: slice(src, node)?.to_string(),
+                type_,
+            })
+        }
+        _ => unsupported("let: binder is not a simple/typed name"),
+    }
+}
+
+/// `let <binder> = <init>` → `Statement::Let` (statement position).
+fn translate_local_decl(node: &DylanAst, src: &str) -> Result<Statement, Unsupported> {
+    let parts = local_decl_parts(node, src)?;
     Ok(Statement::Let {
         span: span_of(node),
-        binders: vec![Binder {
-            span: span_of(lhs),
-            name,
-            type_: None,
-        }],
+        binders: parts.binders,
         rest: None,
-        value,
+        value: parts.value,
     })
+}
+
+/// `let <binder> = <init>` at EXPRESSION position → `Expr::Let`. The
+/// Rust parser parses an in-body `let` (e.g. inside an `if` then/else
+/// branch) with `parse_let_expr_compat`, which yields the
+/// single-binder `Expr::Let { binder, value }` and wraps a
+/// destructuring `let (a, b) = …` in `Expr::Stmt(Statement::Let)`. We
+/// mirror both: one binder → `Expr::Let`; many → `Expr::Stmt`.
+fn translate_local_decl_as_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
+    let span = span_of(node);
+    let parts = local_decl_parts(node, src)?;
+    if parts.binders.len() == 1 {
+        Ok(Expr::Let {
+            span,
+            binder: parts.binders.into_iter().next().unwrap().name,
+            value: Box::new(parts.value),
+        })
+    } else {
+        Ok(Expr::Stmt(Box::new(Statement::Let {
+            span,
+            binders: parts.binders,
+            rest: None,
+            value: parts.value,
+        })))
+    }
 }
 
 fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
@@ -508,6 +644,106 @@ fn translate_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
             let rhs = Box::new(translate_expr(rhs, src)?);
             Ok(Expr::BinOp { span, op, lhs, rhs })
         }
+        // `#"sym"` / `foo:` symbol literal. The Rust parser stores the
+        // RAW token text (`#"foo"` keeps its `#"…"`, a `foo:` keyword
+        // keeps its trailing `:`) in `Expr::Symbol`, so the verbatim
+        // span slice is exactly what `fmt_expr` prints as `(Symbol …)`.
+        Kind::SymbolLit => Ok(Expr::Symbol(span, slice(src, node)?.to_string())),
+        // `~e` / `-e` prefix operator. The Dylan parser stores the
+        // operator token AS the `UnaryOp` node's own span and the
+        // operand as child[0] (see DYLAN_AST_WIRE.md row 17). The Rust
+        // parser builds `Expr::UnOp { op, operand }` — `-`→Neg, `~`→Not.
+        Kind::UnaryOp => {
+            let op = match slice(src, node)? {
+                "-" => nod_reader::ast::UnOp::Neg,
+                "~" => nod_reader::ast::UnOp::Not,
+                other => return unsupported(format!("unary operator {other:?}")),
+            };
+            let operand_node = node
+                .children
+                .first()
+                .ok_or_else(|| Unsupported("UnaryOp has no operand".into()))?;
+            // `-1` / `-1.5` — a `-` IMMEDIATELY followed by a numeric
+            // literal (no source gap) is fused into a SIGNED literal, not
+            // a `UnOp`. This mirrors the Rust *lexer* (lexer.rs
+            // `lex_plus_minus`: `-`/`+` + digit at token-start is one
+            // signed-numeric token), which the Dylan lexer splits into
+            // `-` + `1`. We refuse the operator otherwise (`- 1` with a
+            // gap stays a `UnOp`, matching Rust). Only `-` fuses — the
+            // Dylan parser never treats `+` as unary, and `~` is logical
+            // not.
+            if op == nod_reader::ast::UnOp::Neg
+                && node.span_hi == operand_node.span_lo
+            {
+                match operand_node.kind {
+                    Kind::IntegerLit => {
+                        let text = slice(src, operand_node)?;
+                        let v = parse_integer(text)
+                            .ok_or_else(|| Unsupported(format!("integer literal {text:?}")))?;
+                        return Ok(Expr::Integer(span, -v));
+                    }
+                    Kind::FloatLit => {
+                        let text = slice(src, operand_node)?;
+                        let v: f64 = text
+                            .parse()
+                            .map_err(|_| Unsupported(format!("float literal {text:?}")))?;
+                        return Ok(Expr::Float(span, -v));
+                    }
+                    _ => {}
+                }
+            }
+            let operand = Box::new(translate_expr(operand_node, src)?);
+            Ok(Expr::UnOp { span, op, operand })
+        }
+        // `a[i, j]` indexing. The Rust parser lowers it to a single call
+        // `element(a, i, j)` (parser.rs `parse_postfix`'s LBracket arm),
+        // so the AST has one call shape. The wire `Subscript` node's
+        // child[0] is the base and the remaining children are the
+        // indices.
+        Kind::Subscript => {
+            let mut it = node.children.iter();
+            let base_node = it
+                .next()
+                .ok_or_else(|| Unsupported("Subscript has no base".into()))?;
+            let mut args = vec![translate_expr(base_node, src)?];
+            for idx in it {
+                args.push(translate_expr(idx, src)?);
+            }
+            Ok(Expr::Call {
+                span,
+                callee: Box::new(Expr::Ident(span, "element".to_string())),
+                args,
+            })
+        }
+        // `#(…)` / `#[…]` / `#{…}` literal. The Rust parser lowers each to
+        // a `Call` to a synthetic constructor (`parse_hash_literal`):
+        // `#(` → `#list`, `#[` → `#vector`, `#{` → `#set`. The wire node's
+        // span is the open token, so the byte right after `#` selects the
+        // form. Children are the element exprs → the call args.
+        Kind::HashLit => {
+            let open = slice(src, node)?;
+            let name = match open.as_bytes().get(1) {
+                Some(b'(') => "#list",
+                Some(b'[') => "#vector",
+                Some(b'{') => "#set",
+                _ => return unsupported(format!("hash literal opener {open:?}")),
+            };
+            let mut args = Vec::new();
+            for el in &node.children {
+                args.push(translate_expr(el, src)?);
+            }
+            Ok(Expr::Call {
+                span,
+                callee: Box::new(Expr::Ident(span, name.to_string())),
+                args,
+            })
+        }
+        // A `let`/`local` at EXPRESSION position (e.g. inside an `if`
+        // then/else body, which the Rust parser parses with
+        // `parse_expr_full` → `parse_let_expr_compat`). Reconstruct the
+        // value-producing `Expr::Let` form here; `translate_local_decl`
+        // handles the STATEMENT-position `let`.
+        Kind::LocalDecl => translate_local_decl_as_expr(node, src),
         // A statement at expression position — Dylan's `if`/`while`/… are
         // value-producing. v1 reconstructs `if` (→ Expr::If with
         // Begin-wrapped arms); other statement keywords fall back.
@@ -566,14 +802,55 @@ fn is_body_macro(name: &str) -> bool {
 }
 
 /// Extract the operator token from the source gap between two operands.
-/// The gap can carry a closing `)` from the left operand's call/parens
-/// and/or an opening `(` from the right operand's — e.g. `f(x) + y`
-/// yields the gap `") + "`. Strip ALL parens and whitespace; what
-/// remains is the operator (`+`, `<=`, `:=`, `mod`, …). Operators never
-/// contain parens or whitespace, so this is lossless.
+/// The gap can carry a closing delimiter from the left operand
+/// (`f(x) + y` → `") + "`, `a[i] := v` → `"] := "`, a `#{…}` → `}`), an
+/// opening delimiter from the right operand, and/or **comments** — a
+/// multi-line `// …` block or a `/* … */` block can sit between two
+/// `|`-chained operands (e.g. dylan-parser.dylan's `f = #"dot-dot"` …
+/// 6-line comment … `| f = #"arrow"`). Strip comments first (Dylan `//`
+/// to end-of-line, `/* … */` non-nesting), then ALL bracket/brace/paren
+/// delimiters and whitespace; what remains is the operator (`+`, `<=`,
+/// `:=`, `mod`, `|`, …). A Dylan infix operator never contains a comment,
+/// delimiter, or whitespace, so this is lossless. (A lone `/` is the
+/// divide operator and is preserved — only `//` and `/*` start comments.)
 fn operator_in_gap(gap: &str) -> String {
-    gap.chars()
-        .filter(|c| !c.is_whitespace() && *c != '(' && *c != ')')
+    let mut cleaned = String::with_capacity(gap.len());
+    let mut chars = gap.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' {
+            match chars.peek() {
+                // `// …` line comment → skip through the newline.
+                Some('/') => {
+                    chars.next();
+                    for nc in chars.by_ref() {
+                        if nc == '\n' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // `/* … */` block comment → skip to the closing `*/`
+                // (Dylan block comments do not nest).
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for nc in chars.by_ref() {
+                        if prev == '*' && nc == '/' {
+                            break;
+                        }
+                        prev = nc;
+                    }
+                    continue;
+                }
+                // A lone `/` is the divide operator — keep it.
+                _ => {}
+            }
+        }
+        cleaned.push(c);
+    }
+    cleaned
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '(' | ')' | '[' | ']' | '{' | '}'))
         .collect()
 }
 
@@ -612,8 +889,54 @@ fn translate_statement_as_expr(node: &DylanAst, src: &str) -> Result<Expr, Unsup
     match slice(src, node)? {
         "if" => build_if(node, src),
         "while" | "until" => Ok(Expr::Stmt(Box::new(translate_statement(node, src)?))),
+        // An anonymous `method (params) body end` literal → `Expr::Method`.
+        // (The Dylan parser emits these as a `Statement` whose word is
+        // `method`/`function`, carrying a `ParamList` + optional
+        // `ReturnSpec` before the `Body` — see the `<ast-statement>`
+        // emitter.) The Rust parser builds `Expr::Method { params, body }`
+        // for `method …`; `function …` literals are rare in the corpus
+        // but share the shape.
+        "method" => build_method_literal(node, src),
         other => unsupported(format!("statement {other:?}")),
     }
+}
+
+/// An anonymous `method (params) => (ret) body end` literal →
+/// `Expr::Method`. Wire children (in order): optional `ParamList`,
+/// optional `ReturnSpec`, then the `Body`. The Rust parser discards the
+/// return spec of a method literal (`Expr::Method` carries only params
+/// + body), so we parse it for validity but don't attach it. The body
+/// forms are translated as expressions (a `let` inside becomes
+/// `Expr::Let`), matching `parse_method`'s `Vec<Expr>` body.
+fn build_method_literal(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
+    let mut params: Vec<Param> = Vec::new();
+    let mut body: Option<Vec<Expr>> = None;
+    for child in &node.children {
+        match child.kind {
+            Kind::ParamList => params = translate_param_list(child, src)?,
+            // The return spec is parsed by the Rust `parse_method` but not
+            // represented in `Expr::Method`; accept and ignore it.
+            Kind::ReturnSpec => {
+                let _ = translate_return_spec(child, src)?;
+            }
+            Kind::Body => {
+                body = Some(
+                    child
+                        .children
+                        .iter()
+                        .map(|c| translate_expr(c, src))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            other => return unsupported(format!("method literal child {other:?}")),
+        }
+    }
+    let body = body.ok_or_else(|| Unsupported("method literal has no Body".into()))?;
+    Ok(Expr::Method {
+        span: span_of(node),
+        params,
+        body,
+    })
 }
 
 /// A `Statement` wire node at STATEMENT position → `ast::Statement`.
@@ -629,67 +952,105 @@ fn translate_statement(node: &DylanAst, src: &str) -> Result<Statement, Unsuppor
 
 /// `if` → `Expr::If`. Wire shape: child[0] = leading `Body` holding
 /// `[cond, then-forms…]`, then zero-or-more `StatementClause` children
-/// (`else`/`elseif`). v1 handles a bare `if` and a single `else`;
-/// `elseif` (nested-If desugaring) falls back.
+/// — any number of `elseif` clauses (each carrying its own
+/// `[cond, then-forms…]` Body) optionally followed by one trailing
+/// `else` clause (carrying just `[forms…]`).
+///
+/// `elseif` desugars to a **nested `Expr::If`** exactly as the Rust
+/// parser does (parser.rs `parse_if_branches`): the chain
+/// `if (c1) t… elseif (c2) u… else e… end` becomes
+/// `If(c1, Begin[t…], Begin[ If(c2, Begin[u…], Begin[e…]) ])`. The
+/// outer `else_` arm of each `If` wraps the nested `If` in a `Begin`
+/// (the Rust parser returns `Some(vec![nested])` and then `Begin`-wraps
+/// it), so the dump nests `(If …)` inside a `(Begin (If …))`.
 fn build_if(node: &DylanAst, src: &str) -> Result<Expr, Unsupported> {
     let mut children = node.children.iter();
     let head = children
         .next()
         .ok_or_else(|| Unsupported("if: no head body".into()))?;
-    if head.kind != Kind::Body {
-        return unsupported("if: head is not a Body");
-    }
-    if head.children.is_empty() {
-        return unsupported("if: empty head body (no condition)");
-    }
-    let cond = Box::new(translate_expr(&head.children[0], src)?);
-    let then_body = head.children[1..]
-        .iter()
-        .map(|c| translate_expr(c, src))
-        .collect::<Result<Vec<_>, _>>()?;
-    let then_ = Box::new(Expr::Begin {
-        span: span_of(head),
-        body: then_body,
-    });
+    let (cond, then_) = if_branch_from_body(head, src)?;
 
+    // Collect the trailing clauses, then fold them right-to-left into
+    // the else chain so each `elseif` nests inside the previous one's
+    // else arm (matching the Rust parser's recursive descent).
+    let clauses: Vec<&DylanAst> = children.collect();
     let mut else_: Option<Box<Expr>> = None;
-    for clause in children {
+    for clause in clauses.iter().rev() {
         if clause.kind != Kind::StatementClause {
             return unsupported(format!("if: unexpected child {:?}", clause.kind));
-        }
-        let ckw = slice(src, clause)?;
-        if ckw != "else" {
-            // `elseif`/`finally`/… — the nested-If desugaring is a later
-            // increment; fall back for now.
-            return unsupported(format!("if clause {ckw:?}"));
-        }
-        if else_.is_some() {
-            return unsupported("if: multiple else clauses");
         }
         let cbody = clause
             .children
             .first()
-            .ok_or_else(|| Unsupported("else: no body".into()))?;
+            .ok_or_else(|| Unsupported("if-clause: no body".into()))?;
         if cbody.kind != Kind::Body {
-            return unsupported("else: clause child is not a Body");
+            return unsupported("if-clause: child is not a Body");
         }
-        let else_body = cbody
-            .children
-            .iter()
-            .map(|c| translate_expr(c, src))
-            .collect::<Result<Vec<_>, _>>()?;
-        else_ = Some(Box::new(Expr::Begin {
-            span: span_of(cbody),
-            body: else_body,
-        }));
+        match slice(src, clause)? {
+            "else" => {
+                if else_.is_some() {
+                    return unsupported("if: `else` not the final clause");
+                }
+                let else_body = cbody
+                    .children
+                    .iter()
+                    .map(|c| translate_expr(c, src))
+                    .collect::<Result<Vec<_>, _>>()?;
+                else_ = Some(Box::new(Expr::Begin {
+                    span: span_of(cbody),
+                    body: else_body,
+                }));
+            }
+            "elseif" => {
+                // The clause body is `[cond, then-forms…]`, like the head.
+                let (ei_cond, ei_then) = if_branch_from_body(cbody, src)?;
+                let nested = Expr::If {
+                    span: span_of(clause),
+                    cond: Box::new(ei_cond),
+                    then_: Box::new(ei_then),
+                    else_: else_.take(),
+                };
+                // The Rust parser threads the nested `If` through the
+                // outer else arm wrapped in a `Begin` (the recursive
+                // `parse_if_branches` returns `Some(vec![nested])`).
+                else_ = Some(Box::new(Expr::Begin {
+                    span: span_of(clause),
+                    body: vec![nested],
+                }));
+            }
+            other => return unsupported(format!("if clause {other:?}")),
+        }
     }
 
     Ok(Expr::If {
         span: span_of(node),
-        cond,
-        then_,
+        cond: Box::new(cond),
+        then_: Box::new(then_),
         else_,
     })
+}
+
+/// A leading `Body` of the form `[cond, then-forms…]` (the `if` head or
+/// an `elseif` clause body) → `(cond, Begin[then-forms…])`. The
+/// then-forms can themselves be `let`/`if`/… (translated via
+/// `translate_expr`, which handles a value-position `LocalDecl`/`if`).
+fn if_branch_from_body(body: &DylanAst, src: &str) -> Result<(Expr, Expr), Unsupported> {
+    if body.kind != Kind::Body {
+        return unsupported("if: branch head is not a Body");
+    }
+    if body.children.is_empty() {
+        return unsupported("if: empty branch body (no condition)");
+    }
+    let cond = translate_expr(&body.children[0], src)?;
+    let then_body = body.children[1..]
+        .iter()
+        .map(|c| translate_expr(c, src))
+        .collect::<Result<Vec<_>, _>>()?;
+    let then_ = Expr::Begin {
+        span: span_of(body),
+        body: then_body,
+    };
+    Ok((cond, then_))
 }
 
 /// `while`/`until` → `Statement::While`/`Until`. Wire shape: child[0] =
