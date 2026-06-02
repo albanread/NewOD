@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-02 — The Dylan parser is the default front-end (51e.6)](2026-06-02-parser-is-the-default.md)
+  — Sprint 51e complete. With the class-id drift fixed, the Dylan parser
+  flips from opt-in to the default real-pipeline front-end (`--parse-with-rust`
+  opts out; Rust = fall-back + verify oracle), gated on shim availability.
+  Default full sweep green (35 binaries; only environmental `ide_shell_infra`
+  fails). Lexer + parser are now both Dylan; the 8 remaining corpus
+  fall-backs are macro-phase work that closes in Sprint 52.
 - [2026-06-02 — Shim-AOT class-id drift: a great diagnosis, a rejected fix](2026-06-02-class-id-drift-attempt-rejected.md)
   — Task #7. A delegated fix produced an excellent dual-manifestation
   diagnosis (GAP-001's stdlib `<stream>` classes made the "no stdlib

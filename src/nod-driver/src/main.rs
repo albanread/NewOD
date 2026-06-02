@@ -96,6 +96,14 @@ struct Cli {
     /// byte-identical to the Rust parser's on every fixture.
     #[arg(long = "parse-with-dylan", global = true)]
     parse_with_dylan: bool,
+
+    /// Sprint 51e.6 — opt OUT of the now-default Dylan parser. The Dylan
+    /// parser is the default real-pipeline front-end (Rust stays the
+    /// verify oracle + the per-file fall-back); this flag (or
+    /// `NOD_PARSE_WITH_RUST=1`) forces the legacy Rust parser as the
+    /// authoritative path for `compile`/`eval`/`build`.
+    #[arg(long = "parse-with-rust", global = true)]
+    parse_with_rust: bool,
 }
 
 #[derive(Subcommand)]
@@ -431,6 +439,11 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("NOD_PARSE_WITH_DYLAN", "1"); }
     }
 
+    // Sprint 51e.6 — the Dylan parser is now the DEFAULT real-pipeline
+    // parser; `--parse-with-rust` (or NOD_PARSE_WITH_RUST=1) opts back out.
+    let want_parse_with_rust = cli.parse_with_rust
+        || std::env::var("NOD_PARSE_WITH_RUST").map(|v| v == "1").unwrap_or(false);
+
     // Sprint 51e.5 — `--parse-with-dylan` deliberately does NOT install
     // the Rust-side lex OVERRIDE. The Dylan parse path lexes internally
     // inside the shim (`dylan-parse-emit`), firing the resolver via its
@@ -487,8 +500,22 @@ fn main() -> ExitCode {
     // runs BOTH parsers, compares their `format_ast_module` dumps on the
     // *pipeline* parse, logs any divergence, and proceeds with the Rust
     // result — the safety net the spec mandates before defaulting).
-    if want_parse_with_dylan || want_verify_parse {
+    // Sprint 51e.6 — default-on. Install the Dylan parser override unless
+    // the user opted out (--parse-with-rust). Gate on shim availability via
+    // the build.rs-set cfg: a fresh checkout without the statically-linked
+    // shim cleanly keeps the Rust parser (no install, no per-file fall-back
+    // noise), exactly as before. The override fn JIT-straps the shim
+    // lazily on first parse, so non-parsing commands pay nothing.
+    // (`--parse-with-dylan` is now the default; `--verify-parse` still
+    // additionally runs both parsers and compares — see `dylan_parse_module`.)
+    if !want_parse_with_rust && cfg!(dylan_lex_shim_linked) {
         install_dylan_parse_override();
+    } else if !want_parse_with_rust && (want_parse_with_dylan || want_verify_parse) {
+        eprintln!(
+            "nod-driver: Dylan parser requested but the dylan-lex-shim is not \
+             statically linked; using the Rust parser. Build the shim to activate \
+             the Dylan front-end."
+        );
     }
 
     match cli.command {

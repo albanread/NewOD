@@ -103,7 +103,7 @@ DFM), with the back-end held constant.
 | Phase            | Status                          | Dylan source                                   |
 |------------------|---------------------------------|------------------------------------------------|
 | **Lexer**        | ✅ live (`--lex-with-dylan`)     | `tests/nod-tests/fixtures/dylan-lexer.dylan`   |
-| **Parser**       | ✅ verify + AST emit (`dump-dylan-ast`) | `…/dylan-parser.dylan`                  |
+| **Parser**       | ✅ **default** in the real pipeline (`--parse-with-rust` opts out; Rust = fall-back + verify oracle) | `…/dylan-parser.dylan` |
 | **Macro expander** | ⏳ Rust today; Dylan port queued | — (Sprint 52+)                              |
 | **Sema / namespace** | ⏳ Rust today; C3 piece in Dylan (Sprint 51a) | partial                          |
 | **AST → DFM lowering** | ⏳ Rust today; last front-end phase to migrate | —                          |
@@ -234,7 +234,7 @@ that earned their place:
 | 51b         | lexer (live)                    | byte-identical to Rust lexer          |
 | 51c         | parser (verify)                 | accept/reject agreement on corpus     |
 | 51d         | parser (AST emit)               | `dump-dylan-ast` round-trips          |
-| 51e         | parser AST kind coverage + `ast::Module` build | `--parse-with-dylan` replaces `parse_module` |
+| 51e         | parser → **default** in the real pipeline | Dylan parser is the default; Rust = fall-back + verify oracle; 28/36 corpus byte-identical (macro fixtures close in 52); full sweep green |
 | 52+         | macro expander → Dylan          | verify-mode against Rust expander     |
 | 53+         | sema / namespace → Dylan        | verify-mode against Rust sema         |
 | 54+         | AST → DFM lowering → Dylan      | DFM dumps byte-identical              |
