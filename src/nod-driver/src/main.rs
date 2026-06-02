@@ -267,6 +267,135 @@ enum Command {
     },
 }
 
+// ─── Sprint 51e.5 — Dylan parser in the real pipeline ─────────────────────
+//
+// The Dylan-side parser is wired into the *real* compile/eval/build
+// pipeline (not just the `dump-ast` diagnostic) via the parser override
+// hook in `nod-reader`. `install_dylan_parse_override` installs
+// `dylan_parse_module` as `nod_reader::parse_module_with_macros`'s
+// override; every `parse_user_module` call inside this driver process
+// (single-file `eval`/`dump-*`, and crucially the multi-file
+// `compile_files_for_aot` AST-merge) then routes through the Dylan
+// parser, with a whole-file fall-back to the canonical Rust parser for
+// any file it can't translate.
+//
+// This mirrors `dylan_lex_jit`'s `set_lex_override` install. The Rust
+// parser stays compiled in as the canonical fall-back AND the
+// verify-mode oracle.
+
+/// `nod_reader::ParseFn`-compatible Dylan parse entry point.
+///
+/// Ignores `tokens`, `preamble`, and `seed_macros` — the Dylan parser
+/// re-lexes `src` inside the statically-linked shim and seeds its own
+/// macro recognition. Runs `dylan_parse_wire::parse_to_tree(src)` then
+/// `dylan_to_ast::to_ast_module(&tree, src)`.
+///
+/// * On `Ok(module)` — returns the Dylan-translated `ast::Module` (the
+///   real pipeline lowers it directly), UNLESS `NOD_VERIFY_PARSE=1`, in
+///   which case it also runs `parse_module_with_macros_rust`, compares
+///   the two via `format_ast_module`, prints a loud divergence note if
+///   they differ, and **proceeds with the Rust result** (the safety net
+///   before defaulting — Sprint 51e.6).
+/// * On `Unsupported` OR a wire error — falls back by calling
+///   `nod_reader::parse_module_with_macros_rust` (the canonical, NOT the
+///   dispatcher, so a fall-back can't recurse into this override) and
+///   returns that.
+///
+/// The translated/fell-back note goes to stderr, reusing the wording
+/// from `run_dump_ast` so the same harness reads it.
+fn dylan_parse_module(
+    src: &str,
+    tokens: &[nod_reader::Token],
+    preamble: Option<&nod_reader::Preamble>,
+    seed_macros: &std::collections::HashSet<String>,
+) -> Result<nod_reader::Module, Vec<nod_reader::Diagnostic>> {
+    let verify = std::env::var("NOD_VERIFY_PARSE").map(|v| v == "1").unwrap_or(false);
+
+    // The Dylan path needs the shim's resolver to have fired. `init` is
+    // idempotent (a `OnceLock` guards the resolver), so calling it here
+    // is cheap on warm processes. On a no-shim build it errors and we
+    // fall straight back to the Rust parser.
+    let dylan_module: Option<nod_reader::Module> = match dylan_lex_jit::init() {
+        Err(e) => {
+            eprintln!("parse-with-dylan: fell back (shim init: {e}) [pipeline]");
+            None
+        }
+        Ok(()) => match dylan_parse_wire::parse_to_tree(src) {
+            Ok(tree) => match dylan_to_ast::to_ast_module(&tree, src) {
+                Ok(m) => {
+                    eprintln!("parse-with-dylan: translated [pipeline]");
+                    Some(m)
+                }
+                Err(dylan_to_ast::Unsupported(why)) => {
+                    eprintln!("parse-with-dylan: fell back ({why}) [pipeline]");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("parse-with-dylan: fell back (wire: {e}) [pipeline]");
+                None
+            }
+        },
+    };
+
+    // Verify-mode: parse with the Rust oracle too, compare the dumps,
+    // and proceed with the Rust result regardless. This is the safety
+    // net that runs both parsers on the *pipeline* parse (not just
+    // dump-ast) and surfaces any divergence loudly. Only meaningful when
+    // the Dylan path actually produced a module to compare against.
+    if verify {
+        let rust = nod_reader::parse_module_with_macros_rust(src, tokens, preamble, seed_macros);
+        if let Some(dyl) = &dylan_module
+            && let Ok(rust_m) = &rust
+        {
+            let dyl_dump = nod_reader::format_ast_module(dyl);
+            let rust_dump = nod_reader::format_ast_module(rust_m);
+            if dyl_dump != rust_dump {
+                eprintln!(
+                    "parse-verify: DIVERGENCE [pipeline] — the Dylan parser's AST \
+                     differs from the Rust parser's:\n\
+                     --- rust parse_module_with_macros ---\n{rust_dump}\n\
+                     --- dylan parse ---\n{dyl_dump}"
+                );
+            } else {
+                eprintln!("parse-verify: ok [pipeline] (rust+dylan AST byte-identical)");
+            }
+        }
+        return rust;
+    }
+
+    // Authoritative mode: use the Dylan result when it translated, else
+    // fall back to the canonical Rust parser for the whole file.
+    match dylan_module {
+        Some(m) => Ok(m),
+        None => nod_reader::parse_module_with_macros_rust(src, tokens, preamble, seed_macros),
+    }
+}
+
+/// Install [`dylan_parse_module`] as the process-wide
+/// `nod_reader::parse_module_with_macros` override. Idempotent and
+/// install-once (the `OnceLock` in `nod-reader` keeps the first
+/// installation). Called from `main` under the same
+/// `--parse-with-dylan` / `NOD_PARSE_WITH_DYLAN` condition as the lexer
+/// override.
+fn install_dylan_parse_override() {
+    let _ = nod_reader::set_parse_override(dylan_parse_module);
+    // NOTE: the status wording deliberately avoids the substring
+    // `parse-with-dylan:` — the `dylan_parse_translate` gate scans
+    // stderr for the FIRST line containing that substring to tally
+    // translated-vs-fell-back, and a startup status line carrying it
+    // would shadow the per-parse note. The per-parse notes (emitted by
+    // `dylan_parse_module`) own that substring.
+    if nod_reader::has_parse_override() {
+        eprintln!("nod-driver: Dylan parser override installed (real pipeline active)");
+    } else {
+        eprintln!(
+            "nod-driver: WARNING — Dylan parse-override slot already occupied; \
+             nod_reader::parse_module_with_macros will use whatever was installed first"
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -302,6 +431,19 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("NOD_PARSE_WITH_DYLAN", "1"); }
     }
 
+    // Sprint 51e.5 — `--parse-with-dylan` deliberately does NOT install
+    // the Rust-side lex OVERRIDE. The Dylan parse path lexes internally
+    // inside the shim (`dylan-parse-emit`), firing the resolver via its
+    // own `dylan_lex_jit::init()` call; it never needs `nod_reader::lex`
+    // to be redirected. Critically, the whole-file Rust FALL-BACK must
+    // keep using the Rust lexer so a fallback's AST stays byte-identical
+    // to plain `dump-ast` — the Dylan and Rust lexers differ on a few
+    // surfaces (e.g. `-1` as a call arg: Rust lexes a signed `Integer`,
+    // the Dylan lexer a `Minus` + `Integer` that the Rust parser would
+    // then fold into a `UnOp`). Installing the lex override would route
+    // the fall-back through the Dylan lexer and silently diverge the
+    // dump-ast gate. `--verify-parse` still implies lex-with-dylan (it
+    // shares the lexer shim's resolver for the collect path).
     let want_dylan_lex = cli.lex_with_dylan
         || want_verify_parse
         || std::env::var("NOD_LEX_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
@@ -329,6 +471,24 @@ fn main() -> ExitCode {
                 );
             }
         }
+    }
+
+    // Sprint 51e.5 — install the Dylan parser into the REAL pipeline.
+    // Done here, alongside the lexer override. Every
+    // `parse_module_with_macros` call in this process (single-file
+    // `eval`/`dump-*`, and the multi-file `compile_files_for_aot`
+    // AST-merge that `build` drives) then routes through the Dylan
+    // parser, with a whole-file fall-back to the Rust parser.
+    // `run_dump_ast` keeps its own inline Dylan path and is unaffected
+    // (it calls `parse_module_with_macros_rust` directly on fall-back).
+    //
+    // Installed under `--parse-with-dylan` (authoritative mode: use the
+    // Dylan result) OR `--verify-parse` (verify mode: `dylan_parse_module`
+    // runs BOTH parsers, compares their `format_ast_module` dumps on the
+    // *pipeline* parse, logs any divergence, and proceeds with the Rust
+    // result — the safety net the spec mandates before defaulting).
+    if want_parse_with_dylan || want_verify_parse {
+        install_dylan_parse_override();
     }
 
     match cli.command {
@@ -875,7 +1035,9 @@ fn run_dump_tokens(input: &std::path::Path) -> ExitCode {
 }
 
 fn run_dump_ast(input: &std::path::Path) -> ExitCode {
-    use nod_reader::{SourceMap, format_ast_module, lex, parse_module_with_macros, scan_preamble};
+    use nod_reader::{
+        SourceMap, format_ast_module, lex, parse_module_with_macros_rust, scan_preamble,
+    };
     let src = match std::fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
@@ -943,7 +1105,14 @@ fn run_dump_ast(input: &std::path::Path) -> ExitCode {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let result = parse_module_with_macros(&src, &tokens, pre.as_ref(), &macros);
+    // Sprint 51e.5 — call the canonical Rust parser DIRECTLY here, not
+    // the dispatcher. `run_dump_ast` already ran its own inline Dylan
+    // path above (and `return`ed on success); reaching here means it
+    // fell back, so this is the Rust fall-back. Using `_rust` keeps the
+    // installed pipeline parse-override (set when `--parse-with-dylan`)
+    // from double-firing the Dylan path here — the byte-identical
+    // dump-ast gate stays measuring the translator, not a re-dispatch.
+    let result = parse_module_with_macros_rust(&src, &tokens, pre.as_ref(), &macros);
     let rust_accepted = result.is_ok();
     // Sprint 51c — verify-parse check, when enabled. Runs the
     // Dylan-side parser on the same source and asserts both verdicts

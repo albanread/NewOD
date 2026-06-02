@@ -27,8 +27,9 @@ pub use format_dylan::format_dylan;
 pub use fragments::{Fragment, FragmentError, GroupKind, build_fragments};
 pub use lexer::{LexFn, Preamble, has_lex_override, lex, lex_rust, scan_preamble, set_lex_override};
 pub use parser::{
-    Diagnostic, parse_expr, parse_expr_with_macros, parse_module, parse_module_with_macros,
-    parse_top_level_exprs,
+    Diagnostic, ParseFn, has_parse_override, parse_expr, parse_expr_with_macros, parse_module,
+    parse_module_with_macros, parse_module_with_macros_rust, parse_top_level_exprs,
+    set_parse_override,
 };
 pub use span::{FileId, SourceMap, SourceMapError, Span};
 pub use token::{Token, TokenKind};

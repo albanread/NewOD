@@ -250,8 +250,24 @@ fn load_stdlib() -> Result<StdlibArtefacts, LoadError> {
             .map_err(LoadError::SourceMap)?;
         let toks = nod_reader::lex(src, file_id);
         let pre = nod_reader::scan_preamble(src);
-        let mut parsed =
-            nod_reader::parse_module(src, &toks, pre.as_ref()).map_err(LoadError::Parse)?;
+        // Sprint 51e.5 — the stdlib is compiler infrastructure that MUST
+        // parse correctly in every process; it is NOT a candidate for the
+        // experimental Dylan parser. Call the canonical Rust parser
+        // DIRECTLY (`…_rust`), bypassing the `parse_module_with_macros`
+        // dispatcher so an installed `--parse-with-dylan` parse-override
+        // never routes the stdlib through the partial Dylan parser (which
+        // currently signals a Dylan condition — e.g. "expected ) after
+        // arguments" — on some stdlib constructs, crashing the build).
+        // The Dylan parser feeds the USER pipeline (`parse_user_module`),
+        // not the stdlib load. `lex` is left as the dispatcher: the Dylan
+        // lexer is byte-identical and robust on the stdlib.
+        let mut parsed = nod_reader::parse_module_with_macros_rust(
+            src,
+            &toks,
+            pre.as_ref(),
+            &std::collections::HashSet::new(),
+        )
+        .map_err(LoadError::Parse)?;
         match &mut merged {
             None => merged = Some(parsed),
             Some(m) => m.items.append(&mut parsed.items),

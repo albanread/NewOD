@@ -114,7 +114,72 @@ pub fn parse_module(
 /// As the parser encounters in-source `define macro <name>` items,
 /// it extends its OWN copy of the set so later items in the same
 /// module can call the macro.
+///
+/// Sprint 51e.5 — this is the **dispatcher**. If a parse override has
+/// been installed via [`set_parse_override`] (the Dylan-side parser,
+/// JIT-strapped in by `nod-driver`'s `--parse-with-dylan`), dispatch to
+/// it; otherwise call the canonical [`parse_module_with_macros_rust`].
+/// Mirrors how [`crate::lexer::lex`] dispatches to its `LEX_OVERRIDE` or
+/// `lex_rust`. With no override installed, the path is identical to the
+/// pre-51e.5 behaviour.
 pub fn parse_module_with_macros(
+    src: &str,
+    tokens: &[Token],
+    preamble: Option<&Preamble>,
+    seed_macros: &HashSet<String>,
+) -> Result<Module, Vec<Diagnostic>> {
+    if let Some(&f) = PARSE_OVERRIDE.get() {
+        return f(src, tokens, preamble, seed_macros);
+    }
+    parse_module_with_macros_rust(src, tokens, preamble, seed_macros)
+}
+
+/// Signature of an alternate `parse_module_with_macros` implementation
+/// that can be installed at runtime via [`set_parse_override`]. Must
+/// match [`parse_module_with_macros_rust`] semantically: it receives the
+/// same `(src, tokens, preamble, seed_macros)` and returns the same
+/// `Result<Module, Vec<Diagnostic>>`. The Dylan-side implementation
+/// (`nod-driver::install_dylan_parse_override`) ignores `tokens`,
+/// `preamble`, and `seed_macros` (it re-lexes `src` inside the shim) and
+/// falls back to [`parse_module_with_macros_rust`] for any file it can't
+/// translate, so the result is never wrong — only "Dylan-translated" or
+/// "Rust-fallback".
+pub type ParseFn =
+    fn(&str, &[Token], Option<&Preamble>, &HashSet<String>) -> Result<Module, Vec<Diagnostic>>;
+
+static PARSE_OVERRIDE: std::sync::OnceLock<ParseFn> = std::sync::OnceLock::new();
+
+/// Sprint 51e.5 — install an alternate `parse_module_with_macros`
+/// implementation. Subsequent calls to [`parse_module_with_macros`]
+/// dispatch through it; calls to [`parse_module_with_macros_rust`]
+/// remain unaffected (the verify oracle and the Dylan path's own
+/// fall-back use that as the reference path).
+///
+/// **Install-once.** A `OnceLock` backs the slot, so the first caller
+/// wins. Re-installing a different function returns `Err(existing)` per
+/// the standard `OnceLock` semantics. The driver installs at startup
+/// (after parsing `--parse-with-dylan`) and never replaces — mirrors the
+/// "load once, redirect from Rust parser" model of [`set_lex_override`].
+pub fn set_parse_override(f: ParseFn) -> Result<(), ParseFn> {
+    PARSE_OVERRIDE.set(f)
+}
+
+/// Returns `true` if an alternate `parse_module_with_macros`
+/// implementation is currently installed. Used by the driver's
+/// `--parse-with-dylan` status line.
+pub fn has_parse_override() -> bool {
+    PARSE_OVERRIDE.get().is_some()
+}
+
+/// The canonical (Rust) `parse_module_with_macros`. Always available;
+/// [`parse_module_with_macros`] may dispatch to a Dylan-side override
+/// but `parse_module_with_macros_rust` is the canonical fall-back and
+/// the verify oracle's reference path.
+///
+/// The Dylan-side override (`nod-driver`) calls THIS directly for its
+/// whole-file fall-back, deliberately NOT the dispatcher, so a fall-back
+/// can't recurse back into the override.
+pub fn parse_module_with_macros_rust(
     src: &str,
     tokens: &[Token],
     preamble: Option<&Preamble>,
