@@ -99,8 +99,9 @@ pub use aot::{nod_aot_main_wrapper, nod_aot_register_variable, nod_runtime_init}
 pub use classes::{
     ClassId, ClassMetadata, ClassTable, LayoutFn, ScanFn, SizeFn, SlotDefault, SlotInfo,
     SlotType, _reset_user_classes_for_tests, allocate_user_class_id, class_metadata_for,
-    class_metadata_ptr, find_class_id_by_name, for_each_class, is_subclass,
-    register_user_class, user_class_layout_fn, user_class_scan_fn, user_class_size_fn,
+    class_metadata_ptr, find_class_id_by_name, find_class_id_by_name_excluding_shim_band,
+    for_each_class, is_subclass, register_user_class, set_shim_class_band_active,
+    shim_class_band_active, user_class_layout_fn, user_class_scan_fn, user_class_size_fn,
 };
 pub use closures::{
     cell_class_id, ensure_registered as ensure_closures_registered, environment_class_id,

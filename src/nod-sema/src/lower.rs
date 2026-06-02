@@ -47,11 +47,31 @@ use nod_dfm::{
 use nod_reader::{BinOp, Binder, Expr, Item, Module, Param, ReturnSig, Span, Statement, UnOp};
 use nod_runtime::{
     ClassId, ClassMetadata, SlotDefault, SlotInfo, SlotType, Word, class_metadata_for,
-    class_metadata_ptr, find_class_id_by_name, register_mi_user_class,
-    register_simple_user_class,
+    class_metadata_ptr, find_class_id_by_name, find_class_id_by_name_excluding_shim_band,
+    register_mi_user_class, register_simple_user_class,
 };
 
 use crate::c3::{C3Error, c3_linearise};
+
+/// Sprint 51e — class-name resolution as a USER program sees it.
+///
+/// Front-end-shim classes (`ClassId::FIRST_SHIM..`) get registered in a
+/// host process when a statically-linked shim's AOT resolver fires
+/// (e.g. parsing with `--parse-with-dylan`). They are the compiler
+/// front-end's private classes and must NOT shadow same-named USER
+/// classes, nor block a user program that defines (say) its own
+/// `<token>`. So while lowering a USER module (the shim id band is OFF)
+/// we resolve names through [`find_class_id_by_name_excluding_shim_band`],
+/// which skips the shim band. While lowering the SHIM's OWN source (band
+/// ON), those classes ARE the program's classes, so we fall back to the
+/// unfiltered [`find_class_id_by_name`]. See `ClassId::FIRST_SHIM`.
+fn resolve_class_id_by_name(name: &str) -> Option<ClassId> {
+    if nod_runtime::shim_class_band_active() {
+        find_class_id_by_name(name)
+    } else {
+        find_class_id_by_name_excluding_shim_band(name)
+    }
+}
 
 type LocalEnv = HashMap<String, TempId>;
 
@@ -2585,8 +2605,11 @@ fn register_class(
     slots: &[nod_reader::SlotDef],
     span: Span,
 ) -> Result<ClassId, LoweringError> {
-    // Sprint 12 refuses redefinition.
-    if find_class_id_by_name(name).is_some() {
+    // Sprint 12 refuses redefinition. Sprint 51e: a front-end-shim
+    // class of the same name (high id band) is a separate namespace and
+    // must NOT count as a prior definition — use the shim-band-aware
+    // resolver so a user program can define its own `<token>` etc.
+    if resolve_class_id_by_name(name).is_some() {
         return Err(LoweringError::ClassRedefinitionNotSupported {
             span,
             class_name: name.to_string(),
@@ -2609,7 +2632,7 @@ fn register_class(
                     });
                 }
             };
-            match find_class_id_by_name(&super_name) {
+            match resolve_class_id_by_name(&super_name) {
                 Some(id) => {
                     // Sprint 15 cross-library refusal — if the parent
                     // was already sealed by a prior lowering call, this
@@ -2768,7 +2791,7 @@ fn register_class(
         if i == 0 {
             cpl.push(self_sentinel);
         } else {
-            match find_class_id_by_name(n) {
+            match resolve_class_id_by_name(n) {
                 Some(id) => cpl.push(id),
                 None => {
                     return Err(LoweringError::InconsistentInheritance {
@@ -2892,7 +2915,7 @@ fn slot_type_from_expr(e: &Expr) -> SlotType {
             "<object>" | "<top>" => SlotType::Top,
             other => {
                 // User class? If registered, narrow.
-                if let Some(id) = find_class_id_by_name(other) {
+                if let Some(id) = resolve_class_id_by_name(other) {
                     SlotType::Class(id)
                 } else {
                     SlotType::Top
@@ -3063,7 +3086,7 @@ fn lower_method_item(
     let mut specialisers: Vec<ClassId> = Vec::with_capacity(params.len());
     for p in params {
         let cls = match &p.type_ {
-            Some(Expr::Ident(_, cls)) => match find_class_id_by_name(cls) {
+            Some(Expr::Ident(_, cls)) => match resolve_class_id_by_name(cls) {
                 Some(id) => id,
                 None => {
                     return Err(LoweringError::UndefinedIdent {
@@ -4263,7 +4286,7 @@ fn collect_generic_names(m: &Module) -> HashSet<String> {
                 // For MI: every slot — own or inherited — belongs to a
                 // generic with the slot's name. The dispatch picks the
                 // right per-class method (override or parent's).
-                if let Some(class_id) = find_class_id_by_name(name) {
+                if let Some(class_id) = resolve_class_id_by_name(name) {
                     let md_ptr = nod_runtime::class_metadata_ptr(class_id);
                     if !md_ptr.is_null() {
                         // SAFETY: registered class.
@@ -4306,7 +4329,7 @@ fn type_from_expr(ty: Option<&Expr>) -> TypeEstimate {
             // it as a tagged Word regardless of estimate). The
             // narrowing pass / resolver simply skips temps with `Top`.
             other if other.starts_with('<') && other.ends_with('>') => {
-                match find_class_id_by_name(other) {
+                match resolve_class_id_by_name(other) {
                     Some(id) => TypeEstimate::Class(id.0),
                     None => TypeEstimate::Top,
                 }
@@ -4570,7 +4593,7 @@ impl FunctionBuilder {
                 // the class metadata (i.e. a tagged Word).
                 if name.starts_with('<')
                     && name.ends_with('>')
-                    && let Some(class_id) = ctx.user_classes.get(name).copied().or_else(|| find_class_id_by_name(name))
+                    && let Some(class_id) = ctx.user_classes.get(name).copied().or_else(|| resolve_class_id_by_name(name))
                 {
                     return Ok(self.emit_class_ref(class_id));
                 }
@@ -5674,7 +5697,7 @@ impl FunctionBuilder {
                 .user_classes
                 .get(name)
                 .copied()
-                .or_else(|| find_class_id_by_name(name))
+                .or_else(|| resolve_class_id_by_name(name))
             {
                 Some(id) => id,
                 None => {
@@ -6049,7 +6072,7 @@ impl FunctionBuilder {
                         .user_classes
                         .get(name)
                         .copied()
-                        .or_else(|| find_class_id_by_name(name));
+                        .or_else(|| resolve_class_id_by_name(name));
                     match cid {
                         Some(id) => ClassCheck::UserClass {
                             id: id.0,
@@ -7338,7 +7361,7 @@ fn lower_block_form(
                 .user_classes
                 .get(n)
                 .copied()
-                .or_else(|| find_class_id_by_name(n))
+                .or_else(|| resolve_class_id_by_name(n))
                 .ok_or_else(|| LoweringError::UndefinedIdent {
                     span: h.span,
                     name: n.clone(),

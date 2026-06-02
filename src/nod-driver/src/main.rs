@@ -704,7 +704,13 @@ fn run_build_full(
     // duplicate definitions, then merges everything into one
     // `LoweredModule` before the stdlib is layered on.
     let path_refs: Vec<&std::path::Path> = inputs.iter().map(|p| p.as_path()).collect();
-    let lm = match nod_sema::compile_files_for_aot(&path_refs) {
+    // Sprint 51e — a `--library` build is a front-end shim: its own
+    // `define class`es must be minted from the shim id band so they
+    // don't shift `FIRST_USER..` ids in any host that statically links
+    // the resulting `.obj`. `compile_files_for_aot_with_shape` flips the
+    // band around the shim source's lowering. A normal EXE build passes
+    // `library = false` and is unaffected.
+    let lm = match nod_sema::compile_files_for_aot_with_shape(&path_refs, library) {
         Ok(lm) => lm,
         Err(e) => {
             eprintln!("nod build: {e}");
@@ -875,6 +881,21 @@ fn run_build_full(
     link_cmd.arg("/NXCOMPAT");
     link_cmd.arg("/DYNAMICBASE");
     link_cmd.arg("/HIGHENTROPYVA");
+    // NOTE (tasks #7/#8): we deliberately do NOT pass `/FORCE:MULTIPLE`.
+    // `nod_runtime.lib` ships a default `nod_user_main` stub
+    // (`aot_user_main_stub.rs`); the real AOT EXE supplies its own strong
+    // `nod_user_main` (the renamed Dylan entry in `obj_path`, linked
+    // FIRST), and MSVC's on-demand archive extraction drops the stub —
+    // which works cleanly in DEBUG. It is FRAGILE in RELEASE, where
+    // Cargo's CGU partitioner can colocate the stub with a hot std
+    // monomorphization, forcing extraction → `LNK2005 nod_user_main`
+    // (a pre-existing, *documented release-only* issue —
+    // docs/manual/compiler/jit-and-aot.md:309). `/FORCE:MULTIPLE` would
+    // mask that by silencing ALL duplicate-symbol errors, and still yields
+    // a non-functional release EXE, so it is the wrong instrument. The
+    // correct fix is the `codegen-units = 1` pin the manual already
+    // promises but that is currently absent from every Cargo.toml
+    // (task #8). Debug AOT links cleanly without any of this.
     // GAP-011 diagnostic: emit a linker map file alongside the EXE so a
     // crash-backtrace IP can be resolved back to the AOT Dylan function it
     // belongs to. Costs a few seconds of link time + a text file; no effect

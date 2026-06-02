@@ -959,6 +959,28 @@ pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
 /// to) calling `compile_file_for_aot` on that path — the merge loop
 /// is a no-op when there's only one file.
 pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError> {
+    compile_files_for_aot_with_shape(paths, /* library = */ false)
+}
+
+/// Sprint 51e — variant of [`compile_files_for_aot`] that knows whether
+/// the artifact is a **front-end shim static library** (`--library`).
+///
+/// A shim library carries its own `define class`es (`<token>`,
+/// `<ast-*>`, …) and is designed to be statically linked into a host
+/// (`nod-driver`) whose class registry is already populated by the
+/// stdlib. To keep the shim's classes from colliding with — and shifting
+/// — the host's `FIRST_USER..` user-class ids, the shim's OWN classes
+/// are minted from the disjoint shim band (`ClassId::FIRST_SHIM..`): we
+/// flip [`nod_runtime::set_shim_class_band_active`] ON across the shim
+/// source's `lower_module_full` (the only phase that registers the
+/// shim's classes), having already let the stdlib load with its
+/// canonical `FIRST_USER..` ids. A plain user build leaves the band OFF,
+/// so its classes allocate from `FIRST_USER..` exactly as before — see
+/// `ClassId::FIRST_SHIM`'s doc for the full rationale.
+pub fn compile_files_for_aot_with_shape(
+    paths: &[&Path],
+    library: bool,
+) -> Result<LoweredModule, EvalError> {
     if paths.is_empty() {
         return Err(EvalError::Lower(vec![]));
     }
@@ -1107,7 +1129,21 @@ pub fn compile_files_for_aot(paths: &[&Path]) -> Result<LoweredModule, EvalError
     // resulting `LoweredModule` is structurally identical to what
     // the single-file path produces from a hand-concatenated source.
     expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
-    let mut lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    // Sprint 51e — mint the shim library's OWN classes from the shim
+    // band so they don't consume `FIRST_USER..` ids. The stdlib already
+    // loaded above (its classes keep their canonical low ids); only this
+    // source's `register_class` calls run under the band. Restored
+    // unconditionally afterwards so nothing else in the process inherits
+    // the band. (No-op for a normal user build, where `library` is
+    // false.)
+    if library {
+        nod_runtime::set_shim_class_band_active(true);
+    }
+    let lowered = lower_module_full(&module);
+    if library {
+        nod_runtime::set_shim_class_band_active(false);
+    }
+    let mut lm = lowered.map_err(EvalError::Lower)?;
     merge_stdlib_into_user_module(&mut lm);
     Ok(lm)
 }

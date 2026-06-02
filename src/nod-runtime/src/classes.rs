@@ -46,6 +46,27 @@ impl ClassId {
     pub const PAIR: ClassId = ClassId(11);
     /// First id minted for user-defined classes.
     pub const FIRST_USER: u32 = 1024;
+    /// Sprint 51e — first id minted for **front-end shim** classes.
+    ///
+    /// A statically-linked Dylan front-end shim (the migrated
+    /// lexer/parser, and later the macro expander / sema / lowering)
+    /// carries its OWN `define class`es (`<token>`, `<ast-*>`, …). When
+    /// such a shim's AOT resolver fires INSIDE a host process (e.g.
+    /// `nod-driver` building a user program with `--parse-with-dylan`),
+    /// those classes must NOT consume ids from the `FIRST_USER..` range
+    /// that stdlib + the user program share — otherwise the host's
+    /// `allocate_user_class_id` is bumped by the shim's class count and
+    /// every subsequently-registered USER class lands at a higher id
+    /// than the shim-free user EXE will allocate, tripping the AOT
+    /// class-id-drift assert (`aot.rs`).
+    ///
+    /// Putting shim classes in a disjoint high band keeps the
+    /// `FIRST_USER..` sequence byte-identical whether or not a shim is
+    /// active, so a user program's baked class ids always match what its
+    /// own (shim-free) EXE allocates. The band is far above any
+    /// plausible user-class count; ids stay within `u32` and the
+    /// `<wrapper>` header's 32-bit class-id field.
+    pub const FIRST_SHIM: u32 = 0x4000_0000;
 }
 
 impl std::fmt::Debug for ClassId {
@@ -612,6 +633,14 @@ struct Registry {
     /// the thousands).
     entries: Vec<*const ClassMetadata>,
     next_user_id: u32,
+    /// Sprint 51e — monotonic id source for the front-end shim band
+    /// (`ClassId::FIRST_SHIM..`). Bumped only while
+    /// [`shim_class_band_active`] is set (the shim BUILD lowering its own
+    /// source) or when the AOT resolver registers a shim-band class
+    /// (`expected_class_id >= FIRST_SHIM`). Kept entirely separate from
+    /// `next_user_id` so shim registrations never perturb the user
+    /// id sequence. See `FIRST_SHIM`'s doc for why.
+    next_shim_id: u32,
 }
 
 // SAFETY: entries are pointers into the static area (pinned and
@@ -652,9 +681,34 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
         *guard = Some(Registry {
             entries,
             next_user_id: ClassId::FIRST_USER,
+            next_shim_id: ClassId::FIRST_SHIM,
         });
     }
     f(guard.as_mut().expect("registry initialised"))
+}
+
+/// Sprint 51e — process-global toggle: when set, [`allocate_user_class_id`]
+/// mints from the front-end-shim band (`ClassId::FIRST_SHIM..`) instead
+/// of the normal user band (`ClassId::FIRST_USER..`).
+///
+/// The shim BUILD flips this ON after the stdlib has loaded (so stdlib
+/// classes keep their canonical `FIRST_USER..` ids) and before lowering
+/// the shim's OWN `define class`es, so the shim's classes are minted —
+/// and thus baked into the shim `.obj` — in the high band. It stays OFF
+/// for every other build (user programs, the JIT path), so their classes
+/// allocate from `FIRST_USER..` exactly as before.
+static SHIM_CLASS_BAND_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Sprint 51e — enter/leave the shim class-id band for subsequent
+/// [`allocate_user_class_id`] calls on THIS process. See
+/// [`ClassId::FIRST_SHIM`].
+pub fn set_shim_class_band_active(active: bool) {
+    SHIM_CLASS_BAND_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+/// Sprint 51e — is the shim class-id band currently active?
+pub fn shim_class_band_active() -> bool {
+    SHIM_CLASS_BAND_ACTIVE.load(Ordering::SeqCst)
 }
 
 /// Raw pointer to the metadata for `id`, or null if unregistered. Used
@@ -695,12 +749,25 @@ pub unsafe fn register_user_class(metadata: &'static ClassMetadata) -> ClassId {
     })
 }
 
-/// Reserve the next user class id and bump the counter.
+/// Reserve the next class id and bump the appropriate counter.
+///
+/// Mints from the front-end-shim band (`FIRST_SHIM..`) when
+/// [`shim_class_band_active`] is set, otherwise from the normal user
+/// band (`FIRST_USER..`). The two counters are independent so a shim
+/// build's own classes never perturb the user id sequence — see
+/// [`ClassId::FIRST_SHIM`].
 pub fn allocate_user_class_id() -> ClassId {
+    let shim_band = shim_class_band_active();
     with_registry(|reg| {
-        let id = ClassId(reg.next_user_id);
-        reg.next_user_id += 1;
-        id
+        if shim_band {
+            let id = ClassId(reg.next_shim_id);
+            reg.next_shim_id += 1;
+            id
+        } else {
+            let id = ClassId(reg.next_user_id);
+            reg.next_user_id += 1;
+            id
+        }
     })
 }
 
@@ -714,6 +781,40 @@ pub fn find_class_id_by_name(name: &str) -> Option<ClassId> {
             }
             // SAFETY: pointer is to static-area metadata.
             let md = unsafe { &**p };
+            if md.name == name {
+                return Some(md.id);
+            }
+        }
+        None
+    })
+}
+
+/// Sprint 51e — find a class id by name, **ignoring front-end-shim-band
+/// classes** (`ClassId::FIRST_SHIM..`).
+///
+/// The shim's internal classes (`<token>`, `<ast-*>`, …) get registered
+/// in a host process when a statically-linked front-end shim's resolver
+/// fires (e.g. `nod-driver` parsing with `--parse-with-dylan`). They are
+/// an implementation detail of the compiler's front-end and form a
+/// namespace DISJOINT from the user program's classes — a user program
+/// may legitimately `define class <token>` of its own. Name resolution
+/// during USER-class lowering (`register_class`'s redefinition refusal
+/// and superclass resolution) therefore consults only the user/seed
+/// bands via this function, so a shim class never shadows or blocks a
+/// same-named user class. (The shim's OWN build resolves its own classes
+/// through the unfiltered [`find_class_id_by_name`], because there the
+/// shim classes ARE the program's classes.)
+pub fn find_class_id_by_name_excluding_shim_band(name: &str) -> Option<ClassId> {
+    with_registry(|reg| {
+        for p in &reg.entries {
+            if p.is_null() {
+                continue;
+            }
+            // SAFETY: pointer is to static-area metadata.
+            let md = unsafe { &**p };
+            if md.id.0 >= ClassId::FIRST_SHIM {
+                continue;
+            }
             if md.name == name {
                 return Some(md.id);
             }
@@ -754,6 +855,10 @@ pub fn _reset_user_classes_for_tests() {
         reg.entries
             .retain(|p| !p.is_null() && unsafe { (**p).id.0 } < ClassId::FIRST_USER);
         reg.next_user_id = ClassId::FIRST_USER;
+        // Sprint 51e — the retain above already drops shim-band entries
+        // (their ids are `>= FIRST_SHIM > FIRST_USER`); reset the shim
+        // counter too so a re-lower starts both bands from a clean seed.
+        reg.next_shim_id = ClassId::FIRST_SHIM;
     }
 }
 

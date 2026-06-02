@@ -997,6 +997,55 @@ pub unsafe extern "C" fn nod_aot_register_user_class(
         })
         .collect();
 
+    // Idempotency on an already-registered class (Sprint 51e).
+    //
+    // The contract this function enforces is "class `name` ends up
+    // registered with id `expected_class_id`" — NOT "this call performs
+    // the allocation". Those coincide for the original AOT-EXE path (a
+    // user EXE links the runtime, runs `nod_aot_resolve_relocs` against a
+    // FRESH registry, and every merged-LM class is registered exactly
+    // once). They diverge the moment a statically-linked Dylan front-end
+    // SHIM runs its own resolver INSIDE a host process whose registry is
+    // already populated:
+    //
+    //   * `nod-driver` (with `--parse-with-dylan` / a future migrated
+    //     phase) runs `nod_runtime_init()` + `stdlib::ensure_loaded()`
+    //     during `compile_files_for_aot` BEFORE the first parse fires
+    //     the shim's `dylan_lex_jit::init()` → `nod_aot_resolve_relocs`.
+    //   * The shim's resolver carries baked registrations for its OWN
+    //     merged module, whose `user_classes` list (via
+    //     `merge_modules`) is prefixed by the stdlib's classes —
+    //     including the stdlib `define class`es `<stream>` /
+    //     `<string-stream>` (GAP-001). The host has ALREADY registered
+    //     those (at exactly the ids the shim baked, because both ran the
+    //     identical `nod_runtime_init` + stdlib load).
+    //   * Re-running `register_user_class_metadata` here would mint a
+    //     SECOND, duplicate metadata entry and bump `next_user_id`,
+    //     pushing the shim's subsequent FRESH classes (`<token>`,
+    //     `<ast-*>`, …) past their baked ids and tripping the drift
+    //     assert spuriously.
+    //
+    // So: if `name` is already registered, the only correct outcomes are
+    // "it's at the expected id → nothing to do" or "it's at a DIFFERENT
+    // id → genuine drift, panic". This neither weakens nor bypasses the
+    // drift check — a fresh class still goes through the original
+    // allocate-then-assert path below, and a name registered at the
+    // wrong id now ALSO panics (a case the allocate-first code couldn't
+    // even reach). `find_class_id_by_name` scans the same registry the
+    // allocator feeds, so the comparison is exact.
+    if let Some(existing) = crate::find_class_id_by_name(name) {
+        assert_eq!(
+            existing.0, expected_class_id,
+            "nod_aot_register_user_class: class id drift — compiler expected \
+             {expected_class_id} for class `{name}`, but that class is already \
+             registered at id {} in this process. The AOT registration \
+             sequence diverged from the compile-time sequence; the codegen \
+             path is buggy.",
+            existing.0
+        );
+        return;
+    }
+
     // Build the UserClassSpec. The CPL's first entry IS the compiler's
     // expected class id — `register_user_class_metadata` doesn't rewrite
     // the cpl[0] sentinel because we provided the real id. The
@@ -1012,7 +1061,30 @@ pub unsafe extern "C" fn nod_aot_register_user_class(
         own_slot_count,
         inherited_slot_count,
     };
+
+    // Sprint 51e — front-end-shim classes live in a disjoint high band
+    // (`ClassId::FIRST_SHIM..`, see `classes.rs`). A class baked with a
+    // shim-band `expected_class_id` must be re-minted from the shim
+    // counter (`next_shim_id`) so it does NOT consume a `FIRST_USER..`
+    // id — otherwise registering the shim's classes inside a host that
+    // is also compiling a user program would shift the user program's
+    // ids. We flip the band toggle around `register_user_class_metadata`
+    // (whose inner `allocate_user_class_id` reads it) and restore it.
+    //
+    // This does NOT weaken the drift assert: both bands mint
+    // sequentially (the compiler counted `next_shim_id` / `next_user_id`
+    // up in registration order; the resolver replays that same order),
+    // so `assigned_id == expected_class_id` is a REAL agreement check in
+    // either band, not a tautology.
+    let shim_band = expected_class_id >= crate::ClassId::FIRST_SHIM;
+    let prev_band = crate::shim_class_band_active();
+    if shim_band != prev_band {
+        crate::set_shim_class_band_active(shim_band);
+    }
     let (assigned_id, _md_ptr) = crate::register_user_class_metadata(spec);
+    if shim_band != prev_band {
+        crate::set_shim_class_band_active(prev_band);
+    }
     assert_eq!(
         assigned_id.0, expected_class_id,
         "nod_aot_register_user_class: class id drift — compiler expected \
