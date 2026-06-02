@@ -565,6 +565,222 @@ define function render-frags (frags :: <stretchy-vector>)
   join-chunks(out)
 end function;
 
+// ─── Sprint 52.4 — template substitution with hygiene ────────────────────
+//
+// Hygiene policy (binder-only rename), mirroring nod-macro:
+//   * collect-template-binders walks the template for identifiers in
+//     BINDING position: the ident after `let`, and the param idents of a
+//     `method (…)` / `function (…)` head.
+//   * emit-template-hyg renames every template-literal occurrence of a
+//     binder name to `<name>__nod_hyg_<nonce>`, UNLESS the name is a
+//     pattern variable or is in the conservative no-rename keyword/type
+//     list. Reference-position identifiers (not binders) flow through
+//     verbatim so they resolve against the surrounding scope.
+//   * Substituted (`?x`) call-site fragments are spliced verbatim and
+//     never renamed.
+// The nonce is passed as a string so the gate can pin it deterministically
+// for the byte-identical cross-check against the Rust expander.
+
+// Small string-set on a <stretchy-vector> (linear; sets are tiny).
+define function string-in? (set :: <stretchy-vector>, s :: <byte-string>)
+ => (yes? :: <boolean>)
+  let n = size(set);
+  let i = 0;
+  let found = #f;
+  until (i = n | found)
+    if (set[i] = s) found := #t; else i := i + 1; end;
+  end;
+  found
+end function;
+
+define function string-set-add! (set :: <stretchy-vector>, s :: <byte-string>) => ()
+  if (~ string-in?(set, s)) add!(set, s); end;
+end function;
+
+// Pattern-variable names (recursively, including group sub-patterns).
+define function collect-pattern-var-names (pattern :: <stretchy-vector>)
+ => (out :: <stretchy-vector>)
+  let out = make(<stretchy-vector>);
+  collect-pv(pattern, out);
+  out
+end function;
+
+define function collect-pv (pattern :: <stretchy-vector>, out :: <stretchy-vector>) => ()
+  let n = size(pattern);
+  let i = 0;
+  until (i = n)
+    let p = pattern[i];
+    if (instance?(p, <pat-variable>))
+      string-set-add!(out, pat-var-name(p));
+    elseif (instance?(p, <pat-group>))
+      collect-pv(pat-grp-body(p), out);
+    end;
+    i := i + 1;
+  end;
+end function;
+
+// Is this template element a literal identifier token?
+define function tpl-lit-ident? (e :: <template-elem>) => (yes? :: <boolean>)
+  if (instance?(e, <tpl-literal>))
+    tok-kind(tpl-lit-tok(e)) = #"ident"
+  else
+    #f
+  end
+end function;
+
+// Is this template element a paren group?
+define function tpl-paren-group? (e :: <template-elem>) => (yes? :: <boolean>)
+  if (instance?(e, <tpl-group>))
+    tpl-grp-kind(e) = #"paren"
+  else
+    #f
+  end
+end function;
+
+// Record every Ident at a binding position in a `method`/`function`
+// param list: the head ident and each ident immediately after a comma.
+define function record-param-idents (body :: <stretchy-vector>,
+                                     out :: <stretchy-vector>) => ()
+  let n = size(body);
+  let i = 0;
+  let expect-name = #t;
+  until (i = n)
+    let el = body[i];
+    if (instance?(el, <tpl-literal>))
+      let t = tpl-lit-tok(el);
+      if (tok-kind(t) = #"ident" & expect-name)
+        string-set-add!(out, tok-text(t));
+        expect-name := #f;
+      elseif (tok-kind(t) = #"punct" & tok-text(t) = ",")
+        expect-name := #t;
+      end;
+    else
+      expect-name := #t;
+    end;
+    i := i + 1;
+  end;
+end function;
+
+define function walk-template-for-binders (template :: <stretchy-vector>,
+                                           out :: <stretchy-vector>) => ()
+  let n = size(template);
+  let i = 0;
+  until (i >= n)
+    let e = template[i];
+    if (tpl-lit-ident?(e))
+      let text = tok-text(tpl-lit-tok(e));
+      if (text = "let" & i + 1 < n & tpl-lit-ident?(template[i + 1]))
+        string-set-add!(out, tok-text(tpl-lit-tok(template[i + 1])));
+        i := i + 2;
+      elseif ((text = "method" | text = "function")
+                & i + 1 < n & tpl-paren-group?(template[i + 1]))
+        record-param-idents(tpl-grp-body(template[i + 1]), out);
+        i := i + 2;
+      else
+        i := i + 1;
+      end;
+    elseif (instance?(e, <tpl-group>))
+      walk-template-for-binders(tpl-grp-body(e), out);
+      i := i + 1;
+    else
+      i := i + 1;
+    end;
+  end;
+end function;
+
+define function collect-template-binders (template :: <stretchy-vector>)
+ => (out :: <stretchy-vector>)
+  let out = make(<stretchy-vector>);
+  walk-template-for-binders(template, out);
+  out
+end function;
+
+// Conservative no-rename set: Dylan special-form keywords + core type
+// names + helpers. Mirrors nod-macro::is_template_no_rename exactly.
+define function is-template-no-rename? (name :: <byte-string>) => (yes? :: <boolean>)
+  name = "if" | name = "else" | name = "elseif" | name = "unless"
+    | name = "begin" | name = "let" | name = "local" | name = "method"
+    | name = "case" | name = "select" | name = "for" | name = "while"
+    | name = "until" | name = "block" | name = "exception" | name = "cleanup"
+    | name = "finally" | name = "afterwards" | name = "from" | name = "to"
+    | name = "by" | name = "below" | name = "above" | name = "in"
+    | name = "values" | name = "next-method" | name = "make" | name = "as"
+    | name = "instance?" | name = "subtype?" | name = "element"
+    | name = "<integer>" | name = "<single-float>" | name = "<double-float>"
+    | name = "<boolean>" | name = "<character>" | name = "<string>"
+    | name = "<byte-string>" | name = "<object>" | name = "<class>"
+    | name = "<symbol>" | name = "<pair>" | name = "<list>"
+    | name = "<empty-list>" | name = "<vector>" | name = "<sequence>"
+    | name = "<collection>"
+end function;
+
+// Emit a template with hygiene: rename binder identifiers, splice
+// substitutions verbatim, recurse into groups. `nonce-str` is the
+// hygiene nonce as a string; `binders` and `pvars` are string-sets.
+define function emit-template-hyg (template :: <stretchy-vector>,
+                                   bindings :: <stretchy-vector>,
+                                   out :: <stretchy-vector>,
+                                   nonce-str :: <byte-string>,
+                                   binders :: <stretchy-vector>,
+                                   pvars :: <stretchy-vector>) => ()
+  let n = size(template);
+  let i = 0;
+  until (i = n)
+    let e = template[i];
+    if (instance?(e, <tpl-literal>))
+      let t = tpl-lit-tok(e);
+      let text = tok-text(t);
+      let emit-text = text;
+      if (tok-kind(t) = #"ident" & string-in?(binders, text)
+            & ~ string-in?(pvars, text) & ~ is-template-no-rename?(text))
+        emit-text := concatenate(text, concatenate("__nod_hyg_", nonce-str));
+      end;
+      add!(out, emit-text);
+    elseif (instance?(e, <tpl-substitution>))
+      let frags = bindings-get(bindings, tpl-sub-name(e));
+      if (frags)
+        let m = size(frags);
+        let j = 0;
+        until (j = m)
+          emit-frag(out, frags[j]);
+          j := j + 1;
+        end;
+      end;
+    elseif (instance?(e, <tpl-group>))
+      let k = tpl-grp-kind(e);
+      let open  = "{";
+      let close = "}";
+      if (k = #"paren")
+        open := "("; close := ")";
+      elseif (k = #"bracket")
+        open := "["; close := "]";
+      elseif (k = #"hash-paren")
+        open := "#("; close := ")";
+      elseif (k = #"hash-bracket")
+        open := "#["; close := "]";
+      elseif (k = #"hash-brace")
+        open := "#{"; close := "}";
+      end;
+      add!(out, open);
+      emit-template-hyg(tpl-grp-body(e), bindings, out, nonce-str, binders, pvars);
+      add!(out, close);
+    end;
+    i := i + 1;
+  end;
+end function;
+
+// Full hygienic substitution: collect binders, emit, join.
+define function substitute-hyg (template :: <stretchy-vector>,
+                                bindings :: <stretchy-vector>,
+                                pvars :: <stretchy-vector>,
+                                nonce-str :: <byte-string>)
+ => (s :: <byte-string>)
+  let binders = collect-template-binders(template);
+  let out = make(<stretchy-vector>);
+  emit-template-hyg(template, bindings, out, nonce-str, binders, pvars);
+  join-chunks(out)
+end function;
+
 // ─── Sprint 50b — parse `define macro` body fragments → <macro-def> ──────
 //
 // The Rust nod-macro grammar for a definition body is:
