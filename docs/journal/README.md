@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-02 — Shim-AOT class-id drift: a great diagnosis, a rejected fix](2026-06-02-class-id-drift-attempt-rejected.md)
+  — Task #7. A delegated fix produced an excellent dual-manifestation
+  diagnosis (GAP-001's stdlib `<stream>` classes made the "no stdlib
+  define class" premise stale) but an implementation rejected on review:
+  it masked a *self-introduced* `LNK2005` with `/FORCE:MULTIPLE`, which
+  poisoned its own green-sweep. Independently verified the clean baseline
+  was healthy (c3_oracle + bench_richards pass, no LNK2005) and reverted.
+  Lesson: a green gate obtained by silencing an error class is not green.
 - [2026-06-02 — The Dylan parser enters the real pipeline; the shim-AOT class-id drift surfaces](2026-06-02-parser-in-the-pipeline-and-the-class-id-drift.md)
   — Sprint 51e.5. `--parse-with-dylan` wired into compile/eval/build via
   a `set_parse_override` hook (mirroring the lexer), with Rust fall-back
