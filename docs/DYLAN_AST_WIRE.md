@@ -187,3 +187,80 @@ A whole-file `Body` has `span_lo == 0`, `span_hi == source.len()`.
   translates `define function`/`method` whose bodies are expression
   statements over the cheap expr subset; classes, `BinaryOp`,
   statement bodies, and `let` are the next increments.
+
+---
+
+## 7. Parser+macro inputs (Sprint 52 addendum)
+
+Sprint 52 ports the macro expander (`nod-macro`) to Dylan and runs it
+**inside the Dylan front-end, before this wire is emitted** — locus
+decision **(B)** in `specs/52-macro-expander-dylan.md`. This section is
+the one committed contract change that decision requires. **No new wire
+record, no new kind, no new calling convention is added** — the
+expanded AST travels over the *existing* wire (§1–§3) exactly as the
+already-expanded Rust-side AST does today. The host stays oblivious to
+whether expansion ran: it reconstructs an `ast::Module` and lowers it,
+unchanged.
+
+### 7.1 Pipeline order under locus (B)
+
+```
+Rust today:   parse ──► expand ──► [wire] ──► reconstruct ──► lower
+Sprint 52:    parse ──► expand ──► [wire] ──► reconstruct ──► lower
+              └──────── Dylan side ────────┘  └──── host ────┘
+```
+
+The *logical* order is identical — expansion precedes lowering. Only
+the wire boundary moves to *after* expansion, and parse+expand are now
+both Dylan-side. The wire therefore carries kernel-shaped, macro-free
+AST: the host never sees a macro call, just as it never does after the
+Rust expander runs today. Consequently **no `MacroCall` kind is ever
+emitted on the wire** — a residual macro call in the Dylan-side tree is
+a Dylan-side expansion bug, caught by the verify gate (§7.4), not a wire
+concern.
+
+### 7.2 Inputs the Dylan parse-and-expand entry receives
+
+The parse shim's entry point is extended from "source to parse" to the
+following three inputs. (a) already existed for `dylan_parse_emit`; (b)
+and (c) are the Sprint 52 additions.
+
+| # | Input | Origin | Purpose |
+|---|-------|--------|---------|
+| (a) | **source to parse** — a `<byte-string>` Word | host (`dylan_parse_emit(source_bs)`, §2) | the module text |
+| (b) | **stdlib macro source** — `<byte-string>` Word(s), the stdlib `.dylan` blob(s) | host passes the same source the Rust `nod-sema::stdlib` loader reads (`src/nod-dylan/dylan-sources/stdlib.dylan`) | the Dylan side lexes+parses it and collects its `define macro`s into the macro table — no def-wire needed, the defs *are* source the Dylan side reads directly |
+| (c) | **stdlib macro-name seed** — already defined by 51e.3 (`nod_sema::stdlib_macro_names()`) | host | parse-time recognition of body-shaped macro call sites (`cond`/`case`/`unless`/`when`/`for-each`/…) so the parser does not error on tokens like `KwOtherwise` that appear only inside those forms |
+
+The in-file `define macro`s (a module defining its own macros) are
+collected by the Dylan side from the module source itself (input (a)) —
+no extra input. Macro *definitions* never cross the wire as data; they
+are always collected from source, Dylan-side.
+
+### 7.3 Why no def-wire (the (A)-vs-(B) crux)
+
+Architecture (A) would serialise macro *definitions* across a new
+AST-input wire so a host-side shim could drive expansion. (B) avoids it
+entirely: the stdlib's macros are *Dylan source*, and the Dylan
+front-end already self-parses the corpus — so it lexes+parses the
+stdlib source and collects the defs into its own table (input (b)). The
+fewer byte-contracts, the fewer parity hazards; (B) adds **zero** new
+contracts beyond documenting inputs (b)/(c) here.
+
+### 7.4 Verify gate (unchanged machinery)
+
+Verify-mode (`NOD_VERIFY_EXPAND=1`) runs both `Rust parse → Rust expand`
+and `Dylan parse+expand → reconstruct`, and asserts the two
+`ast::Module`s are **byte-identical** — the exact `dump-expanded`
+comparison 51e already uses, now with the Dylan side having expanded
+before emitting. Spans are included where load-bearing (the dump prints
+them), so hygiene renames and span-rewrites are part of the gate.
+Divergence fails loudly; the Rust result proceeds.
+
+### 7.5 Fresh-checkout safety
+
+Identical to the parser's rule (51e.6): the Dylan expander installs only
+when the parse+macro shim is statically linked
+(`cfg!(dylan_lex_shim_linked)`). A fresh checkout with no shim stays on
+the Rust expander — no install, no per-file fall-back noise. A module
+whose expansion the Dylan side cannot complete falls back to Rust
+`parse → expand` for the whole module.
