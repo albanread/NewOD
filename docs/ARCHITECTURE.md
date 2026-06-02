@@ -120,7 +120,7 @@ becomes the default.
 |-------------------|------------------|-----------------------------------------------------|
 | DFM → LLVM codegen | `nod-llvm`      | LLVM's API is C/C++; inkwell is the Rust binding. Codegen is "emit good IR for LLVM," not a place Dylan adds value. |
 | Garbage collector | `nod-runtime`    | Precise GC needs `unsafe`, raw pointers, `gc.statepoint` lowering, TLABs. Systems code. Shared with the sibling portfolio. |
-| JIT engine        | `nod-llvm`       | LLVM ORC + Win64 SEH registration. C++ ABI surface. |
+| JIT engine        | `nod-llvm`       | LLVM MCJIT + Win64 SEH registration. C++ ABI surface. (A future move to ORC v2 LLJIT is noted in `DEFERRED.md`.) |
 | AOT linker        | `nod-driver`     | Object-file emission + `link.exe` orchestration.    |
 | Runtime           | `nod-runtime`    | Class metadata, dispatch caches, conditions, the tagged-`Word` representation. |
 | FFI plumbing      | `nod-runtime` / `nod-winapi` | Win64 calling-convention dispatcher, callback bridge. |

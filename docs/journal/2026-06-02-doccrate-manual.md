@@ -47,7 +47,8 @@ Reviewing agent drafts against source turned up several places where the
 manual (and worth fixing in the design docs):
 
 - **The in-image JIT is LLVM MCJIT, not ORC.** `jit.rs:740` calls
-  `LLVMCreateMCJITCompilerForModule`; README/ARCHITECTURE call it "ORC JIT".
+  `LLVMCreateMCJITCompilerForModule`; `ARCHITECTURE.md` called it "LLVM ORC"
+  (now corrected).
   The manual documents MCJIT and notes the discrepancy.
 - **The GC layout that NewOpenDylan actually uses is `DylanLayout`**
   (`nod-runtime/src/dylan_layout.rs`); `LispLayout`/`TinyLayout` in

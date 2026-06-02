@@ -106,6 +106,7 @@ What draws us to Dylan specifically:
 
 ## Where to start
 
+- **[docs/manual/](docs/manual/index.md)** — the diagram-rich **manual** of the language and compiler. Start here for an explanatory tour; browse it offline with `pwsh tools/doccrate/Browse-Docs.ps1`.
 - **[docs/MANIFESTO.md](docs/MANIFESTO.md)** — design constraints. Read this first.
 - **[docs/PLAN.md](docs/PLAN.md)** — language survey + 12-phase implementation plan.
 - **[docs/SPRINTS.md](docs/SPRINTS.md)** — two-week sprint breakdown with deliverables, acceptance criteria, and demos.

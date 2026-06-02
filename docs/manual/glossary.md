@@ -79,9 +79,10 @@ visibility. See [Modules & libraries](language/modules-and-libraries.md).
 
 ## M–R
 
-**MCJIT** — the LLVM JIT engine NewOpenDylan actually uses
-(`LLVMCreateMCJITCompilerForModule`). The project's high-level docs call it "ORC"; the
-code is MCJIT. See [JIT & AOT](compiler/jit-and-aot.md).
+**MCJIT** — the LLVM JIT engine NewOpenDylan uses
+(`LLVMCreateMCJITCompilerForModule`) to compile and run code in-image. *Not* ORC; a
+future move to ORC v2 LLJIT is noted as a possibility in `docs/DEFERRED.md`. See
+[JIT & AOT](compiler/jit-and-aot.md).
 
 **Mark-evacuate** — the collector style: mark the live objects, then evacuate (copy)
 survivors into fresh space, leaving the old pages to be reclaimed wholesale. The heap is

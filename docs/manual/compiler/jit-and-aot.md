@@ -8,11 +8,11 @@ is handed off.
 
 > Crates: `src/nod-llvm` · `src/nod-driver`  ·  Status: live — JIT primary, AOT debug-mode
 
-> **Terminology note:** the project's high-level docs (`README.md`,
-> `ARCHITECTURE.md`) call the in-image JIT the "ORC JIT". The engine actually
-> wired today is LLVM's legacy **MCJIT** (`LLVMCreateMCJITCompilerForModule`,
-> `jit.rs:740`) — a different LLVM JIT API. This manual says MCJIT to match the
-> code; a future move to ORC is possible but has not happened.
+> **Terminology note:** the in-image JIT is LLVM's legacy **MCJIT**
+> (`LLVMCreateMCJITCompilerForModule`, `jit.rs:740`) — *not* ORC, a different LLVM
+> JIT API. A future migration to ORC v2 LLJIT is noted as a possibility in
+> `docs/DEFERRED.md` (it would expose `LLVMOrcLLJITAddObjectFile` for on-disk
+> object caching), but has not happened.
 
 ## Role in the pipeline
 
