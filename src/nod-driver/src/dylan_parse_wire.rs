@@ -72,6 +72,7 @@ pub enum Kind {
     SlotInit = 35,
     HashLit = 36,
     DefineBinding = 37,
+    Modifier = 38,
 }
 
 impl Kind {
@@ -115,6 +116,7 @@ impl Kind {
             35 => Kind::SlotInit,
             36 => Kind::HashLit,
             37 => Kind::DefineBinding,
+            38 => Kind::Modifier,
             _ => return None,
         })
     }
@@ -159,6 +161,7 @@ impl Kind {
             Kind::SlotInit => "SlotInit",
             Kind::HashLit => "HashLit",
             Kind::DefineBinding => "DefineBinding",
+            Kind::Modifier => "Modifier",
         }
     }
 }

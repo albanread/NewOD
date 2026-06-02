@@ -590,6 +590,12 @@ define constant $ast-kind-hash-lit          = 36;
 // single child is the binding list (Body holding the `binder = init`).
 define constant $ast-kind-define-binding    = 37;
 
+// Sprint 51e.4 — one definition adjective (`sealed`/`open`/`abstract`/…).
+// Leaf; span is the modifier word's token. Emitted as a leading child of
+// the definition node; the host maps &src[span] to ast::Modifier and
+// collects them in source order.
+define constant $ast-kind-modifier          = 38;
+
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
 // are NOT here — they are their own node types, not body-definitions.
@@ -627,6 +633,24 @@ define function patch-subtree-size (out :: <stretchy-vector>,
   let total-ints = %stretchy-vector-size(out);
   let subtree-records = (total-ints - record-index) / 4;
   %stretchy-vector-element-setter(subtree-records, out, record-index + 3);
+end function;
+
+// Sprint 51e.4 — emit one Modifier leaf per definition adjective
+// (sealed/open/abstract/…), span = the modifier word's token. Emitted as
+// leading children of a definition node; the host maps each &src[span] to
+// an ast::Modifier and collects them in source order. Empty vector → no
+// children, so unmodified definitions are unchanged.
+define function emit-modifiers (mods :: <stretchy-vector>,
+                                out :: <stretchy-vector>) => ()
+  let n = %stretchy-vector-size(mods);
+  let i = 0;
+  until (i = n)
+    let tok = %stretchy-vector-element(mods, i);
+    let s = token-span(tok);
+    let mi = emit-record(out, $ast-kind-modifier, span-start(s), span-end(s));
+    patch-subtree-size(out, mi);
+    i := i + 1;
+  end;
 end function;
 
 define function span-of (node :: <ast-node>) => (lo :: <integer>, hi :: <integer>)
@@ -719,6 +743,9 @@ define method emit-node (d :: <ast-body-definition>, source :: <byte-string>,
     let lo = span-start(word-span);
     let hi = span-end(word-span);
     let idx = emit-record(out, kind, lo, hi);
+    // Sprint 51e.4 — definition adjectives (sealed/open/inline/…) as
+    // leading Modifier children.
+    emit-modifiers(defn-modifiers(d), out);
     // Sprint 51e — emit the signature so the host can rebuild the full
     // ast::Item {name, params, return_, body}. Children, in order:
     //   DefName (the name token), ParamList, ReturnSpec (only when an
@@ -756,6 +783,7 @@ define method emit-node (d :: <ast-list-definition>, source :: <byte-string>,
   if (word-name = "constant" | word-name = "variable")
     let idx = emit-record(out, $ast-kind-define-binding,
                           span-start(s), span-end(s));
+    emit-modifiers(defn-modifiers(d), out);
     emit-node(defn-list(d), source, out);
     patch-subtree-size(out, idx);
   else
@@ -842,6 +870,8 @@ define method emit-node (d :: <ast-class-definition>, source :: <byte-string>,
   let word-tok = defn-word(d);
   let s = token-span(word-tok);
   let idx = emit-record(out, $ast-kind-define-class, span-start(s), span-end(s));
+  // Sprint 51e.4 — class adjectives (sealed/open/abstract/…) first.
+  emit-modifiers(defn-modifiers(d), out);
   // Sprint 51e — class name as a DefName child (same kind as a
   // function's name), so the host needn't re-scan source after `class`.
   let nm = class-name(d);
@@ -867,15 +897,32 @@ define method emit-node (d :: <ast-class-definition>, source :: <byte-string>,
   patch-subtree-size(out, idx);
 end method;
 
-// Sprint 51e — `define generic NAME (params) => (returns);`. No body,
-// no `end`. v1 emits a leaf at the `generic` keyword span; the
-// signature is recoverable from `&src` and gets dedicated children in
-// a later pass.
+// Sprint 51e.4 — `define [modifiers] generic NAME (params) => (returns);`.
+// No body, no `end`. Children, in order: Modifier* (adjectives), DefName
+// (the generic's name), ParamList, ReturnSpec (when `=>` present). Same
+// shape as a body-definition minus the Body, so the host rebuilds
+// ast::Item::DefineGeneric {modifiers, name, params, return_}.
 define method emit-node (d :: <ast-generic-definition>, source :: <byte-string>,
                          out :: <stretchy-vector>) => ()
   let word-tok = gen-word(d);
   let s = token-span(word-tok);
-  emit-record(out, $ast-kind-define-generic, span-start(s), span-end(s));
+  let idx = emit-record(out, $ast-kind-define-generic, span-start(s), span-end(s));
+  emit-modifiers(defn-modifiers(d), out);
+  let nm = gen-name(d);
+  if (instance?(nm, <token>))
+    let ns = token-span(nm);
+    let ni = emit-record(out, $ast-kind-def-name, span-start(ns), span-end(ns));
+    patch-subtree-size(out, ni);
+  end;
+  let ps = gen-params(d);
+  if (instance?(ps, <ast-param-list>))
+    emit-node(ps, source, out);
+  end;
+  let rs = gen-return(d);
+  if (instance?(rs, <ast-return-spec>) & ret-present?(rs) = #t)
+    emit-node(rs, source, out);
+  end;
+  patch-subtree-size(out, idx);
 end method;
 
 // Sprint 51e — `<ast-statement>`: if / until / while / begin / select /

@@ -33,8 +33,8 @@
 
 use crate::dylan_parse_wire::{DylanAst, Kind};
 use nod_reader::ast::{
-    Binder, Expr, Item, Module, Param, ReturnRest, ReturnSig, ReturnValue, SlotAllocation, SlotDef,
-    Statement,
+    Binder, Expr, Item, Modifier, Module, Param, ReturnRest, ReturnSig, ReturnValue,
+    SlotAllocation, SlotDef, Statement,
 };
 use nod_reader::span::{FileId, Span};
 
@@ -114,9 +114,29 @@ pub fn to_ast_module(tree: &DylanAst, src: &str) -> Result<Module, Unsupported> 
     })
 }
 
+/// Collect the leading `Modifier` children of a definition node into a
+/// `Vec<Modifier>` in source order. Each is a leaf whose span is the
+/// adjective word (`sealed`/`open`/…); `&src[span]` maps to `ast::Modifier`
+/// via `Modifier::from_word`. An unknown adjective is `Unsupported` (the
+/// Rust parser would reject it too). The order matches the Rust parser's
+/// (both collect in source order), so the `(Modifiers …)` dump agrees.
+fn collect_modifiers(node: &DylanAst, src: &str) -> Result<Vec<Modifier>, Unsupported> {
+    let mut mods = Vec::new();
+    for child in &node.children {
+        if child.kind == Kind::Modifier {
+            let word = slice(src, child)?;
+            let m = Modifier::from_word(word)
+                .ok_or_else(|| Unsupported(format!("unknown modifier {word:?}")))?;
+            mods.push(m);
+        }
+    }
+    Ok(mods)
+}
+
 fn translate_item(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     match node.kind {
         Kind::DefineFunction | Kind::DefineMethod => translate_def(node, src),
+        Kind::DefineGeneric => translate_generic(node, src),
         Kind::DefineClass => translate_class(node, src),
         Kind::DefineBinding => translate_binding(node, src),
         // A free-standing top-level expression (e.g. `s00(1) + t00(0)`)
@@ -134,14 +154,17 @@ fn translate_item(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
 /// children: `DefName` (class name), then super exprs and `SlotSpec`s
 /// (dispatched by kind).
 fn translate_class(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
-    if has_modifiers(src, node.span_lo as usize) {
-        return unsupported("class has modifiers (not on the wire yet)");
-    }
+    // Sprint 51e.4 — modifiers (sealed/open/abstract/…) now arrive as
+    // leading `Modifier` children on the wire; collect them in source
+    // order. The `Kind::Modifier => {}` arm below skips them in the
+    // child walk so they aren't mistaken for superclass exprs.
+    let modifiers = collect_modifiers(node, src)?;
     let mut name: Option<String> = None;
     let mut supers: Vec<Expr> = Vec::new();
     let mut slots: Vec<SlotDef> = Vec::new();
     for child in &node.children {
         match child.kind {
+            Kind::Modifier => {}
             Kind::DefName => name = Some(slice(src, child)?.to_string()),
             Kind::SlotSpec => slots.push(translate_slot(child, src)?),
             _ => supers.push(translate_expr(child, src)?),
@@ -150,10 +173,38 @@ fn translate_class(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     let name = name.ok_or_else(|| Unsupported("class has no DefName".into()))?;
     Ok(Item::DefineClass {
         span: span_of(node),
-        modifiers: Vec::new(),
+        modifiers,
         name,
         supers,
         slots,
+    })
+}
+
+/// `define [modifiers] generic NAME (params) => (returns);` →
+/// `Item::DefineGeneric`. Wire children (dispatched by kind): `Modifier`*,
+/// `DefName`, `ParamList`, optional `ReturnSpec`. No body (a generic has
+/// no `end`). Mirrors `translate_def` minus the Body.
+fn translate_generic(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
+    let modifiers = collect_modifiers(node, src)?;
+    let mut name: Option<String> = None;
+    let mut params: Vec<Param> = Vec::new();
+    let mut return_: Option<ReturnSig> = None;
+    for child in &node.children {
+        match child.kind {
+            Kind::Modifier => {}
+            Kind::DefName => name = Some(slice(src, child)?.to_string()),
+            Kind::ParamList => params = translate_param_list(child, src)?,
+            Kind::ReturnSpec => return_ = Some(translate_return_spec(child, src)?),
+            other => return unsupported(format!("unexpected generic child {other:?}")),
+        }
+    }
+    let name = name.ok_or_else(|| Unsupported("generic has no DefName".into()))?;
+    Ok(Item::DefineGeneric {
+        span: span_of(node),
+        modifiers,
+        name,
+        params,
+        return_,
     })
 }
 
@@ -166,12 +217,10 @@ fn translate_class(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
 /// keyword. Only a single, simple/typed binder is reconstructed; a
 /// destructuring `define constant (a, b) = …` falls back.
 fn translate_binding(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
-    // `define constant`/`variable` may carry a modifier (e.g.
-    // `define inline-only constant`); modifier-on-wire is 51e.4, so if
-    // the keyword isn't immediately preceded by `define`, fall back.
-    if has_modifiers(src, node.span_lo as usize) {
-        return unsupported("define binding has modifiers (not on the wire yet)");
-    }
+    // Sprint 51e.4 — `define [modifiers] constant`/`variable`; modifiers
+    // arrive as leading `Modifier` children (collected here), and
+    // `local_decl_parts` finds the binding Body by kind, past them.
+    let modifiers = collect_modifiers(node, src)?;
     let is_constant = match slice(src, node)? {
         "constant" => true,
         "variable" => false,
@@ -186,7 +235,7 @@ fn translate_binding(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     Ok(if is_constant {
         Item::DefineConstant {
             span,
-            modifiers: Vec::new(),
+            modifiers,
             name: binder.name,
             type_: binder.type_,
             value: parts.value,
@@ -194,7 +243,7 @@ fn translate_binding(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     } else {
         Item::DefineVariable {
             span,
-            modifiers: Vec::new(),
+            modifiers,
             name: binder.name,
             type_: binder.type_,
             value: parts.value,
@@ -263,12 +312,10 @@ fn translate_slot(node: &DylanAst, src: &str) -> Result<SlotDef, Unsupported> {
 /// children are (in any order, dispatched by kind): `DefName`,
 /// `ParamList`, optional `ReturnSpec`, `Body`.
 fn translate_def(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
-    // The wire doesn't carry definition modifiers yet. They sit between
-    // `define` and the body-word; if the token immediately preceding the
-    // body-word isn't `define`, there's a modifier we can't reconstruct.
-    if has_modifiers(src, node.span_lo as usize) {
-        return unsupported("definition has modifiers (not on the wire yet)");
-    }
+    // Sprint 51e.4 — modifiers (sealed/open/inline/…) arrive as leading
+    // `Modifier` children; collect them in source order. The
+    // `Kind::Modifier => {}` arm skips them in the dispatch walk.
+    let modifiers = collect_modifiers(node, src)?;
 
     let mut name: Option<String> = None;
     let mut params: Vec<Param> = Vec::new();
@@ -277,6 +324,7 @@ fn translate_def(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
 
     for child in &node.children {
         match child.kind {
+            Kind::Modifier => {}
             Kind::DefName => name = Some(slice(src, child)?.to_string()),
             Kind::ParamList => params = translate_param_list(child, src)?,
             Kind::ReturnSpec => return_ = Some(translate_return_spec(child, src)?),
@@ -292,7 +340,7 @@ fn translate_def(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
     Ok(match node.kind {
         Kind::DefineFunction => Item::DefineFunction {
             span,
-            modifiers: Vec::new(),
+            modifiers,
             name,
             params,
             return_,
@@ -300,7 +348,7 @@ fn translate_def(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
         },
         Kind::DefineMethod => Item::DefineMethod {
             span,
-            modifiers: Vec::new(),
+            modifiers,
             name,
             params,
             return_,
@@ -308,31 +356,6 @@ fn translate_def(node: &DylanAst, src: &str) -> Result<Item, Unsupported> {
         },
         _ => unreachable!("translate_def only called for function/method"),
     })
-}
-
-/// Is there a modifier word between `define` and the body-word at
-/// `body_word_lo`? The token directly before the body-word is `define`
-/// when there are none. Scans back over whitespace, then over the
-/// preceding identifier run.
-fn has_modifiers(src: &str, body_word_lo: usize) -> bool {
-    let bytes = src.as_bytes();
-    let mut i = body_word_lo;
-    // Back over whitespace.
-    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
-        i -= 1;
-    }
-    // Back over the identifier run (Dylan names: alnum plus -, _, !, ?,
-    // *, $, <, >).
-    let end = i;
-    while i > 0 && is_name_byte(bytes[i - 1]) {
-        i -= 1;
-    }
-    let word = &src[i..end];
-    word != "define"
-}
-
-fn is_name_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'!' | b'?' | b'*' | b'$' | b'<' | b'>')
 }
 
 fn translate_param_list(node: &DylanAst, src: &str) -> Result<Vec<Param>, Unsupported> {
@@ -440,13 +463,14 @@ struct LetParts {
 /// binder (`let (a, b) = e` → a `ParenList` LHS). A `#rest` in the
 /// destructuring or a missing init falls back.
 fn local_decl_parts(node: &DylanAst, src: &str) -> Result<LetParts, Unsupported> {
+    // Find the binding Body by KIND, not position: a statement `let` has
+    // it as child[0], but a `define [modifiers] constant/variable` (which
+    // shares this decoder) emits leading `Modifier` children before it.
     let body = node
         .children
-        .first()
+        .iter()
+        .find(|c| c.kind == Kind::Body)
         .ok_or_else(|| Unsupported("let: no body".into()))?;
-    if body.kind != Kind::Body {
-        return unsupported("let: child is not a Body");
-    }
     if body.children.len() != 1 {
         return unsupported(format!("let: body has {} forms", body.children.len()));
     }
