@@ -87,3 +87,43 @@ namespace), make the ~11 `lower.rs` resolution sites band-aware, and
 (it points at a CGU/symbol-emission interaction worth understanding), and
 **validate WITHOUT `/FORCE:MULTIPLE`.** The drift gates 51e.6 + all of
 52/53/54 AOT integration, so it remains the critical-path next step.
+
+## Correction (adversarial review, same day)
+
+An adversarial agent was tasked to demolish this rejection. It found a real
+error in the reasoning above, which I verified independently and accept:
+
+- **"The linker collision did not pre-exist" is FALSE.** The `LNK2005
+  nod_user_main` collision is a **pre-existing, documented release-mode**
+  issue: `docs/manual/compiler/jit-and-aot.md:309-313`,
+  `docs/manual/language/overview.md:258`,
+  `docs/manual/getting-started.md:93` all record "release-mode AOT hits
+  LNK2005 nod_user_main; debug works." I tested **debug** (c3_oracle,
+  bench_richards pass) and wrongly rebutted the stash author's **release**
+  claim — a debug-vs-release category error. (`bench_richards` is also not
+  an AOT test; it's the in-process JIT path — another mischaracterisation.)
+- **The proper fix for the release LNK2005 is the `codegen-units = 1`
+  pin** that `jit-and-aot.md:313` *claims* nod-runtime already has — but
+  `git grep codegen-units -- '*.toml'` returns **nothing**. The pin was
+  never applied; the doc is aspirational. That's the real, separate bug.
+
+**What still holds — the decision.** The stash adds `/FORCE:MULTIPLE`
+*unconditionally* (no release/library guard), so it's on for the debug AOT
+path too (where it's inert), and a force-linked **release** binary links
+but is **non-functional** (prints nothing) — it converts a loud link error
+into a silent runtime failure. So `/FORCE:MULTIPLE` is still the wrong
+instrument and the change is right to not ship as-is.
+
+**The better path (the adversary's salvage, which I adopt).** The
+band + idempotency + 11-site `resolve_class_id_by_name` work is **sound and
+is the hard-won part**. The minimal correct change is: take the stashed
+work, **delete only the `/FORCE:MULTIPLE` line**, and re-validate in
+**debug** (where the baseline is green and the release LNK2005 is
+out of scope). Rejecting the *entire* change rather than that one line was
+a proportionality miss. The release-AOT LNK2005 stays a separate,
+pre-existing issue with its own fix (add the missing `codegen-units = 1`).
+
+**Meta-lesson.** The original rejection reached the right *outcome* by a
+*partly-wrong* argument. The adversarial pass corrected the argument and
+recovered real work — exactly why challenging a consensus is worth the
+tokens even when the consensus "wins."
