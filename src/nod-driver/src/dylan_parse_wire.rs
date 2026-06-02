@@ -70,6 +70,8 @@ pub enum Kind {
     SlotRequired = 33,
     SlotType = 34,
     SlotInit = 35,
+    HashLit = 36,
+    DefineBinding = 37,
 }
 
 impl Kind {
@@ -111,6 +113,8 @@ impl Kind {
             33 => Kind::SlotRequired,
             34 => Kind::SlotType,
             35 => Kind::SlotInit,
+            36 => Kind::HashLit,
+            37 => Kind::DefineBinding,
             _ => return None,
         })
     }
@@ -153,6 +157,8 @@ impl Kind {
             Kind::SlotRequired => "SlotRequired",
             Kind::SlotType => "SlotType",
             Kind::SlotInit => "SlotInit",
+            Kind::HashLit => "HashLit",
+            Kind::DefineBinding => "DefineBinding",
         }
     }
 }

@@ -580,6 +580,16 @@ define constant $ast-kind-slot-required     = 33;   // marker: required-init-key
 define constant $ast-kind-slot-type         = 34;   // 1 child: the `:: type` expr
 define constant $ast-kind-slot-init         = 35;   // 1 child: the `= init` expr
 
+// Sprint 51e — `#(…)` / `#[…]` / `#{…}` literal. Children are the
+// element expressions; the host reads the open token (the node span) to
+// pick the synthetic constructor (#list / #vector / #set).
+define constant $ast-kind-hash-lit          = 36;
+
+// Sprint 51e — `define constant`/`variable NAME [:: TYPE] = INIT`
+// (an <ast-list-definition>). Span is the constant/variable keyword; the
+// single child is the binding list (Body holding the `binder = init`).
+define constant $ast-kind-define-binding    = 37;
+
 // Map an <ast-body-definition> body-word to its wire kind, or -1 if the
 // emitter doesn't structure that form yet (→ Error). `class`/`generic`
 // are NOT here — they are their own node types, not body-definitions.
@@ -733,6 +743,26 @@ define method emit-node (d :: <ast-body-definition>, source :: <byte-string>,
   end
 end method;
 
+// Sprint 51e — `define constant`/`variable NAME [:: TYPE] = INIT`. Span
+// is the `constant`/`variable` keyword (host reads &src[span] to pick
+// DefineConstant vs DefineVariable); the single child is the binding
+// list Body. `define domain` (the other list-word) has no nod-reader
+// `Item` analogue → Error (host falls back).
+define method emit-node (d :: <ast-list-definition>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let word-tok = defn-word(d);
+  let word-name = token-name(word-tok);
+  let s = token-span(word-tok);
+  if (word-name = "constant" | word-name = "variable")
+    let idx = emit-record(out, $ast-kind-define-binding,
+                          span-start(s), span-end(s));
+    emit-node(defn-list(d), source, out);
+    patch-subtree-size(out, idx);
+  else
+    emit-record(out, $ast-kind-error, span-start(s), span-end(s));
+  end
+end method;
+
 // Sprint 51e — parameter list. One <param> child per required
 // parameter (each with an optional type child); plus a single
 // <var-marker> when the list has #rest/#key/#all-keys/#next, which the
@@ -863,6 +893,21 @@ define method emit-node (s :: <ast-statement>, source :: <byte-string>,
   let word-tok = stmt-word(s);
   let sp = token-span(word-tok);
   let idx = emit-record(out, $ast-kind-statement, span-start(sp), span-end(sp));
+  // Sprint 51e — anonymous `method (params) => (ret) body end` /
+  // `function …` literals carry a signature on the statement (set by
+  // parse-function-literal). Emit the ParamList + ReturnSpec FIRST (same
+  // child order as a definition), so the host can rebuild
+  // `Expr::Method { params, body }`. A plain statement (if/while/begin/…)
+  // leaves both `#f`, so nothing extra is emitted and the wire shape is
+  // unchanged for those.
+  let ps = stmt-params(s);
+  if (instance?(ps, <ast-param-list>))
+    emit-node(ps, source, out);
+  end;
+  let rs = stmt-return(s);
+  if (instance?(rs, <ast-return-spec>) & ret-present?(rs) = #t)
+    emit-node(rs, source, out);
+  end;
   emit-node(stmt-body(s), source, out);
   let clauses = stmt-clauses(s);
   if (instance?(clauses, <stretchy-vector>))
@@ -1110,6 +1155,45 @@ define method emit-node (r :: <ast-ratio-lit>, source :: <byte-string>,
   emit-record(out, $ast-kind-ratio-lit, lo, hi);
 end method;
 
+// Sprint 51e — `#(elem, …)` list literal. Span is the `#(` open token;
+// children are the element constants. An IMPROPER list (`#(a . tail)`)
+// has no nod-reader analogue (parse_hash_literal is comma-only), so emit
+// Error there and let the host fall back. The host reads &src[span] to
+// see it's `#(` → rebuilds `Call(#list, elems)`.
+define method emit-node (l :: <ast-list-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(l);
+  if (instance?(lit-tail(l), <ast-node>))
+    emit-record(out, $ast-kind-error, lo, hi);
+  else
+    let idx = emit-record(out, $ast-kind-hash-lit, lo, hi);
+    let elems = lit-elems(l);
+    let n = %stretchy-vector-size(elems);
+    let i = 0;
+    until (i = n)
+      emit-node(%stretchy-vector-element(elems, i), source, out);
+      i := i + 1;
+    end;
+    patch-subtree-size(out, idx);
+  end
+end method;
+
+// Sprint 51e — `#[elem, …]` vector literal. Same shape; the `#[` open
+// token in the span tells the host to rebuild `Call(#vector, elems)`.
+define method emit-node (v :: <ast-vector-lit>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  let (lo, hi) = span-of(v);
+  let idx = emit-record(out, $ast-kind-hash-lit, lo, hi);
+  let elems = lit-elems(v);
+  let n = %stretchy-vector-size(elems);
+  let i = 0;
+  until (i = n)
+    emit-node(%stretchy-vector-element(elems, i), source, out);
+    i := i + 1;
+  end;
+  patch-subtree-size(out, idx);
+end method;
+
 define method emit-node (b :: <ast-binary-op>, source :: <byte-string>,
                          out :: <stretchy-vector>) => ()
   let (lo, hi) = span-of(b);
@@ -1124,6 +1208,22 @@ define method emit-node (e :: <ast-error-node>, source :: <byte-string>,
                          out :: <stretchy-vector>) => ()
   let (lo, hi) = span-of(e);
   emit-record(out, $ast-kind-error, lo, hi);
+end method;
+
+// Sprint 51e — a typed binder `name :: <type>` appearing as a standalone
+// node (the LHS of a `let name :: T = init` / `define variable name :: T
+// = init` binding — parse-list-fragment wraps it into an <ast-typed-name>
+// before the `=` fold). Without a dedicated method this fell to the
+// default <ast-node> arm and emitted Error 0..0, masking the whole
+// binding. Emit it as a `Param` record (kind 28): the span is the NAME
+// token and the optional `:: type` is a single child — the same shape the
+// host already decodes for parameters. The host (local_decl_parts) reads
+// the binder name from the span; nod-reader's `Statement::Let` keeps the
+// type but the dump prints only the name, so the binder NAME is all the
+// gate needs.
+define method emit-node (tn :: <ast-typed-name>, source :: <byte-string>,
+                         out :: <stretchy-vector>) => ()
+  emit-typed-name(tn, $ast-kind-param, source, out);
 end method;
 
 // <ast-pos-arg> is the parser's wrapper for "this is a positional

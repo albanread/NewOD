@@ -928,6 +928,44 @@ define function parse-body (ts :: <token-stream>) => (b :: <ast-body>)
   b
 end function;
 
+// Like parse-body, but seeded with a leading constituent already parsed
+// (used for `if`/`while`/`until`/`unless` and `elseif`, whose
+// parenthesised condition is parsed separately as the body's first
+// constituent — see parse-statement). The remaining constituents are
+// gathered exactly as parse-body does.
+define function parse-body-with-leading (ts :: <token-stream>, lead :: <ast-node>)
+ => (b :: <ast-body>)
+  let b = make-ast-body();
+  add!(body-constituents(b), lead);
+  // An optional semicolon may separate the condition from the body.
+  if (is-punct?(ts-peek(ts), #"semicolon"))
+    ts-advance(ts);
+  end;
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (is-body-terminator?(t))
+      done? := #t;
+    else
+      let node = parse-constituent(ts);
+      add!(body-constituents(b), node);
+      if (is-punct?(ts-peek(ts), #"semicolon"))
+        ts-advance(ts);
+      end;
+    end;
+  end;
+  b
+end function;
+
+// Statements whose head is a parenthesised condition `( test )` that
+// nod-reader consumes as a unit before the body: `if`/`while`/`until`/
+// `unless`. (`for` has its own iteration header; `begin`/`block`/`case`/
+// `select` have no parenthesised test.)
+define function stmt-takes-paren-condition? (word :: <token>) => (yes? :: <boolean>)
+  is-keyword?(word, #"if") | is-keyword?(word, #"while")
+    | is-keyword?(word, #"until") | is-keyword?(word, #"unless")
+end function;
+
 // Sprint 46b — tolerant body consumer for definition shapes whose
 // internal syntax the structured constituent parser doesn't model
 // today:
@@ -1391,11 +1429,18 @@ define function parse-list-fragment (ts :: <token-stream>) => (b :: <ast-body>)
     if (is-body-terminator?(t) | is-punct?(t, #"semicolon"))
       done? := #t;
     else
-      let node = parse-expression(ts);
-      // `define variable NAME :: TYPE = EXPR` — promote a bare variable-ref
-      // followed by `::` into an <ast-typed-name>, then optionally fold in
-      // the `= rhs` initialiser as a binary-op so the list-form's downstream
-      // lowering sees a familiar shape.
+      // A `let`/`define variable`/`define constant` declarator is
+      // `BINDER [:: TYPE] [= INIT]`. The BINDER is a single operand — a
+      // variable-name or a `(a, b)` destructuring paren-list — NOT a
+      // binary chain: the `=` here is the binder/init SEPARATOR, not an
+      // ordinary `=` operator. Parse the binder as one operand first
+      // (parse-operand stops before infix `::`/`=`), then split at the
+      // first `=`. Otherwise `let ok = a = b & c` would fold the binder
+      // `=` into one flat left-leaning chain `(((ok = a) = b) & c)`,
+      // burying the binder — whereas nod-reader's parser.rs splits it as
+      // `ok` + `(a = b & c)` (parse_let_expr_compat / finish_let_stmt).
+      let node = parse-operand(ts);
+      // `:: TYPE` — promote a bare variable-ref binder to a typed-name.
       if (is-punct?(ts-peek(ts), #"colon-colon")
             & instance?(node, <ast-variable-ref>))
         ts-advance(ts);                         // consume `::`
@@ -1403,11 +1448,15 @@ define function parse-list-fragment (ts :: <token-stream>) => (b :: <ast-body>)
         let tn = make(<ast-typed-name>, tok: varref-tok(node));
         typed-name-type(tn) := ty;
         node := tn;
-        if (is-punct?(ts-peek(ts), #"equal"))
-          let eq  = ts-advance(ts);
-          let rhs = parse-expression(ts);
-          node := make(<ast-binary-op>, left: node, operator: eq, right: rhs);
-        end;
+      end;
+      // `= INIT` — the initialiser is a FULL expression (right of the
+      // binder `=`); fold it in as a binary-op so the list-form's
+      // downstream lowering (and the host translator) sees the familiar
+      // `(binder = init)` shape.
+      if (is-punct?(ts-peek(ts), #"equal"))
+        let eq  = ts-advance(ts);
+        let rhs = parse-expression(ts);
+        node := make(<ast-binary-op>, left: node, operator: eq, right: rhs);
       end;
       add!(body-constituents(b), node);
       // Commas inside list-fragment (multiple declarators).
@@ -2045,7 +2094,28 @@ define function parse-statement (ts :: <token-stream>) => (n :: <ast-statement>)
   if (is-keyword?(word, #"for") & is-punct?(ts-peek(ts), #"lparen"))
     stmt-for-header(s) := parse-for-header(ts);
   end;
-  stmt-body(s) := parse-body(ts);   // leading clause body (stops at sep / end)
+  // `if`/`while`/`until`/`unless` carry a PARENTHESISED condition.
+  // nod-reader's parse_if/while/until consume exactly `( expr )` for the
+  // test (parser.rs), then start the body fresh. The Dylan parser models
+  // the condition as the leading body's first constituent — but if we let
+  // the generic binary-chain parser run, a body that begins with a prefix
+  // operator fuses with the test: `if (x < 0) -x` parses as
+  // `(x < 0) - x` (one BINOP), swallowing the consequent. Parse the test
+  // as a single OPERAND (parse-operand → parse-leaf handles the `( … )`
+  // group via parse-paren-fragment and stops at the matching `)`, without
+  // folding a following infix operator), add it as the first body
+  // constituent, then parse the rest of the body — so `-x` lands as a
+  // separate consequent (a UnaryOp), matching Rust. Using parse-operand
+  // (not parse-expression) reuses the tolerant paren-fragment parsing
+  // (comma lists, `:: type`) the leading-constituent path already had.
+  if (stmt-takes-paren-condition?(word) & is-punct?(ts-peek(ts), #"lparen"))
+    // NB: avoid `cond` as a local name here — it is a begin-word keyword,
+    // so a `let cond = …` binder would itself re-enter parse-statement.
+    let test-expr = parse-operand(ts);
+    stmt-body(s) := parse-body-with-leading(ts, test-expr);
+  else
+    stmt-body(s) := parse-body(ts);   // leading clause body (stops at sep / end)
+  end;
   // Collect any trailing clauses: (CLAUSE-SEP body)* up to `end`.  parse-body
   // halts on each clause separator, so each iteration consumes one separator
   // and the body that follows it.  An `elseif (c)` head keeps `(c)` as the
@@ -2055,7 +2125,15 @@ define function parse-statement (ts :: <token-stream>) => (n :: <ast-statement>)
   until (done? | ts-at-end?(ts))
     if (is-clause-separator?(ts-peek(ts)))
       let sep = ts-advance(ts);          // consume else / elseif / cleanup / …
-      let cbody = parse-body(ts);
+      // `elseif (c)` carries a parenthesised condition exactly like the
+      // leading `if`; parse it as the clause body's first constituent the
+      // same way (so `elseif (x < 0) -x` keeps `-x` as a separate form).
+      let cbody = if (is-keyword?(sep, #"elseif") & is-punct?(ts-peek(ts), #"lparen"))
+                    let test-expr = parse-operand(ts);
+                    parse-body-with-leading(ts, test-expr);
+                  else
+                    parse-body(ts);
+                  end;
       add!(clauses, make(<ast-statement-clause>, word: sep, body: cbody));
     else
       done? := #t;
@@ -2068,7 +2146,17 @@ define function parse-statement (ts :: <token-stream>) => (n :: <ast-statement>)
   if (is-end-token?(ts-peek(ts)))
     ts-advance(ts);
     let t = ts-peek(ts);
-    if (is-name-not-end?(t) & ~ is-punct?(t, #"semicolon"))
+    // The optional tail label echoes the statement word or its name
+    // (`end if`, `end method`, `end f`). It must NOT be a clause
+    // separator: `else`/`elseif`/`cleanup`/`exception`/`finally` are
+    // keyword-tokens (so is-name-not-end? accepts them), but they
+    // belong to an ENCLOSING statement, not this `end`. Without this
+    // guard a nested `if … end` that is the last form before the outer
+    // `else` swallows that `else` as its tail label, collapsing the
+    // outer if's else clause into its head body (the Rust parser, which
+    // only consumes the exact statement keyword, never does this).
+    if (is-name-not-end?(t) & ~ is-punct?(t, #"semicolon")
+          & ~ is-clause-separator?(t))
       stmt-end-word(s) := ts-advance(ts);
     end;
   end;
