@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-02 — Parser parity push: 14 → 28/36, and two traps](2026-06-02-parser-parity-push-14-to-28.md)
+  — Sprint 51e. Authored the 51e–54 migration specs, then drove the
+  translation gate 14→28/36 (Precedence:c ladder, comment-aware
+  operator extraction, HashLit/DefineBinding kinds, definition modifiers
+  + DefineGeneric). Two traps documented: fall-back reasons are
+  first-reported-reason artifacts, and the gate's self-build can measure
+  a stale binary. Remaining 8 fall-backs are macro-phase (Sprint 52) work.
 - [2026-06-01 — The translator payoff: Paren-transparent dump, `:=` precedence, 9→14/36](2026-06-01-translator-payoff-paren-and-assign.md)
   — Sprint 51e. Cashing in the flat-precedence migration by removing the
   translator's nested-binop guard. Took two more fixes: a `Paren`-transparent
