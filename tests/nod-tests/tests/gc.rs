@@ -249,16 +249,21 @@ fn many_allocations_trigger_minor_gcs() {
 #[test]
 fn sprint_10_eval_smoke_tests_post_gc() {
     let s1 = eval_expr_to_string("1 + 2 * 3").expect("eval ok");
-    assert_eq!(s1, "7");
+    // Sprint 51e flat (DRM) precedence: all binary operators share one
+    // left-associative level, so `1 + 2 * 3` is `(1 + 2) * 3 = 9`, NOT
+    // the C-style `1 + (2 * 3) = 7`. This assertion was stale from the
+    // flat-precedence default landing (cf. the matching, already-updated
+    // assertion in `codegen.rs::eval_arithmetic_precedence`).
+    assert_eq!(s1, "9");
     let s2 = eval_expr_to_string("instance?(#t, <boolean>)").expect("eval ok");
     assert_eq!(s2, "#t");
     // Trigger a few collects on the process-global heap.
     collect_minor();
     collect_minor();
     collect_full();
-    // Re-evaluate — same answer.
+    // Re-evaluate — same answer. Flat (DRM) precedence: `(1 + 2) * 3 = 9`.
     let s3 = eval_expr_to_string("1 + 2 * 3").expect("eval ok");
-    assert_eq!(s3, "7");
+    assert_eq!(s3, "9");
     let s4 = eval_expr_to_string("instance?(#t, <boolean>)").expect("eval ok");
     assert_eq!(s4, "#t");
 }
