@@ -127,3 +127,28 @@ pre-existing issue with its own fix (add the missing `codegen-units = 1`).
 *partly-wrong* argument. The adversarial pass corrected the argument and
 recovered real work — exactly why challenging a consensus is worth the
 tokens even when the consensus "wins."
+
+## Resolved (committed `028f8ac`)
+
+Adopted the salvage: applied the stashed band/idempotency/lower.rs work,
+**deleted only the `/FORCE:MULTIPLE` line** (replaced with a comment
+pointing at the real release fix, task #8), rebuilt the shim `.obj` so its
+classes bake into the `FIRST_SHIM` band, and validated in DEBUG:
+
+- The previously-crashing `c3_oracle`/`lexer_oracle`/`macro_engine` now
+  **pass** under `NOD_PARSE_WITH_DYLAN=1` — no drift, no `LNK2005`, no
+  `/FORCE:MULTIPLE`.
+- Full sweep green BOTH ways (baseline and under the shim flag,
+  `--test-threads=1`); every class-id-heavy suite (classes, dispatch,
+  collections, conditions, gc, gc_precise, heap_objects, closures,
+  first_class_functions, **bench_richards** full-AOT) passes — dispatch is
+  uncorrupted with the band active. `dylan_parse_translate` 28/36
+  unregressed. Only `ide_shell_infra` fails — a pre-existing environmental
+  Win32/D2D access-violation (the band is off in baseline, so it cannot be
+  this change), excluded as before.
+
+The reverted attempt's stash was dropped (the work now lives in `028f8ac`).
+This **unblocks 51e.6** (the parser can default once the full sweep is
+green under the shim flag — it now is) and removes the shim-AOT blocker for
+all of 52/53/54. The release-mode `LNK2005` remains open as task #8 (the
+`codegen-units = 1` pin), independent of the front-end migration.
