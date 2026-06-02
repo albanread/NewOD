@@ -28,6 +28,15 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-02 — Porting the macro engine to Dylan (Sprint 52.1–52.5, 52.6 prep)](2026-06-02-macro-engine-to-dylan-52.md)
+  — The macro expander joins the lexer and parser in being Dylan-written.
+  Locus (B): expand Dylan-side before the wire, no new wire. Engine ported
+  sub-task by sub-task (data model + collector, 7-kind matching,
+  substitution + hygiene, multi-rule selection, fragment-level module walk
+  to fixpoint), each behind a Rust-parity or hand-verified gate; five macro
+  gates green. Discovered the whole-file text round-trip is fidelity-limited
+  (preamble + keyword-name colon loss), so the 52.6 front-end integration
+  must emit expanded tokens with synthesized spans, not text.
 - [2026-06-02 — The Dylan parser is the default front-end (51e.6)](2026-06-02-parser-is-the-default.md)
   — Sprint 51e complete. With the class-id drift fixed, the Dylan parser
   flips from opt-in to the default real-pipeline front-end (`--parse-with-rust`
