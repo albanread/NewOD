@@ -45,6 +45,15 @@ Precedence: c
 define class <token-stream> (<object>)
   slot ts-tokens :: <stretchy-vector>, init-keyword: tokens:;
   slot ts-pos    :: <integer>,        init-value: 0;
+  // Sprint 51e — `Precedence: c` module-header pragma. `#f` (default) is
+  // the DRM rule: every binary operator is one flat, left-associative
+  // level (parse-binary-expression). `#t` opts the file into the legacy
+  // C-style precedence ladder (parse-c-or → … → parse-c-pow), a faithful
+  // mirror of nod-reader parser.rs's `precedence_c` path. The flag is set
+  // by the shim (`parse-dylan-with-precedence`) after scanning the source
+  // preamble for `Precedence: c`, since the lexer skips that header block
+  // and the parser would otherwise never see it.
+  slot ts-precedence-c? :: <boolean>, init-value: #f, init-keyword: precedence-c?:;
 end class;
 
 define function make-token-stream (toks :: <stretchy-vector>)
@@ -875,7 +884,20 @@ end function;
 //   Wraps the token vector in a stream and parses a source-record (body).
 
 define function parse-dylan (tokens :: <stretchy-vector>) => (result :: <ast-body>)
+  parse-dylan-with-precedence(tokens, #f)
+end function;
+
+// Sprint 51e — same as parse-dylan, but with the `Precedence: c` pragma
+// threaded in. The shim scans the raw source preamble for the header (the
+// lexer drops it) and passes the verdict here so the expression parser
+// can pick the flat (DRM) chain or the legacy C ladder. Keeping a
+// separate entry leaves the zero-argument `parse-dylan` (used by the
+// standalone EXE path and by `dylan-parse-collect`) unchanged.
+define function parse-dylan-with-precedence
+    (tokens :: <stretchy-vector>, precedence-c? :: <boolean>)
+ => (result :: <ast-body>)
   let ts = make-token-stream(tokens);
+  ts-precedence-c?(ts) := precedence-c?;
   parse-body(ts)
 end function;
 
@@ -1498,7 +1520,16 @@ end function;
 // parse_assign wraps parse_binary).  We parse a full binary expression for
 // the left side, then if `:=` follows, recurse on the right for right-assoc.
 define function parse-expression (ts :: <token-stream>) => (n :: <ast-node>)
-  let left = parse-binary-expression(ts);
+  // Sprint 51e — `Precedence: c` files climb the legacy C-style ladder
+  // (parse-c-or → … → parse-c-pow); the default is the flat DRM chain.
+  // This mirrors nod-reader parser.rs's `parse_assign`, which wraps either
+  // `parse_or` (C mode) or `parse_binary` (flat) the same way.  `:=` sits
+  // above BOTH and is right-associative regardless of the pragma.
+  let left = if (ts-precedence-c?(ts))
+               parse-c-or(ts)
+             else
+               parse-binary-expression(ts)
+             end;
   if (~ ts-at-end?(ts) & is-punct?(ts-peek(ts), #"assign"))
     let op = ts-advance(ts);            // consume `:=`
     let right = parse-expression(ts);   // right-associative
@@ -1525,6 +1556,150 @@ define function parse-binary-expression (ts :: <token-stream>) => (n :: <ast-nod
     end;
   end;
   left
+end function;
+
+// ── Legacy C-style precedence ladder (`Precedence: c` files only) ─────────
+//
+// A faithful, level-for-level mirror of nod-reader parser.rs's
+// `parse_or → parse_and → parse_cmp → parse_add → parse_mul → parse_pow`
+// chain (parser.rs:388-512).  Files written before the DRM-flat rule
+// opt in via a `Precedence: c` module header and keep their original
+// C-style grouping (`3 + 4 * 5` → `3 + (4 * 5)`); everything else uses
+// the flat parse-binary-expression above.  The gate is byte-identical
+// output, so the operator membership of each level MUST match parser.rs
+// exactly — in particular `mod`/`rem` sit at the multiplicative level
+// (parse-c-mul, with `* /`), `^` is its own right-associative level
+// above that (parse-c-pow), and `=>`/`..` are NOT operators here (the
+// flat `is-binary-op?` treats them as infix, but the Rust C-ladder does
+// not, so a C-mode chain stops at them — matching parse_or…parse_pow,
+// which only recognise the forms enumerated below).
+//
+// Each level is left-associative (loop, fold into the lhs) except
+// parse-c-pow, which is right-associative (recurse on the rhs), exactly
+// as parser.rs::parse_pow does.  The shared leaf is parse-binary-operand
+// (= the Rust `parse_unary`, plus the keyword-name→symbol handling the
+// flat leaf already does), so only operator GROUPING differs between the
+// two Dylan modes, never the leaf shape.
+
+// Level 1 (lowest): `|`  →  Or.  Mirrors parser.rs::parse_or.
+define function parse-c-or (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-c-and(ts);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-punct?(ts-peek(ts), #"bar"))
+      let op = ts-advance(ts);
+      let right = parse-c-and(ts);
+      left := make(<ast-binary-op>, left: left, operator: op, right: right);
+    else
+      done? := #t;
+    end;
+  end;
+  left
+end function;
+
+// Level 2: `&`  →  And.  Mirrors parser.rs::parse_and.
+define function parse-c-and (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-c-cmp(ts);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-punct?(ts-peek(ts), #"amp"))
+      let op = ts-advance(ts);
+      let right = parse-c-cmp(ts);
+      left := make(<ast-binary-op>, left: left, operator: op, right: right);
+    else
+      done? := #t;
+    end;
+  end;
+  left
+end function;
+
+// Level 3 (comparison): `= == ~= ~== < > <= >=`.  Mirrors
+// parser.rs::parse_cmp.  No `=>`/`..` here (parser.rs has none).
+define function is-c-cmp-op? (t :: <token>) => (yes? :: <boolean>)
+  if (instance?(t, <punctuation-token>))
+    let f = punctuation-token-form(t);
+    f = #"equal"            | f = #"equal-equal"
+      | f = #"tilde-equal"  | f = #"tilde-equal-equal"
+      | f = #"less"         | f = #"greater"
+      | f = #"less-equal"   | f = #"greater-equal"
+  else
+    #f
+  end
+end function;
+
+define function parse-c-cmp (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-c-add(ts);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-c-cmp-op?(ts-peek(ts)))
+      let op = ts-advance(ts);
+      let right = parse-c-add(ts);
+      left := make(<ast-binary-op>, left: left, operator: op, right: right);
+    else
+      done? := #t;
+    end;
+  end;
+  left
+end function;
+
+// Level 4 (additive): `+ -`.  Mirrors parser.rs::parse_add.
+define function parse-c-add (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-c-mul(ts);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    let t = ts-peek(ts);
+    if (is-punct?(t, #"plus") | is-punct?(t, #"minus"))
+      let op = ts-advance(ts);
+      let right = parse-c-mul(ts);
+      left := make(<ast-binary-op>, left: left, operator: op, right: right);
+    else
+      done? := #t;
+    end;
+  end;
+  left
+end function;
+
+// Level 5 (multiplicative): `* /` plus the word operators `mod` `rem`.
+// Mirrors parser.rs::parse_mul (which matches Star/Slash and the Ident
+// words "mod"/"rem").
+define function is-c-mul-op? (t :: <token>) => (yes? :: <boolean>)
+  if (instance?(t, <punctuation-token>))
+    let f = punctuation-token-form(t);
+    f = #"star" | f = #"slash"
+  elseif (instance?(t, <identifier-token>))
+    let nm = identifier-token-name(t);
+    nm = "mod" | nm = "rem"
+  else
+    #f
+  end
+end function;
+
+define function parse-c-mul (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-c-pow(ts);
+  let done? = #f;
+  until (done? | ts-at-end?(ts))
+    if (is-c-mul-op?(ts-peek(ts)))
+      let op = ts-advance(ts);
+      let right = parse-c-pow(ts);
+      left := make(<ast-binary-op>, left: left, operator: op, right: right);
+    else
+      done? := #t;
+    end;
+  end;
+  left
+end function;
+
+// Level 6 (exponentiation): `^`, RIGHT-associative.  Mirrors
+// parser.rs::parse_pow (recurses on the rhs rather than looping).
+define function parse-c-pow (ts :: <token-stream>) => (n :: <ast-node>)
+  let left = parse-binary-operand(ts);
+  if (~ ts-at-end?(ts) & is-punct?(ts-peek(ts), #"caret"))
+    let op = ts-advance(ts);
+    let right = parse-c-pow(ts);   // right-associative
+    make(<ast-binary-op>, left: left, operator: op, right: right)
+  else
+    left
+  end
 end function;
 
 // binary-operand:

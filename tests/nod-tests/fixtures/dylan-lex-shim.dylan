@@ -304,6 +304,110 @@ define function preamble-end (source :: <byte-string>) => (cursor :: <integer>)
   end
 end function;
 
+// ─── precedence-c-header? — port of the Rust `Precedence: c` detection ────
+//
+// Sprint 51e. The `Precedence:` module-header pragma lives in the source
+// preamble (the `Key: value` block) that the lexer SKIPS, so the parser
+// never sees it through the token stream. We surface it here, exactly
+// where the host already has the raw `source`, by scanning the preamble
+// byte range (`[0, preamble-end)`) for a header line whose key is
+// `Precedence` and whose value is `c`, both compared case-insensitively
+// after trimming surrounding whitespace. This mirrors nod-reader
+// parser.rs:137-142 and src/nod-driver/src/dylan_to_ast.rs:87-92
+// (`k.eq_ignore_ascii_case("precedence") && v.trim().eq_ignore_ascii_case("c")`),
+// so both parsers agree on which files climb the C-style ladder.
+//
+// The verdict is threaded into the parser via `parse-dylan-with-precedence`
+// (dylan-parser.dylan), which sets `ts-precedence-c?` on the token stream.
+
+// ASCII-lowercase one byte (A-Z → a-z); other bytes unchanged.
+define function ascii-lower (b :: <integer>) => (lo :: <integer>)
+  if (b >= 65 & b <= 90) b + 32 else b end
+end function;
+
+// Does the source slice [lo, hi) equal `lit` (a lowercase literal),
+// comparing case-insensitively? Used for the `precedence`/`c` match.
+define function slice-ci=? (source :: <byte-string>, lo :: <integer>,
+                            hi :: <integer>, lit :: <byte-string>)
+ => (yes? :: <boolean>)
+  let len = hi - lo;
+  if (len ~= size(lit))
+    #f
+  else
+    let i = 0;
+    let ok = #t;
+    until (i >= len | ~ ok)
+      if (ascii-lower(%byte-string-element(source, lo + i)) ~= %byte-string-element(lit, i))
+        ok := #f;
+      end;
+      i := i + 1;
+    end;
+    ok
+  end
+end function;
+
+// Advance `lo` past leading spaces/tabs; return the trimmed start.
+define function trim-left (source :: <byte-string>, lo :: <integer>,
+                           hi :: <integer>) => (start :: <integer>)
+  let i = lo;
+  until (i >= hi | (%byte-string-element(source, i) ~= 32
+                      & %byte-string-element(source, i) ~= 9))
+    i := i + 1;
+  end;
+  i
+end function;
+
+// Retract `hi` past trailing spaces/tabs/CR; return the trimmed end.
+define function trim-right (source :: <byte-string>, lo :: <integer>,
+                            hi :: <integer>) => (stop :: <integer>)
+  let i = hi;
+  until (i <= lo | (%byte-string-element(source, i - 1) ~= 32
+                      & %byte-string-element(source, i - 1) ~= 9
+                      & %byte-string-element(source, i - 1) ~= 13))
+    i := i - 1;
+  end;
+  i
+end function;
+
+define function precedence-c-header? (source :: <byte-string>)
+ => (yes? :: <boolean>)
+  let pre = preamble-end(source);
+  let found = #f;
+  let line-start = 0;
+  // Walk each preamble line. A header line is `key: value`; we compare the
+  // trimmed key to "precedence" and the trimmed value to "c". Continuation
+  // lines (leading whitespace) have no colon and are skipped harmlessly.
+  until (line-start >= pre | found)
+    // Find this line's LF (or the preamble end).
+    let line-end = line-start;
+    until (line-end >= pre | %byte-string-element(source, line-end) = 10)
+      line-end := line-end + 1;
+    end;
+    // Find the first colon within the line.
+    let colon = line-start;
+    let saw-colon = #f;
+    until (colon >= line-end | saw-colon)
+      if (%byte-string-element(source, colon) = 58)
+        saw-colon := #t;
+      else
+        colon := colon + 1;
+      end;
+    end;
+    if (saw-colon)
+      let key-lo = trim-left(source, line-start, colon);
+      let key-hi = trim-right(source, key-lo, colon);
+      let val-lo = trim-left(source, colon + 1, line-end);
+      let val-hi = trim-right(source, val-lo, line-end);
+      if (slice-ci=?(source, key-lo, key-hi, "precedence")
+            & slice-ci=?(source, val-lo, val-hi, "c"))
+        found := #t;
+      end;
+    end;
+    line-start := line-end + 1;
+  end;
+  found
+end function;
+
 // ─── emit-tokens — print kind + span for each emit-eligible token ─────────
 
 define function emit-tokens (tokens, source :: <byte-string>) => ()
@@ -1035,7 +1139,14 @@ end method;
 define function dylan-parse-emit (source :: <byte-string>)
  => (records :: <object>)
   let tokens = lex(source);
-  let ast = parse-dylan(tokens);
+  // Sprint 51e — honour the `Precedence: c` module-header pragma. The
+  // lexer drops the preamble, so we re-scan the raw source here (where the
+  // host hands us the bytes) and thread the verdict into the parser. A
+  // `Precedence: c` file then climbs the legacy C-style operator ladder;
+  // every other file keeps the flat DRM chain. This makes the wire tree's
+  // operator nesting match nod-reader's C-precedence path byte-for-byte,
+  // so the 9 grandfathered corpus files translate instead of falling back.
+  let ast = parse-dylan-with-precedence(tokens, precedence-c-header?(source));
   let out = %make-stretchy-vector(64);
   emit-node(ast, source, out);
   out

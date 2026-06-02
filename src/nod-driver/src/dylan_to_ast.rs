@@ -79,17 +79,14 @@ pub fn to_ast_module(tree: &DylanAst, src: &str) -> Result<Module, Unsupported> 
         .unwrap_or_default();
     let body_start = preamble.as_ref().map(|p| p.end).unwrap_or(0);
 
-    // A `Precedence: c` file is parsed C-style by the Rust parser but
-    // flat by the (pragma-unaware) Dylan-in-Dylan parser — the two can't
-    // agree on mixed-operator grouping, so decline the whole file and
-    // let the host fall back to the Rust parser. (Removed once the Dylan
-    // parser learns the pragma; until then this keeps the gate honest.)
-    if header
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("precedence") && v.trim().eq_ignore_ascii_case("c"))
-    {
-        return unsupported("Precedence: c file — Dylan parser is flat-only");
-    }
+    // Sprint 51e — the Dylan-in-Dylan parser now honours the `Precedence: c`
+    // module header itself (see dylan-lex-shim.dylan `precedence-c-header?`
+    // + dylan-parser.dylan's C-style ladder), so a C-precedence file emits a
+    // wire tree whose operator nesting already matches nod-reader's
+    // C-precedence path. We no longer decline these files here; the
+    // `BinaryOp` arm below reconstructs the nesting faithfully (the dump
+    // diffs tree shape, and both parsers now build the same shape). The
+    // prior wholesale `Precedence: c` reject is gone with the pragma gap.
 
     let mut items = Vec::new();
     for child in &tree.children {
