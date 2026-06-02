@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-02 — The Dylan parser enters the real pipeline; the shim-AOT class-id drift surfaces](2026-06-02-parser-in-the-pipeline-and-the-class-id-drift.md)
+  — Sprint 51e.5. `--parse-with-dylan` wired into compile/eval/build via
+  a `set_parse_override` hook (mirroring the lexer), with Rust fall-back
+  + verify-mode; `eval "1 + 2 * 3"` → 9 through the Dylan parser. Surfaced
+  the cross-cutting blocker: firing any front-end shim registers its
+  `define class`es through the shared user-class-id counter, drifting the
+  AOT-baked class ids. Gates 51e.6 default + all of 52/53/54; diagnosed
+  with three fix directions, deferred as a back-end fix.
 - [2026-06-02 — Parser parity push: 14 → 28/36, and two traps](2026-06-02-parser-parity-push-14-to-28.md)
   — Sprint 51e. Authored the 51e–54 migration specs, then drove the
   translation gate 14→28/36 (Precedence:c ladder, comment-aware
