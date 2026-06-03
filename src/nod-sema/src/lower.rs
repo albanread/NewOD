@@ -632,6 +632,18 @@ pub struct LoweredModule {
     /// reference any of those). The JIT path drives the same set
     /// through `register_variables` once the engine is materialised.
     pub variables: Vec<VariableRegistration>,
+    /// Sprint 53 — the sema *recording* outputs, captured so the model
+    /// can be serialised (`dump-sema`) and byte-compared against the
+    /// Dylan-computed model. `top_names` + `generics` were previously
+    /// computed and discarded; classes (`user_classes`) and `sealing`
+    /// already lived here. Together these four are the `SemaModel` the
+    /// sprint ports to Dylan. Lowering does not read these back —
+    /// they're a recording snapshot, not an input (the structural
+    /// `lower_with_model` split that enforces that is a later step).
+    pub top_names: TopNames,
+    /// Sprint 53 — generic-function names (sorted, deterministic) the
+    /// recording walk collected.
+    pub generics: Vec<String>,
 }
 
 /// GAP-004 — one `define variable` registration: the variable's source
@@ -2335,6 +2347,12 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     }
     let _ = materialized_call_names;
 
+    // Sprint 53 — snapshot the sema recording outputs. `top_names` and
+    // `generics` were computed in Phase 2; clone them (they were also
+    // read by lowering) plus sort the generic set for a stable dump.
+    let mut generics_sorted: Vec<String> = generics.iter().cloned().collect();
+    generics_sorted.sort();
+
     Ok(LoweredModule {
         functions: out,
         methods,
@@ -2347,7 +2365,96 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         warnings,
         user_classes: user_class_registrations,
         variables: variable_registrations,
+        top_names: top_names.clone(),
+        generics: generics_sorted,
     })
+}
+
+/// Resolve a `ClassId` to its registered class name, or a stable
+/// placeholder. Used by `format_sema_model` so the dump references
+/// classes by NAME (the portable invariant) rather than numeric id —
+/// ids are assigned globally and won't match across the Rust and Dylan
+/// sema implementations, but names + slot offsets + CPL order do.
+fn sema_class_name(id: ClassId) -> String {
+    let p = nod_runtime::class_metadata_ptr(id);
+    if p.is_null() {
+        format!("#<class {}>", id.0)
+    } else {
+        // SAFETY: static-area metadata, process-lived.
+        unsafe { (*p).name.clone() }
+    }
+}
+
+/// Sprint 53 — serialise the sema recording model (`SemaModel`:
+/// top-names, generics, classes, sealing) to deterministic, stable text.
+/// This is the `dump-sema` oracle: the Dylan-computed model must
+/// byte-match this. Tables are sorted; classes are in registration
+/// order; class references are by name (see `sema_class_name`).
+pub fn format_sema_model(lm: &LoweredModule) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+
+    s.push_str("=== top-names ===\n");
+    let mut fns: Vec<(&String, &TypeEstimate)> = lm.top_names.fns.iter().collect();
+    fns.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, est) in fns {
+        let arity = lm.top_names.fn_arity.get(name).copied().unwrap_or(0);
+        let _ = writeln!(s, "fn {name} arity={arity} return={est:?}");
+    }
+    let mut consts: Vec<&String> = lm.top_names.constants.iter().collect();
+    consts.sort();
+    for c in consts {
+        let _ = writeln!(s, "constant {c}");
+    }
+    let mut vars: Vec<&String> = lm.top_names.variables.iter().collect();
+    vars.sort();
+    for v in vars {
+        let _ = writeln!(s, "variable {v}");
+    }
+
+    s.push_str("=== generics ===\n");
+    for g in &lm.generics {
+        let _ = writeln!(s, "generic {g}");
+    }
+
+    s.push_str("=== classes ===\n");
+    for c in &lm.user_classes {
+        let _ = writeln!(s, "class {}", c.name);
+        let parents: Vec<String> = c.parents.iter().map(|&id| sema_class_name(id)).collect();
+        let _ = writeln!(s, "  parents [{}]", parents.join(", "));
+        let cpl: Vec<String> = c.cpl.iter().map(|&id| sema_class_name(id)).collect();
+        let _ = writeln!(s, "  cpl [{}]", cpl.join(", "));
+        for (i, slot) in c.slots.iter().enumerate() {
+            let origin = sema_class_name(c.slot_origin[i]);
+            let _ = writeln!(
+                s,
+                "  slot {} @{} setter={} origin={}",
+                slot.name, slot.offset, slot.has_setter, origin
+            );
+        }
+    }
+
+    s.push_str("=== sealing ===\n");
+    let mut sc: Vec<&String> = lm.sealing.sealed_classes.iter().collect();
+    sc.sort();
+    for c in sc {
+        let _ = writeln!(s, "sealed-class {c}");
+    }
+    let mut sg: Vec<&String> = lm.sealing.sealed_generics.iter().collect();
+    sg.sort();
+    for g in sg {
+        let _ = writeln!(s, "sealed-generic {g}");
+    }
+    let mut doms: Vec<(&String, &Vec<Vec<ClassId>>)> = lm.sealing.domains.iter().collect();
+    doms.sort_by(|a, b| a.0.cmp(b.0));
+    for (g, tuples) in doms {
+        for t in tuples {
+            let names: Vec<String> = t.iter().map(|&id| sema_class_name(id)).collect();
+            let _ = writeln!(s, "sealed-domain {g} ({})", names.join(", "));
+        }
+    }
+
+    s
 }
 
 /// Sprint 27: walk the AST collecting any call expressions whose
@@ -3404,6 +3511,7 @@ fn lower_function_inner(
 
 // ─── Top-level name set + lowering context ─────────────────────────────────
 
+#[derive(Clone, Debug, Default)]
 pub struct TopNames {
     fns: HashMap<String, TypeEstimate>,
     /// Sprint 21: arity per top-level function. Populated alongside

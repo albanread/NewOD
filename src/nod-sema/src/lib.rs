@@ -177,6 +177,26 @@ pub fn dump_dfm_for_file(path: &Path) -> Result<String, DumpError> {
     Ok(nod_dfm::format_dfm_module(&lm.functions))
 }
 
+/// Sprint 53 — driver helper: read a Dylan file, parse + expand + run the
+/// sema recording walk, and return the deterministic `SemaModel` dump
+/// (top-names, generics, classes, sealing). This is the `dump-sema`
+/// oracle the Dylan-computed model byte-matches against. Reuses the same
+/// parse+expand+lower path as `dump-dfm` (the model is captured on
+/// `LoweredModule` during lowering), then formats only the recording
+/// half via [`lower::format_sema_model`].
+pub fn dump_sema_for_file(path: &Path) -> Result<String, DumpError> {
+    stdlib::ensure_loaded();
+    let src = std::fs::read_to_string(path).map_err(DumpError::Io)?;
+    let mut sm = nod_reader::SourceMap::new();
+    let file_id = sm.add(path.to_path_buf(), src.clone()).map_err(DumpError::SourceMap)?;
+    let toks = nod_reader::lex(&src, file_id);
+    let pre = nod_reader::scan_preamble(&src);
+    let mut module = parse_user_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
+    expand_with_stdlib_macros(&mut module, &sm).map_err(DumpError::Macro)?;
+    let lm = lower_module_full(&module).map_err(DumpError::Lower)?;
+    Ok(lower::format_sema_model(&lm))
+}
+
 /// Driver helper: read a Dylan file, parse + lower + codegen, return the
 /// textual LLVM IR. Driver wires this into `dump-llvm`.
 pub fn dump_llvm_for_file(path: &Path) -> Result<String, DumpError> {

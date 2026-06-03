@@ -193,6 +193,13 @@ enum Command {
         /// Path to a `.dylan` source file.
         input: PathBuf,
     },
+    /// Sprint 53 — print the sema recording model (top-names, generics,
+    /// classes, sealing) as deterministic text. The byte-identical oracle
+    /// for the Dylan sema port.
+    DumpSema {
+        /// Path to a `.dylan` source file.
+        input: PathBuf,
+    },
     /// Lex + parse + lower + codegen a Dylan source file; print textual LLVM IR.
     DumpLlvm {
         /// Path to a `.dylan` source file.
@@ -638,6 +645,7 @@ fn main() -> ExitCode {
         Some(Command::DumpAst { input }) => run_dump_ast(&input),
         Some(Command::DumpGraph { input }) => run_dump_graph(&input),
         Some(Command::DumpDfm { input }) => run_dump_dfm(&input),
+        Some(Command::DumpSema { input }) => run_dump_sema(&input),
         Some(Command::DumpLlvm { input }) => run_dump_llvm(&input),
         Some(Command::Eval { expr }) => run_eval(&expr),
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
@@ -1074,6 +1082,19 @@ fn run_dump_dfm(input: &std::path::Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("nod-driver dump-dfm: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_dump_sema(input: &std::path::Path) -> ExitCode {
+    match nod_sema::dump_sema_for_file(input) {
+        Ok(dump) => {
+            print!("{dump}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("nod-driver dump-sema: {e}");
             ExitCode::from(2)
         }
     }
