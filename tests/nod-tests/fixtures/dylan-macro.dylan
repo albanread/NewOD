@@ -443,8 +443,21 @@ end function;
 // paren / comma / semicolon after). Same heuristic the Rust engine
 // uses to keep emitted text readable.
 
+// Render a <tok>'s surface text. Keyword-name tokens (`Module:`, `x:`)
+// are stored colon-stripped by the lexer adapter; re-append the colon so
+// rendered text re-lexes back to a keyword-name (not a bare ident) — this
+// keeps the `Module:` preamble and body keyword-args faithful through the
+// expand → render → re-lex round-trip.
+define function tok-render-text (t :: <tok>) => (s :: <byte-string>)
+  if (tok-kind(t) = #"keyword-name")
+    concatenate(tok-text(t), ":")
+  else
+    tok-text(t)
+  end
+end function;
+
 define function emit-tok (out :: <stretchy-vector>, t :: <tok>) => ()
-  add!(out, tok-text(t));
+  add!(out, tok-render-text(t));
 end function;
 
 define function emit-frag (out :: <stretchy-vector>, f :: <fragment>) => ()
@@ -730,7 +743,10 @@ define function emit-template-hyg (template :: <stretchy-vector>,
     if (instance?(e, <tpl-literal>))
       let t = tpl-lit-tok(e);
       let text = tok-text(t);
-      let emit-text = text;
+      // Base surface text (keyword-name colon re-appended); a renameable
+      // binder ident is an ident, never a keyword-name, so the rename
+      // branch and the colon handling don't overlap.
+      let emit-text = tok-render-text(t);
       if (tok-kind(t) = #"ident" & string-in?(binders, text)
             & ~ string-in?(pvars, text) & ~ is-template-no-rename?(text))
         emit-text := concatenate(text, concatenate("__nod_hyg_", nonce-str));
@@ -980,11 +996,63 @@ end function;
 
 // Expand a whole module's source to fixpoint: collect its macro defs,
 // lex+fragment the source, expand all call sites, and render the result.
+// Is the source's first line a `Word: …` header line? (A single word,
+// then `:`, before any whitespace or newline.) Used to decide whether a
+// `Module:`-style preamble is present.
+define function header-present? (source :: <byte-string>) => (yes? :: <boolean>)
+  let n = size(source);
+  let i = 0;
+  let saw-space = #f;
+  let done = #f;
+  let result = #f;
+  until (i >= n | done)
+    let c = %byte-string-element(source, i);
+    if (c = 10 | c = 13)        // newline before a colon → not a header
+      done := #t;
+    elseif (c = 58)             // ':' with a non-empty, space-free key
+      if (~ saw-space & i > 0) result := #t; end;
+      done := #t;
+    elseif (c = 32 | c = 9)
+      saw-space := #t;
+    end;
+    i := i + 1;
+  end;
+  result
+end function;
+
+// Byte offset where the module BODY starts: past the header block (up to
+// and including the first blank line) when a header is present, else 0.
+// The preamble is host-side metadata; the expanded output is body-only,
+// so the single-line render doesn't break preamble detection on re-parse.
+define function body-start-offset (source :: <byte-string>) => (off :: <integer>)
+  if (~ header-present?(source))
+    0
+  else
+    let n = size(source);
+    let i = 0;
+    let off = 0;
+    let found = #f;
+    until (i >= n | found)
+      if (%byte-string-element(source, i) = 10)    // LF
+        let j = i + 1;
+        if (j < n & %byte-string-element(source, j) = 13) j := j + 1; end;
+        if (j < n & %byte-string-element(source, j) = 10)  // blank line
+          off := j + 1;
+          found := #t;
+        end;
+      end;
+      i := i + 1;
+    end;
+    if (found) off else 0 end
+  end
+end function;
+
 define function expand-module-source (source :: <byte-string>,
                                       table :: <stretchy-vector>,
                                       nonce-str :: <byte-string>)
  => (text :: <byte-string>)
-  let frags    = tokens-to-fragments(lex-source-to-toks(source));
+  let body     = copy-sequence(source, body-start-offset(source), size(source));
+  let frags    = tokens-to-fragments(lex-source-to-toks(body));
   let expanded = expand-fragments(frags, table, nonce-str, 0);
   render-frags(expanded)
 end function;
