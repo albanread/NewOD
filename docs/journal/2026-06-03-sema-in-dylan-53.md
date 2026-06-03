@@ -73,3 +73,46 @@ on a growing fixture subset. Then integrate `--sema-with-dylan` +
 verify-mode (53.5). Per the perf strategy, the *default* flip waits for
 the whole front-end; this sprint is about correctness + the model
 crossing to Dylan.
+
+## 53.2 implementation plan (scoped, turnkey)
+
+Write a Dylan `collect-top-names(ast-body, source) -> <byte-string>`
+(new `dylan-sema.dylan`, bundled with `dylan-parser.dylan` so it sees the
+`<ast-*>` tree) that emits the `=== top-names ===` section byte-matching
+the Rust `format_sema_model` for **class-free** fixtures first
+(`factorial`, `hello`, `mutual`, `kernel-arith`).
+
+- **Oracle target** (factorial): `fn factorial arity=1 return=Integer` /
+  `fn main arity=0 return=Integer`. Sorted by name; then `constant <n>` /
+  `variable <n>` lines (sorted).
+- **AST accessors** (from `dylan-parser.dylan`):
+  - root `<ast-body>` → constituents vector.
+  - `<ast-body-definition>`: `defn-word` (token; "function"/"method"),
+    `defn-method-name` (token | #f), `defn-params` (`<ast-param-list>` |
+    #f), `defn-return` (`<ast-return-spec>` | #f).
+  - `<ast-param-list>`: `params-required` (vector) → **arity** = its size.
+  - `<ast-return-spec>`: `ret-values` (vector of `<ast-typed-name>`); the
+    first value's type expr → the **return estimate**.
+  - `<ast-list-definition>`: `defn-word` ("constant"/"variable") →
+    constants/variables; the bound name is in `defn-list`.
+  - token text via `token-source-text(tok, source)` (already used by the
+    lexer adapter) or `identifier-token-name`.
+- **Return-estimate mapping** (must match `TypeEstimate` Debug names):
+  `<integer>`→`Integer`, `<single-float>`→`SingleFloat`,
+  `<double-float>`→`DoubleFloat`, `<character>`→`Character`,
+  `<boolean>`→`Boolean`, `<byte-string>`/`<string>`→`String`, no return
+  spec / unknown type → `Top`. **TODO:** confirm against
+  `collect_top_level_names` (now ~line 4250+ in `lower.rs` after the 53.1
+  insertions) — it may infer from the body when no `=>` is present
+  (factorial has an explicit `=> (<integer>)`, so the explicit-type path
+  covers the first fixtures; body-inference is a follow-up).
+- **Gate**: a `dump-sema`-style driver (`.prj` bundling lexer+parser+sema)
+  that prints the top-names section for a fixture; a Rust gate runs the
+  Dylan driver and `--parse-with-rust dump-sema`, slices both
+  `=== top-names ===` sections, and asserts byte-equality. Start with
+  `factorial`; grow the fixture set.
+
+Auto-generated slot-accessor names (`<C>-getter-x`, …) in top-names come
+from **class** processing, so they arrive with 53.3 (classes); 53.2
+covers user `define function`/`constant`/`variable` only — which is why
+class-free fixtures are the right first gate.
