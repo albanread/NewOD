@@ -23,6 +23,7 @@ name           = "dylan-lex-shim"
 sources        = [
     "dylan-lexer.dylan",
     "dylan-parser.dylan",
+    "dylan-macro.dylan",
     "dylan-lex-shim.dylan",
 ]
 output         = "dylan-lex-shim.exe"

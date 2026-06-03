@@ -319,6 +319,55 @@ fn dylan_parse_module(
 ) -> Result<nod_reader::Module, Vec<nod_reader::Diagnostic>> {
     let verify = std::env::var("NOD_VERIFY_PARSE").map(|v| v == "1").unwrap_or(false);
 
+    // Sprint 52.6 (locus B) — under `NOD_EXPAND_WITH_DYLAN`, expand the
+    // source's macro calls Dylan-side BEFORE parsing, then run the normal
+    // parse on the expanded (macro-free) source. The host stays oblivious;
+    // nod-sema's own macro-expansion pass then no-ops on the already-
+    // expanded AST. Falls back to the original source if expansion fails
+    // (no shim, or a UTF-8/wire error).
+    let want_expand = std::env::var("NOD_EXPAND_WITH_DYLAN")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let expanded_holder: Option<(String, Vec<nod_reader::Token>, Option<nod_reader::Preamble>)> =
+        if want_expand {
+            // The shim's resolver must have fired before `dylan-expand-source`
+            // runs (it lexes, which sets the lexer's `*src*`/`*pos*` module
+            // variables via AOT-resolved name literals). `init` is idempotent.
+            match dylan_lex_jit::init() {
+                Err(e) => {
+                    eprintln!("expand-with-dylan: fell back (shim init: {e}) [pipeline]");
+                    None
+                }
+                Ok(()) => match dylan_parse_wire::expand_source_via_shim(
+                    src,
+                    nod_sema::stdlib::stdlib_macro_source(),
+                ) {
+                    Ok(exp) => {
+                        eprintln!("expand-with-dylan: expanded [pipeline]");
+                        let mut sm = nod_reader::SourceMap::new();
+                        let fid = sm
+                            .add(std::path::PathBuf::from("<expanded>"), exp.clone())
+                            .expect("source map add for expanded source");
+                        let toks = nod_reader::lex_rust(&exp, fid);
+                        let pre = nod_reader::scan_preamble(&exp);
+                        Some((exp, toks, pre))
+                    }
+                    Err(e) => {
+                        eprintln!("expand-with-dylan: fell back ({e}) [pipeline]");
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+    // Re-bind the parse inputs to the expanded source when expansion ran.
+    let (src, tokens, preamble): (&str, &[nod_reader::Token], Option<&nod_reader::Preamble>) =
+        match &expanded_holder {
+            Some((s, t, p)) => (s.as_str(), t.as_slice(), p.as_ref()),
+            None => (src, tokens, preamble),
+        };
+
     // The Dylan path needs the shim's resolver to have fired. `init` is
     // idempotent (a `OnceLock` guards the resolver), so calling it here
     // is cheap on warm processes. On a no-shim build it errors and we

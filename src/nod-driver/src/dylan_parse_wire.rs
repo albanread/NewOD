@@ -29,6 +29,71 @@ unsafe extern "C" fn dylan_parse_emit(_source: u64) -> u64 {
     unreachable!("dylan_lex_shim_linked is not set")
 }
 
+#[cfg(dylan_lex_shim_linked)]
+unsafe extern "C" {
+    /// Sprint 52.6 — `define function dylan-expand-source (source,
+    /// stdlib-source) => (expanded :: <byte-string>)` from
+    /// `dylan-lex-shim.dylan`. Expands every macro call in `source` to
+    /// fixpoint (using the stdlib macros from `stdlib-source` plus the
+    /// file's own `define macro`s), strips the define-macro forms, and
+    /// returns the expanded source (preamble preserved). Word in (two
+    /// `<byte-string>`s), Word out (a `<byte-string>`).
+    #[link_name = "dylan-expand-source"]
+    fn dylan_expand_source(source: u64, stdlib_source: u64) -> u64;
+}
+
+#[cfg(not(dylan_lex_shim_linked))]
+unsafe extern "C" fn dylan_expand_source(_source: u64, _stdlib: u64) -> u64 {
+    unreachable!("dylan_lex_shim_linked is not set")
+}
+
+/// Allocate a Dylan `<byte-string>` from Rust bytes and return its Word.
+fn alloc_dylan_byte_string(bytes: &[u8]) -> Result<u64, String> {
+    let len_word =
+        Word::from_fixnum(bytes.len() as i64).map_err(|_| "source longer than fixnum range".to_string())?;
+    // SAFETY: nod_byte_string_allocate is the vetted constructor.
+    let bs_raw = unsafe { nod_runtime::nod_byte_string_allocate(len_word.raw()) };
+    for (i, &b) in bytes.iter().enumerate() {
+        let byte_word = Word::from_fixnum(b as i64).expect("byte fits");
+        let i_word = Word::from_fixnum(i as i64).expect("offset fits");
+        // SAFETY: bs_raw just allocated, single-threaded.
+        unsafe {
+            nod_runtime::nod_byte_string_element_setter(byte_word.raw(), bs_raw, i_word.raw());
+        }
+    }
+    Ok(bs_raw)
+}
+
+/// Read a Dylan `<byte-string>` Word back into a Rust `String`.
+fn read_dylan_byte_string(bs_raw: u64) -> Result<String, String> {
+    let size = Word::from_raw(unsafe { nod_runtime::nod_byte_string_size(bs_raw) })
+        .as_fixnum()
+        .ok_or_else(|| "byte-string size not a fixnum".to_string())? as usize;
+    let mut bytes = Vec::with_capacity(size);
+    for i in 0..size {
+        let i_word = Word::from_fixnum(i as i64).expect("offset fits");
+        let b = Word::from_raw(unsafe { nod_runtime::nod_byte_string_element(bs_raw, i_word.raw()) })
+            .as_fixnum()
+            .ok_or_else(|| "byte-string element not a fixnum".to_string())? as u8;
+        bytes.push(b);
+    }
+    String::from_utf8(bytes).map_err(|e| format!("expanded source is not valid UTF-8: {e}"))
+}
+
+/// Sprint 52.6 (locus B) — expand `src`'s macro calls Dylan-side, before
+/// the AST-wire emit, by calling the statically-linked `dylan-expand-source`
+/// shim entry. `stdlib_src` is the stdlib macro source the Dylan side
+/// collects stdlib `define macro`s from (pass `""` to use only the file's
+/// own macros). Returns the expanded (macro-free) source on success.
+pub fn expand_source_via_shim(src: &str, stdlib_src: &str) -> Result<String, String> {
+    let src_bs = alloc_dylan_byte_string(src.as_bytes())?;
+    let stdlib_bs = alloc_dylan_byte_string(stdlib_src.as_bytes())?;
+    // SAFETY: both Words are live <byte-string>s; the entry is the
+    // statically-linked expander.
+    let out_bs = unsafe { dylan_expand_source(src_bs, stdlib_bs) };
+    read_dylan_byte_string(out_bs)
+}
+
 /// AST kind codes — must match `docs/DYLAN_AST_WIRE.md` §3 and the
 /// `$ast-kind-*` constants in `dylan-lex-shim.dylan`.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

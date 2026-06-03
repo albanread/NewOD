@@ -1051,10 +1051,18 @@ define function expand-module-source (source :: <byte-string>,
                                       table :: <stretchy-vector>,
                                       nonce-str :: <byte-string>)
  => (text :: <byte-string>)
-  let body     = copy-sequence(source, body-start-offset(source), size(source));
+  // Keep the `Module:` preamble VERBATIM (with its newlines) and prepend
+  // it to the single-line expanded body. This preserves the module name
+  // (the host needs it for namespace resolution) and re-lexes as a normal
+  // file — preamble detection works because the header still has its
+  // newline structure, even though the body that follows is single-line
+  // (the parser is whitespace-insensitive).
+  let off      = body-start-offset(source);
+  let preamble = copy-sequence(source, 0, off);
+  let body     = copy-sequence(source, off, size(source));
   let frags    = tokens-to-fragments(lex-source-to-toks(body));
   let expanded = expand-fragments(frags, table, nonce-str, 0);
-  render-frags(expanded)
+  concatenate(preamble, render-frags(expanded))
 end function;
 
 // ─── Sprint 50b — parse `define macro` body fragments → <macro-def> ──────

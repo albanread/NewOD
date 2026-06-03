@@ -1299,6 +1299,34 @@ define function dylan-parse-emit (source :: <byte-string>)
   out
 end function;
 
+// ─── dylan-expand-source — Sprint 52.6 locus-(B) macro expander ──────────
+//
+// Expand every macro call in `source` to fixpoint — using the stdlib
+// macros collected from `stdlib-source` plus the file's own `define
+// macro`s — strip the `define macro` forms and the `Module:` preamble,
+// and return the expanded (macro-free) source text. The host, under
+// `NOD_EXPAND_WITH_DYLAN`, feeds the result straight to the normal parse
+// path (`dylan-parse-emit`), so parse / wire / translate are unchanged —
+// they just operate on already-expanded, kernel-shaped source. This is
+// the locus-(B) "expand before the wire emit" step, implemented as a pure
+// source→source transform (correctness gated byte-for-byte against the
+// Rust expander by `macro_file_expand.rs`).
+//
+// In-file macros are collected first so a file redefining a stdlib macro
+// shadows it (macro-table-lookup returns the first match).
+define function dylan-expand-source (source :: <byte-string>,
+                                     stdlib-source :: <byte-string>)
+ => (expanded :: <byte-string>)
+  let table = collect-macro-defs(source);
+  let stdlib-defs = collect-macro-defs(stdlib-source);
+  let i = 0;
+  until (i = size(stdlib-defs))
+    add!(table, stdlib-defs[i]);
+    i := i + 1;
+  end;
+  expand-module-source(source, table, "0")
+end function;
+
 // ─── main — read argv[1] as a path, lex, emit ────────────────────────────
 
 define function shim-main () => ()

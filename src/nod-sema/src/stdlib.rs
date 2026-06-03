@@ -117,6 +117,15 @@ const STDLIB_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Sprint 52.6 — the raw `stdlib.dylan` source, embedded at build time.
+/// The locus-(B) Dylan macro expander needs it to collect the stdlib's
+/// `define macro`s (so user code using `unless`/`when`/`cond`/`for-each`
+/// expands Dylan-side). This is the wire input (b) documented in
+/// `docs/DYLAN_AST_WIRE.md` §7.
+pub fn stdlib_macro_source() -> &'static str {
+    STDLIB_FILES[0].1
+}
+
 /// Sprint 20b: macro entries the loader collected. User-side
 /// expansion merges these into the per-call `MacroTable`.
 pub(crate) fn stdlib_macros() -> &'static MacroTable {
