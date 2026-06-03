@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-03 — Sema in Dylan (Sprint 53)](2026-06-03-sema-in-dylan-53.md)
+  — Pipeline correction (lex→parse→expand→sema→**DFM**→lowering; DFM is the
+  oddly-named CFG IR, its own stage). 53.1: captured the sema recording
+  model (top-names + generics) onto LoweredModule alongside the existing
+  classes + sealing; `format_sema_model` + `dump-sema` oracle + gate;
+  `DYLAN_SEMA_WIRE.md`. Class refs by name not id (ids are process-global);
+  sema has global side effects (single-call per process). Next: port the
+  recording walk to Dylan, tractable-subset-first.
 - [2026-06-02 — Porting the macro engine to Dylan (Sprint 52.1–52.5, 52.6 prep)](2026-06-02-macro-engine-to-dylan-52.md)
   — The macro expander joins the lexer and parser in being Dylan-written.
   Locus (B): expand Dylan-side before the wire, no new wire. Engine ported
