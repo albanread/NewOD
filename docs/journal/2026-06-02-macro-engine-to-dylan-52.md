@@ -164,17 +164,31 @@ shim-strapped Dylan expander running per file, and especially
 `collect-macro-defs(stdlib-source)` re-lexing the entire stdlib via the
 (JIT'd, slow) Dylan lexer on EVERY expand call. So:
 
-- **52.7 (flip the expander to default) is gated on performance, not
-  correctness.** Default-on would make every compile minutes-slow.
-- The clear optimization: cache the stdlib macro table once (it's
-  invariant across files), and/or memoize/lex-once. That + keeping the
-  shim warm should bring it back to seconds.
-- Until then the expander stays **opt-in** (`NOD_EXPAND_WITH_DYLAN`),
-  correct and gated, with the Rust expander the default.
+- **52.7 (flip the expander to default) is deferred — and not to a
+  hybrid-perf pass.** A small stdlib-table cache landed (`1dfe6e4`;
+  correct, gate green), but the real cost isn't the stdlib re-lex — it's
+  the **per-parse AST-wire crossing** (Dylan builds the tree → serialize
+  to 4-int records → Rust reconstructs `ast::Module`) plus the
+  JIT-strapped shim, repeated per stage. Those intermediate crossings
+  exist only because the front-end is *partially* ported.
 
-The macro engine is self-hosted and proven end-to-end; what stands
-between here and "default" is an expander-perf pass, not more correctness
-work.
+## Update 4 — strategy: perf waits for the whole front-end
+
+Decision (user): **do not optimize the shim/wire hybrid for speed.** When
+lex → parse → expand → sema → lower are all Dylan, the intermediate
+AST-wire crossings vanish — the Dylan→Rust boundary drops to a single
+DFM/IR handoff (back-end stays Rust+LLVM), crossed once per compile, not
+per stage. Performance comes from that consolidation, not per-step tuning
+now.
+
+So Sprint 52 is **complete as a correctness milestone**: the macro engine
+is self-hosted, wired into the real pipeline, gated, and **opt-in**
+(`NOD_EXPAND_WITH_DYLAN`); the Rust expander stays the default. The
+"make-default" flip waits for the whole-front-end milestone, not a perf
+pass. Next is **Sprint 53 — sema in Dylan** (`specs/53-sema-dylan.md`),
+continuing the port down the pipeline; the wire and shim costs are
+transient scaffolding that retire when the front-end is whole. Recorded
+in memory `perf-waits-for-whole-frontend` so this isn't re-litigated.
 
 1. Emit expanded tokens (not text) with synthesized spans — finish the
    52.4 span-rewrite, fragment→`<token>` flattening.
