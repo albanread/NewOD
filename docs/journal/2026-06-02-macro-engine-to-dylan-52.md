@@ -89,36 +89,44 @@ Two more findings closed out the session:
   single-line render doesn't confuse preamble detection. Commit `a153d90`.
   The expander is correct; the source→source transform is the whole job.
 
-- **The production shim rollout hits the class-id drift — as warned.**
+- **Bundling the engine into the shim is SAFE — my first read was wrong.**
   Tried bundling `dylan-macro.dylan` into `dylan-lex-shim.prj` + a
-  `dylan-expand-source` entry. The shim builds and the *parser* path stays
-  green (`dylan_parse_coverage` passes), but the engine's ~15 classes
-  (`<tok>`, `<fragment>`, the pattern/template families, …) shift the
-  shared user-class-id space, drifting the AOT-baked ids — exactly the
-  hazard `028f8ac` addressed for the parser/lexer with a disjoint shim
-  class-id band. Reverted; the clean shim is restored and `macro_engine`
-  (real AOT compile+run) is green. (Aside: `dump-dfm` panics at
-  `aot.rs:1037` under the shim on any fixture — pre-existing, unrelated.)
+  `dylan-expand-source` entry, saw `dump-dfm` crash, and jumped to "the
+  engine's ~15 classes drift the AOT class-ids." **That was a
+  misattribution.** Re-tested with reliable paths: with `dylan-macro`
+  bundled, `macro_engine` (AOT compile+run), `tables` (14 codegen),
+  `c3_oracle`, `gc_stress`, `sealing`, and `dylan_parse_coverage` all
+  pass. The disjoint shim class-id band (`classes.rs` `next_shim_id`,
+  `028f8ac`) already absorbs the engine's classes — and `dump-dfm`
+  crashes the SAME way on the clean shim, so it isn't caused by the
+  bundle. `aot.rs:1037` is the drift *assertion*; it fires because I
+  rebuilt the shim `.lib.obj` with a shim-linked driver instead of the
+  bootstrap (no-shim) sequence, baking a subtly-drifting `.obj`. The
+  band is fine; the rollout is NOT blocked on it. The real care item is
+  rebuilding the `.obj` via bootstrap.
 
 ## Where it leaves us
 
 The engine is complete, parity-gated, AND its whole-file output is
 verify-mode-proven against the Rust expander (`1c8cde4` … `a153d90`, five
-macro gates green). What remains is the front-end **production rollout**,
-and the class-id band is its gating dependency:
+macro gates green). What remains is the front-end **production rollout**, which is now
+unblocked — the band already handles the engine's classes:
 
-- **Extend the disjoint shim-class-id band** (`028f8ac`'s mechanism) to
-  cover `dylan-macro.dylan`'s classes, so bundling the engine into
-  `dylan-lex-shim.prj` doesn't drift the AOT-baked ids. This is the
-  back-end prerequisite for the whole rollout.
-- Then: the `dylan-expand-source` shim entry (written, reverted), a
-  host-side byte-string read-back + the parse override calling expand
-  first under `NOD_EXPAND_WITH_DYLAN`, stdlib-source delivery, the
-  verify-mode AST comparison (normalising out Header/DefineMacro as the
-  test gate does), the full-corpus sweep, and the default flip (52.7).
+- **Rebuild the shim `.lib.obj` via the bootstrap** (no-shim driver):
+  remove the `.obj`, `cargo build -p nod-driver` (no-shim), then
+  `build --library` the shim, then `touch main.rs` + `cargo build` to
+  relink. Rebuilding with a shim-linked driver bakes a drifting `.obj`
+  (the `dump-dfm` `aot.rs:1037` symptom). This is the one care item.
+- Then: bundle `dylan-macro.dylan` + the `dylan-expand-source` shim entry
+  (written, reverted), a host-side byte-string read-back + the parse
+  override calling expand first under `NOD_EXPAND_WITH_DYLAN`,
+  stdlib-source delivery, the verify-mode AST comparison (normalising out
+  Header/DefineMacro as the test gate does), the full-corpus sweep, and
+  the default flip (52.7).
 
-The remaining work is now back-end (class-id band) + mechanical host
-wiring, not engine correctness — that part is done and proven.
+The remaining work is mechanical host wiring + the bootstrap `.obj`
+rebuild discipline — not engine correctness, and not a class-id-band
+extension. The engine is done and proven.
 
 1. Emit expanded tokens (not text) with synthesized spans — finish the
    52.4 span-rewrite, fragment→`<token>` flattening.
