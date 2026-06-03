@@ -1314,11 +1314,21 @@ end function;
 //
 // In-file macros are collected first so a file redefining a stdlib macro
 // shadows it (macro-table-lookup returns the first match).
+//
+// The stdlib macro set is invariant across files, but collecting it
+// re-lexes the (large) stdlib source via the JIT'd Dylan lexer — the
+// dominant cost when expanding a multi-file build. Cache it in a module
+// variable (a GC root) so it's collected once per process, not per file.
+define variable *stdlib-macros-cache* :: <object> = #f;
+
 define function dylan-expand-source (source :: <byte-string>,
                                      stdlib-source :: <byte-string>)
  => (expanded :: <byte-string>)
+  if (~ *stdlib-macros-cache*)
+    *stdlib-macros-cache* := collect-macro-defs(stdlib-source);
+  end;
   let table = collect-macro-defs(source);
-  let stdlib-defs = collect-macro-defs(stdlib-source);
+  let stdlib-defs = *stdlib-macros-cache*;
   let i = 0;
   until (i = size(stdlib-defs))
     add!(table, stdlib-defs[i]);
