@@ -73,12 +73,52 @@ literals, which corrupts re-lexed expansions like `unless ?x (1) end`).
   span-rewrite piece deferred from 52.4) straight into the parser, never
   round-tripping through text.
 
+## Update — 52.6 verify-mode PROVEN, then the production rollout hits class-id drift
+
+Two more findings closed out the session:
+
+- **Verify-mode works end-to-end (test level).** `macro_file_expand.rs`
+  runs the Dylan expander over a whole file, re-parses the expanded source
+  with the Rust parser, and asserts the AST is byte-identical to Rust
+  `parse → expand` (modulo the compile-time-only `(Header …)`/
+  `(DefineMacro …)` subtrees). `macros-unless.dylan` and
+  `macro-for-range.dylan` both match exactly — hygiene and call-shape
+  included. Two fidelity fixes made the text round-trip faithful:
+  re-append the colon on keyword-name tokens (`Module:`, `x:`) when
+  rendering, and strip the `Module:` preamble (host-side metadata) so the
+  single-line render doesn't confuse preamble detection. Commit `a153d90`.
+  The expander is correct; the source→source transform is the whole job.
+
+- **The production shim rollout hits the class-id drift — as warned.**
+  Tried bundling `dylan-macro.dylan` into `dylan-lex-shim.prj` + a
+  `dylan-expand-source` entry. The shim builds and the *parser* path stays
+  green (`dylan_parse_coverage` passes), but the engine's ~15 classes
+  (`<tok>`, `<fragment>`, the pattern/template families, …) shift the
+  shared user-class-id space, drifting the AOT-baked ids — exactly the
+  hazard `028f8ac` addressed for the parser/lexer with a disjoint shim
+  class-id band. Reverted; the clean shim is restored and `macro_engine`
+  (real AOT compile+run) is green. (Aside: `dump-dfm` panics at
+  `aot.rs:1037` under the shim on any fixture — pre-existing, unrelated.)
+
 ## Where it leaves us
 
-The engine is complete and parity-gated (52.1–52.5 + the strip/call-shaped
-prep), all committed (`1c8cde4` … `1c4caf2`), five macro gates green. What
-remains for 52.6/52.7 is the front-end **integration**, and it is the
-substantial part:
+The engine is complete, parity-gated, AND its whole-file output is
+verify-mode-proven against the Rust expander (`1c8cde4` … `a153d90`, five
+macro gates green). What remains is the front-end **production rollout**,
+and the class-id band is its gating dependency:
+
+- **Extend the disjoint shim-class-id band** (`028f8ac`'s mechanism) to
+  cover `dylan-macro.dylan`'s classes, so bundling the engine into
+  `dylan-lex-shim.prj` doesn't drift the AOT-baked ids. This is the
+  back-end prerequisite for the whole rollout.
+- Then: the `dylan-expand-source` shim entry (written, reverted), a
+  host-side byte-string read-back + the parse override calling expand
+  first under `NOD_EXPAND_WITH_DYLAN`, stdlib-source delivery, the
+  verify-mode AST comparison (normalising out Header/DefineMacro as the
+  test gate does), the full-corpus sweep, and the default flip (52.7).
+
+The remaining work is now back-end (class-id band) + mechanical host
+wiring, not engine correctness — that part is done and proven.
 
 1. Emit expanded tokens (not text) with synthesized spans — finish the
    52.4 span-rewrite, fragment→`<token>` flattening.
