@@ -128,6 +128,54 @@ The remaining work is mechanical host wiring + the bootstrap `.obj`
 rebuild discipline — not engine correctness, and not a class-id-band
 extension. The engine is done and proven.
 
+## Update 2 — 52.6c landed: the expander runs in the real pipeline
+
+Wired end-to-end (commit `f29da53`). The shim gains
+`dylan-expand-source(source, stdlib-source)`; `dylan-macro.dylan` is
+bundled into `dylan-lex-shim.prj` (bootstrap-rebuild the `.obj`); the host
+parse override (`dylan_parse_module`) expands `src` Dylan-side under
+`NOD_EXPAND_WITH_DYLAN` before parsing, then parses the macro-free result.
+Two things that bit and got fixed:
+
+- **`expand-module-source` must PREPEND the verbatim preamble**, not strip
+  it — the host needs the module name, and the single-line body still
+  re-lexes because the header keeps its newlines.
+- **Init the shim resolver before calling `dylan-expand-source`.** The
+  expander lexes, which sets the lexer's `*src*`/`*pos*` module variables
+  via AOT-resolved name literals; calling expand before `dylan_lex_jit::init()`
+  panics in `nod_var_set_by_name` (garbage name Word). The existing parse
+  path inits first; the expand path must too.
+
+Headline: `expand-pipeline-smoke.dylan` (a `main` using stdlib `unless`)
+builds under the flag — `expand-with-dylan: expanded` → `parse-with-dylan:
+translated` → runs → `42`. A file that FELL BACK without the flag (the
+parser declines `define macro`) now goes fully Dylan-side. Gate:
+`macro_pipeline.rs`.
+
+## Update 3 — render fidelity holds on real source, but perf is the 52.7 gate
+
+Ran `macro_engine` (builds the lexer+parser+engine `.prj`, ~6k lines)
+under `NOD_EXPAND_WITH_DYLAN=1`: **passes** — the expander re-renders and
+round-trips the compiler's own complex source correctly (strings, the
+whole lot). So `render-frags` fidelity is solid, not just on toy macros.
+
+BUT it took **1077 s** vs ~22 s — ~50× slower. The cost is the
+shim-strapped Dylan expander running per file, and especially
+`collect-macro-defs(stdlib-source)` re-lexing the entire stdlib via the
+(JIT'd, slow) Dylan lexer on EVERY expand call. So:
+
+- **52.7 (flip the expander to default) is gated on performance, not
+  correctness.** Default-on would make every compile minutes-slow.
+- The clear optimization: cache the stdlib macro table once (it's
+  invariant across files), and/or memoize/lex-once. That + keeping the
+  shim warm should bring it back to seconds.
+- Until then the expander stays **opt-in** (`NOD_EXPAND_WITH_DYLAN`),
+  correct and gated, with the Rust expander the default.
+
+The macro engine is self-hosted and proven end-to-end; what stands
+between here and "default" is an expander-perf pass, not more correctness
+work.
+
 1. Emit expanded tokens (not text) with synthesized spans — finish the
    52.4 span-rewrite, fragment→`<token>` flattening.
 2. A shim entry that lexes → fragments → expands → feeds the parser, with
