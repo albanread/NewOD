@@ -41,7 +41,7 @@
 //! memory, so dispatch finds them forever.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use inkwell::context::Context;
 use nod_llvm::{Jit, codegen_module};
@@ -182,9 +182,30 @@ pub fn ensure_loaded() -> &'static StdlibArtefacts {
     if let Some(a) = STDLIB_ARTEFACTS.get() {
         return a;
     }
-    // Single-shot load. `OnceLock::get_or_init` would race with
-    // re-entrancy through nod-sema's lowering helpers; we use a
-    // manual fast-then-slow path with `set` on first success.
+    // `load_stdlib()` has process-global SIDE EFFECTS — it registers the
+    // stdlib's classes (`<stream>`, `<string-stream>`, …) into the shared
+    // class registry. The artefact `OnceLock` only guards the *result*; it
+    // does NOT stop two threads from both taking the slow path and both
+    // running the side-effecting load, in which case the loser panics with
+    // `ClassRedefinitionNotSupported`. (The test harness runs eval tests in
+    // parallel, which is exactly when this raced — codegen/gc/heap_objects/
+    // runtime all flaked on it; serialised, they pass.) Serialise the load
+    // behind a dedicated gate with double-checked locking so the
+    // registration runs at most once per process.
+    //
+    // We deliberately keep the artefact `OnceLock` free of `get_or_init`:
+    // `load_stdlib` lowers the stdlib through nod-sema helpers that read the
+    // other stdlib `OnceLock`s, and a `get_or_init` init closure re-entering
+    // the same lock would panic. A separate gate Mutex sidesteps that — and
+    // since the single-threaded path already loads exactly once (no
+    // re-entrant double-registration, or it would fail serially too), the
+    // gate cannot deadlock.
+    static LOAD_GATE: Mutex<()> = Mutex::new(());
+    let _gate = LOAD_GATE.lock().expect("stdlib load gate poisoned");
+    // Another thread may have finished the load while we waited on the gate.
+    if let Some(a) = STDLIB_ARTEFACTS.get() {
+        return a;
+    }
     let artefacts = load_stdlib().expect("stdlib.dylan failed to load — internal bug");
     let leaked: &'static StdlibArtefacts = Box::leak(Box::new(artefacts));
     let _ = STDLIB_ARTEFACTS.set(leaked);
