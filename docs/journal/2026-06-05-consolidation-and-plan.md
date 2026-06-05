@@ -30,13 +30,27 @@ trajectory is healthy; this is progress, not drift.**
    landed in 48b, but the symptom (`stretchy_vector_push` stale-root
    panic) still fires on heavy parse loops. This is the one real
    correctness hole — precise GC roots going stale.
-2. **`short_circuit_ops` JIT tests hang.** Deadlock under parallel test
-   threads AND at least one test (`and_short_circuits_past_out_of_range_array_index`)
-   does not terminate even serialised/in-isolation. Means the full
-   `cargo test -p nod-tests` sweep can't complete unattended. **Strong
-   suspicion this and GAP-011 share a root** (a liveness/CFG fixpoint not
-   converging on the `&`/`|` join blocks). Worth investigating together.
-   (A background-task chip was raised for this.)
+2. ~~**`short_circuit_ops` JIT tests hang.**~~ **RESOLVED (commit
+   `5f43507`).** The shared-root-with-GAP-011 hypothesis was WRONG. The
+   real cause: a **flat-precedence regression from the Sprint 51e DRM
+   migration**, which this very plan's verification also missed (it never
+   ran `--test short_circuit_ops`, exactly the gap that left the stale
+   `parser.rs` precedence tests). The two loop conditions
+   (`until (i = n | element(s,i) = 98)` etc.) were authored under the old
+   C-precedence parser; under flat precedence they regroup as
+   `((i = n | element(s,i)) = 98)`, so once the index check fails the
+   `|`/`&` yields `#f` and the trailing `= 98` keeps the loop alive
+   forever. Dumping the JIT IR proved codegen + the short-circuit
+   lowering are correct — only the grouping was wrong. Fixed by
+   parenthesising the comparands. All 10 pass in 0.32s; a repo-wide scan
+   found no other inline-Dylan test with the same shape. **Lesson
+   (again): a global precedence change must be validated by running every
+   JIT/value suite, not just the structural gates — structural gates
+   compare two parsers that now agree on the *wrong* grouping.**
+   Aside found en route: `nod-driver eval` on the *default* (shim/AOT)
+   path crashes on the class-id-drift assertion (`aot.rs:1037`) for
+   class-registering snippets — i.e. P1-4 below is broader than
+   "dump-sema only"; the `--parse-with-rust` JIT path is unaffected.
 
 **P1 — completeness, no green/red impact yet**
 3. **Sprint 53.2 sema walk is unfinished** (`dylan-sema.dylan`, just
@@ -69,12 +83,12 @@ trajectory is healthy; this is progress, not drift.**
 The theme: **get back to an unattended all-green sweep before adding new
 surface.** Correctness first, then finish what's half-built, then resume.
 
-1. **Make the test sweep completable again (P0-2).** Decide the
-   `short_circuit_ops` story: is it a genuine non-termination (fix it) or
-   purely a parallel-JIT-global-state deadlock (mark the suite
-   `--test-threads=1` / `harness=false` and document the convention, à la
-   the other JIT projects)? Confirm by reproducing at an earlier commit to
-   date any regression. *This unblocks every future "is it green?" check.*
+1. ~~**Make the test sweep completable again (P0-2).**~~ **DONE
+   (`5f43507`)** — was a precedence regression, not a deadlock; see above.
+   Remaining: run the full `cargo test -p nod-tests` once to confirm
+   nothing *else* hangs or fails now that the keystone is cleared, and
+   that the whole-crate build is clean (watch for any lingering
+   `is_no_alloc` test-build breakage).
 2. **Land GAP-011 (P0-1).** Likely shares a root with (1). Get the
    `stretchy_vector_push` stale-root panic to stop firing on heavy parse
    loops; close #300.
