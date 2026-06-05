@@ -42,7 +42,11 @@ fn or_short_circuits_past_out_of_range_array_index() {
           // Scan until we hit the end OR find byte 'b' (= 98). The
           // end-check must short-circuit; without it, element(s, 3)
           // signals out-of-range and the test panics.
-          until (i = n | element(s, i) = 98)
+          // NOTE: the comparands MUST be parenthesised. Dylan has flat
+          // (DRM) operator precedence, so `i = n | element(s,i) = 98`
+          // would group as `((i = n | element(s,i)) = 98)` — wrong, and
+          // it never terminates (the `|` result is then `= 98`-tested).
+          until ((i = n) | (element(s, i) = 98))
             i := i + 1;
           end;
           i
@@ -70,7 +74,10 @@ fn and_short_circuits_past_out_of_range_array_index() {
           // match 'z' (= 122). The in-range check must short-
           // circuit; without it, `element(s, n)` signals out-of-
           // range. 'z' is not in "abc", so i walks to n = 3.
-          while (i < n & element(s, i) ~= 122)
+          // NOTE: parenthesise the comparands — flat (DRM) precedence
+          // groups `i < n & element(s,i) ~= 122` as
+          // `((i < n & element(s,i)) ~= 122)`, which never terminates.
+          while ((i < n) & (element(s, i) ~= 122))
             i := i + 1;
           end;
           i
