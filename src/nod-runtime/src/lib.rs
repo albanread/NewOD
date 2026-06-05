@@ -469,6 +469,29 @@ static SYMBOL_LITERAL_SLOTS: LazyLock<Mutex<HashMap<String, &'static u64>>> =
 static STUB_ENTRY_SLOTS: LazyLock<Mutex<HashMap<(String, String), &'static u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Test-only: clear the process-global stub-entry slot dedup map so a
+/// test starts from a clean slate. The other runtime registries all
+/// expose a `_reset_*_for_tests` hook; this one was missing, which made
+/// `api_stub_table_deduplicates_call_sites` order-dependent — a sibling
+/// test that already registered `(dll, symbol)` left it memoised here, so
+/// `stub_entry_slot_addr` early-returned without calling
+/// `allocate_stub_table`, the entries counter stayed 0, and the
+/// "at least one entry was allocated" assertion failed in the full sweep
+/// while passing in isolation.
+///
+/// Safe between tests: each test compiles, links, and runs its own module
+/// exactly once, so no live module re-links against a cleared slot. The
+/// previously-leaked `&'static u64` slots stay valid regardless (they are
+/// simply orphaned); the next allocation for the same key leaks a fresh
+/// one.
+#[doc(hidden)]
+pub fn _reset_stub_entry_slots_for_tests() {
+    STUB_ENTRY_SLOTS
+        .lock()
+        .expect("stub entry slot table poisoned")
+        .clear();
+}
+
 /// Sprint 38c — stable address of a `u64` holding the raw metadata
 /// pointer (`class_metadata_ptr(id) as u64`) for `class_id`. Repeated
 /// calls with the same id return the SAME `*const u64`.

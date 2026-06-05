@@ -190,6 +190,11 @@ end;
 fn api_stub_table_deduplicates_call_sites() {
     setup();
     nod_runtime::_reset_winffi_stats_for_tests();
+    // Clean slate for the process-global stub-entry dedup map too —
+    // otherwise a sibling test that already registered GetTickCount
+    // leaves it memoised, this eval allocates zero new entries, and the
+    // `>= 1` assertion below fails (order-dependent; passed in isolation).
+    nod_runtime::_reset_stub_entry_slots_for_tests();
     let items = "\
 define c-function GetTickCount () => (ticks :: <c-dword>);
   library: \"kernel32.dll\";
