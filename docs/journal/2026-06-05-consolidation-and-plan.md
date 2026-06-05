@@ -112,3 +112,42 @@ surface.** Correctness first, then finish what's half-built, then resume.
   progress before; warnings in `newgc-core` wait for a GC sprint.
 - **Perf stays deferred until consolidation.** Resist hybrid-perf
   rabbit holes; the win falls out of the single DFM handoff.
+
+## Sweep outcome (same day, after the keystone fix)
+
+With `short_circuit_ops` fixed the full `cargo test -p nod-tests` sweep
+became completable for the first time. Ran it `--no-fail-fast` to get the
+whole picture. The striking result: **of ~24 distinct failures, exactly
+ZERO were product bugs.** Every one was a test-harness artefact:
+
+| Failure | Count | Root cause | Resolution |
+|---|---|---|---|
+| `short_circuit_ops` loops | 2 | flat-precedence regression (51e) in the test source | parens (`5f43507`) |
+| `c_function_call` dedup | 1 | test isolation — `STUB_ENTRY_SLOTS` had no `_reset_*_for_tests` | add reset (`eef9cc4`) |
+| `codegen`/`gc`/`heap_objects`/`runtime` | 17 | parallel-test race: stdlib load registered `<stream>` twice | thread-safe `ensure_loaded` (`a11c760`) |
+| `ide_shell_infra` | 1 | same stdlib race | fell out with `a11c760` |
+| `winffi_structs::set_rect` | 1 | flat-precedence regression in the packing expr (`33040000` = the flat eval) | parens (`2442878`) |
+| `lexer_oracle::oracle_hello` | 1 | intermittent: concurrent `nod-driver build`→`link.exe` collide (`LNK1104`); passes in isolation | **open** (test-infra) |
+
+Two lessons, both reinforcing the plan's process notes:
+
+- **A completable sweep is a precondition for trusting "green".** Three of
+  these (the stdlib race, the link flake, ide_shell_infra) were *only*
+  ever observable once the keystone hang was cleared and the sweep could
+  run end-to-end. The fail-fast default had been hiding everything past
+  the first failure.
+- **The 51e precedence migration's blast radius was wider than its
+  verification.** It updated the codegen/runtime value tests but missed
+  `parser.rs`, `short_circuit_ops`, and `winffi_structs` — because the
+  structural gates (translate/coverage) compare two parsers that now
+  *agree on the wrong grouping*, so only value-asserting JIT tests catch
+  it, and those weren't all run. Every value/JIT suite must run after a
+  precedence change.
+
+**Remaining (one item):** the `lexer_oracle` parallel-build flake. The
+build-shelling tests (`oracle_hello`, the AOT EXE tests) each invoke
+`nod-driver build` → `link.exe`; run concurrently they contend on shared
+output files. Fix options for the weekend: serialise the build-invoking
+tests (`#[serial]` + a shared build lock), or give each a unique output
+dir. Not a product bug — but it's the last thing between here and an
+unattended all-green `cargo test`.
