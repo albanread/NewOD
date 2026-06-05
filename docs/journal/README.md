@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-05 — Consolidation after the hacking week: state, loose ends, and the plan](2026-06-05-consolidation-and-plan.md)
+  — A deliberate stabilise-and-plan pause after the fast Sprint 52–53 run.
+  Inventories the loose ends (GAP-011 liveness, the `short_circuit_ops`
+  hang, the unfinished 53.2 sema walk, shim class-id drift) triaged P0–P2,
+  and lays out the path back to an unattended all-green sweep before
+  resuming the sema port. Plus process notes for the calmer week.
 - [2026-06-03 — Sema in Dylan (Sprint 53)](2026-06-03-sema-in-dylan-53.md)
   — Pipeline correction (lex→parse→expand→sema→**DFM**→lowering; DFM is the
   oddly-named CFG IR, its own stage). 53.1: captured the sema recording
