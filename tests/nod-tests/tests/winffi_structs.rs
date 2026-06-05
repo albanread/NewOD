@@ -242,9 +242,16 @@ end;
 /// **Sprint 34 headline #3.** SetRect writes all four fields of a
 /// RECT through the user32 API. We then read each field back from
 /// Dylan and combine via positional decimal packing
-/// (`left + top*10 + right*100 + bottom*1000`) — the sum
-/// `10 + 20*10 + 30*100 + 40*1000 = 43210` is a single integer that
-/// breaks if any field went to the wrong offset.
+/// (`left + (top*10) + (right*100) + (bottom*1000)`) — the sum
+/// `10 + (20*10) + (30*100) + (40*1000) = 43210` is a single integer
+/// that breaks if any field went to the wrong offset.
+///
+/// NOTE: the products MUST be parenthesised. Dylan has flat (DRM)
+/// operator precedence, so the unparenthesised
+/// `left + top*10 + right*100 + bottom*1000` regroups left-assoc as
+/// `((((left+top)*10+right)*100+bottom)*1000)` = 33040000 for
+/// (10,20,30,40) — a false failure even though SetRect populated the
+/// fields correctly.
 #[test]
 #[serial]
 fn set_rect_populates_all_four_fields() {
@@ -260,7 +267,7 @@ end;
 ",
         "let r = make(<rect>); \
          SetRect(r, 10, 20, 30, 40); \
-         rect-left(r) + rect-top(r) * 10 + rect-right(r) * 100 + rect-bottom(r) * 1000",
+         rect-left(r) + (rect-top(r) * 10) + (rect-right(r) * 100) + (rect-bottom(r) * 1000)",
     )
     .unwrap_or_else(|e| panic!("SetRect test failed: {e:?}"));
     let n: i64 = s.parse().expect("integer return");
