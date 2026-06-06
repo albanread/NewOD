@@ -7,6 +7,6 @@
 # section for class-free fixtures.
 
 name           = "dylan-sema"
-sources        = ["dylan-lexer.dylan", "dylan-parser.dylan", "dylan-sema.dylan"]
+sources        = ["dylan-lexer.dylan", "dylan-parser.dylan", "dylan-c3.dylan", "dylan-sema.dylan"]
 output         = "dylan-sema.exe"
 start_function = "sema-main"
