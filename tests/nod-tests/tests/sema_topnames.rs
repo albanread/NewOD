@@ -1,37 +1,39 @@
-//! Sprint 53.2 — byte-match oracle gate for the Dylan-side sema
-//! "top-level name table" walk.
+//! Sprint 53.2 / 53.3 — byte-match oracle gate for the Dylan-side sema
+//! recording walk.
 //!
 //! Two implementations of the same recording pass must agree, byte for
-//! byte, on the `=== top-names ===` section of the sema model:
+//! byte, on the sema model:
 //!
 //!   * **Dylan walk** — `collect-top-names` in
 //!     `tests/nod-tests/fixtures/dylan-sema.dylan`, AOT-compiled into
 //!     `dylan-sema.exe` from `dylan-sema.prj`. Running the EXE on a
-//!     fixture prints *only* the top-names section: sorted
-//!     `fn <name> arity=<N> return=<Est>` lines, then sorted
-//!     `constant <name>` / `variable <name>` lines.
+//!     fixture prints, in order: `=== top-names ===` (sorted
+//!     `fn <name> arity=<N> return=<Est>` lines then sorted
+//!     `constant <name>` / `variable <name>` lines), `=== generics ===`
+//!     (sorted getter/setter generic names), `=== classes ===` (one
+//!     block per user class: `class`, `parents`, `cpl`, `slot …`
+//!     lines), and an empty `=== sealing ===` header.
 //!
 //!   * **Rust oracle** — `nod-driver --parse-with-rust dump-sema <fx>`
-//!     prints four sections via `nod_sema::format_sema_model`
-//!     (`=== top-names ===`, `=== generics ===`, `=== classes ===`,
-//!     `=== sealing ===`). We slice from the start up to (not including)
-//!     `=== generics ===` — that prefix is the top-names section the
-//!     Dylan walk should reproduce.
+//!     prints the same four sections via `nod_sema::format_sema_model`.
 //!
-//! Scope (Sprint 53.2): CLASS-FREE fixtures only. `define class`
-//! generates auto slot-accessor `fn` entries in the oracle that the
-//! 53.2 Dylan walk intentionally omits (those arrive in Sprint 53.3),
-//! so class fixtures are out of scope here.
+//! Sprint 53.2 gated only the `=== top-names ===` section for CLASS-FREE
+//! fixtures. Sprint 53.3 adds the slot-accessor `fn` entries, the
+//! `=== generics ===` section, and the `=== classes ===` section, and
+//! gates two single-class fixtures (`point`, `gc_precise_two_makes`).
+//! We now compare everything the Dylan walk emits — the oracle sliced
+//! up to and **including** the `=== sealing ===` header — against the
+//! Dylan EXE's full stdout. The `=== sealing ===` body is empty for all
+//! eight fixtures and is the subject of Sprint 53.4, so any sealed-*
+//! lines the oracle prints after that header are sliced off here.
 //!
-//! The gate covers six fixtures that were confirmed to byte-match:
-//! `factorial`, `sprint09-add`, `mutual`, `hello`, `stdlib-size-call`,
-//! and `kernel-arith`. `kernel-arith` exercises a `define constant`
-//! (`*answer*`): the Dylan walk emits a single `constant *answer*` line
-//! and *no* `fn` line for it. The Rust oracle records constant /
-//! variable names in `top_names.fns` too (they lower to zero-arg getter
-//! functions — see `collect_top_level_names`), but `format_sema_model`
-//! filters those out of the `fn` listing so the dump matches the Dylan
-//! walk's classification.
+//! `kernel-arith` exercises a `define constant` (`*answer*`): the Dylan
+//! walk emits a single `constant *answer*` line and *no* `fn` line for
+//! it. The Rust oracle records constant / variable names in
+//! `top_names.fns` too (they lower to zero-arg getter functions — see
+//! `collect_top_level_names`), but `format_sema_model` filters those out
+//! of the `fn` listing so the dump matches the Dylan walk's
+//! classification.
 //!
 //! `#[ignore]` like the other AOT tests — it shells out to cargo + the
 //! linker to build the EXE once, then runs it per fixture. Run with:
@@ -60,8 +62,11 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
-/// The class-free fixtures the gate proves byte-match. All live under
-/// `tests/nod-tests/fixtures/`.
+/// The fixtures the gate proves byte-match. All live under
+/// `tests/nod-tests/fixtures/`. The first six are class-free (Sprint
+/// 53.2); `point` and `gc_precise_two_makes` are single-class fixtures
+/// added in Sprint 53.3 (one user class, super `<object>`, two slots,
+/// both with setters).
 const FIXTURES: &[&str] = &[
     "factorial",
     "sprint09-add",
@@ -69,6 +74,8 @@ const FIXTURES: &[&str] = &[
     "hello",
     "stdlib-size-call",
     "kernel-arith",
+    "point",
+    "gc_precise_two_makes",
 ];
 
 /// Normalize a top-names block the same way on both sides: CRLF -> LF,
@@ -86,23 +93,26 @@ fn normalize(block: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// The Dylan EXE prints *only* the top-names section, so its whole
-/// stdout is the block to compare (after normalization).
-fn dylan_top_names(text: &str) -> String {
+/// The Dylan EXE prints all four sections through the (empty)
+/// `=== sealing ===` header, so its whole stdout is the block to compare
+/// (after normalization).
+fn dylan_model(text: &str) -> String {
     normalize(text)
 }
 
-/// Slice the oracle's four-section dump down to the top-names section:
-/// everything from the start up to (not including) `=== generics ===`.
-fn oracle_top_names(text: &str) -> String {
+/// Slice the oracle's four-section dump down to everything the Dylan walk
+/// covers: from the start up to **and including** the `=== sealing ===`
+/// header line, dropping any sealed-class / sealed-generic / domain lines
+/// that follow it (Sprint 53.4 territory; empty for all gated fixtures).
+fn oracle_through_sealing(text: &str) -> String {
     let lf = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut block = String::new();
     for line in lf.lines() {
-        if line.trim_end() == "=== generics ===" {
-            break;
-        }
         block.push_str(line);
         block.push('\n');
+        if line.trim_end() == "=== sealing ===" {
+            break;
+        }
     }
     normalize(&block)
 }
@@ -198,14 +208,14 @@ fn dylan_sema_top_names_byte_match() {
             "dylan-sema EXE did not exit 0 for {fx}:\nstdout:\n{dyl_stdout}\nstderr:\n{dyl_stderr}"
         );
 
-        let dyl = dylan_top_names(&dyl_stdout);
-        let orc = oracle_top_names(&run_oracle(&ws, &input));
+        let dyl = dylan_model(&dyl_stdout);
+        let orc = oracle_through_sealing(&run_oracle(&ws, &input));
 
         if dyl != orc {
             failures.push(format!(
                 "FIXTURE {fx} MISMATCH\n\
-                 ----- dylan-sema.exe (top-names) -----\n{dyl}\n\
-                 ----- oracle (top-names slice) -----\n{orc}\n\
+                 ----- dylan-sema.exe (full model) -----\n{dyl}\n\
+                 ----- oracle (sliced through === sealing ===) -----\n{orc}\n\
                  --------------------------------------"
             ));
         } else {
