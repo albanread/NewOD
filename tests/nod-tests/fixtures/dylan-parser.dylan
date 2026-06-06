@@ -154,6 +154,98 @@ define function is-begin-word? (t :: <token>) => (yes? :: <boolean>)
   end
 end function;
 
+// KNOWN-STATEMENT-MACRO: a NAME-token (not a keyword) that names a
+// body-shaped statement macro — `when (test) body end`,
+// `with-cleanup body cleanup body end`.
+//
+// Mirrors nod-reader's `known_macros` dispatch (parser.rs:808-812): a
+// leading identifier is parsed as a body-shaped macro call when it is a
+// known macro AND the lookahead confirms a body shape. `known_macros`
+// (parser.rs:255,270,2762) is seeded from the stdlib `define macro`
+// names — `for-each`, `unless`, `when`, `cond`, `with-cleanup`
+// (src/nod-dylan/dylan-sources/stdlib.dylan). We restrict to the
+// body-shaped ones the Dylan lexer does NOT already reserve as a
+// keyword-token: `unless` / `cond` / `for` ARE keyword-tokens in
+// dylan-lexer.dylan (so they reach parse-statement via is-begin-word?),
+// but `when` is NOT reserved there (it lexes as a plain
+// <identifier-token>) and neither is `with-cleanup`. Both therefore
+// reach the leaf parser as names and need this routing — without it a
+// `when (test) … end` block parses as a bare call `when(test)`, its
+// `end` is then mis-consumed as the enclosing definition's `end`, and
+// every following top-level form is dropped (the macro-when-cleanup
+// divergence). `for-each` is call-shaped, not body-shaped, and isn't in
+// this corpus, so it is intentionally left to the existing call path.
+// Comparison uses the file's `<byte-string>` `=` idiom (cf.
+// `identifier-token-name(t) = "above"` in is-for-connector?).
+define function is-known-statement-macro? (name :: <byte-string>)
+ => (yes? :: <boolean>)
+  name = "when" | name = "with-cleanup"
+end function;
+
+// Lookahead for the no-paren body-shaped macro call, mirroring
+// nod-reader's `peek_after_ident_is_macro_call_shape` no-paren path
+// (parser.rs:944-976). `with-cleanup` takes this path because the token
+// after it is `x`, not `(`.
+//
+// Starting at the token AFTER the name, track bracket `depth` (start 0)
+// and `saw-body-content?` (start #f). For each token:
+//   * an open bracket of any kind — `(` `[` `{` `#(` `#[` `#{` —
+//     depth += 1, saw-body-content? := #t
+//   * a close bracket `)` `]` `}` — if depth = 0 return #f, else depth -= 1
+//   * `end` at depth 0 — return saw-body-content?
+//   * `;` at depth 0 — continue (semicolons separate body statements)
+//   * end of tokens — return #f
+//   * anything else — saw-body-content? := #t
+//
+// The lexer emits parens/brackets/braces as <punctuation-token> forms
+// (#"lparen"/#"rparen", #"lbracket"/#"rbracket", #"lbrace"/#"rbrace";
+// dylan-lexer.dylan:1453-1468). The hash-opens `#(` and `#[` are their
+// own token classes (<literal-vector-open> / <literal-sequence-open>),
+// and `#{` is the punct form #"hash-lbrace" — all three are openers with
+// no close form of their own kind (they close with `)`/`]`/`}`), exactly
+// as in nod-reader (HashLParen/HashLBracket/HashLBrace → depth+1).
+define function peek-name-opens-body-statement? (ts :: <token-stream>)
+ => (yes? :: <boolean>)
+  let toks = ts-tokens(ts);
+  let n    = size(toks);
+  let i    = ts-pos(ts) + 1;   // first token AFTER the peeked name
+  let depth = 0;
+  let saw-body-content? = #f;
+  let result = #f;
+  let done? = #f;
+  until (done? | i >= n)
+    let t = toks[i];
+    if (is-punct?(t, #"lparen") | is-punct?(t, #"lbracket")
+          | is-punct?(t, #"lbrace") | is-punct?(t, #"hash-lbrace")
+          | instance?(t, <literal-vector-open>)
+          | instance?(t, <literal-sequence-open>))
+      depth := depth + 1;
+      saw-body-content? := #t;
+    elseif (is-punct?(t, #"rparen") | is-punct?(t, #"rbracket")
+              | is-punct?(t, #"rbrace"))
+      if (depth = 0)
+        done? := #t;            // unbalanced closer → not a body statement
+      else
+        depth := depth - 1;
+      end;
+    elseif (is-end-token?(t) & depth = 0)
+      result := saw-body-content?;
+      done? := #t;
+    elseif (is-punct?(t, #"semicolon") & depth = 0)
+      // Semicolons separate body statements — keep scanning. (Unlike the
+      // `else` arm below, this deliberately does NOT set saw-body-content?,
+      // mirroring parser.rs's empty Semicolon match arm.)
+      #f;
+    elseif (instance?(t, <eof-token>))
+      done? := #t;              // EOF before `end` → not a body statement
+    else
+      saw-body-content? := #t;
+    end;
+    i := i + 1;
+  end;
+  result
+end function;
+
 // FUNCTION-WORD: `method` and `function` begin an anonymous function body.
 //
 // Sprint 46b — added `c-function`. The c-function definition shape
@@ -1903,6 +1995,20 @@ define function parse-leaf (ts :: <token-stream>) => (n :: <ast-node>)
     parse-function-literal(ts)
   elseif (is-begin-word?(t))
     // BEGIN-WORD body END [word] [name]
+    parse-statement(ts)
+  elseif (is-name-token?(t)
+            & is-known-statement-macro?(token-name(t))
+            & peek-name-opens-body-statement?(ts))
+    // NAME-token body-shaped statement macro (`when (test) … end`,
+    // `with-cleanup … cleanup … end`). Mirrors nod-reader's dispatch
+    // (parser.rs:808-812): a leading identifier that is a known macro AND
+    // whose lookahead confirms a body shape is parsed as a body-shaped
+    // macro call rather than a bare variable reference. We PEEK the name
+    // (no advance) before deciding; parse-statement consumes the leading
+    // word itself (its ts-advance at the top). Without this, `when` /
+    // `with-cleanup` parse as a bare call/variable-ref and the parser
+    // then desyncs (the orphaned `end`, or the `cleanup` clause keyword),
+    // corrupting and dropping the enclosing definition.
     parse-statement(ts)
   elseif (is-name-token?(t))
     // variable reference: any name including keywords used as names

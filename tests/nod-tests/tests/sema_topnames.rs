@@ -72,10 +72,13 @@ fn fixtures_dir() -> PathBuf {
 /// the whole fixture corpus and found the Dylan walk already reproduces
 /// the Rust oracle for the great majority of inputs — so the list below
 /// is broadened to that verified-matching set, not just the hand-picked
-/// shapes. (The known remaining divergences are documented in the journal:
+/// shapes. Sprint 53.5c closed the `macro-when-cleanup` divergence: the
+/// Dylan parser now recognizes the NAME-token body-shaped statement macro
+/// `with-cleanup … cleanup … end` (it was previously parsed as a bare
+/// variable-ref and desynced, dropping the enclosing `define function`).
+/// (The one known remaining divergence is documented in the journal:
 /// anonymous-method lifting `__anon-method-N` — `rope`, `ide_rope`,
-/// `unified_ide`, `nod-ide`; and macro-expansion-before-sema —
-/// `macro-when-cleanup`. Those await their own focused sprints.)
+/// `unified_ide`, `nod-ide` — which awaits its own focused sprint.)
 const FIXTURES: &[&str] = &[
     // 53.2 — class-free top-names (functions / constants / variables).
     "factorial",
@@ -99,6 +102,8 @@ const FIXTURES: &[&str] = &[
     "macros-unless",
     "macro-when-only",
     "macro-for-range",
+    // 53.5c — NAME-token body-shaped statement macro (`with-cleanup`).
+    "macro-when-cleanup",
     "dylan-lexer-main",
     "dylan-macro-collect",
     "dylan-macro-expand",
