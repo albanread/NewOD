@@ -1422,6 +1422,22 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // tries to validate its parameter / return type annotations
     // against the class table.
     nod_runtime::ensure_c_types_registered();
+    // Sprint 54 on-ramp — class-id-drift fix (host/shim registration
+    // conflict). `nod_runtime_init` (the AOT/shim path) registers the
+    // float c-types (`<c-float>` / `<c-double>`) and `<c-ffi-error>`
+    // EAGERLY right here, after `ensure_c_types_registered`. The host
+    // JIT/eval path used to defer them — float types to first use, and
+    // `<c-ffi-error>` to the `define c-function` pre-pass further down —
+    // so they landed AFTER the stdlib's `<stream>` / `<string-stream>`
+    // `define class`es instead of before. That 3-class divergence (2
+    // float + 1 c-ffi-error) pushed the host's `<stream>` id 3 below the
+    // id the shim baked assuming the eager order, tripping
+    // `nod_aot_register_user_class`'s drift assert when the shim's
+    // resolver ran inside the host. Registering them here — in the
+    // canonical order — makes the host and AOT/shim paths assign
+    // identical user-band ids. Idempotent: the later calls become no-ops.
+    nod_runtime::ensure_float_types_registered();
+    nod_runtime::ensure_c_ffi_error_registered();
 
     // Sprint 21 pre-pass: rewrite every `Expr::Method` in expression
     // position to a synthetic `Expr::Ident(__anon-method-NNNN)` and

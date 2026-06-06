@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-06 — Killing the shim class-id drift (the year-3 on-ramp keystone)](2026-06-06-shim-class-id-drift-fix.md)
+  — First step of the 54–56 endgame (the named pre-54 prerequisite, #311).
+  `nod-driver eval` crashed on the default shim path: the shim's baked
+  user-class ids ran 3 above the host's. Trace-driven diagnosis pinned it
+  to divergent seed-registration order — the host deferred `<c-float>` /
+  `<c-double>` / `<c-ffi-error>` past the stdlib's `<stream>`, while
+  `nod_runtime_init` registers them eagerly. 4-line fix in
+  `lower_module_full`; the shim didn't even need rebuilding.
 - [2026-06-06 — Roadmap: Sprints 54–56, the last three rungs of front-end self-hosting](2026-06-06-roadmap-54-56.md)
   — Forward plan making the ratified roadmap concrete. On-ramp (finish the
   53.x Dylan sema walk + fix the shim class-id drift — the keystone risk),
