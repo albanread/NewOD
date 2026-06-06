@@ -1,6 +1,6 @@
 # NewOpenDylan Macros — design stub
 
-*Sprint 01 placeholder. Full design lands ahead of Sprint 17 (pattern-rule macros).*
+*Pattern-rule macros shipped (Sprint 17+); `define macro` is the default home for new control-flow surface — `unless`, `when`, `cond`, `with-*` all live in `stdlib.dylan` as macros. Maintained reference: [`manual/compiler/macro-expander.md`](manual/compiler/macro-expander.md).*
 
 Dylan has **hygienic pattern-rule macros**, defined via `define macro …`.
 They are essential — much of the `dylan` kernel library is macro-driven, so

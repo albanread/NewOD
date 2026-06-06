@@ -1,6 +1,6 @@
 # NewOpenDylan DFM IR — design stub
 
-*Sprint 01 placeholder. Full design lands at Sprint 06 (DFM IR skeleton + format dump).*
+*The DFM IR — the typed-SSA contract at the permanent front-end/back-end boundary — has been implemented and stable since Sprint 06, and every compiler stage now targets it. Maintained reference: [`manual/compiler/dfm.md`](manual/compiler/dfm.md) and the `nod-dfm` crate.*
 
 The **Dylan Flow Machine** (DFM) is the typed SSA IR sitting between the
 namespace-resolved AST and LLVM IR. Inspired by upstream Open Dylan's DFMC

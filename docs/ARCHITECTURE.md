@@ -104,9 +104,9 @@ DFM), with the back-end held constant.
 |------------------|---------------------------------|------------------------------------------------|
 | **Lexer**        | ✅ live (`--lex-with-dylan`)     | `tests/nod-tests/fixtures/dylan-lexer.dylan`   |
 | **Parser**       | ✅ **default** in the real pipeline (`--parse-with-rust` opts out; Rust = fall-back + verify oracle) | `…/dylan-parser.dylan` |
-| **Macro expander** | ⏳ Rust today; Dylan port queued | — (Sprint 52+)                              |
-| **Sema / namespace** | ⏳ Rust today; C3 piece in Dylan (Sprint 51a) | partial                          |
-| **AST → DFM lowering** | ⏳ Rust today; last front-end phase to migrate | —                          |
+| **Macro expander** | ✅ Rust default; Dylan port **live (opt-in)** via `NOD_EXPAND_WITH_DYLAN` (Sprint 52) | `…/dylan-macro*.dylan` |
+| **Sema / namespace** | ◐ Rust authoritative; Dylan **oracle live** (`dump-sema` + `DYLAN_SEMA_WIRE.md`) + recording walk in progress (Sprint 53) | `…/dylan-sema.dylan` (WIP) |
+| **AST → DFM lowering** | ⏳ Rust today; the last stage to migrate (Sprint 55; Sprint 54 makes the Dylan sema authoritative first) | —     |
 
 The front-end's eventual home is Dylan source compiled by our own
 back-end. Until each phase lands in Dylan, its Rust implementation

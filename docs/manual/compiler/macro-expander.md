@@ -5,7 +5,7 @@ home for new control-flow surface in NewOpenDylan: forms like `unless`, `when`,
 `cond`, and `with-cleanup` live in `stdlib.dylan` as `define macro` rules and expand
 through this engine rather than adding hardcoded variants to the parser's AST.
 
-> Crate: `src/nod-macro`  ·  Status: live (Rust); Dylan port queued
+> Crate: `src/nod-macro`  ·  Status: live (Rust, default); Dylan port **live (opt-in)** via `NOD_EXPAND_WITH_DYLAN` (Sprint 52)
 
 ## Role in the pipeline
 
@@ -202,10 +202,13 @@ classDiagram
 - **Depth limit.** Recursive and mutually recursive macros are bounded by
   `DEFAULT_DEPTH_LIMIT = 64` (`lib.rs:241`). A macro without a base case produces
   `MacroError::ExpansionDepthExceeded`.
-- **Same-file restriction (Sprint 18).** `ExpansionCtx` (`lib.rs:1267`) notes that the
-  call site and the macro definition share a single `SourceMap`. Cross-file macro use
-  is deferred to Sprint 19; until then, macros defined in `stdlib.dylan` only expand
-  when that file is part of the same parsed module.
+- **Module-scoped expansion.** `ExpansionCtx` (`lib.rs:1267`) shares a single
+  `SourceMap` across the call site and the macro definition — expansion runs over one
+  merged module. Multi-file compilation (Sprint 44) parses every file and concatenates
+  their ASTs into ONE module *before* expansion, and the stdlib merges into every
+  program, so `stdlib.dylan`'s macros (`unless`, `when`, `cond`, …) expand in user code
+  as a matter of course. The remaining limit is conceptual, not a barrier: expansion is
+  module-scoped rather than whole-program-across-separate-`SourceMap`s.
 - **`*` repetition is not yet implemented.** The pattern language has no repetition
   operator. As a direct consequence, `cond` in `stdlib.dylan` (`lib.rs` test at `1887`)
   ships with a fixed arity cap: the definition contains four explicit rules covering

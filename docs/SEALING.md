@@ -1,6 +1,6 @@
 # NewOpenDylan Sealing — design stub
 
-*Sprint 01 placeholder. Full design lands ahead of Sprint 14 (sealed dispatch).*
+*Sealed dispatch shipped (Sprint 14+): sealing is planned and enforced in sema, enabling devirtualised calls. Maintained reference: [`manual/compiler/sema.md`](manual/compiler/sema.md) (dispatch + sealing).*
 
 **Sealing is load-bearing** — it is what makes Dylan "feel dynamic, compile
 like static" (MANIFESTO.md §Core decisions #10). The sealing analyser lives

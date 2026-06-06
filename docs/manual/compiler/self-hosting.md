@@ -5,7 +5,7 @@ migrates from Rust to Dylan and is compiled by NewOpenDylan's own back-end.
 The back-end (codegen, GC, JIT, linker, runtime) stays Rust+LLVM permanently.
 DFM IR is the cut line that makes the migration safe and verifiable.
 
-> Crates: `src/nod-driver` · Dylan front-end fixtures  ·  Status: lexer live, parser verify + AST emit, macro / sema / lowering queued
+> Crates: `src/nod-driver` · Dylan front-end fixtures  ·  Status: lexer live; parser **default** (Rust = fallback + oracle); macro expander live (opt-in, `NOD_EXPAND_WITH_DYLAN`); sema oracle live + recording walk in progress (Sprint 53); lowering queued (Sprint 55)
 
 ## Role in the pipeline
 

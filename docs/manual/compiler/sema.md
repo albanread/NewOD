@@ -5,7 +5,7 @@ a namespace context, resolves names, registers classes and slots under multiple
 inheritance, plans and seals dispatch, and lowers everything to DFM IR — the
 last front-end phase before the back-end takes over.
 
-> Crate: `src/nod-sema`  ·  Status: live (Rust) — last front-end phase to migrate to Dylan
+> Crate: `src/nod-sema`  ·  Status: live (Rust, authoritative); Dylan **oracle live** (`dump-sema` + `DYLAN_SEMA_WIRE.md`) with the recording walk in progress (Sprint 53)
 
 ## Role in the pipeline
 

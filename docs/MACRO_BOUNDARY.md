@@ -188,8 +188,9 @@ These unlock families of subsequent macros. Sprint-sized each.
 1. **Auxiliary `rule` clauses inside `define macro`** — enables
    multi-clause forms like `for`. (See `nod-macro/src/lib.rs` header
    comment "Still deferred.")
-2. **`when` macro** — trivial, paired with `unless`. Doesn't need
-   engine work; just an oversight that it's not yet in stdlib.
+2. ~~**`when` macro**~~ **DONE** — `when` ships as a `define macro` in
+   `stdlib.dylan` (alongside `unless` / `cond`), expanding through the
+   engine like any other stdlib control-flow form.
 3. **Cleanup-aware macros** — `with-*` family. Needs the macro
    engine to know about the `block / cleanup` shape.
 4. **Cross-file macro use** — currently the parser's known-macros

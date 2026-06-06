@@ -1,6 +1,6 @@
 # NewOpenDylan GC — design stub
 
-*Sprint 01 placeholder. Full design lands ahead of Sprint 11 (GC bring-up).*
+*The generational mark-evacuate collector (NewGC) shipped (Sprint 11+) and became the default backend in Sprint 23, with precise roots from the JIT/AOT. Maintained reference: [`manual/compiler/gc.md`](manual/compiler/gc.md).*
 
 The garbage collector for NewOpenDylan is a **precise, generational copying
 collector** written in pure Rust, inheriting from
