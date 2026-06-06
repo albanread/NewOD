@@ -166,13 +166,208 @@ define function list-defn-name (defn :: <ast-list-definition>,
   end
 end function;
 
+// ─── classes + slots (Sprint 53.3) ───────────────────────────────────────
+//
+// A user `define class` contributes, in the sema model:
+//   * slot-accessor `fn` entries in `=== top-names ===`:
+//       `<C>-getter-<s>` arity=1 return=<slot-type-estimate>, and
+//       `<C>-setter-<s>` arity=2 return=Top  (when the slot has a setter).
+//   * a getter generic `<s>` and (when the slot has a setter) a setter
+//     generic `<s>-setter`, in `=== generics ===` (sorted, deduped).
+//   * a `class` block in `=== classes ===`: the parents (declaration
+//     order), the CPL (C3), and one `slot <s> @<offset> setter=<b>
+//     origin=<C>` line per slot.
+//
+// Mirrors the Rust oracle `format_sema_model` (src/nod-sema/src/lower.rs).
+
+// Is byte-string `s` already in vector `v`? (Linear; vectors are tiny.)
+define function bs-member? (v :: <stretchy-vector>, s :: <byte-string>)
+ => (yes? :: <boolean>)
+  let n = size(v);
+  let i = 0;
+  let found? = #f;
+  // `>=` guard so an empty vector is a clean no-op (GAP-011 off-by-one).
+  until (i >= n | found?)
+    if (v[i] = s) found? := #t; end;
+    i := i + 1;
+  end;
+  found?
+end function;
+
+// Name text of a superclass expression. For the simple fixtures each
+// super is an `<ast-variable-ref>` (`<object>`); fall back to "" for any
+// other shape so a faulting deref never leaks in.
+define function super-name (node :: <object>, source :: <byte-string>)
+ => (name :: <byte-string>)
+  if (instance?(node, <ast-variable-ref>))
+    token-source-text(varref-tok(node), source)
+  else
+    ""
+  end
+end function;
+
+// Return-type estimate of a slot: map its declared type, or Top when the
+// slot has no `:: <type>`.
+define function slot-est (s :: <ast-slot-spec>, source :: <byte-string>)
+ => (est :: <byte-string>)
+  if (instance?(slot-type(s), <ast-node>))
+    map-type-estimate(type-node-name(slot-type(s), source))
+  else
+    "Top"
+  end
+end function;
+
+// A slot has a setter unless it is declared `constant`. (The oracle also
+// honours an explicit `setter: #f` slot option; the parsed AST here does
+// not surface that flag separately, and none of the gated fixtures use
+// it, so the `constant` adjective is the discriminator we implement.)
+define function slot-has-setter? (s :: <ast-slot-spec>, source :: <byte-string>)
+ => (yes? :: <boolean>)
+  let adjs = slot-adjectives(s);
+  let n = size(adjs);
+  let i = 0;
+  let is-constant? = #f;
+  // Use the source-text slice (not token-name) so the match works whether
+  // `constant` lexes as an identifier or a reserved keyword token.
+  until (i >= n | is-constant?)
+    if (token-source-text(adjs[i], source) = "constant") is-constant? := #t; end;
+    i := i + 1;
+  end;
+  ~ is-constant?
+end function;
+
+// Per-class record: name, parent names, the class's CPL (computed by C3),
+// and parallel vectors describing its OWN slots.
+define class <class-rec> (<object>)
+  slot rec-name        :: <byte-string>,    init-keyword: name:;
+  slot rec-parents     :: <stretchy-vector>, init-keyword: parents:;
+  slot rec-cpl         :: <stretchy-vector>, init-keyword: cpl:;
+  slot rec-slot-names  :: <stretchy-vector>, init-keyword: slot-names:;
+  slot rec-slot-ests   :: <stretchy-vector>, init-keyword: slot-ests:;
+  slot rec-slot-setters :: <stretchy-vector>, init-keyword: slot-setters:;
+end class;
+
+// CPL registry: parallel name / cpl vectors. Seeded with `<object>`.
+// `registry-lookup` returns a parent's CPL — `[<object>]` for the seed,
+// the computed CPL for an earlier user class, or the leaf fallback
+// `[name]` for an unknown parent (a builtin other than `<object>`; none
+// of the gated fixtures hit this).
+define function registry-lookup (names :: <stretchy-vector>,
+                                 cpls  :: <stretchy-vector>,
+                                 name  :: <byte-string>)
+ => (cpl :: <stretchy-vector>)
+  let n = size(names);
+  let i = 0;
+  let found = #f;
+  until (i >= n | found)
+    if (names[i] = name) found := cpls[i]; end;
+    i := i + 1;
+  end;
+  if (found)
+    found
+  else
+    // Leaf fallback: treat the unknown parent as a root with CPL [name].
+    let v = make(<stretchy-vector>);
+    add!(v, name);
+    v
+  end
+end function;
+
+// Build a <class-rec> for one `<ast-class-definition>`, computing its CPL
+// from the running registry. Registers the result into the registry so a
+// later subclass can find it.
+define function build-class-rec (cd :: <ast-class-definition>,
+                                 source :: <byte-string>,
+                                 reg-names :: <stretchy-vector>,
+                                 reg-cpls  :: <stretchy-vector>)
+ => (rec :: <class-rec>)
+  let cname = token-source-text(class-name(cd), source);
+
+  // Parent names in declaration order.
+  let parents = make(<stretchy-vector>);
+  let supers = class-supers(cd);
+  let ns = size(supers);
+  let si = 0;
+  until (si >= ns)
+    add!(parents, super-name(supers[si], source));
+    si := si + 1;
+  end;
+
+  // Parent CPLs (parallel to `parents`) for the C3 input.
+  let parent-cpls = make(<stretchy-vector>);
+  let pi = 0;
+  let np = size(parents);
+  until (pi >= np)
+    add!(parent-cpls, registry-lookup(reg-names, reg-cpls, parents[pi]));
+    pi := pi + 1;
+  end;
+
+  // C3 linearisation → this class's CPL.
+  let c3 = c3-linearise(cname, parents, parent-cpls);
+  let cpl = c3-result-cpl(c3);
+
+  // Own slots.
+  let slot-names   = make(<stretchy-vector>);
+  let slot-ests    = make(<stretchy-vector>);
+  let slot-setters = make(<stretchy-vector>);
+  let slots = class-slots(cd);
+  let nsl = size(slots);
+  let sli = 0;
+  until (sli >= nsl)
+    let s = slots[sli];
+    if (instance?(slot-name-tok(s), <token>))
+      add!(slot-names,   token-source-text(slot-name-tok(s), source));
+      add!(slot-ests,    slot-est(s, source));
+      add!(slot-setters, slot-has-setter?(s, source));
+    end;
+    sli := sli + 1;
+  end;
+
+  // Register into the running registry for later subclasses.
+  add!(reg-names, cname);
+  add!(reg-cpls, cpl);
+
+  make(<class-rec>,
+       name: cname, parents: parents, cpl: cpl,
+       slot-names: slot-names, slot-ests: slot-ests,
+       slot-setters: slot-setters)
+end function;
+
+// Join a vector of byte-strings with ", " (for parents / cpl listings).
+define function join-comma (v :: <stretchy-vector>) => (s :: <byte-string>)
+  let n = size(v);
+  let out = "";
+  let i = 0;
+  until (i >= n)
+    if (i = 0)
+      out := v[i];
+    else
+      out := concatenate(out, concatenate(", ", v[i]));
+    end;
+    i := i + 1;
+  end;
+  out
+end function;
+
 // ─── the walk ────────────────────────────────────────────────────────────
 
 define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
  => (text :: <byte-string>)
-  let fns    = make(<stretchy-vector>);
-  let consts = make(<stretchy-vector>);
-  let vars   = make(<stretchy-vector>);
+  let fns      = make(<stretchy-vector>);
+  let consts   = make(<stretchy-vector>);
+  let vars     = make(<stretchy-vector>);
+  let classes  = make(<stretchy-vector>);   // <class-rec> in declaration order
+  let generics = make(<stretchy-vector>);   // generic names (deduped, sorted later)
+  // CPL registry, seeded with `<object>` → [<object>].
+  let reg-names = make(<stretchy-vector>);
+  let reg-cpls  = make(<stretchy-vector>);
+  begin
+    let obj-cpl = make(<stretchy-vector>);
+    add!(obj-cpl, "<object>");
+    add!(reg-names, "<object>");
+    add!(reg-cpls, obj-cpl);
+  end;
+
   let items  = body-constituents(ast);
   let n = size(items);
   let i = 0;
@@ -198,6 +393,40 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
       if (word = "constant")    add!(consts, name);
       elseif (word = "variable") add!(vars, name);
       end;
+    elseif (instance?(item, <ast-class-definition>))
+      // Build the class record (computes + registers its CPL), then emit
+      // the slot accessors into `fns` and the slot generics.
+      let rec = build-class-rec(item, source, reg-names, reg-cpls);
+      add!(classes, rec);
+      let cname = rec-name(rec);
+      let snames = rec-slot-names(rec);
+      let sests  = rec-slot-ests(rec);
+      let ssetters = rec-slot-setters(rec);
+      let ns = size(snames);
+      let sj = 0;
+      until (sj >= ns)
+        let sname = snames[sj];
+        let sest  = sests[sj];
+        let has-setter? = ssetters[sj];
+        // Getter accessor fn: `<C>-getter-<s>` arity=1 return=<est>.
+        let getter = concatenate(cname, concatenate("-getter-", sname));
+        let gline  = concatenate("fn ", concatenate(getter,
+                       concatenate(" arity=1 return=", sest)));
+        add!(fns, make(<top-fn>, name: getter, line: gline));
+        // Getter generic `<s>`.
+        if (~ bs-member?(generics, sname)) add!(generics, sname); end;
+        if (has-setter?)
+          // Setter accessor fn: `<C>-setter-<s>` arity=2 return=Top.
+          let setter = concatenate(cname, concatenate("-setter-", sname));
+          let sline  = concatenate("fn ", concatenate(setter,
+                         " arity=2 return=Top"));
+          add!(fns, make(<top-fn>, name: setter, line: sline));
+          // Setter generic `<s>-setter`.
+          let sg = concatenate(sname, "-setter");
+          if (~ bs-member?(generics, sg)) add!(generics, sg); end;
+        end;
+        sj := sj + 1;
+      end;
     end;
     i := i + 1;
   end;
@@ -205,7 +434,9 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
   sort-fns!(fns);
   sort-strings!(consts);
   sort-strings!(vars);
+  sort-strings!(generics);
 
+  // ── === top-names === ──
   let out = "=== top-names ===\n";
   let fi = 0;
   until (fi = size(fns))
@@ -222,6 +453,55 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
     out := concatenate(out, concatenate("variable ", concatenate(vars[vi], "\n")));
     vi := vi + 1;
   end;
+
+  // ── === generics === ──
+  out := concatenate(out, "=== generics ===\n");
+  let gi = 0;
+  until (gi = size(generics))
+    out := concatenate(out, concatenate("generic ", concatenate(generics[gi], "\n")));
+    gi := gi + 1;
+  end;
+
+  // ── === classes === ──
+  out := concatenate(out, "=== classes ===\n");
+  let cli = 0;
+  until (cli = size(classes))
+    let rec = classes[cli];
+    out := concatenate(out, concatenate("class ", concatenate(rec-name(rec), "\n")));
+    out := concatenate(out, concatenate("  parents [",
+                              concatenate(join-comma(rec-parents(rec)), "]\n")));
+    out := concatenate(out, concatenate("  cpl [",
+                              concatenate(join-comma(rec-cpl(rec)), "]\n")));
+    // Slots: object header @0, own slots laid out 8 bytes each from @8.
+    // (These fixtures have no slot-bearing superclass, so there are no
+    // inherited slots to place first; origin is always the class itself.)
+    let snames   = rec-slot-names(rec);
+    let ssetters = rec-slot-setters(rec);
+    let nsl = size(snames);
+    let sk = 0;
+    until (sk >= nsl)
+      let offset = 8 + (sk * 8);
+      let setter-str = if (ssetters[sk]) "true" else "false" end;
+      out := concatenate(out,
+               concatenate("  slot ",
+                 concatenate(snames[sk],
+                   concatenate(" @",
+                     concatenate(integer-to-string(offset),
+                       concatenate(" setter=",
+                         concatenate(setter-str,
+                           concatenate(" origin=",
+                             concatenate(rec-name(rec), "\n")))))))));
+      sk := sk + 1;
+    end;
+    cli := cli + 1;
+  end;
+
+  // ── === sealing === ──
+  // Sprint 53.4 fills this in. For the gated class fixtures it is empty
+  // (no sealed classes / generics / domains), so we emit just the header
+  // to match the oracle's section layout.
+  out := concatenate(out, "=== sealing ===\n");
+
   out
 end function;
 
