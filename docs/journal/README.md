@@ -28,6 +28,25 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-06 — GAP-011 #2: it is a codegen WRONG-VALUE bug, not GC (diagnosis + design)](2026-06-06-gap011-2-codegen-wrong-value-diagnosis.md)
+  — Diagnose-and-design pass on the second sema-walk crash. The headline is
+  a correction: the `%byte-string-size` crash in `collect-top-names` is a
+  **deterministic codegen miscompilation** (a temp at a control-flow merge
+  bound to the wrong SSA value because lowering didn't thread it through a
+  block param), **not** GC staleness — zero collections fire (tiny input),
+  and the faulting address varies by ASLR. The `NOD_DIAG_MERGE_DIVERGENCE`
+  detector over-reports (flags benign cases like a 40k-iteration repro that
+  runs clean), so it's a screen not an oracle. Fix design: a `nod-dfm`
+  `legalize_block_params` post-pass over the existing global liveness.
+- [2026-06-06 — GAP-011: stretchy-vector mid-grow root staleness](2026-06-06-gap011-stretchy-vector-mid-grow-root-staleness.md)
+  — Resuming the SEMA phase surfaced a real GC bug that blocked the build:
+  the self-hosted Dylan lexer aborted mid-build on large files
+  (`sv evacuated mid-grow`). `nod_stretchy_vector_push` rooted its vector
+  via `RootGuard` and re-read it after the grow alloc, but `RootGuard` takes
+  a *shared* `&Word`, so `-O2`/`-O3` reused the pre-GC register copy. Fix:
+  `RootGuard::reload()` (volatile read of the registered slot). Verified —
+  release parse step over all four self-host files clean, full sweep 0
+  failed. (Then `dylan-sema.exe` built + ran, exposing #2 above.)
 - [2026-06-06 — Killing the shim class-id drift (the year-3 on-ramp keystone)](2026-06-06-shim-class-id-drift-fix.md)
   — First step of the 54–56 endgame (the named pre-54 prerequisite, #311).
   `nod-driver eval` crashed on the default shim path: the shim's baked

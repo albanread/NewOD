@@ -103,7 +103,13 @@ the original local.*
    colocates the stub with a hot std monomorphization. Documented release-
    only issue (`jit-and-aot.md:309`); the promised fix is a
    `codegen-units = 1` pin on `nod-runtime`. Debug AOT links cleanly.
-2. **#2 — confirmed: a SECOND, deeper GC bug (the real year-3 blocker).**
+2. **#2 — a SECOND, distinct bug (the real year-3 blocker).**
+   **CORRECTION (later same day):** #2 turned out to be a *codegen
+   wrong-value miscompilation, NOT a GC bug* — zero collections fire
+   before the crash (tiny input, 4 MB nursery). Full re-diagnosis +
+   fix design in
+   [`2026-06-06-gap011-2-codegen-wrong-value-diagnosis.md`](2026-06-06-gap011-2-codegen-wrong-value-diagnosis.md).
+   The GC-staleness reading below is superseded; kept for the trail.
    Rebuilt `dylan-sema.exe` (debug, `--parse-with-rust`) and ran on
    `factorial.dylan` with probes. Findings:
    - `source` is **valid throughout** (size=221 at after-load, after-lex,
