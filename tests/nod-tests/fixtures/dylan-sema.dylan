@@ -236,6 +236,24 @@ define function slot-has-setter? (s :: <ast-slot-spec>, source :: <byte-string>)
   ~ is-constant?
 end function;
 
+// Does a definition's `define`-modifier vector contain `sealed`? Mirrors
+// `slot-has-setter?`: scan the modifier tokens, comparing the source-text
+// slice (so the match works whether `sealed` lexes as an identifier or a
+// reserved-word token). Used to detect `define sealed class` /
+// `define sealed generic`.
+define function modifiers-has-sealed? (mods :: <stretchy-vector>,
+                                       source :: <byte-string>)
+ => (yes? :: <boolean>)
+  let n = size(mods);
+  let i = 0;
+  let found? = #f;
+  until (i >= n | found?)
+    if (token-source-text(mods[i], source) = "sealed") found? := #t; end;
+    i := i + 1;
+  end;
+  found?
+end function;
+
 // Per-class record: name, parent names, the class's CPL (computed by C3),
 // and parallel vectors describing its OWN slots.
 define class <class-rec> (<object>)
@@ -358,6 +376,8 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
   let vars     = make(<stretchy-vector>);
   let classes  = make(<stretchy-vector>);   // <class-rec> in declaration order
   let generics = make(<stretchy-vector>);   // generic names (deduped, sorted later)
+  let sealed-classes  = make(<stretchy-vector>);  // `define sealed class` names (sorted later)
+  let sealed-generics = make(<stretchy-vector>);  // `define sealed generic` names (sorted later)
   // CPL registry, seeded with `<object>` → [<object>].
   let reg-names = make(<stretchy-vector>);
   let reg-cpls  = make(<stretchy-vector>);
@@ -375,7 +395,17 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
     let item = items[i];
     if (instance?(item, <ast-body-definition>))
       let word = token-source-text(defn-word(item), source);
-      if (word = "function" | word = "method")
+      // Only `define function` contributes a top-names `fn`. The oracle
+      // attaches `define method` bodies to their generic (the explicit
+      // `define generic`, recorded below), so a method emits NO `fn`
+      // line and must not duplicate the generic's entry.
+      //
+      // DEFERRED: a bare `define method` with no explicit `define generic`
+      // implicitly CREATES a generic of that name in the real sema model.
+      // No fixture here exercises that (richards' run-task generic is
+      // explicit), so implicit-generic creation from methods is left for a
+      // later sprint.
+      if (word = "function")
         let name-tok = defn-method-name(item);
         if (name-tok)
           let name  = token-source-text(name-tok, source);
@@ -398,6 +428,10 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
       // the slot accessors into `fns` and the slot generics.
       let rec = build-class-rec(item, source, reg-names, reg-cpls);
       add!(classes, rec);
+      // `define sealed class` → a `sealed-class <name>` entry.
+      if (modifiers-has-sealed?(defn-modifiers(item), source))
+        add!(sealed-classes, rec-name(rec));
+      end;
       let cname = rec-name(rec);
       let snames = rec-slot-names(rec);
       let sests  = rec-slot-ests(rec);
@@ -427,6 +461,18 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
         end;
         sj := sj + 1;
       end;
+    elseif (instance?(item, <ast-generic-definition>))
+      // `define generic NAME (...) => (...)` → a `generic <NAME>` entry
+      // (deduped against slot getter/setter generics). `define sealed
+      // generic` additionally yields a `sealed-generic <NAME>` entry.
+      let gtok = gen-name(item);
+      if (instance?(gtok, <token>))
+        let gname = token-source-text(gtok, source);
+        if (~ bs-member?(generics, gname)) add!(generics, gname); end;
+        if (modifiers-has-sealed?(defn-modifiers(item), source))
+          add!(sealed-generics, gname);
+        end;
+      end;
     end;
     i := i + 1;
   end;
@@ -435,6 +481,8 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
   sort-strings!(consts);
   sort-strings!(vars);
   sort-strings!(generics);
+  sort-strings!(sealed-classes);
+  sort-strings!(sealed-generics);
 
   // ── === top-names === ──
   let out = "=== top-names ===\n";
@@ -497,10 +545,26 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
   end;
 
   // ── === sealing === ──
-  // Sprint 53.4 fills this in. For the gated class fixtures it is empty
-  // (no sealed classes / generics / domains), so we emit just the header
-  // to match the oracle's section layout.
+  // Sorted `sealed-class <name>` lines first, then sorted
+  // `sealed-generic <name>` lines (matching the oracle's order). The
+  // header is always emitted even when both are empty.
+  //
+  // DEFERRED: `define sealed domain` (a `sealed-domain G (T, ...)` entry
+  // in the real model) is not exercised by any fixture, so it is not
+  // collected here.
   out := concatenate(out, "=== sealing ===\n");
+  let sci = 0;
+  until (sci = size(sealed-classes))
+    out := concatenate(out,
+             concatenate("sealed-class ", concatenate(sealed-classes[sci], "\n")));
+    sci := sci + 1;
+  end;
+  let sgi = 0;
+  until (sgi = size(sealed-generics))
+    out := concatenate(out,
+             concatenate("sealed-generic ", concatenate(sealed-generics[sgi], "\n")));
+    sgi := sgi + 1;
+  end;
 
   out
 end function;
