@@ -1085,11 +1085,17 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
             panic!("stretchy_vector_push: not a <stretchy-vector>");
         }
     };
-    // Root the value across any allocations.
+    // Root the value + vector across any allocations. The guards are
+    // NAMED (not `_`-discarded) so the grow path can `reload()` them: the
+    // grow allocation can trigger a moving GC that evacuates `sv` and/or
+    // `value`, and the collector rewrites the registered root *slots* — but
+    // a plain read of the `sv`/`value` locals may reuse a pre-GC register
+    // copy (GAP-011). `reload()` forces a fresh read of the slot the
+    // collector rewrote.
     let value_local = value;
-    let _value_guard = crate::make::RootGuard::new(&value_local);
+    let value_guard = crate::make::RootGuard::new(&value_local);
     let sv_local = sv;
-    let _sv_guard = crate::make::RootGuard::new(&sv_local);
+    let sv_guard = crate::make::RootGuard::new(&sv_local);
 
     let storage = if length >= capacity {
         // Grow: allocate a new SOV with 2x capacity, copy elements.
@@ -1103,8 +1109,12 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
         // — though stores themselves don't allocate, this is belt + braces).
         let new_storage_local = new_storage;
         let _new_storage_guard = crate::make::RootGuard::new(&new_storage_local);
-        // Refresh `storage` in case sv_local got evacuated — read again.
-        let (_, _, fresh_storage) = stretchy_vector_fields(sv_local)
+        // The grow alloc above may have evacuated `sv`. Reload it from its
+        // registered root slot (a fresh memory read, NOT the possibly-cached
+        // `sv_local` register) so we read the post-GC address. Everything
+        // below uses `sv_fresh`.
+        let sv_fresh = sv_guard.reload();
+        let (_, _, fresh_storage) = stretchy_vector_fields(sv_fresh)
             .expect("stretchy_vector_push: sv evacuated mid-grow");
         // SAFETY: fresh_storage is the live backing SOV.
         let src = unsafe {
@@ -1128,15 +1138,15 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
         let dst_slots = unsafe { dst.slots_mut() };
         dst_slots[..length].copy_from_slice(&src_slots[..length]);
         // Install new storage + new capacity via write barrier.
-        // SAFETY: sv_local is a <stretchy-vector>.
+        // SAFETY: sv_fresh is the post-GC <stretchy-vector> address.
         unsafe {
             write_slot(
-                sv_local,
+                sv_fresh,
                 stretchy_vector_slot_offset("%storage"),
                 new_storage_local,
             );
             write_slot(
-                sv_local,
+                sv_fresh,
                 stretchy_vector_slot_offset("%capacity"),
                 Word::from_fixnum(new_cap as i64).expect("cap fits"),
             );
@@ -1155,15 +1165,22 @@ pub fn stretchy_vector_push(sv: Word, value: Word) {
     };
     // SAFETY: same.
     let slots = unsafe { sov.slots_mut() };
+    // Reload `value` and `sv` from their root slots: if we took the grow
+    // path above, the allocation there may have evacuated either one, and
+    // the collector rewrote the registered slots — but the `value_local` /
+    // `sv_local` registers may be stale (GAP-011). On the non-grow path no
+    // GC fired, so `reload()` returns the original value unchanged.
+    let value_now = value_guard.reload();
+    let sv_now = sv_guard.reload();
     // Use write_barrier for the slot write so card-marking is recorded.
     let slot_ptr = &mut slots[length] as *mut Word;
     // SAFETY: slot_ptr is inside the live SOV allocation.
-    unsafe { crate::write_barrier(slot_ptr, value_local) };
+    unsafe { crate::write_barrier(slot_ptr, value_now) };
     // Bump length.
-    // SAFETY: sv_local is a <stretchy-vector>.
+    // SAFETY: sv_now is the post-GC <stretchy-vector> address.
     unsafe {
         write_slot(
-            sv_local,
+            sv_now,
             stretchy_vector_slot_offset("%length"),
             Word::from_fixnum((length + 1) as i64).expect("len fits"),
         );

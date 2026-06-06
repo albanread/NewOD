@@ -424,6 +424,33 @@ impl RootGuard {
         crate::heap::register_root(slot_ptr);
         Self { slot: slot_ptr }
     }
+
+    /// GAP-011: read the current value of the rooted slot with a
+    /// **volatile** load.
+    ///
+    /// The evacuator rewrites `*slot` *through the registered root
+    /// pointer* whenever it moves the pointee (see
+    /// `heap::minor_forward_word`). But the slot is the address of a
+    /// `&Word`-shared local; the compiler is entitled to assume that a
+    /// value behind a shared reference does not change, and at `-O2`/`-O3`
+    /// it reuses the pre-collection register copy of that local. A caller
+    /// that USES a rooted value *after* a potentially-collecting
+    /// allocation then sees the stale (pre-evacuation) address — which now
+    /// holds a forwarding pointer, not the live object. That is the
+    /// "evacuated mid-grow" / "not a `<stretchy-vector>`" crash class.
+    ///
+    /// Reloading through this method forces a fresh memory read of the
+    /// slot the collector actually rewrote, so the caller observes the
+    /// post-GC address. Use it for every rooted value read back across an
+    /// allocation (vector growth, table rehash, list cons, …).
+    #[inline]
+    pub fn reload(&self) -> Word {
+        // SAFETY: `slot` is the address of a live, 8-aligned stack-bound
+        // `Word` that outlives this guard (construction contract). The
+        // volatile load prevents the compiler from substituting a cached
+        // register value for the collector's in-memory rewrite.
+        unsafe { core::ptr::read_volatile(self.slot) }
+    }
 }
 
 impl Drop for RootGuard {
