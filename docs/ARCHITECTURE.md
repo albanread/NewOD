@@ -237,8 +237,17 @@ that earned their place:
 | 51e         | parser → **default** in the real pipeline | Dylan parser is the default; Rust = fall-back + verify oracle; 28/36 corpus byte-identical (macro fixtures close in 52); full sweep green |
 | 52+         | macro expander → Dylan          | verify-mode against Rust expander     |
 | 53+         | sema / namespace → Dylan        | verify-mode against Rust sema         |
-| 54+         | AST → DFM lowering → Dylan      | DFM dumps byte-identical              |
+| 54          | sema authoritative (`lower_with_model`) | DFM byte-identical from the Dylan sema model |
+| 55          | AST → DFM lowering → Dylan (55a stmts/exprs, 55b classes/dispatch, 55c closures/blocks) | `dump-dfm` byte-identical Dylan-vs-Rust |
+| 56          | consolidation: one DFM handoff, `--…-with-dylan` flags retired | full sweep green at default; the per-stage shim round-trips (the ~50× cost) gone |
 | —           | **front-end fully self-hosted** | every phase Dylan, back-end unchanged |
+
+**Pre-54 prerequisite (the on-ramp):** finish the 53.x Dylan sema
+recording walk, and fix the shim class-id drift (`aot.rs` registration
+determinism). Everything from 54 on routes through the static-linked
+Dylan shim, so deterministic class/symbol identity across the wire
+crossing is a hard precondition, not a polish item. Detailed phasing:
+[`journal/2026-06-06-roadmap-54-56.md`](journal/2026-06-06-roadmap-54-56.md).
 
 When the last row lands, NewOpenDylan compiles its own front-end with
 its own back-end, and the only Rust in the compile path is the part

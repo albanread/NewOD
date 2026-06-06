@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-06 — Roadmap: Sprints 54–56, the last three rungs of front-end self-hosting](2026-06-06-roadmap-54-56.md)
+  — Forward plan making the ratified roadmap concrete. On-ramp (finish the
+  53.x Dylan sema walk + fix the shim class-id drift — the keystone risk),
+  then **54** `lower_with_model` (sema goes load-bearing), **55** AST→DFM
+  lowering in Dylan (last front-end stage; sub-phased 55a/b/c), **56**
+  consolidation to one DFM handoff (flags retire, the deferred ~50× perf
+  returns, front-end fully self-hosted).
 - [2026-06-05 — Consolidation after the hacking week: state, loose ends, and the plan](2026-06-05-consolidation-and-plan.md)
   — A deliberate stabilise-and-plan pause after the fast Sprint 52–53 run.
   Inventories the loose ends (GAP-011 liveness, the `short_circuit_ops`
