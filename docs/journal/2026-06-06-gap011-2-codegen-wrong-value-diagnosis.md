@@ -178,3 +178,66 @@ the smallest correct change that matches the existing architecture.
 - #2 re-diagnosed: **codegen wrong-value (missing phi), not GC.** Design
   above. No code change made this pass (per "diagnose + design only").
 - Repro fixture `gc_loop_accum.dylan` added (negative controls).
+
+---
+
+## RESOLUTION (later same day) — it was NOT a compiler bug
+
+The "missing phi" hypothesis above was **wrong**. Bisecting the crash with
+`DBG` markers inside `collect-top-names` localised it precisely: the abort
+fires *between* `sort-fns!` and the output loops — inside `sort-strings!`
+called on the **empty** `consts` / `vars` tables (factorial.dylan has no
+`define constant` / `define variable`).
+
+The bug is a **source-level off-by-one in the fixture's insertion sorts**:
+
+```dylan
+let i = 1;
+until (i = n)        // n = 0 for an empty table → 1 = 0 is #f → body runs
+  let x = v[i];      // reads v[1] on a size-0 vector → out of bounds
+  ...
+```
+
+`i` starts at 1, so the `= n` guard never holds for `n = 0`; the body runs
+and indexes `v[1]` on an empty `<stretchy-vector>`. The out-of-bounds read
+returns a stray non-`<byte-string>` Word, which flows into the comparator
+and aborts in `nod_byte_string_size`. This explains every signal that was
+read as "deterministic codegen miscompilation":
+
+- **0 collections** — there is no GC; it is a plain bad read.
+- **ASLR-varying fault address** — the OOB read returns whatever Word sits
+  past the vector, which moves with the heap layout.
+- **"Heisenbug" under probes** — added `format-out`s shift the heap so the
+  past-the-end Word differs, not because of phi/GC timing.
+
+The team writeup's standing warning was right: *"Do not implement the
+SSA-renaming / per-temp-slot rewrite — it targets a mechanism that does not
+fire here."* An SSA `legalize_block_params` pass was prototyped, confirmed
+it threaded the flagged `sc_join` sites, **and did not fix the crash** (0 GC
+⇒ no reload divergence ⇒ first-writer-wins already carried the single
+correct value). It was reverted.
+
+### Fix
+
+`tests/nod-tests/fixtures/dylan-sema.dylan`: guard both insertion sorts with
+`until (i >= n)` so an empty table is a no-op. Also removed the leftover
+`DBG …` 53.2 scaffolding from `collect-top-names` so the `=== top-names ===`
+output is clean. `dylan-sema.exe factorial.dylan` now exits 0 and prints the
+correct two-function table; a multi-def input sorts functions / constants /
+variables correctly.
+
+Regression: `tests/nod-tests/tests/sema_self_host.rs`
+(`dylan_sema_handles_input_with_empty_const_and_var_tables`, `#[ignore]`)
+builds the `dylan-sema` project and runs it on `factorial.dylan`, asserting
+exit 0 + the expected entries — it crashed before the fix, passes after.
+
+### Note on the latent codegen first-writer-wins hole
+
+The reload-divergence class the design above targets (a GC-typed temp live
+across a merge from ≥2 edges that carry *different* reloaded SSA values,
+bound by `note_successor_entry_temps`' first-writer-wins) is a *real* codegen
+unsoundness in principle, but measurement keeps showing it does not fire on
+the current corpus (this crash, the parser corpus, and the `pick` 40k-iter
+control all run clean). It remains a deferred hardening item, not a live
+bug; `legalize_block_params` (DFM post-pass) is the recommended shape if a
+genuine reproducer ever surfaces.

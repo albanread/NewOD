@@ -103,7 +103,10 @@ end function;
 define function sort-strings! (v :: <stretchy-vector>) => ()
   let n = size(v);
   let i = 1;
-  until (i = n)
+  // `i` starts at 1, so guard with `>=` not `=`: an empty vector (n = 0)
+  // would otherwise step straight past n and index v[1] out of bounds
+  // (factorial.dylan has no constants/variables, hitting exactly this).
+  until (i >= n)
     let x = v[i];
     let j = i;
     until (j = 0 | bs-le?(v[j - 1], x))
@@ -119,7 +122,9 @@ end function;
 define function sort-fns! (v :: <stretchy-vector>) => ()
   let n = size(v);
   let i = 1;
-  until (i = n)
+  // See sort-strings!: guard with `>=` so an empty vector (n = 0) is a no-op
+  // instead of indexing v[1] out of bounds.
+  until (i >= n)
     let x = v[i];
     let j = i;
     until (j = 0 | bs-le?(top-fn-name(v[j - 1]), top-fn-name(x)))
@@ -170,20 +175,6 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
   let vars   = make(<stretchy-vector>);
   let items  = body-constituents(ast);
   let n = size(items);
-  // DIAGNOSTIC (53.2 debug): report the constituent count + per-item class.
-  format-out("DBG constituents=%d\n", n);
-  begin
-    let d = 0;
-    until (d = n)
-      let it = items[d];
-      let kind = if (instance?(it, <ast-body-definition>)) "body-defn"
-                 elseif (instance?(it, <ast-list-definition>)) "list-defn"
-                 elseif (instance?(it, <ast-error-node>)) "error"
-                 else "other" end;
-      format-out("DBG item[%d] = %s\n", d, kind);
-      d := d + 1;
-    end;
-  end;
   let i = 0;
   until (i = n)
     let item = items[i];
