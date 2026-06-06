@@ -2411,7 +2411,24 @@ pub fn format_sema_model(lm: &LoweredModule) -> String {
     let mut s = String::new();
 
     s.push_str("=== top-names ===\n");
-    let mut fns: Vec<(&String, &TypeEstimate)> = lm.top_names.fns.iter().collect();
+    // Sprint 53.2 — `define constant` / `define variable` names are
+    // ALSO recorded in `fns` (with arity 0) because codegen lowers them
+    // as zero-arg getter functions and `Expr::Ident` resolution consults
+    // `top_names.contains()` / `.arity()` (see `collect_top_level_names`
+    // + the GAP-002 note in `lower_expr`). But in the SEMA MODEL they are
+    // classification-wise constants / variables, not functions: the
+    // Dylan-side `collect-top-names` walk emits only `constant <name>` /
+    // `variable <name>` lines for them, no `fn` line. Filter them out of
+    // the `fns` listing here so the dump byte-matches the Dylan walk. The
+    // `fns` recording itself is untouched (still load-bearing for codegen).
+    let mut fns: Vec<(&String, &TypeEstimate)> = lm
+        .top_names
+        .fns
+        .iter()
+        .filter(|(name, _)| {
+            !lm.top_names.constants.contains(*name) && !lm.top_names.variables.contains(*name)
+        })
+        .collect();
     fns.sort_by(|a, b| a.0.cmp(b.0));
     for (name, est) in fns {
         let arity = lm.top_names.fn_arity.get(name).copied().unwrap_or(0);
