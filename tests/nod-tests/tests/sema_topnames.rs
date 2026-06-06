@@ -1,5 +1,5 @@
-//! Sprint 53.2 / 53.3 — byte-match oracle gate for the Dylan-side sema
-//! recording walk.
+//! Sprint 53.2 / 53.3 / 53.4 — byte-match oracle gate for the Dylan-side
+//! sema recording walk.
 //!
 //! Two implementations of the same recording pass must agree, byte for
 //! byte, on the sema model:
@@ -12,7 +12,8 @@
 //!     `constant <name>` / `variable <name>` lines), `=== generics ===`
 //!     (sorted getter/setter generic names), `=== classes ===` (one
 //!     block per user class: `class`, `parents`, `cpl`, `slot …`
-//!     lines), and an empty `=== sealing ===` header.
+//!     lines), and the `=== sealing ===` section (sorted `sealed-class`
+//!     lines then sorted `sealed-generic` lines).
 //!
 //!   * **Rust oracle** — `nod-driver --parse-with-rust dump-sema <fx>`
 //!     prints the same four sections via `nod_sema::format_sema_model`.
@@ -21,11 +22,12 @@
 //! fixtures. Sprint 53.3 adds the slot-accessor `fn` entries, the
 //! `=== generics ===` section, and the `=== classes ===` section, and
 //! gates two single-class fixtures (`point`, `gc_precise_two_makes`).
-//! We now compare everything the Dylan walk emits — the oracle sliced
-//! up to and **including** the `=== sealing ===` header — against the
-//! Dylan EXE's full stdout. The `=== sealing ===` body is empty for all
-//! eight fixtures and is the subject of Sprint 53.4, so any sealed-*
-//! lines the oracle prints after that header are sliced off here.
+//! Sprint 53.4 adds generics from `define generic`, drops the spurious
+//! `fn` line for `define method`, fills in the `=== sealing ===` body,
+//! and gates `richards-shape` (a 5-class hierarchy with a sealed generic
+//! and four methods). We now compare the Dylan EXE's full stdout against
+//! the oracle's complete four-section dump — no slicing — since both
+//! sides emit the whole sealing body.
 //!
 //! `kernel-arith` exercises a `define constant` (`*answer*`): the Dylan
 //! walk emits a single `constant *answer*` line and *no* `fn` line for
@@ -76,6 +78,13 @@ const FIXTURES: &[&str] = &[
     "kernel-arith",
     "point",
     "gc_precise_two_makes",
+    // Sprint 53.4: a 5-class `<task>` hierarchy with an explicit
+    // `define sealed generic run-task` + four `define method run-task`
+    // and several `define function`. Exercises the new generics-from-
+    // `define generic`, method-emits-no-`fn`, and `=== sealing ===`
+    // (sealed-class / sealed-generic) logic — the first fixture with a
+    // non-empty sealing section.
+    "richards-shape",
 ];
 
 /// Normalize a top-names block the same way on both sides: CRLF -> LF,
@@ -93,28 +102,21 @@ fn normalize(block: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// The Dylan EXE prints all four sections through the (empty)
-/// `=== sealing ===` header, so its whole stdout is the block to compare
-/// (after normalization).
+/// The Dylan EXE prints all four sections, including the full
+/// `=== sealing ===` body (Sprint 53.4), so its whole stdout is the block
+/// to compare (after normalization).
 fn dylan_model(text: &str) -> String {
     normalize(text)
 }
 
-/// Slice the oracle's four-section dump down to everything the Dylan walk
-/// covers: from the start up to **and including** the `=== sealing ===`
-/// header line, dropping any sealed-class / sealed-generic / domain lines
-/// that follow it (Sprint 53.4 territory; empty for all gated fixtures).
-fn oracle_through_sealing(text: &str) -> String {
-    let lf = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut block = String::new();
-    for line in lf.lines() {
-        block.push_str(line);
-        block.push('\n');
-        if line.trim_end() == "=== sealing ===" {
-            break;
-        }
-    }
-    normalize(&block)
+/// The whole oracle four-section dump, normalized. As of Sprint 53.4 the
+/// Dylan walk emits the complete `=== sealing ===` body too (sorted
+/// `sealed-class` lines then sorted `sealed-generic` lines), so the test
+/// compares against the oracle's entire output rather than slicing it at
+/// the `=== sealing ===` header. The first eight fixtures have an empty
+/// sealing section; `richards-shape` exercises a non-empty one.
+fn oracle_full(text: &str) -> String {
+    normalize(text)
 }
 
 /// Build `dylan-sema.exe` once into a temp path. Panics (failing the
@@ -209,13 +211,13 @@ fn dylan_sema_top_names_byte_match() {
         );
 
         let dyl = dylan_model(&dyl_stdout);
-        let orc = oracle_through_sealing(&run_oracle(&ws, &input));
+        let orc = oracle_full(&run_oracle(&ws, &input));
 
         if dyl != orc {
             failures.push(format!(
                 "FIXTURE {fx} MISMATCH\n\
                  ----- dylan-sema.exe (full model) -----\n{dyl}\n\
-                 ----- oracle (sliced through === sealing ===) -----\n{orc}\n\
+                 ----- oracle (full four-section dump) -----\n{orc}\n\
                  --------------------------------------"
             ));
         } else {
