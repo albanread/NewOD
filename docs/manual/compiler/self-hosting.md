@@ -217,8 +217,16 @@ The verify-mode progression for each phase:
    (`--parse-with-dylan` with the translation-coverage harness)
 3. **Default** — Dylan phase is the shipping path; Rust phase retired.
 
-The lexer completed step 3 (Sprint 51b). The parser completed step 1 (Sprint
-51c) and step 2 (Sprints 51d–51e). Step 3 for the parser is the next milestone.
+The lexer completed step 3 (Sprint 51b). The parser completed all three steps —
+verdict-verify (51c), AST-verify (51d), and **default** (51e): it is now the
+shipping parser, with the Rust parser kept as fall-back and verify oracle. The
+macro expander reached step 1 (verify-mode, opt-in) in Sprint 52, and sema
+reached step 1 (an oracle) in Sprint 53. AST→DFM lowering is the last stage to
+migrate (Sprints 54–55); the Sprint 56 consolidation then collapses the
+per-stage shim crossings into a single DFM handoff and retires the
+`--…-with-dylan` flags. See
+[`ARCHITECTURE.md` §Roadmap](../../ARCHITECTURE.md) and
+[`journal/2026-06-06-roadmap-54-56.md`](../../journal/2026-06-06-roadmap-54-56.md).
 
 ## Status by phase
 
@@ -226,11 +234,11 @@ The lexer completed step 3 (Sprint 51b). The parser completed step 1 (Sprint
 |-------|-------------|--------|----------------|
 | **Lexer** | `tests/nod-tests/fixtures/dylan-lexer.dylan` | Live — byte-identical to Rust lexer | `--lex-with-dylan` / `NOD_LEX_WITH_DYLAN` |
 | **Parser (verdict verify)** | `tests/nod-tests/fixtures/dylan-parser.dylan` | Live — agree on corpus accept/reject | `--verify-parse` / `NOD_VERIFY_PARSE` |
-| **Parser (AST emit)** | same + `dylan-lex-shim.dylan` | Live — `dump-dylan-ast` round-trips; `--parse-with-dylan` replaces `parse_module` for covered constructs | `--parse-with-dylan` / `NOD_PARSE_WITH_DYLAN` |
-| **Macro expander** | — | Queued (Sprint 52+) | — |
-| **Sema / namespace** | — | Queued (Sprint 53+) | — |
-| **AST to DFM lowering** | — | Queued (Sprint 54+) | — |
-| **Front-end fully self-hosted** | — | Future milestone | all phases default |
+| **Parser (AST emit)** | same + `dylan-lex-shim.dylan` | Live — **default** in the real pipeline; replaces `parse_module` for covered constructs, Rust = fall-back + verify oracle | `--parse-with-dylan` / `NOD_PARSE_WITH_DYLAN` |
+| **Macro expander** | `tests/nod-tests/fixtures/dylan-macro*.dylan` | Live (opt-in) — verify-mode against the Rust expander; wired into the pipeline (Sprint 52) | `NOD_EXPAND_WITH_DYLAN` |
+| **Sema / namespace** | `tests/nod-tests/fixtures/dylan-sema.dylan` (WIP) | Oracle live — `dump-sema` + `DYLAN_SEMA_WIRE.md`; Dylan recording walk in progress (Sprint 53) | `dump-sema` (oracle) |
+| **AST to DFM lowering** | — | Queued — Sprint 55 (Sprint 54 first makes the Dylan sema authoritative via `lower_with_model`) | — |
+| **Front-end fully self-hosted** | — | Future milestone — after the Sprint 56 consolidation (one DFM handoff, flags retired) | all phases default |
 
 Sources: `docs/ARCHITECTURE.md` §"What lives where" and §"Roadmap".
 
