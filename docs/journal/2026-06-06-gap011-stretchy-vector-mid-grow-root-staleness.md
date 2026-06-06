@@ -103,15 +103,38 @@ the original local.*
    colocates the stub with a hot std monomorphization. Documented release-
    only issue (`jit-and-aot.md:309`); the promised fix is a
    `codegen-units = 1` pin on `nod-runtime`. Debug AOT links cleanly.
-2. **Re-verify the original `collect-top-names` `source` crash (#2).**
-   That was a *debug* crash in compiled Dylan (`copy-sequence`/byte-string
-   path), so it is a different mechanism (codegen precise roots, not the
-   Rust `RootGuard`). The `NOD_DIAG_MERGE_DIVERGENCE` probe lights up on
-   `copy-sequence`, `find-substring`, `nod-byte-string-substr-eq?`, … —
-   mostly function-param false positives (handled by the `param_homes`
-   alloca mechanism), but some genuine non-param locals. Rebuild
-   `dylan-sema.exe` (debug) and re-run on `factorial.dylan` to see whether
-   #2 survives the #1 fix.
+2. **#2 — confirmed: a SECOND, deeper GC bug (the real year-3 blocker).**
+   Rebuilt `dylan-sema.exe` (debug, `--parse-with-rust`) and ran on
+   `factorial.dylan` with probes. Findings:
+   - `source` is **valid throughout** (size=221 at after-load, after-lex,
+     **after-parse**, preloop, and at both body-defns). So #2 is NOT a
+     `source`-staleness bug — `source` survives the whole walk. The #1 fix
+     plus the existing `param_homes` mechanism handle the params fine.
+   - The crash is `%byte-string-size` on a *different* byte-string during
+     the output construction. With NO probes it crashes in the per-`fn`
+     `line = concatenate(...)`; adding stepwise bindings + `format-out`
+     probes makes that survive and moves the crash to the post-loop
+     `out := concatenate(out, …)` accumulator. **A crash that relocates
+     when you add allocating probes is a GC-timing staleness (Heisenbug).**
+   - It is a *debug* crash, so it is NOT the #1 `RootGuard` register-cache
+     class. It is the **codegen precise-root path for loop-carried /
+     cross-block heap locals** — the `NOD_DIAG_MERGE_DIVERGENCE` class
+     (the in-progress GAP-011 codegen liveness/phi-threading work). The
+     liveness *computation* (`populate_safepoint_roots`) is correct; the
+     gap is codegen installing a stale carried value at a merge/loop-header
+     for a heap local that lowering didn't thread through a block param.
+   - **Pervasive, not workaroundable.** Both the straight-line `line`
+     concatenate and the loop-carried `out` accumulator are vulnerable
+     depending on GC timing, so you cannot write meaningful loop/branch
+     Dylan (string building, accumulators, locals held across calls)
+     without tripping it. The sema walk's last mile therefore depends on
+     fixing #2 in codegen, not on restructuring the Dylan.
+   - **Fix candidates:** (A) lowering threads every live-across-block
+     heap local through block params (the documented codegen contract;
+     large change to `lower.rs` CFG construction); or (B) codegen extends
+     the `param_homes` home-alloca mechanism to ALL GC-typed locals
+     (uniform, codegen-local, but changes the SSA model + perf). Gate
+     either with the merge-divergence detector going to zero.
 3. **Harden sibling grow/rehash primitives.** `tables.rs` (14 RootGuards),
    `lists.rs`, `closures.rs` re-read rooted locals after allocation in the
    same shape. They are not crashing today but carry the identical latent
