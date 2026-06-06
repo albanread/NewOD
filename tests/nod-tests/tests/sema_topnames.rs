@@ -65,26 +65,58 @@ fn fixtures_dir() -> PathBuf {
 }
 
 /// The fixtures the gate proves byte-match. All live under
-/// `tests/nod-tests/fixtures/`. The first six are class-free (Sprint
-/// 53.2); `point` and `gc_precise_two_makes` are single-class fixtures
-/// added in Sprint 53.3 (one user class, super `<object>`, two slots,
-/// both with setters).
+/// `tests/nod-tests/fixtures/`.
+///
+/// Sprints 53.2–53.4 grew the Dylan walk section by section (top-names,
+/// generics, classes, sealing). Sprint 53.5 then ran the byte-match over
+/// the whole fixture corpus and found the Dylan walk already reproduces
+/// the Rust oracle for the great majority of inputs — so the list below
+/// is broadened to that verified-matching set, not just the hand-picked
+/// shapes. (The known remaining divergences are documented in the journal:
+/// anonymous-method lifting `__anon-method-N` — `rope`, `ide_rope`,
+/// `unified_ide`, `nod-ide`; and macro-expansion-before-sema —
+/// `macro-when-cleanup`. Those await their own focused sprints.)
 const FIXTURES: &[&str] = &[
+    // 53.2 — class-free top-names (functions / constants / variables).
     "factorial",
     "sprint09-add",
     "mutual",
     "hello",
     "stdlib-size-call",
     "kernel-arith",
+    "stdlib-min",
+    // 53.3 — single-class fixtures (one class, super `<object>`, slots).
     "point",
     "gc_precise_two_makes",
-    // Sprint 53.4: a 5-class `<task>` hierarchy with an explicit
-    // `define sealed generic run-task` + four `define method run-task`
-    // and several `define function`. Exercises the new generics-from-
-    // `define generic`, method-emits-no-`fn`, and `=== sealing ===`
-    // (sealed-class / sealed-generic) logic — the first fixture with a
-    // non-empty sealing section.
-    "richards-shape",
+    // 53.4 — class hierarchy + sealing + `define generic`.
+    "richards-shape",       // sealed `<task>` hierarchy + sealed generic
+    "richards-shape-open",  // same shape, open (non-sealed) classes
+    // 53.5 — corpus broadening: fixtures the Dylan walk already byte-matches
+    // (verified by a full-corpus survey). Macro-using surface + the macro
+    // engine's test inputs + GAP/GC repros + jit-cache + translate + IDE
+    // helpers — a wide spread of real shapes, all green with no walk change.
+    "cond_smoke",
+    "macros-unless",
+    "macro-when-only",
+    "macro-for-range",
+    "dylan-lexer-main",
+    "dylan-macro-collect",
+    "dylan-macro-expand",
+    "dylan-macro-file",
+    "dylan-macro-match",
+    "dylan-macro-walk",
+    "expand-pipeline-smoke",
+    "gap-007-repro",
+    "gap011-repro",
+    "gap011-repro2",
+    "gap011-jcs-min-crash",
+    "jit_cache_sample",
+    "jit_cache_sample_items",
+    "translate-class",
+    "translate-loop",
+    "ide_helpers",
+    "ide_syntax",
+    "ide_win_calls",
 ];
 
 /// Normalize a top-names block the same way on both sides: CRLF -> LF,
