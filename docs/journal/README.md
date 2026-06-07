@@ -28,6 +28,15 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a: `while`/`until` loops + `:=` (the env-merge)](2026-06-07-sprint-55a-loops-and-assignment.md)
+  — The hardest 55a step: loop-carried vars threaded through a `loop_header`
+  block-param (carried set = assigned ∪ used ∪ GC-typed env, sorted — drives
+  header params + entry/back-edge args), until/while differ only in `If`
+  polarity, `:=` is a pure SSA env-rebind (no computation), loops carry a `#t`
+  void marker. Subagent-implemented from a recipe + exact target dumps, then
+  reviewed function-by-function + independently byte-verified. Gate → 10
+  fixtures (+ committed `lower-loop`). Next: generalize the env-merge to
+  `if`/short-circuit (so arms can assign).
 - [2026-06-07 — Sprint 55a: short-circuit `|` / `&`](2026-06-07-sprint-55a-short-circuit.md)
   — `|`/`&` aren't PrimOps; they lower to an `sc_edge`/`sc_rhs`/`sc_join`
   diamond (`|`: `If lhs edge rhs`; `&` swaps the targets), edge carries the LHS

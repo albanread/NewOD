@@ -367,6 +367,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-let",             // 55a: chained `let` bindings + arithmetic
     "lower-if",              // 55a: `let` + `if`/`else` (block-param SSA diamond)
     "lower-shortcircuit",    // 55a: `|` / `&` short-circuit diamonds
+    "lower-loop",            // 55a: while/until loops + `:=` (env-merge phis)
     "factorial",             // 55a: recursion + `if` (real corpus fixture)
     "jit_cache_sample_items", // 55a: real corpus fixture, now fully lowered
 ];

@@ -443,7 +443,13 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
     t
   elseif (instance?(node, <ast-binary-op>))
     let op-text = token-source-text(binop-operator(node), source);
-    if (op-text = "|" | op-text = "&")
+    if (op-text = ":=")
+      // `lhs := rhs` — plain-local SSA rebind (lower_assign). Lower the RHS and,
+      // if the LHS is a simple env-bound name, rebind name->rhs-temp; the
+      // assignment value IS the rhs temp and NO computation is emitted for the
+      // assignment itself. A non-simple / unbound LHS is outside scope -> #f.
+      lower-assign(b, node, ret-map, source)
+    elseif (op-text = "|" | op-text = "&")
       // `|` / `&` short-circuit — a diamond, NOT a PrimOp (lower_short_circuit).
       lower-short-circuit(b, node, op-text, ret-map, source)
     else
@@ -498,10 +504,15 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
       end
     end
   elseif (instance?(node, <ast-statement>))
-    // Control-flow statements in expression position. 55a: `if`. Others
-    // (begin / while / until / case / method-literal) are later → #f.
-    if (token-source-text(stmt-word(node), source) = "if")
+    // Control-flow statements in expression position. 55a: `if`, `while`,
+    // `until`. Others (begin / case / method-literal) are later → #f.
+    let word = token-source-text(stmt-word(node), source);
+    if (word = "if")
       lower-if-expr(b, node, ret-map, source)
+    elseif (word = "while")
+      lower-loop(b, node, #f, ret-map, source)
+    elseif (word = "until")
+      lower-loop(b, node, #t, ret-map, source)
     else
       #f
     end
@@ -568,8 +579,13 @@ define function lower-body-stmt (b :: <fn-builder>, item :: <object>,
   end
 end function;
 
-// Lower a range of body constituents [start, end) in order; the last value is
+// Lower a range of body constituents [start, end) in order; the last *value* is
 // returned. #f if any is unsupported, or the range is empty.
+//
+// A body statement's result is classified (lower_function_inner's last_temp
+// update): #f → bail; an <integer> temp → a value (updates `last`); anything
+// else truthy (the void marker `#t` from a loop, which produces no value) is a
+// void statement — it is lowered for effect but does NOT update `last`.
 define function lower-stmt-range (b :: <fn-builder>, cs :: <stretchy-vector>,
                                   start :: <integer>, ret-map :: <name-ret-map>,
                                   source :: <byte-string>)
@@ -580,7 +596,11 @@ define function lower-stmt-range (b :: <fn-builder>, cs :: <stretchy-vector>,
   let ok? = #t;
   until (i >= n | ~ ok?)
     let t = lower-body-stmt(b, cs[i], ret-map, source);
-    if (t) last := t; else ok? := #f; end;
+    if (~ t)
+      ok? := #f;
+    elseif (instance?(t, <integer>))
+      last := t;
+    end;
     i := i + 1;
   end;
   if (~ ok?) #f else last end
@@ -734,6 +754,343 @@ define function lower-if-expr (b :: <fn-builder>, stmt :: <ast-statement>,
   end
 end function;
 
+// ─── lower-assign — mirrors lower_assign (plain-local SSA-rebind case) ──────
+//
+// `lhs := rhs`. Lower the RHS to a temp; if the LHS is a bare name currently
+// bound in env (a plain local / param), REBIND name->rhs-temp and return the
+// rhs temp — emitting NO computation for the assignment itself (an SSA rebind
+// is just an env update; the value of `:=` is the RHS). A non-simple LHS, or a
+// name not in env (module variable / cell-promoted local — later sprints),
+// bails to the Rust path (#f). The 55a subset has no GC-typed locals, so the
+// cell/closure/module-variable branches of lower_assign never apply here.
+define function lower-assign (b :: <fn-builder>, node :: <ast-binary-op>,
+                              ret-map :: <name-ret-map>, source :: <byte-string>)
+ => (temp :: <object>)
+  let lhs = binop-left(node);
+  if (~ instance?(lhs, <ast-variable-ref>))
+    #f
+  else
+    let name = token-source-text(varref-tok(lhs), source);
+    if (~ fb-lookup(b, name))
+      #f                                  // unbound name — module var / later
+    else
+      let t = lower-expr(b, binop-right(node), ret-map, source);
+      if (~ t)
+        #f
+      else
+        fb-bind(b, name, t);              // SSA rebind; most-recent wins
+        t
+      end
+    end
+  end
+end function;
+
+// ── string sort (local; mirrors bs-le? / sort-strings! in dylan-sema.dylan) ──
+// Byte-wise lexical compare a <= b. Shorter-but-equal-prefix sorts first.
+define function lower-bs-le? (a :: <byte-string>, b :: <byte-string>)
+ => (yes? :: <boolean>)
+  let na = size(a);
+  let nb = size(b);
+  let n = if (na < nb) na else nb end;
+  let i = 0;
+  let result = #f;
+  let decided = #f;
+  until (i >= n | decided)
+    let ca = %byte-string-element(a, i);
+    let cb = %byte-string-element(b, i);
+    if (ca < cb)      result := #t; decided := #t;
+    elseif (ca > cb)  result := #f; decided := #t;
+    end;
+    i := i + 1;
+  end;
+  if (decided) result else na <= nb end
+end function;
+
+// In-place insertion sort of a stretchy-vector of <byte-string> (ascending).
+define function lower-sort-strings! (v :: <stretchy-vector>) => ()
+  let n = size(v);
+  let i = 1;
+  until (i >= n)
+    let x = v[i];
+    let j = i;
+    until (j = 0 | lower-bs-le?(v[j - 1], x))
+      v[j] := v[j - 1];
+      j := j - 1;
+    end;
+    v[j] := x;
+    i := i + 1;
+  end;
+end function;
+
+// Add `name` to set-vector `v` if not already present (HashSet::insert).
+define function set-add! (v :: <stretchy-vector>, name :: <byte-string>) => ()
+  let n = size(v);
+  let i = 0;
+  let found = #f;
+  until (i >= n | found)
+    if (v[i] = name) found := #t; end;
+    i := i + 1;
+  end;
+  if (~ found) add!(v, name); end;
+end function;
+
+// ── carried-set walks — mirror collect_used_bound_names_* / collect_assigned_*
+//
+// Both walk the loop's cond + body collecting env-bound names into a set-vector
+// `out`. They recurse over binops, calls (callee + positional-arg values),
+// control statements (if/while/until: stmt-body constituents + clause bodies),
+// and nested `let` initialisers — the node shapes that appear in the 55a subset.
+
+// Names that are READ (and currently bound in env). An <ast-variable-ref> whose
+// name is in env is a use. (`x := …` also reaches here via the binop LHS, which
+// is harmless: the assigned name is carried regardless.)
+define function collect-used (b :: <fn-builder>, node :: <object>,
+                              source :: <byte-string>, out :: <stretchy-vector>) => ()
+  if (instance?(node, <ast-variable-ref>))
+    let name = token-source-text(varref-tok(node), source);
+    if (fb-lookup(b, name)) set-add!(out, name); end;
+  elseif (instance?(node, <ast-binary-op>))
+    collect-used(b, binop-left(node), source, out);
+    collect-used(b, binop-right(node), source, out);
+  elseif (instance?(node, <ast-call>))
+    collect-used(b, call-fn(node), source, out);
+    let args = call-args(node);
+    let n = size(args);
+    let i = 0;
+    until (i >= n)
+      let an = args[i];
+      let av = if (instance?(an, <ast-pos-arg>)) pos-arg-value(an) else an end;
+      collect-used(b, av, source, out);
+      i := i + 1;
+    end;
+  elseif (instance?(node, <ast-local-decl>))
+    collect-used-in-body(b, ldecl-list(node), source, out);
+  elseif (instance?(node, <ast-statement>))
+    collect-used-in-body(b, stmt-body(node), source, out);
+    let clauses = stmt-clauses(node);
+    if (instance?(clauses, <stretchy-vector>))
+      let n = size(clauses);
+      let i = 0;
+      until (i >= n)
+        collect-used-in-body(b, clause-body(clauses[i]), source, out);
+        i := i + 1;
+      end;
+    end;
+  end;
+end function;
+
+define function collect-used-in-body (b :: <fn-builder>, body :: <object>,
+                                      source :: <byte-string>, out :: <stretchy-vector>) => ()
+  let cs = body-constituents(body);
+  let n = size(cs);
+  let i = 0;
+  until (i >= n)
+    collect-used(b, cs[i], source, out);
+    i := i + 1;
+  end;
+end function;
+
+// Names ASSIGNED via `:=` to a bound env name (collect_assigned_in_*). For an
+// assignment binop the LHS env-name is added and only the RHS is recursed;
+// other binops recurse both sides. `let` shadowing a bound outer name marks
+// that name assigned (Sprint 18 rule), matching the Rust binder-shadow arm.
+define function collect-assigned (b :: <fn-builder>, node :: <object>,
+                                  source :: <byte-string>, out :: <stretchy-vector>) => ()
+  if (instance?(node, <ast-binary-op>))
+    let op-text = token-source-text(binop-operator(node), source);
+    if (op-text = ":=")
+      let lhs = binop-left(node);
+      if (instance?(lhs, <ast-variable-ref>))
+        let name = token-source-text(varref-tok(lhs), source);
+        if (fb-lookup(b, name)) set-add!(out, name); end;
+      end;
+      collect-assigned(b, binop-right(node), source, out);
+    else
+      collect-assigned(b, binop-left(node), source, out);
+      collect-assigned(b, binop-right(node), source, out);
+    end;
+  elseif (instance?(node, <ast-call>))
+    collect-assigned(b, call-fn(node), source, out);
+    let args = call-args(node);
+    let n = size(args);
+    let i = 0;
+    until (i >= n)
+      let an = args[i];
+      let av = if (instance?(an, <ast-pos-arg>)) pos-arg-value(an) else an end;
+      collect-assigned(b, av, source, out);
+      i := i + 1;
+    end;
+  elseif (instance?(node, <ast-local-decl>))
+    collect-assigned-in-body(b, ldecl-list(node), source, out);
+  elseif (instance?(node, <ast-statement>))
+    collect-assigned-in-body(b, stmt-body(node), source, out);
+    let clauses = stmt-clauses(node);
+    if (instance?(clauses, <stretchy-vector>))
+      let n = size(clauses);
+      let i = 0;
+      until (i >= n)
+        collect-assigned-in-body(b, clause-body(clauses[i]), source, out);
+        i := i + 1;
+      end;
+    end;
+  end;
+end function;
+
+define function collect-assigned-in-body (b :: <fn-builder>, body :: <object>,
+                                          source :: <byte-string>, out :: <stretchy-vector>) => ()
+  let cs = body-constituents(body);
+  let n = size(cs);
+  let i = 0;
+  until (i >= n)
+    collect-assigned(b, cs[i], source, out);
+    i := i + 1;
+  end;
+end function;
+
+// ─── lower-loop — mirrors lower_while_like (while + until) ──────────────────
+//
+// `while (cond) body… end` / `until (cond) body… end`. stmt-body = [cond,
+// body…]. Builds the loop_header / loop_body / loop_exit CFG with the carried
+// (phi) set threaded through the header block-params.
+//
+//   loop_header(phi…):  cond_t = <cond>;  If cond_t <then> <else>
+//      while: then=body  else=exit ;  until: then=exit  else=body
+//      (ONLY the branch labels swap — the cond primop is NOT negated.)
+//   loop_body:          <body stmts>;  Jump loop_header(carried env temps…)
+//   loop_exit:          continue (the loop's value is void).
+//
+// Carried set = names assigned via `:=` in the body, OR used in cond/body, OR
+// GC-typed in env — sorted lexically. That single order governs header-param
+// order, the entry-jump args, and the back-edge args. Returns the void marker
+// (#t) on success, or #f if any sub-lowering bails (-> Rust path).
+//
+// Block creation order is load-bearing for the byte-match: header FIRST (id H);
+// header params consume temp ids BEFORE the cond is lowered; body/exit are
+// created AFTER lowering the cond (so any sc_* blocks from a short-circuit cond
+// precede them — GAP-009).
+define function lower-loop (b :: <fn-builder>, stmt :: <ast-statement>,
+                            invert? :: <object>, ret-map :: <name-ret-map>,
+                            source :: <byte-string>)
+ => (temp :: <object>)
+  let scs = body-constituents(stmt-body(stmt));
+  if (size(scs) < 1)
+    #f                                   // no condition — malformed
+  else
+    let cond-node = scs[0];
+    // (1) loop_header FIRST (id H).
+    let header-idx = fb-new-block(b, "loop_header");
+    // (2) Carried set: assigned ∪ used ∪ GC-typed env names, then sort.
+    let carried = make(<stretchy-vector>);
+    collect-assigned-in-body(b, stmt-body(stmt), source, carried);  // cond + body
+    let used = make(<stretchy-vector>);
+    collect-used(b, cond-node, source, used);
+    let bi = 1;
+    let nb = size(scs);
+    until (bi >= nb)
+      collect-used(b, scs[bi], source, used);
+      bi := bi + 1;
+    end;
+    // Add GC-typed env names + used names to the carried set (assigned already
+    // in). (No 55a fixture has GC-typed locals, but mirror the Rust rule.)
+    let enames = fb-env-names(b);
+    let etemps = fb-env-temps(b);
+    let ne = size(enames);
+    let ei = 0;
+    until (ei >= ne)
+      if (gc-typed-label?(fb-temp-type(b, etemps[ei])))
+        set-add!(carried, enames[ei]);
+      end;
+      ei := ei + 1;
+    end;
+    let nu = size(used);
+    let ui = 0;
+    until (ui >= nu)
+      // Only carry names still bound in env (used is already env-filtered).
+      set-add!(carried, used[ui]);
+      ui := ui + 1;
+    end;
+    lower-sort-strings!(carried);
+    // (3) Capture each carried name's CURRENT (pre-loop) env temp in sorted
+    // order, and add a header block-param per carried name (consuming temp ids
+    // BEFORE the cond is lowered). Bail if any carried name is somehow unbound.
+    let nc = size(carried);
+    let pre-temps = make(<stretchy-vector>);
+    let phis = make(<stretchy-vector>);
+    let ok? = #t;
+    let ci = 0;
+    until (ci >= nc | ~ ok?)
+      let outer = fb-lookup(b, carried[ci]);
+      if (~ outer)
+        ok? := #f;
+      else
+        add!(pre-temps, outer);
+        let phi = fb-add-block-param(b, header-idx, fb-temp-type(b, outer));
+        add!(phis, phi);
+      end;
+      ci := ci + 1;
+    end;
+    if (~ ok?)
+      #f
+    else
+      let header-lbl = fb-block-label(b, header-idx);
+      // (4) Entry-side jump → header with pre-loop temps (sorted order).
+      fb-terminate-jump(b, header-lbl, pre-temps);
+      // (5) Rebind env name->phi so header/body read the loop phis.
+      let ri = 0;
+      until (ri >= nc)
+        fb-bind(b, carried[ri], phis[ri]);
+        ri := ri + 1;
+      end;
+      // (6) header: lower cond, then create body/exit, then branch.
+      fb-switch-to(b, header-idx);
+      let cond-t = lower-expr(b, cond-node, ret-map, source);
+      if (~ cond-t)
+        #f
+      else
+        let body-idx = fb-new-block(b, "loop_body");
+        let exit-idx = fb-new-block(b, "loop_exit");
+        let body-lbl = fb-block-label(b, body-idx);
+        let exit-lbl = fb-block-label(b, exit-idx);
+        if (invert?)
+          fb-terminate-if(b, cond-t, exit-lbl, body-lbl);   // until polarity
+        else
+          fb-terminate-if(b, cond-t, body-lbl, exit-lbl);   // while polarity
+        end;
+        // (7) loop_body: lower body stmts (`:=` rebinds env), then back-edge.
+        fb-switch-to(b, body-idx);
+        let body-ok? = #t;
+        let si = 1;
+        until (si >= nb | ~ body-ok?)
+          let t = lower-body-stmt(b, scs[si], ret-map, source);
+          if (~ t) body-ok? := #f; end;   // <integer>/void both fine (discarded)
+          si := si + 1;
+        end;
+        if (~ body-ok?)
+          #f
+        else
+          // Back-edge args: env[name] for each carried name, in sorted order.
+          let back-args = make(<stretchy-vector>);
+          let qi = 0;
+          until (qi >= nc)
+            add!(back-args, fb-lookup(b, carried[qi]));
+            qi := qi + 1;
+          end;
+          fb-terminate-jump(b, header-lbl, back-args);
+          // (8) Restore env name->phi (post-loop reads see the header phi),
+          // then continue at exit. The loop's own value is void.
+          let xi = 0;
+          until (xi >= nc)
+            fb-bind(b, carried[xi], phis[xi]);
+            xi := xi + 1;
+          end;
+          fb-switch-to(b, exit-idx);
+          #t                              // void marker — loop produces no value
+        end
+      end
+    end
+  end
+end function;
+
 // ─── lower-function — mirrors lower_function_inner (straight-line case) ─────
 //
 // Builds a <dfm-func> for one `define function` whose body is a single
@@ -785,7 +1142,14 @@ define function lower-function (defn :: <ast-body-definition>,
     let ok? = #t;
     until (ci >= nc | ~ ok?)
       let t = lower-body-stmt(b, cs[ci], ret-map, source);
-      if (t) last-temp := t; else ok? := #f; end;
+      // #f → bail; <integer> temp → the running return value; void marker (a
+      // loop) → lowered for effect, does NOT become the return value (so
+      // `until(...)...end; result` returns `result`, not the loop).
+      if (~ t)
+        ok? := #f;
+      elseif (instance?(t, <integer>))
+        last-temp := t;
+      end;
       ci := ci + 1;
     end;
     if (~ ok? | ~ last-temp)
