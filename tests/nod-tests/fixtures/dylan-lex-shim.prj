@@ -33,6 +33,7 @@ sources        = [
     "dylan-macro.dylan",
     "dylan-c3.dylan",
     "dylan-sema.dylan",
+    "dylan-lower.dylan",
     "dylan-lex-shim.dylan",
 ]
 output         = "dylan-lex-shim.exe"

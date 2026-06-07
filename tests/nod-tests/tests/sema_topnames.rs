@@ -355,6 +355,91 @@ fn run_dump_dfm(ws: &Path, input: &Path, sema_with_dylan: bool) -> (String, Stri
     )
 }
 
+/// Sprint 55 Phase 0 — fixtures whose every top-level item is a straight-line
+/// `define function` (literals / binops / direct calls, no control flow,
+/// classes, or closures) — the subset the Dylan-side lowering handles so far.
+const PHASE0_LOWER_FIXTURES: &[&str] = &["sprint09-add", "mutual"];
+
+/// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan
+/// AST→DFM lowering via the `dylan-lower-emit` shim entry). Returns
+/// `(stdout, stderr, success)`.
+fn run_dump_dylan_dfm(ws: &Path, input: &Path) -> (String, String, bool) {
+    let out = Command::new("cargo")
+        .current_dir(ws)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "nod-driver",
+            "--",
+            "dump-dylan-dfm",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn nod-driver dump-dylan-dfm");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Sprint 55 Phase 0 — the lowering byte-match gate: the Dylan-side AST→DFM
+/// lowering (`dump-dylan-dfm`, in-process via the shim) must produce DFM
+/// byte-identical to the Rust lowering (`dump-dfm`) on the straight-line
+/// subset. This is the oracle for the lowering port, the analogue of the sema
+/// `dump-sema` gates. Grows fixture-by-fixture as 55a/b/c add forms. Skips
+/// cleanly when the shim isn't statically linked.
+#[test]
+#[ignore]
+#[serial]
+fn dylan_lower_phase0_dump_dfm_byte_match() {
+    let ws = workspace_root();
+
+    // Probe: no shim ⇒ dump-dylan-dfm fails with "shim init" ⇒ skip.
+    let probe = fixtures_dir().join("sprint09-add.dylan");
+    let (_, probe_err, probe_ok) = run_dump_dylan_dfm(&ws, &probe);
+    if !probe_ok && probe_err.contains("shim init") {
+        eprintln!("SKIP dylan_lower_phase0_dump_dfm_byte_match: shim not linked.\n{probe_err}");
+        return;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for fx in PHASE0_LOWER_FIXTURES {
+        let input = fixtures_dir().join(format!("{fx}.dylan"));
+        assert!(input.is_file(), "missing fixture {}", input.display());
+
+        let (dyl_out, dyl_err, dyl_ok) = run_dump_dylan_dfm(&ws, &input);
+        assert!(dyl_ok, "dump-dylan-dfm failed for {fx}:\nstderr:\n{dyl_err}");
+        let d = normalize(&dyl_out);
+        // An empty dump means the Dylan lowering bailed (fixture left to Rust);
+        // a Phase-0 fixture MUST be lowerable, so empty is a failure here.
+        assert!(
+            !d.is_empty(),
+            "Phase-0 fixture {fx} produced no Dylan DFM (lowering bailed)"
+        );
+        let r = normalize(&run_dump_dfm(&ws, &input, false).0);
+        if d != r {
+            let first = r
+                .lines()
+                .zip(d.lines())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| format!("  line {i}:\n    rust : {a}\n    dylan: {b}"))
+                .unwrap_or_else(|| "  (length differs)".to_string());
+            failures.push(format!("FIXTURE {fx} DFM MISMATCH\n{first}"));
+        } else {
+            eprintln!("MATCH: {fx}");
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Dylan AST→DFM lowering diverged from the Rust lowering:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
 /// Sprint 54c — THE load-bearing gate (the roadmap's Sprint 54 acceptance
 /// criterion): the back-end's DFM must be byte-identical whether the sema
 /// recording came from the Rust `analyse_module` or from the Dylan walk

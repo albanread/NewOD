@@ -257,6 +257,15 @@ enum Command {
         /// Path to a `.dylan` source file.
         input: PathBuf,
     },
+    /// Sprint 55 Phase 0 — run the Dylan-side AST→DFM lowering IN-PROCESS (via
+    /// the statically-linked `dylan-lower-emit` shim entry) and print its
+    /// `dump-dfm` text. Byte-identical to `dump-dfm` on the Phase-0 subset
+    /// (straight-line functions); prints nothing for modules outside it. This
+    /// is the byte-match gate for the lowering port. Requires the shim linked.
+    DumpDylanDfm {
+        /// Path to a `.dylan` source file.
+        input: PathBuf,
+    },
     /// Run the Dylan-in-Dylan parser over a source file and print the AST dump.
     ///
     /// Builds [dylan-lexer.dylan, dylan-parser.dylan] into a cached EXE,
@@ -690,6 +699,7 @@ fn main() -> ExitCode {
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
         Some(Command::DumpDylanAst { input }) => run_dump_dylan_ast(&input),
         Some(Command::DumpDylanSema { input }) => run_dump_dylan_sema(&input),
+        Some(Command::DumpDylanDfm { input }) => run_dump_dylan_dfm(&input),
         Some(Command::ParseDylan { input, time }) => {
             let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
             let code = run_parse_dylan(&input);
@@ -1434,6 +1444,33 @@ fn run_dump_dylan_ast(input: &std::path::Path) -> ExitCode {
 fn dylan_sema_dump_provider(src: &str) -> Result<String, String> {
     dylan_lex_jit::init()?;
     dylan_parse_wire::sema_emit_via_shim(src)
+}
+
+fn run_dump_dylan_dfm(input: &std::path::Path) -> ExitCode {
+    // Sprint 55 Phase 0 — exercise the in-process Dylan lowering end-to-end.
+    // Fire the shim resolver if needed, then call `dylan-lower-emit` and print
+    // its DFM dump verbatim ("" for modules outside the Phase-0 subset).
+    if let Err(e) = dylan_lex_jit::init() {
+        eprintln!("nod-driver dump-dylan-dfm: shim init failed: {e}");
+        return ExitCode::from(1);
+    }
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-dfm: read {}: {e}", input.display());
+            return ExitCode::from(2);
+        }
+    };
+    match dylan_parse_wire::lower_emit_via_shim(&src) {
+        Ok(dfm) => {
+            print!("{dfm}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-dfm: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn run_dump_dylan_sema(input: &std::path::Path) -> ExitCode {

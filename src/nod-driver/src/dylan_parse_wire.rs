@@ -125,6 +125,37 @@ pub fn sema_emit_via_shim(src: &str) -> Result<String, String> {
     read_dylan_byte_string(out_bs)
 }
 
+#[cfg(dylan_lex_shim_linked)]
+unsafe extern "C" {
+    /// Sprint 55 Phase 0 — `define function dylan-lower-emit (source) =>
+    /// (dfm-text :: <byte-string>)` from `dylan-lower.dylan`. Lexes + parses
+    /// then runs the Dylan-side AST→DFM lowering (Phase-0 straight-line
+    /// subset) and returns the `dump-dfm` text, byte-identical to
+    /// `nod_dfm::format_dfm_module`. Returns "" for any module outside the
+    /// Phase-0 subset (so the host keeps it on the Rust path). Word in (a
+    /// `<byte-string>`), Word out (a `<byte-string>`).
+    #[link_name = "dylan-lower-emit"]
+    fn dylan_lower_emit(source: u64) -> u64;
+}
+
+#[cfg(not(dylan_lex_shim_linked))]
+unsafe extern "C" fn dylan_lower_emit(_source: u64) -> u64 {
+    unreachable!("dylan_lex_shim_linked is not set")
+}
+
+/// Sprint 55 Phase 0 — run the Dylan-side AST→DFM lowering in-process via the
+/// statically-linked `dylan-lower-emit` shim entry, returning its `dump-dfm`
+/// text (empty string when the module is outside the Phase-0 subset). Caller
+/// must have run [`crate::dylan_lex_jit::init`] first. Used by
+/// `dump-dylan-dfm` (the `dump-dfm` byte-match gate for the lowering port).
+pub fn lower_emit_via_shim(src: &str) -> Result<String, String> {
+    let src_bs = alloc_dylan_byte_string(src.as_bytes())?;
+    // SAFETY: src_bs is a live <byte-string>; the entry is the statically-
+    // linked Dylan lowering, called after init()'s nod_aot_resolve_relocs.
+    let out_bs = unsafe { dylan_lower_emit(src_bs) };
+    read_dylan_byte_string(out_bs)
+}
+
 /// AST kind codes — must match `docs/DYLAN_AST_WIRE.md` §3 and the
 /// `$ast-kind-*` constants in `dylan-lex-shim.dylan`.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

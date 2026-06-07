@@ -28,6 +28,15 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55 Phase 0: the Dylan AST→DFM lowering scaffold](2026-06-07-sprint-55-phase0-lowering-scaffold.md)
+  — Stands up `dylan-lower.dylan` (DFM structs + FunctionBuilder + lower-expr +
+  a byte-exact `format-dfm`) and proves the byte-match end-to-end: `dump-dylan-dfm`
+  (in-process via the `dylan-lower-emit` shim) == `dump-dfm` on the straight-line
+  subset (`sprint09-add`, `mutual`). Two bugs the gate caught: no LocalEnv for
+  param reads, and the `Module:` preamble being parsed as items (skip
+  non-definitions like `collect-top-names`, never emit a wrong dump). Text
+  transport (no DFM wire yet). New `dylan_lower_phase0_dump_dfm_byte_match` gate,
+  grows form-by-form through 55a/b/c.
 - [2026-06-07 — Sprint 55 plan: porting AST→DFM lowering to Dylan](2026-06-07-sprint-55-lowering-plan.md)
   — The plan for the last and densest front-end stage. Maps the target (a
   block-parameter SSA CFG; lowering emits ~8 of 10 `Computation` variants —
