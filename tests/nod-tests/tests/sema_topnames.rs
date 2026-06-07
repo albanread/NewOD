@@ -355,6 +355,31 @@ fn run_dump_dfm(ws: &Path, input: &Path, sema_with_dylan: bool) -> (String, Stri
     )
 }
 
+/// Sprint 55 — `nod-driver --lower-with-dylan dump-dfm <fx>`, returns
+/// `(stdout, stderr, success)`. The Dylan AST→DFM lowering is reconstructed
+/// host-side and run through the same back-end passes.
+fn run_dump_dfm_lower_with_dylan(ws: &Path, input: &Path) -> (String, String, bool) {
+    let out = Command::new("cargo")
+        .current_dir(ws)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "nod-driver",
+            "--",
+            "--lower-with-dylan",
+            "dump-dfm",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn nod-driver --lower-with-dylan dump-dfm");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
 /// Sprint 55 Phase 0 / 55a — fixtures the Dylan-side lowering reproduces
 /// byte-for-byte so far: straight-line `define function`s (literals / binops /
 /// direct calls / `let` bindings; no control flow, classes, or closures).
@@ -559,6 +584,75 @@ fn dump_dfm_sema_with_dylan_byte_match() {
     assert!(
         failures.is_empty(),
         "DFM diverged between the Rust and Dylan sema recordings:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// Sprint 55 — THE load-bearing LOWERING gate (the analogue of
+/// `dump_dfm_sema_with_dylan_byte_match` for the lowering flip): the back-end's
+/// DFM must be byte-identical whether the Phase-3/4 functions came from the Rust
+/// lowering or were reconstructed host-side from the Dylan `dylan-lower-emit`
+/// dump (`--lower-with-dylan`) — with the SAME narrow / resolve-dispatch /
+/// safepoint passes run on either. Passing this means the Dylan AST→DFM lowering
+/// is authoritative for the back-end on the covered subset; an uncovered form
+/// bails the Dylan lowering to "" and the host transparently uses the Rust
+/// lowering. Skips cleanly when the shim isn't statically linked.
+#[test]
+#[ignore]
+#[serial]
+fn dump_dfm_lower_with_dylan_byte_match() {
+    let ws = workspace_root();
+
+    // Probe: no shim ⇒ `--lower-with-dylan` warns + falls back to Rust (the run
+    // wouldn't exercise the Dylan path), so skip rather than pass vacuously.
+    let probe = fixtures_dir().join("hello.dylan");
+    let (_, probe_err, probe_ok) = run_dump_dfm_lower_with_dylan(&ws, &probe);
+    if !probe_ok || probe_err.contains("not statically linked") {
+        eprintln!("SKIP dump_dfm_lower_with_dylan_byte_match: shim not linked.\n{probe_err}");
+        return;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for fx in PHASE0_LOWER_FIXTURES {
+        let input = fixtures_dir().join(format!("{fx}.dylan"));
+        assert!(input.is_file(), "missing fixture {}", input.display());
+
+        let (rust_out, _, rust_ok) = run_dump_dfm(&ws, &input, false);
+        let (dyl_out, dyl_err, dyl_ok) = run_dump_dfm_lower_with_dylan(&ws, &input);
+        assert!(rust_ok, "dump-dfm (rust lowering) failed for {fx}");
+        assert!(
+            dyl_ok,
+            "dump-dfm --lower-with-dylan failed for {fx}:\nstderr:\n{dyl_err}"
+        );
+
+        let r = normalize(&rust_out);
+        let d = normalize(&dyl_out);
+        // A Phase-0 fixture MUST be lowered by the Dylan path (non-empty dump
+        // reconstructed + passed), not silently fall back — so it cannot be
+        // empty here.
+        assert!(
+            !d.is_empty(),
+            "Phase-0 fixture {fx} produced no DFM under --lower-with-dylan"
+        );
+        if r != d {
+            let first = r
+                .lines()
+                .zip(d.lines())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| format!("  line {i}:\n    rust : {a}\n    dylan: {b}"))
+                .unwrap_or_else(|| "  (length differs)".to_string());
+            failures.push(format!(
+                "FIXTURE {fx} DFM MISMATCH (rust lowering vs dylan lowering)\n{first}"
+            ));
+        } else {
+            eprintln!("MATCH: {fx}");
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "DFM diverged between the Rust and Dylan lowering:\n\n{}",
         failures.join("\n\n")
     );
 }

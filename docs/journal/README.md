@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55: the lowering flip (Dylan AST→DFM is load-bearing)](2026-06-07-sprint-55-lowering-flip-load-bearing.md)
+  — The keystone: `--lower-with-dylan` replaces the Rust Phase-3/4 functions with
+  the Dylan `dylan-lower-emit` DFM, reconstructed host-side (`parse_dfm_module`),
+  and runs the SAME back-end passes on it. Byte-identical `dump-dfm` across all 13
+  lowering fixtures (new gate `dump_dfm_lower_with_dylan_byte_match`); bails fall
+  back to Rust. Mirrors 54c's sema flip one stage later; dissolves the text-gate
+  ceiling for the coming make/dispatch forms (same passes + same host class-ids).
 - [2026-06-07 — Sprint 55b: `instance?` → TypeCheck](2026-06-07-sprint-55b-instance-typecheck.md)
   — Second id-free/pass-free 55b piece: `instance?(v, <class>)` → `TypeCheck v
   <label>` (dst <boolean>). The label is `ClassCheck::name()`, not verbatim —

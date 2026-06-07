@@ -1585,7 +1585,7 @@ fn register_module_classes(
 }
 
 pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>> {
-    lower_module_full_inner(m, None)
+    lower_module_full_inner(m, None, None)
 }
 
 /// Sprint 54c — lower a module whose recording `SemaModel` was produced
@@ -1598,12 +1598,29 @@ pub fn lower_module_full_with_model(
     m: &Module,
     model: SemaModel,
 ) -> Result<LoweredModule, Vec<LoweringError>> {
-    lower_module_full_inner(m, Some(model))
+    lower_module_full_inner(m, Some(model), None)
+}
+
+/// Sprint 55 — the load-bearing LOWERING flip (the analogue of 54c's sema
+/// flip). When `dfm_dump` is `Some(non-empty)`, the Phase-3/4 Rust lowering
+/// output is REPLACED by the functions reconstructed from that dump (the
+/// Dylan-side `dylan-lower-emit` text, under `--lower-with-dylan`), and the
+/// SAME back-end passes (narrow / resolve-dispatch / safepoint-roots) then run
+/// on the Dylan-produced DFM. `injected_model` selects the sema source exactly
+/// as in [`lower_module_full_with_model`]; the two flips compose. An empty
+/// `dfm_dump` (the Dylan lowering bailed) leaves the Rust lowering in place.
+pub fn lower_module_full_choice(
+    m: &Module,
+    injected_model: Option<SemaModel>,
+    dfm_dump: Option<&str>,
+) -> Result<LoweredModule, Vec<LoweringError>> {
+    lower_module_full_inner(m, injected_model, dfm_dump)
 }
 
 fn lower_module_full_inner(
     m: &Module,
     injected_model: Option<SemaModel>,
+    dfm_dump: Option<&str>,
 ) -> Result<LoweredModule, Vec<LoweringError>> {
     // Sprint 19: ensure the seed condition classes are registered
     // before lowering starts so `<error>` / `<simple-error>` / etc.
@@ -2394,6 +2411,31 @@ fn lower_module_full_inner(
             });
         }
     }
+    // Sprint 55 — the LOWERING flip seam. If a Dylan-produced DFM dump was
+    // supplied (`--lower-with-dylan`), REPLACE the Phase-3/4 Rust functions
+    // with the ones reconstructed from it; the back-end passes below then run
+    // on the Dylan-produced DFM exactly as on the Rust one. Classes are already
+    // registered (Phase 1 / `analyse_module[_from_dump]`), so the reconstruction
+    // resolves class-name labels through the live registry. An empty dump means
+    // the Dylan lowering bailed → keep the Rust output. The Dylan dump is a
+    // COMPLETE module (accessors + functions), so drop any Rust-lifted thunks to
+    // avoid duplicating them at the append below.
+    if let Some(dump) = dfm_dump
+        && !dump.trim().is_empty()
+    {
+        let parsed = nod_dfm::parse_dfm_module(dump, &|name| {
+            resolve_class_id_by_name(name).map(|c| c.0)
+        })
+        .map_err(|e| {
+            vec![LoweringError::Unsupported {
+                span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
+                message: format!("dfm reconstruct (--lower-with-dylan): {e}"),
+            }]
+        })?;
+        out = parsed;
+        lift_sink.functions.clear();
+    }
+
     // `sealing` was computed in `analyse_module`; install it here (the
     // historical point, before dispatch resolution) to preserve behavior.
     crate::optimise::install_sealing_facts(&sealing);

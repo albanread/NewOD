@@ -113,6 +113,17 @@ struct Cli {
     /// Requires the shim to be statically linked.
     #[arg(long = "sema-with-dylan", global = true)]
     sema_with_dylan: bool,
+
+    /// Sprint 55 — make the Dylan AST→DFM lowering load-bearing: the back-end
+    /// consumes the DFM the Dylan lowering produces (in-process via the
+    /// `dylan-lower-emit` shim entry, reconstructed host-side) instead of the
+    /// Rust Phase-3/4 lowering, then runs the SAME passes on it. Also settable
+    /// via `NOD_LOWER_WITH_DYLAN=1`. Wired into `dump-dfm` (gated
+    /// `dump-dfm --lower-with-dylan` byte-identical to plain `dump-dfm` on the
+    /// covered subset; the Dylan lowering bails to Rust otherwise). Requires the
+    /// shim to be statically linked.
+    #[arg(long = "lower-with-dylan", global = true)]
+    lower_with_dylan: bool,
 }
 
 #[derive(Subcommand)]
@@ -539,6 +550,27 @@ fn main() -> ExitCode {
                 "nod-driver: --sema-with-dylan requested but the dylan-lex-shim is \
                  not statically linked; using the Rust sema. Build the shim to activate \
                  the Dylan sema."
+            );
+        }
+    }
+
+    // Sprint 55 — `--lower-with-dylan` makes the Dylan AST→DFM lowering
+    // load-bearing for the back-end (currently `dump-dfm`). Install a provider
+    // that produces the DFM dump in-process via the `dylan-lower-emit` shim;
+    // `nod_sema`'s `lower_with_sema_choice` reconstructs `Vec<Function>` from it
+    // (when non-empty) and runs the back-end passes on it. Requires the shim.
+    let want_lower_with_dylan = cli.lower_with_dylan
+        || std::env::var("NOD_LOWER_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
+    if want_lower_with_dylan {
+        if cfg!(dylan_lex_shim_linked) {
+            // SAFETY: single-threaded process startup.
+            unsafe { std::env::set_var("NOD_LOWER_WITH_DYLAN", "1"); }
+            let _ = nod_sema::set_dfm_dump_provider(dylan_dfm_dump_provider);
+        } else {
+            eprintln!(
+                "nod-driver: --lower-with-dylan requested but the dylan-lex-shim is \
+                 not statically linked; using the Rust lowering. Build the shim to \
+                 activate the Dylan lowering."
             );
         }
     }
@@ -1444,6 +1476,17 @@ fn run_dump_dylan_ast(input: &std::path::Path) -> ExitCode {
 fn dylan_sema_dump_provider(src: &str) -> Result<String, String> {
     dylan_lex_jit::init()?;
     dylan_parse_wire::sema_emit_via_shim(src)
+}
+
+/// Sprint 55 — the `--lower-with-dylan` DFM-dump provider installed into
+/// `nod_sema::set_dfm_dump_provider`. Given source text, fire the shared
+/// resolver once (`init`) then run the in-process Dylan AST→DFM lowering via the
+/// `dylan-lower-emit` shim entry, returning its `dump-dfm`-format text (or `""`
+/// when the Dylan lowering bails on an unsupported form); `nod_sema`
+/// reconstructs `Vec<Function>` from it and runs the back-end passes.
+fn dylan_dfm_dump_provider(src: &str) -> Result<String, String> {
+    dylan_lex_jit::init()?;
+    dylan_parse_wire::lower_emit_via_shim(src)
 }
 
 fn run_dump_dylan_dfm(input: &std::path::Path) -> ExitCode {

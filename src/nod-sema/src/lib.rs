@@ -179,23 +179,52 @@ pub fn set_sema_dump_provider(
     SEMA_DUMP_PROVIDER.set(f)
 }
 
+/// Sprint 55 — `--lower-with-dylan` provider. The driver installs a function
+/// that, given the source text, returns the Dylan-produced DFM dump (by calling
+/// the in-process `dylan-lower-emit` shim entry). When installed, opted-in
+/// lowering paths reconstruct `Vec<Function>` from that dump
+/// ([`nod_dfm::parse_dfm_module`]) and run the SAME back-end passes on it —
+/// making the Dylan lowering authoritative. An empty dump (the Dylan lowering
+/// bailed on an unsupported form) transparently falls back to the Rust lowering.
+/// Composes with [`SEMA_DUMP_PROVIDER`]: sema source and lowering source are
+/// chosen independently.
+static DFM_DUMP_PROVIDER: std::sync::OnceLock<fn(&str) -> Result<String, String>> =
+    std::sync::OnceLock::new();
+
+/// Install the `--lower-with-dylan` DFM-dump provider (first install wins).
+/// `Err` returns the provider back if already set.
+pub fn set_dfm_dump_provider(
+    f: fn(&str) -> Result<String, String>,
+) -> Result<(), fn(&str) -> Result<String, String>> {
+    DFM_DUMP_PROVIDER.set(f)
+}
+
 /// Lower `module` (already parsed + expanded from `src`), choosing the sema
-/// recording source: when the `--sema-with-dylan` provider is installed, build
-/// the `SemaModel` from the Dylan walk's dump and feed it to lowering; else use
-/// the all-Rust recording. The single seam that makes the Dylan sema
+/// recording source AND the lowering source independently. When the
+/// `--sema-with-dylan` provider is installed, build the `SemaModel` from the
+/// Dylan walk's dump; else use the all-Rust recording. When the
+/// `--lower-with-dylan` provider is installed, replace the Rust Phase-3/4
+/// functions with those reconstructed from the Dylan DFM dump (the back-end
+/// passes then run on it). The single seam that makes the Dylan front end
 /// load-bearing for `dump-dfm` (and, later, the compile paths).
 fn lower_with_sema_choice(
     src: &str,
     module: &nod_reader::Module,
 ) -> Result<LoweredModule, DumpError> {
+    // The Dylan lowering dump (if `--lower-with-dylan`): "" ⇒ bailed ⇒ Rust.
+    let dfm_dump: Option<String> = match DFM_DUMP_PROVIDER.get() {
+        Some(provider) => Some(provider(src).map_err(DumpError::LowerDylan)?),
+        None => None,
+    };
+    let dfm_ref = dfm_dump.as_deref();
     match SEMA_DUMP_PROVIDER.get() {
         Some(provider) => {
             let dump = provider(src).map_err(DumpError::SemaDylan)?;
             let model =
                 lower::analyse_module_from_dump(module, &dump).map_err(DumpError::SemaDylan)?;
-            lower::lower_module_full_with_model(module, model).map_err(DumpError::Lower)
+            lower::lower_module_full_choice(module, Some(model), dfm_ref).map_err(DumpError::Lower)
         }
-        None => lower_module_full(module).map_err(DumpError::Lower),
+        None => lower::lower_module_full_choice(module, None, dfm_ref).map_err(DumpError::Lower),
     }
 }
 
@@ -2054,6 +2083,9 @@ pub enum DumpError {
     /// Sprint 54c — `--sema-with-dylan`: the Dylan sema provider failed, or
     /// its model dump couldn't be reconstructed into a `SemaModel`.
     SemaDylan(String),
+    /// Sprint 55 — `--lower-with-dylan`: the Dylan lowering provider failed
+    /// (the DFM-dump reconstruction itself surfaces as `Lower`).
+    LowerDylan(String),
 }
 
 impl std::fmt::Display for DumpError {
@@ -2078,6 +2110,7 @@ impl std::fmt::Display for DumpError {
             }
             DumpError::Codegen(e) => write!(f, "codegen: {e}"),
             DumpError::SemaDylan(msg) => write!(f, "sema-with-dylan: {msg}"),
+            DumpError::LowerDylan(msg) => write!(f, "lower-with-dylan: {msg}"),
         }
     }
 }
