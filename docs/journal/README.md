@@ -28,6 +28,11 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a: short-circuit `|` / `&`](2026-06-07-sprint-55a-short-circuit.md)
+  — `|`/`&` aren't PrimOps; they lower to an `sc_edge`/`sc_rhs`/`sc_join`
+  diamond (`|`: `If lhs edge rhs`; `&` swaps the targets), edge carries the LHS
+  value, join-param is the result. Same shape/guard as `if`. Gate → 9 fixtures
+  (+ committed `lower-shortcircuit`).
 - [2026-06-07 — Sprint 55a: `if` — the block-parameter SSA core](2026-06-07-sprint-55a-if-control-flow.md)
   — The brutal core: `if` lowers to a then/else/join block-param-SSA diamond,
   byte-exact (block ids/labels, temp order, join merge-param, missing-else →

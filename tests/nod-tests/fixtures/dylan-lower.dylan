@@ -442,23 +442,29 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
                     op: #f, args: make(<stretchy-vector>), callee: #f));
     t
   elseif (instance?(node, <ast-binary-op>))
-    // Operands lower left-then-right — this ORDER fixes the operand temp ids.
-    let l = lower-expr(b, binop-left(node), ret-map, source);
-    let r = lower-expr(b, binop-right(node), ret-map, source);
-    if (~ l | ~ r)
-      #f
+    let op-text = token-source-text(binop-operator(node), source);
+    if (op-text = "|" | op-text = "&")
+      // `|` / `&` short-circuit — a diamond, NOT a PrimOp (lower_short_circuit).
+      lower-short-circuit(b, node, op-text, ret-map, source)
     else
-      let lt = fb-temp-type(b, l);
-      let rt = fb-temp-type(b, r);
-      let op-text = token-source-text(binop-operator(node), source);
-      let prim = select-binop(op-text, lt, rt);
-      if (~ prim)
+      // Strict binop. Operands lower left-then-right — this ORDER fixes the
+      // operand temp ids.
+      let l = lower-expr(b, binop-left(node), ret-map, source);
+      let r = lower-expr(b, binop-right(node), ret-map, source);
+      if (~ l | ~ r)
         #f
       else
-        let dst = fb-fresh-temp(b, primop-result-label(prim));
-        fb-push(b, make(<dfm-comp>, kind: "primop", dst: dst, cval: #f,
-                        op: prim, args: pair-args(l, r), callee: #f));
-        dst
+        let lt = fb-temp-type(b, l);
+        let rt = fb-temp-type(b, r);
+        let prim = select-binop(op-text, lt, rt);
+        if (~ prim)
+          #f
+        else
+          let dst = fb-fresh-temp(b, primop-result-label(prim));
+          fb-push(b, make(<dfm-comp>, kind: "primop", dst: dst, cval: #f,
+                          op: prim, args: pair-args(l, r), callee: #f));
+          dst
+        end
       end
     end
   elseif (instance?(node, <ast-call>))
@@ -591,6 +597,56 @@ define function env-has-gc-typed? (b :: <fn-builder>) => (yes? :: <boolean>)
     i := i + 1;
   end;
   found
+end function;
+
+// ─── lower-short-circuit — mirrors lower_short_circuit (`|` / `&`) ──────────
+//
+// `a | b` / `a & b` lower to an sc_edge / sc_rhs / sc_join diamond. The LHS is
+// evaluated in the current block; on the short-circuit outcome control jumps to
+// sc_edge carrying the LHS value, otherwise to sc_rhs which evaluates the RHS
+// and jumps with its value; sc_join's block-param is the result.
+//   `|`: LHS true  → sc_edge (value = LHS); false → sc_rhs.  (If lhs edge rhs)
+//   `&`: LHS true  → sc_rhs;  false → sc_edge (value = LHS). (If lhs rhs edge)
+// Same env-merge guard as `if` (bail to Rust on GC-typed env).
+define function lower-short-circuit (b :: <fn-builder>, node :: <ast-binary-op>,
+                                     op :: <byte-string>, ret-map :: <name-ret-map>,
+                                     source :: <byte-string>)
+ => (temp :: <object>)
+  if (env-has-gc-typed?(b))
+    #f
+  else
+    let lhs = lower-expr(b, binop-left(node), ret-map, source);
+    if (~ lhs)
+      #f
+    else
+      let lhs-ty = fb-temp-type(b, lhs);
+      let edge-idx = fb-new-block(b, "sc_edge");
+      let rhs-idx = fb-new-block(b, "sc_rhs");
+      let join-idx = fb-new-block(b, "sc_join");
+      let edge-lbl = fb-block-label(b, edge-idx);
+      let rhs-lbl = fb-block-label(b, rhs-idx);
+      let join-lbl = fb-block-label(b, join-idx);
+      if (op = "|")
+        fb-terminate-if(b, lhs, edge-lbl, rhs-lbl);
+      else
+        fb-terminate-if(b, lhs, rhs-lbl, edge-lbl);
+      end;
+      // sc_edge: short-circuit — carry the LHS value.
+      fb-switch-to(b, edge-idx);
+      fb-terminate-jump(b, join-lbl, singleton-vec(lhs));
+      // sc_rhs: evaluate the RHS.
+      fb-switch-to(b, rhs-idx);
+      let rhs = lower-expr(b, binop-right(node), ret-map, source);
+      if (~ rhs)
+        #f
+      else
+        let rhs-ty = fb-temp-type(b, rhs);
+        fb-terminate-jump(b, join-lbl, singleton-vec(rhs));
+        fb-switch-to(b, join-idx);
+        fb-add-block-param(b, join-idx, join-type-label(lhs-ty, rhs-ty))
+      end
+    end
+  end
 end function;
 
 // ─── lower-if-expr — mirrors lower_if (the value-merge, non-mutating case) ──
