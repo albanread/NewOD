@@ -14,10 +14,12 @@
 mod format;
 mod ir;
 mod liveness;
+mod parse;
 mod verify;
 
 pub use nod_reader::{FileId, Span};
 pub use format::{format_dfm, format_dfm_module, format_for_cache_key};
+pub use parse::parse_dfm_module;
 pub use ir::{
     Block, BlockId, ClassCheck, Computation, ConstValue, Function, FunctionId, PrimOp, SlotTypeKind,
     SafepointLocation, SafepointRootLocation, Temporary, TempId, Terminator, TypeEstimate,

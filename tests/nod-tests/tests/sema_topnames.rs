@@ -455,6 +455,55 @@ fn dylan_lower_phase0_dump_dfm_byte_match() {
     );
 }
 
+/// Sprint 55 — DFM parser round-trip: `nod_dfm::parse_dfm_module` is the exact
+/// inverse of `format_dfm_module` on REAL corpus dumps. For each lowering
+/// fixture, the Rust `dump-dfm` text parsed back into `Vec<Function>` and
+/// re-formatted must be byte-identical. This isolates the parser — the
+/// reconstruction step of the load-bearing lowering flip — from both the Dylan
+/// lowering and the back-end passes. Pure Rust (no shim), so it always runs.
+#[test]
+#[serial]
+fn dfm_parse_reformat_roundtrip() {
+    let mut failures: Vec<String> = Vec::new();
+    for fx in PHASE0_LOWER_FIXTURES {
+        let input = fixtures_dir().join(format!("{fx}.dylan"));
+        assert!(input.is_file(), "missing fixture {}", input.display());
+
+        let dump = match nod_sema::dump_dfm_for_file(&input) {
+            Ok(d) => d,
+            Err(e) => {
+                failures.push(format!("{fx}: dump-dfm failed: {e:?}"));
+                continue;
+            }
+        };
+        // The reconstruction's class resolver is irrelevant to a round-trip
+        // (the dump carries class *names*, never ids), so a constant works.
+        let parsed = match nod_dfm::parse_dfm_module(&dump, &|_| Some(0)) {
+            Ok(p) => p,
+            Err(e) => {
+                failures.push(format!("{fx}: parse_dfm_module failed: {e}"));
+                continue;
+            }
+        };
+        let reformatted = nod_dfm::format_dfm_module(&parsed);
+        if reformatted != dump {
+            let first = dump
+                .lines()
+                .zip(reformatted.lines())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| format!("  line {i}:\n    orig: {a}\n    back: {b}"))
+                .unwrap_or_else(|| "  (length differs)".to_string());
+            failures.push(format!("{fx}: round-trip mismatch\n{first}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "DFM parser round-trip diverged from format_dfm_module:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
 /// Sprint 54c — THE load-bearing gate (the roadmap's Sprint 54 acceptance
 /// criterion): the back-end's DFM must be byte-identical whether the sema
 /// recording came from the Rust `analyse_module` or from the Dylan walk
