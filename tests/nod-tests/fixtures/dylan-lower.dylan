@@ -334,6 +334,14 @@ define function nrm-lookup (m :: <name-ret-map>, name :: <byte-string>)
   if (found) found else "<top>" end
 end function;
 
+// Is `name` a known top-level `define function`? Only these are safe plain
+// DirectCalls; a call to any other name (a stdlib function, a generic, or a
+// `%`-primitive) needs classification the Dylan side can't do yet, so it bails.
+define function nrm-contains? (m :: <name-ret-map>, name :: <byte-string>)
+ => (yes? :: <boolean>)
+  name-in-vec?(nrm-names(m), name)
+end function;
+
 // Declared return label of a `define function`, or #f if none.
 define function defn-declared-return-label (defn :: <ast-body-definition>,
                                             user-classes :: <stretchy-vector>,
@@ -362,6 +370,15 @@ define function defn-declared-return-label (defn :: <ast-body-definition>,
       label-for-type-name(type-name, user-classes)
     end
   end
+end function;
+
+// Is the definition declared void (`=> ()` — a return spec with zero values)?
+// Such a function returns `<unit>` with a bare `Return`, even if its body
+// produced a value temp (e.g. `let i = 0; while … end`, where the last
+// non-void statement was the `let`, not the loop).
+define function defn-is-void? (defn :: <ast-body-definition>) => (yes? :: <boolean>)
+  let rspec = defn-return(defn);
+  if (rspec) size(ret-values(rspec)) = 0 else #f end
 end function;
 
 // Build name -> declared-return-label map over top-level `define function`s.
@@ -621,9 +638,18 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
                           op: #f, args: arg-temps, callee: name));
           dst
         end
+      elseif (~ nrm-contains?(ret-map, name))
+        // Not a known top-level function — a stdlib function (DirectCall),
+        // generic (Dispatch), or `%`-primitive (DirectCall to a `nod_…` name).
+        // The Dylan side can't yet classify which, and emitting the wrong shape
+        // would be a miscompile, so bail to the Rust path. (The old Phase-0
+        // "unknown ident -> DirectCall" was unsound for generics / %-prims; it
+        // only happened to work for non-generic stdlib functions.)
+        #f
       else
-        // Args lower left-to-right BEFORE the dst is minted (dst id comes after
-        // all arg ids, matching lower.rs fresh_temp(ret) ordering).
+        // A known top-level `define function` -> DirectCall. Args lower
+        // left-to-right BEFORE the dst is minted (dst id comes after all arg
+        // ids, matching lower.rs fresh_temp(ret) ordering).
         let arg-nodes = call-args(node);
         let n = size(arg-nodes);
         let arg-temps = make(<stretchy-vector>);
@@ -1697,10 +1723,13 @@ define function lower-function (defn :: <ast-body-definition>,
     end;
     if (~ ok?)
       #f
-    elseif (~ last-temp)
-      // Void function: the body lowered but produced no value — a trailing
-      // loop, or a `=> ()` signature. Rust types these `<unit>` with a bare
-      // `Return` (no value). (lower.rs: a unit-valued body → Return{None}.)
+    elseif (defn-is-void?(defn) | ~ last-temp)
+      // Void function: declared `=> ()` (value discarded), or the body produced
+      // no value (a trailing loop with no prior binding). Rust types these
+      // `<unit>` with a bare `Return`. (lower.rs: a unit-valued body →
+      // Return{None}.) Checking `defn-is-void?` — not just `~ last-temp` — is
+      // essential: `let i = 0; while … end` leaves `last-temp` at the `let`'s
+      // temp, but a `=> ()` function still returns void.
       func-return-type(fb-func(b)) := "<unit>";
       fb-terminate-return(b, #f);
       fb-func(b)

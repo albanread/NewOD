@@ -387,7 +387,12 @@ fn run_dump_dfm_lower_with_dylan(ws: &Path, input: &Path) -> (String, String, bo
 const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "sprint09-add",          // params + binop
     "mutual",                // 3 fns: direct calls + int consts + binops
-    "hello",                 // string literal (Rust `{:?}` escaping) + call
+    // NOTE: `hello` (format-out) and `translate-loop` (done/consume) were here
+    // but now correctly BAIL: the Dylan call path only DirectCalls KNOWN
+    // top-level functions; a call to a stdlib function/generic/%-primitive can't
+    // yet be classified (DirectCall vs Dispatch vs nod_-name), so it bails
+    // rather than risk a wrong dump. They return once a generic-name primitive
+    // (+ %-prim name mapping) lands.
     "gap011-jcs-min-crash",  // 40 fns, chained direct calls
     "lower-let",             // 55a: chained `let` bindings + arithmetic
     "lower-if",              // 55a: `let` + `if`/`else` (block-param SSA diamond)
@@ -408,7 +413,6 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
 /// reconstructed DFM. Listed separately from PHASE0_LOWER_FIXTURES (which the
 /// standalone text gate also uses).
 const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
-    "translate-loop",        // 55a-tail: void (=> ()) functions + loop safepoints
     "point",                 // 55b: make + slot-getter Dispatch + class-typed param
     "gc_precise_two_makes",  // 55b: two makes + dispatch + populated safepoints
     "translate-class",       // 55b: class + make/dispatch (real corpus fixture)

@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: call-path soundness (the unknown→DirectCall trap)](2026-06-07-sprint-55b-call-path-soundness.md)
+  — A whole-corpus survey caught 4 NEW mismatches after make/dispatch: enabling
+  `make` let the gap repros lower into a latent unsoundness — Phase-0 emitted
+  `DirectCall` for ANY callee, wrong for stdlib generics (`size`→Dispatch) and
+  `%`-prims (`%make-…`→`nod_…`). Fix: only DirectCall KNOWN top-level functions;
+  bail other non-local callees. `hello`/`translate-loop` bail until a
+  generic-name primitive lands. Invariant (0 corpus mismatches) restored. Lesson:
+  the survey, not the curated gate, is the safety net.
 - [2026-06-07 — Sprint 55b: make + dispatch (first class programs in Dylan)](2026-06-07-sprint-55b-make-dispatch.md)
   — `point`/`gc_precise_two_makes`/`translate-class` now lower in Dylan and
   byte-match through the flip. `make` emits `ClassMetadataPtr` BY NAME (parser
