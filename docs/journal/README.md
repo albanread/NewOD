@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: make + dispatch (first class programs in Dylan)](2026-06-07-sprint-55b-make-dispatch.md)
+  — `point`/`gc_precise_two_makes`/`translate-class` now lower in Dylan and
+  byte-match through the flip. `make` emits `ClassMetadataPtr` BY NAME (parser
+  resolves it post-registration); generic calls → `Dispatch` (host populates
+  safepoints + resolves); class-typed params print bare `<class>` (the id isn't
+  needed there). Only a few lines of Rust (`parse_const`); the rest is Dylan.
+  Flip-only fixtures. richards still bails (needs `define method`).
 - [2026-06-07 — Sprint 55a-tail: unary `-`, `define constant`, void functions](2026-06-07-sprint-55a-tail-unary-constant-void.md)
   — Three small forms: unary `-x`→NegInt/NegFloat, `define constant`→0-arg init
   fn, void (`=> ()`) functions→`<unit>`+bare Return. `kernel-arith` joins the

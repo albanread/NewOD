@@ -336,6 +336,7 @@ end function;
 
 // Declared return label of a `define function`, or #f if none.
 define function defn-declared-return-label (defn :: <ast-body-definition>,
+                                            user-classes :: <stretchy-vector>,
                                             source :: <byte-string>)
  => (label :: <object>)
   let rspec = defn-return(defn);
@@ -358,13 +359,14 @@ define function defn-declared-return-label (defn :: <ast-body-definition>,
         else
           token-source-text(typed-name-tok(tn), source)
         end;
-      type-name-to-label(type-name)
+      label-for-type-name(type-name, user-classes)
     end
   end
 end function;
 
 // Build name -> declared-return-label map over top-level `define function`s.
 define function build-name-ret-map (items :: <stretchy-vector>,
+                                    user-classes :: <stretchy-vector>,
                                     source :: <byte-string>)
  => (m :: <name-ret-map>)
   let names  = make(<stretchy-vector>);
@@ -379,7 +381,7 @@ define function build-name-ret-map (items :: <stretchy-vector>,
         let name-tok = defn-method-name(item);
         if (name-tok)
           let name = token-source-text(name-tok, source);
-          let lbl  = defn-declared-return-label(item, source);
+          let lbl  = defn-declared-return-label(item, user-classes, source);
           add!(names, name);
           add!(labels, if (lbl) lbl else "<top>" end);
         end;
@@ -545,11 +547,80 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
             end
           end
         end
-      // A call to a slot/generic name is a Dispatch (lower.rs 6060), and `make`
-      // is an intrinsic — neither is a plain DirectCall. Until those forms land,
-      // bail the whole function to the Rust path so we never emit a wrong dump.
-      elseif (name-in-vec?(fb-generics(b), name) | is-lower-intrinsic?(name))
-        #f
+      // `make(<C>, kw: v, …)` -> a ClassMetadataPtr Const (class emitted BY
+      // NAME — the host reconstruction resolves it against the registered class
+      // table), then interleaved (SymbolLiteralRef(kw), value) consts, then
+      // `DirectCall %make(…)` dst <top> (lower_make, lower.rs 6095). A
+      // positional (non-keyword) supplied arg bails (make-from shapes — later).
+      elseif (name = "make")
+        let arg-nodes = call-args(node);
+        if (size(arg-nodes) < 1)
+          #f
+        else
+          let cls-node = unwrap-arg(arg-nodes[0]);
+          if (~ instance?(cls-node, <ast-variable-ref>))
+            #f
+          else
+            let make-args = make(<stretchy-vector>);
+            let cptr = fb-fresh-temp(b, "<top>");
+            fb-push(b, make(<dfm-comp>, kind: "const", dst: cptr,
+                            cval: concatenate("ClassMetadataPtr(",
+                                    concatenate(token-source-text(varref-tok(cls-node), source),
+                                                ", tagged=false)")),
+                            op: #f, args: make(<stretchy-vector>), callee: #f));
+            add!(make-args, cptr);
+            let ok? = #t;
+            let i = 1;
+            let n = size(arg-nodes);
+            until (i >= n | ~ ok?)
+              let a = arg-nodes[i];
+              if (~ instance?(a, <ast-kw-arg>))
+                ok? := #f;
+              else
+                let kw = keyword-name-token-name(kw-arg-key(a));
+                let symt = fb-fresh-temp(b, "<top>");
+                fb-push(b, make(<dfm-comp>, kind: "const", dst: symt,
+                                cval: concatenate("SymbolLiteralRef(\"",
+                                        concatenate(escape-string-debug(kw), "\")")),
+                                op: #f, args: make(<stretchy-vector>), callee: #f));
+                add!(make-args, symt);
+                let v = lower-expr(b, kw-arg-value(a), ret-map, source);
+                if (~ v) ok? := #f; else add!(make-args, v); end;
+              end;
+              i := i + 1;
+            end;
+            if (~ ok?)
+              #f
+            else
+              let dst = fb-fresh-temp(b, "<top>");
+              fb-push(b, make(<dfm-comp>, kind: "directcall", dst: dst, cval: #f,
+                              op: #f, args: make-args, callee: "%make"));
+              dst
+            end
+          end
+        end
+      // A call to a known generic (a slot getter, etc.) -> `Dispatch g(args)`
+      // dst <top>, EMPTY safepoint set (the host liveness pass populates it; the
+      // resolver may later rewrite it to Direct/SealedDirectCall). lower.rs 6060.
+      elseif (name-in-vec?(fb-generics(b), name))
+        let arg-nodes = call-args(node);
+        let n = size(arg-nodes);
+        let arg-temps = make(<stretchy-vector>);
+        let i = 0;
+        let ok? = #t;
+        until (i >= n | ~ ok?)
+          let at = lower-expr(b, unwrap-arg(arg-nodes[i]), ret-map, source);
+          if (~ at) ok? := #f; else add!(arg-temps, at); end;
+          i := i + 1;
+        end;
+        if (~ ok?)
+          #f
+        else
+          let dst = fb-fresh-temp(b, "<top>");
+          fb-push(b, make(<dfm-comp>, kind: "dispatch", dst: dst, cval: #f,
+                          op: #f, args: arg-temps, callee: name));
+          dst
+        end
       else
         // Args lower left-to-right BEFORE the dst is minted (dst id comes after
         // all arg ids, matching lower.rs fresh_temp(ret) ordering).
@@ -1293,13 +1364,6 @@ define function name-in-vec? (v :: <stretchy-vector>, s :: <byte-string>)
   found
 end function;
 
-// Names treated as intrinsics by lower_call (NOT plain DirectCalls). Until each
-// is ported, a call to one bails the function to Rust. `instance?` is now
-// handled (TypeCheck); `make` still bails.
-define function is-lower-intrinsic? (name :: <byte-string>) => (yes? :: <boolean>)
-  name = "make"
-end function;
-
 // ClassCheck::name() — the label printed for a `TypeCheck`. Most class names
 // pass through verbatim (builtins like <integer>/<boolean>/<character>/<symbol>,
 // <object>, and user classes by source name), but two builtins normalize to
@@ -1470,14 +1534,48 @@ define function emit-class-accessors (cd :: <ast-class-definition>,
   end;
 end function;
 
+// Names of all user `define class`es in the module (so a param/return/slot of a
+// user-class type can be typed `<class>` rather than `<top>`).
+define function build-user-class-names (items :: <stretchy-vector>, source :: <byte-string>)
+ => (names :: <stretchy-vector>)
+  let names = make(<stretchy-vector>);
+  let n = size(items);
+  let i = 0;
+  until (i >= n)
+    let item = items[i];
+    if (instance?(item, <ast-class-definition>))
+      let nt = class-name(item);
+      if (instance?(nt, <token>))
+        add!(names, token-source-text(nt, source));
+      end;
+    end;
+    i := i + 1;
+  end;
+  names
+end function;
+
+// Map a declared type name to its DFM label, treating any user class as
+// `<class>` (TypeEstimate::Class, which `name()` renders `<class>`); other names
+// go through the scalar `type-name-to-label` (-> `<top>` for the unknown rest).
+define function label-for-type-name (type-name :: <byte-string>,
+                                     user-classes :: <stretchy-vector>)
+ => (label :: <byte-string>)
+  if (name-in-vec?(user-classes, type-name))
+    "<class>"
+  else
+    type-name-to-label(type-name)
+  end
+end function;
+
 // Declared return label of a constant's binder: `*x* :: <integer> = …` gives
 // the typed-name's type label; a bare `*x* = …` gives #f (use the init type).
-define function constant-declared-label (lhs :: <object>, source :: <byte-string>)
+define function constant-declared-label (lhs :: <object>, user-classes :: <stretchy-vector>,
+                                         source :: <byte-string>)
  => (label :: <object>)
   if (instance?(lhs, <ast-typed-name>))
     let ty = typed-name-type(lhs);
     if (ty & instance?(ty, <ast-variable-ref>))
-      type-name-to-label(token-source-text(varref-tok(ty), source))
+      label-for-type-name(token-source-text(varref-tok(ty), source), user-classes)
     else
       #f
     end
@@ -1493,6 +1591,7 @@ end function;
 define function lower-constant-defn (ld :: <ast-list-definition>,
                                      ret-map :: <name-ret-map>,
                                      gnames :: <stretchy-vector>,
+                                     user-classes :: <stretchy-vector>,
                                      source :: <byte-string>) => (func :: <object>)
   let cs = body-constituents(defn-list(ld));
   if (size(cs) ~= 1)
@@ -1520,7 +1619,7 @@ define function lower-constant-defn (ld :: <ast-list-definition>,
         if (~ t)
           #f
         else
-          let declared = constant-declared-label(lhs, source);
+          let declared = constant-declared-label(lhs, user-classes, source);
           let ret-label = if (declared) declared else fb-temp-type(b, t) end;
           func-return-type(fb-func(b)) := ret-label;
           fb-terminate-return(b, t);
@@ -1541,7 +1640,9 @@ end function;
 
 define function lower-function (defn :: <ast-body-definition>,
                                 ret-map :: <name-ret-map>,
-                                gnames :: <stretchy-vector>, source :: <byte-string>)
+                                gnames :: <stretchy-vector>,
+                                user-classes :: <stretchy-vector>,
+                                source :: <byte-string>)
  => (func :: <object>)
   let name-tok = defn-method-name(defn);
   if (~ name-tok)
@@ -1565,7 +1666,7 @@ define function lower-function (defn :: <ast-body-definition>,
           else
             ""
           end;
-        let t = fb-fresh-temp(b, type-name-to-label(type-name));
+        let t = fb-fresh-temp(b, label-for-type-name(type-name, user-classes));
         add!(func-params(fb-func(b)), t);
         // Bind the param name so body var-refs resolve to its temp.
         fb-bind(b, token-source-text(typed-name-tok(tn), source), t);
@@ -1605,7 +1706,7 @@ define function lower-function (defn :: <ast-body-definition>,
       fb-func(b)
     else
       // (3) return_type: declared wins, else the final temp's type.
-      let declared = defn-declared-return-label(defn, source);
+      let declared = defn-declared-return-label(defn, user-classes, source);
       let ret-label = if (declared) declared else fb-temp-type(b, last-temp) end;
       func-return-type(fb-func(b)) := ret-label;
       // (4) Return{value}.
@@ -1707,6 +1808,21 @@ define function fmt-computation (c :: <dfm-comp>, temps :: <stretchy-vector>)
     concatenate(head,
       concatenate(" = TypeCheck t", concatenate(integer-to-string(comp-args(c)[0]),
         concatenate(" ", concatenate(comp-cval(c), "\n")))))
+  elseif (kind = "dispatch")
+    // `= Dispatch generic(t0, t1)` (format.rs 189-206). Lowering always emits an
+    // EMPTY safepoint set (the host liveness pass populates it), and the dst is
+    // always <top> here, so `head` (which uses the dst's label) is correct.
+    let line = concatenate(head,
+                 concatenate(" = Dispatch ", concatenate(comp-callee(c), "(")));
+    let args = comp-args(c);
+    let n = size(args);
+    let i = 0;
+    until (i >= n)
+      if (i > 0) line := concatenate(line, ", "); end;
+      line := concatenate(line, concatenate("t", integer-to-string(args[i])));
+      i := i + 1;
+    end;
+    concatenate(line, ")\n")
   else
     // directcall: ` = DirectCall callee(t0, t1)`; empty safepoint + not
     // no_alloc -> nothing appended.
@@ -1836,7 +1952,8 @@ define function dylan-lower-emit (source :: <byte-string>)
   let tokens = lex(source);
   let ast    = parse-dylan-with-precedence(tokens, precedence-c-header?(source));
   let items  = body-constituents(ast);
-  let ret-map = build-name-ret-map(items, source);
+  let user-classes = build-user-class-names(items, source);
+  let ret-map = build-name-ret-map(items, user-classes, source);
   let gnames  = build-generic-names(items, source);
   let funcs  = make(<stretchy-vector>);
   let n = size(items);
@@ -1864,7 +1981,7 @@ define function dylan-lower-emit (source :: <byte-string>)
     if (instance?(item, <ast-body-definition>))
       let word = token-source-text(defn-word(item), source);
       if (word = "function")
-        let f = lower-function(item, ret-map, gnames, source);
+        let f = lower-function(item, ret-map, gnames, user-classes, source);
         if (f) add!(funcs, f); else all-ok? := #f; end;
       else
         all-ok? := #f;     // `define method` — 55b dispatch
@@ -1875,7 +1992,7 @@ define function dylan-lower-emit (source :: <byte-string>)
       // `define constant` emits a 0-arg initializer function; `define variable`
       // and anything else still bails.
       if (token-source-text(defn-word(item), source) = "constant")
-        let f = lower-constant-defn(item, ret-map, gnames, source);
+        let f = lower-constant-defn(item, ret-map, gnames, user-classes, source);
         if (f) add!(funcs, f); else all-ok? := #f; end;
       else
         all-ok? := #f;

@@ -483,7 +483,7 @@ fn parse_computation(
     match kw {
         // `Const ` then a ConstValue (`fmt_computation` L85-89).
         "Const" => {
-            let value = parse_const(lno, args_part)?;
+            let value = parse_const(lno, args_part, resolve_class)?;
             Ok(Computation::Const { dst, value })
         }
         // `PrimOp {Op}` then zero-or-more ` t{id}` (L90-102).
@@ -843,7 +843,17 @@ fn parse_slot_kind_bracketed(lno: usize, tok: &str) -> Result<SlotTypeKind, Stri
 // ---------------------------------------------------------------------------
 
 /// Parse a `ConstValue`, inverse of `fmt_const` (format.rs L262-310).
-fn parse_const(lno: usize, s: &str) -> Result<ConstValue, String> {
+///
+/// `resolve_class` is used for `ClassMetadataPtr`: the human format prints a
+/// numeric class id, but a Dylan-side lowering wire dump emits the class NAME
+/// (it can't know the host-assigned id at lowering time) — a non-numeric id
+/// payload is resolved through `resolve_class`. The id round-trips as-is when
+/// numeric, so this does not disturb `format`→`parse`→`format` identity.
+fn parse_const(
+    lno: usize,
+    s: &str,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
+) -> Result<ConstValue, String> {
     // `Unit` is the only payload-less form (L279-281).
     if s == "Unit" {
         return Ok(ConstValue::Unit);
@@ -892,14 +902,18 @@ fn parse_const(lno: usize, s: &str) -> Result<ConstValue, String> {
                 .ok_or_else(|| format!("line {lno}: bad WordBits literal {inner:?}"))?;
             ConstValue::WordBits(bits)
         }
-        // ClassMetadataPtr(N, tagged=BOOL) — L285-287.
+        // ClassMetadataPtr(N, tagged=BOOL) — L285-287. N is numeric in the human
+        // format; a Dylan wire dump emits the class NAME, resolved here.
         "ClassMetadataPtr" => {
             let (id_part, tag_part) = inner
                 .split_once(", ")
                 .ok_or_else(|| format!("line {lno}: malformed ClassMetadataPtr {inner:?}"))?;
-            let class_id: u32 = id_part
-                .parse()
-                .map_err(|_| format!("line {lno}: bad ClassMetadataPtr id {id_part:?}"))?;
+            let class_id: u32 = match id_part.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => resolve_class(id_part).ok_or_else(|| {
+                    format!("line {lno}: unresolved class name in ClassMetadataPtr: {id_part:?}")
+                })?,
+            };
             let tagged = parse_tagged_eq(lno, tag_part)?;
             ConstValue::ClassMetadataPtr { class_id, tagged }
         }
@@ -1633,6 +1647,32 @@ mod tests {
     #[test]
     fn roundtrip_types() {
         assert_roundtrip(&[fn_types()]);
+    }
+
+    /// A Dylan-side lowering wire dump emits `ClassMetadataPtr` by class NAME
+    /// (it can't know the host-assigned id at lowering time); the reconstruction
+    /// resolves it via `resolve_class`. (The human format uses a numeric id,
+    /// which round-trips unchanged — see `roundtrip_computations`.)
+    #[test]
+    fn classmetadataptr_by_name_resolves() {
+        let text = "fn mk () -> <top>:\n  \
+                    entry:\n    \
+                    t0: <top> = Const ClassMetadataPtr(<my-class>, tagged=false)\n    \
+                    Return t0\n";
+        let resolver = |name: &str| if name == "<my-class>" { Some(4242) } else { None };
+        let fns = parse_dfm_module(text, &resolver).unwrap();
+        match &fns[0].blocks[0].computations[0] {
+            Computation::Const {
+                value: ConstValue::ClassMetadataPtr { class_id, tagged },
+                ..
+            } => {
+                assert_eq!(*class_id, 4242);
+                assert!(!tagged);
+            }
+            other => panic!("expected ClassMetadataPtr, got {other:?}"),
+        }
+        // An unresolvable name is a descriptive error, not a panic.
+        assert!(parse_dfm_module(text, &|_| None).is_err());
     }
 
     #[test]

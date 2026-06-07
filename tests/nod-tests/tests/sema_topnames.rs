@@ -409,6 +409,9 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
 /// standalone text gate also uses).
 const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "translate-loop",        // 55a-tail: void (=> ()) functions + loop safepoints
+    "point",                 // 55b: make + slot-getter Dispatch + class-typed param
+    "gc_precise_two_makes",  // 55b: two makes + dispatch + populated safepoints
+    "translate-class",       // 55b: class + make/dispatch (real corpus fixture)
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan
