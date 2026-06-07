@@ -28,6 +28,16 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 53.5b: anonymous-method lifting (`__anon-method-N`)](2026-06-07-sema-53-5b-anon-method-lifting.md)
+  — The Dylan sema walk now lifts `method (…) … end` literals in expression
+  position to synthetic `__anon-method-N` top-level functions, mirroring the
+  Rust `lift_anonymous_methods` pre-pass (pre-order, source-order numbering;
+  arity = param count, return = `Top`). `nod-ide` byte-matches end-to-end and
+  joins the gate (now 35). Ground truth corrected the 53.5(1) survey: `rope` /
+  `ide_rope` / `unified_ide` carry two further, independent gaps (implicit
+  generics from bare `define method`; user-class return = `Class(id)`, a
+  Sprint-54 class-id-determinism concern) — so they stay ungated, scoped out
+  of the anon-method work.
 - [2026-06-06 — GAP-011 #2: it is a codegen WRONG-VALUE bug, not GC (diagnosis + design)](2026-06-06-gap011-2-codegen-wrong-value-diagnosis.md)
   — Diagnose-and-design pass on the second sema-walk crash. The headline is
   a correction: the `%byte-string-size` crash in `collect-top-names` is a

@@ -76,9 +76,23 @@ fn fixtures_dir() -> PathBuf {
 /// Dylan parser now recognizes the NAME-token body-shaped statement macro
 /// `with-cleanup … cleanup … end` (it was previously parsed as a bare
 /// variable-ref and desynced, dropping the enclosing `define function`).
-/// (The one known remaining divergence is documented in the journal:
-/// anonymous-method lifting `__anon-method-N` — `rope`, `ide_rope`,
-/// `unified_ide`, `nod-ide` — which awaits its own focused sprint.)
+/// Sprint 53.5b closed the anonymous-method-lifting divergence: the Dylan
+/// walk now mirrors the Rust lowering pre-pass (`lift_anonymous_methods`),
+/// lifting every `method (...) ... end` literal in expression position to a
+/// synthetic `__anon-method-N` top-level function, numbered in the same
+/// depth-first source order. `nod-ide` (four such literals) now byte-matches
+/// end-to-end and joins the gate. Ground truth corrected the 53.5(1) survey,
+/// which had blamed the `rope` / `ide_rope` / `unified_ide` divergence solely
+/// on anon-methods: those three carry TWO further, independent gaps the
+/// anon-method work does not touch, so they stay ungated for now —
+///   * implicit generics from bare `define method` (the oracle records a
+///     `generic <name>` per method name; the Dylan walk only emits generics
+///     from `define generic` + slot accessors, per the DEFERRED note in
+///     `collect-top-names`), and
+///   * user-class return estimates (`empty-rope () => (r :: <rope-leaf>)`
+///     dumps `return=Class(<id>)` in the oracle vs `return=Top` here), which
+///     needs the runtime class-id reproduced in the Dylan walk — the Sprint
+///     54 class-id-determinism problem, not an anon-method concern.
 const FIXTURES: &[&str] = &[
     // 53.2 — class-free top-names (functions / constants / variables).
     "factorial",
@@ -122,6 +136,9 @@ const FIXTURES: &[&str] = &[
     "ide_helpers",
     "ide_syntax",
     "ide_win_calls",
+    // 53.5b — anonymous-method lifting (`__anon-method-N`). `nod-ide` has
+    // four `method (…) … end` literals and now byte-matches end-to-end.
+    "nod-ide",
 ];
 
 /// Normalize a top-names block the same way on both sides: CRLF -> LF,

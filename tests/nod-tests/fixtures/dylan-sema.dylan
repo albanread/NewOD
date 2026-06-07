@@ -367,6 +367,192 @@ define function join-comma (v :: <stretchy-vector>) => (s :: <byte-string>)
   out
 end function;
 
+// ─── Sprint 53.5b: anonymous-method lifting ──────────────────────────────
+//
+// The Rust lowering pre-pass (`lift_anonymous_methods`, nod-sema/src/lower.rs)
+// rewrites every `method (...) ... end` literal in EXPRESSION position into a
+// synthetic top-level `define function` named `__anon-method-N`. `N` is a
+// counter incremented once per literal during a depth-first, source-order
+// walk of the module's items: a literal is numbered BEFORE the literals
+// nested inside its own body (pre-order), and sibling literals are numbered
+// left-to-right. Those synthetic functions are recorded in `top_names.fns`
+// with arity = the literal's parameter count and return = Top (the lifter
+// always sets `return_: None`), so they surface as
+// `fn __anon-method-N arity=A return=Top` lines in the sema dump.
+//
+// This pre-pass replicates that lift over the Dylan `<ast-*>` tree so the
+// dump byte-matches the oracle. It mirrors `dump-node`'s child-visit order
+// (dylan-parser.dylan) — the same source order the Rust lifter sees — and
+// the same inclusions/exclusions as `lift_item`/`lift_statement`/`lift_expr`:
+// it descends `define function`/`define method` bodies and `define
+// constant`/`variable` initialisers, but NOT class supers / slot defaults,
+// generic signatures, or `local method` bodies (Rust's `Statement::Local`).
+//
+// `ctr` is a one-element <stretchy-vector> used as a mutable counter box,
+// threaded through the recursion (top-level functions cannot share a mutable
+// `let` binding, so the count must live on the heap).
+
+// Emit one `fn __anon-method-N arity=A return=Top` entry and bump the counter.
+define function lift-anon-emit (ctr :: <stretchy-vector>, arity :: <integer>,
+                                fns :: <stretchy-vector>) => ()
+  let id = ctr[0];
+  ctr[0] := id + 1;
+  let name = concatenate("__anon-method-", integer-to-string(id));
+  let line = concatenate("fn ", concatenate(name,
+               concatenate(" arity=", concatenate(integer-to-string(arity),
+                 " return=Top"))));
+  add!(fns, make(<top-fn>, name: name, line: line));
+end function;
+
+// Walk an <ast-body>'s constituents in order.
+define function lift-anon-body (body :: <ast-body>, source :: <byte-string>,
+                                fns :: <stretchy-vector>,
+                                ctr :: <stretchy-vector>) => ()
+  let cs = body-constituents(body);
+  let n = size(cs);
+  let i = 0;
+  until (i >= n)
+    lift-anon-node(cs[i], source, fns, ctr);
+    i := i + 1;
+  end;
+end function;
+
+// Walk a `for` iteration header's `connector expr` parts.
+define function lift-anon-for-clause (fc :: <ast-for-clause>, source :: <byte-string>,
+                                      fns :: <stretchy-vector>,
+                                      ctr :: <stretchy-vector>) => ()
+  let parts = for-clause-parts(fc);
+  let n = size(parts);
+  let i = 0;
+  until (i >= n)
+    lift-anon-node(for-part-expr(parts[i]), source, fns, ctr);
+    i := i + 1;
+  end;
+end function;
+
+// Recurse one AST node, lifting any anonymous method literal it (or its
+// children) contains, in source order.
+define function lift-anon-node (node :: <object>, source :: <byte-string>,
+                                fns :: <stretchy-vector>,
+                                ctr :: <stretchy-vector>) => ()
+  if (instance?(node, <ast-statement>))
+    let word = token-source-text(stmt-word(node), source);
+    if ((word = "method" | word = "function")
+          & ~ instance?(stmt-method-name(node), <token>))
+      // Anonymous method/function literal — number it (parent before
+      // nested), then descend its body so nested literals get higher N.
+      let arity = if (instance?(stmt-params(node), <ast-param-list>))
+                    size(params-required(stmt-params(node)))
+                  else
+                    0
+                  end;
+      lift-anon-emit(ctr, arity, fns);
+      lift-anon-body(stmt-body(node), source, fns, ctr);
+    else
+      // Control statement (if / begin / while / until / block / for /
+      // case / select / unless / when, or a named method literal). Visit
+      // the for-header expressions, then the leading body, then trailing
+      // clauses — the source order the Rust lifter sees once the macro
+      // engine has lowered these to core forms.
+      if (instance?(stmt-for-header(node), <stretchy-vector>))
+        let fcs = stmt-for-header(node);
+        let nf = size(fcs);
+        let fi = 0;
+        until (fi >= nf)
+          lift-anon-for-clause(fcs[fi], source, fns, ctr);
+          fi := fi + 1;
+        end;
+      end;
+      lift-anon-body(stmt-body(node), source, fns, ctr);
+      if (instance?(stmt-clauses(node), <stretchy-vector>))
+        let cls = stmt-clauses(node);
+        let nc = size(cls);
+        let ci = 0;
+        until (ci >= nc)
+          lift-anon-body(clause-body(cls[ci]), source, fns, ctr);
+          ci := ci + 1;
+        end;
+      end;
+    end;
+  elseif (instance?(node, <ast-local-decl>))
+    // `let binder = init` — the init lives in the list-fragment body.
+    lift-anon-body(ldecl-list(node), source, fns, ctr);
+  elseif (instance?(node, <ast-binary-op>))
+    lift-anon-node(binop-left(node), source, fns, ctr);
+    lift-anon-node(binop-right(node), source, fns, ctr);
+  elseif (instance?(node, <ast-unary-op>))
+    lift-anon-node(unary-operand(node), source, fns, ctr);
+  elseif (instance?(node, <ast-call>))
+    lift-anon-node(call-fn(node), source, fns, ctr);
+    let args = call-args(node);
+    let na = size(args);
+    let ai = 0;
+    until (ai >= na)
+      lift-anon-node(args[ai], source, fns, ctr);
+      ai := ai + 1;
+    end;
+  elseif (instance?(node, <ast-dot-call>))
+    lift-anon-node(dot-receiver(node), source, fns, ctr);
+  elseif (instance?(node, <ast-subscript>))
+    lift-anon-node(sub-receiver(node), source, fns, ctr);
+    let args = sub-args(node);
+    let na = size(args);
+    let ai = 0;
+    until (ai >= na)
+      lift-anon-node(args[ai], source, fns, ctr);
+      ai := ai + 1;
+    end;
+  elseif (instance?(node, <ast-pos-arg>))
+    lift-anon-node(pos-arg-value(node), source, fns, ctr);
+  elseif (instance?(node, <ast-kw-arg>))
+    lift-anon-node(kw-arg-value(node), source, fns, ctr);
+  elseif (instance?(node, <ast-paren-list>))
+    let items = paren-list-items(node);
+    let ni = size(items);
+    let pi = 0;
+    until (pi >= ni)
+      lift-anon-node(items[pi], source, fns, ctr);
+      pi := pi + 1;
+    end;
+  elseif (instance?(node, <ast-body>))
+    lift-anon-body(node, source, fns, ctr);
+  end;
+  // <ast-local-methods> (skip — mirror Rust Statement::Local), literals,
+  // variable-refs, typed-names, and definitions hold no liftable literal.
+end function;
+
+// Pre-pass over the top-level items, in declaration order, appending one
+// `fn __anon-method-N` entry per anonymous method literal (see above).
+define function collect-anon-methods (items :: <stretchy-vector>,
+                                      source :: <byte-string>,
+                                      fns :: <stretchy-vector>) => ()
+  let ctr = make(<stretchy-vector>);
+  add!(ctr, 0);
+  let n = size(items);
+  let i = 0;
+  until (i >= n)
+    let item = items[i];
+    if (instance?(item, <ast-body-definition>))
+      let word = token-source-text(defn-word(item), source);
+      if (word = "function" | word = "method")
+        lift-anon-body(defn-body(item), source, fns, ctr);
+      end;
+    elseif (instance?(item, <ast-list-definition>))
+      // `define constant`/`variable` — descend the initialiser.
+      lift-anon-body(defn-list(item), source, fns, ctr);
+    elseif (instance?(item, <ast-class-definition>)
+              | instance?(item, <ast-generic-definition>))
+      // Skip — the Rust lifter does not descend class supers / slot
+      // defaults or generic signatures.
+      #f
+    else
+      // Bare top-level expression (Rust `Item::Expr`).
+      lift-anon-node(item, source, fns, ctr);
+    end;
+    i := i + 1;
+  end;
+end function;
+
 // ─── the walk ────────────────────────────────────────────────────────────
 
 define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
@@ -476,6 +662,12 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
     end;
     i := i + 1;
   end;
+
+  // Sprint 53.5b — anonymous method literals lift to synthetic
+  // `__anon-method-N` top-level functions in the Rust sema model. Run the
+  // lift pre-pass over the same items, in declaration order, so the indices
+  // follow the oracle's; the entries sort into `fns` with everything else.
+  collect-anon-methods(items, source, fns);
 
   sort-fns!(fns);
   sort-strings!(consts);
