@@ -365,6 +365,9 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "hello",                 // string literal (Rust `{:?}` escaping) + call
     "gap011-jcs-min-crash",  // 40 fns, chained direct calls
     "lower-let",             // 55a: chained `let` bindings + arithmetic
+    "lower-if",              // 55a: `let` + `if`/`else` (block-param SSA diamond)
+    "factorial",             // 55a: recursion + `if` (real corpus fixture)
+    "jit_cache_sample_items", // 55a: real corpus fixture, now fully lowered
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan

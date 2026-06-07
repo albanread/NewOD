@@ -50,13 +50,30 @@ end class;
 // A block (ir.rs Block). Phase 0 makes exactly the entry block. Terminator is
 // inlined: block-term-kind is "return"; block-term-value is the <integer> temp
 // id, or #f for a bare `Return`.
+// A terminator (ir.rs Terminator). kind ∈ {"return","if","jump"}:
+//   return: value = <integer> temp or #f.
+//   if:     value = cond temp; a = then-label; b = else-label.
+//   jump:   a = target-label; args = <stretchy-vector> of temp ids.
+// Held as a separate object so <dfm-block>'s `make` stays within the 8-keyword
+// limit and every slot is supplied (avoiding the slot-default GAP).
+define class <dfm-term> (<object>)
+  slot term-kind  :: <byte-string>, init-keyword: kind:;
+  slot term-value :: <object>,      init-keyword: value:;
+  slot term-a     :: <object>,      init-keyword: a:;
+  slot term-b     :: <object>,      init-keyword: b:;
+  slot term-args  :: <object>,      init-keyword: args:;
+end class;
+
+define function make-return-term (value :: <object>) => (t :: <dfm-term>)
+  make(<dfm-term>, kind: "return", value: value, a: #f, b: #f, args: #f)
+end function;
+
 define class <dfm-block> (<object>)
-  slot block-id         :: <integer>,         init-keyword: id:;
-  slot block-label      :: <byte-string>,     init-keyword: label:;
-  slot block-params     :: <stretchy-vector>, init-keyword: params:;
-  slot block-comps      :: <stretchy-vector>, init-keyword: comps:;
-  slot block-term-kind  :: <byte-string>,     init-keyword: term-kind:;
-  slot block-term-value :: <object>,          init-keyword: term-value:;
+  slot block-id     :: <integer>,         init-keyword: id:;
+  slot block-label  :: <byte-string>,     init-keyword: label:;
+  slot block-params :: <stretchy-vector>, init-keyword: params:;
+  slot block-comps  :: <stretchy-vector>, init-keyword: comps:;
+  slot block-term   :: <dfm-term>,        init-keyword: term:;
 end class;
 
 // A function (ir.rs Function). func-temps is the master temp list (so we can
@@ -90,7 +107,7 @@ define function make-fn-builder (name :: <byte-string>) => (b :: <fn-builder>)
                    id: 0, label: "entry",
                    params: make(<stretchy-vector>),
                    comps:  make(<stretchy-vector>),
-                   term-kind: "return", term-value: #f);
+                   term: make-return-term(#f));
   let blocks = make(<stretchy-vector>);
   add!(blocks, entry);
   let func = make(<dfm-func>,
@@ -143,14 +160,68 @@ end function;
 // <integer> temp id, or #f for bare Return).
 define function fb-terminate-return (b :: <fn-builder>, value :: <object>) => ()
   let blk = func-blocks(fb-func(b))[fb-current(b)];
-  block-term-kind(blk) := "return";
-  block-term-value(blk) := value;
+  block-term(blk) := make-return-term(value);
 end function;
 
 // Function::temp_type — rendered type label of a temp id (Top fallback).
 define function fb-temp-type (b :: <fn-builder>, id :: <integer>)
  => (ty :: <byte-string>)
   temp-type-of(func-temps(fb-func(b)), id)
+end function;
+
+// new_block — allocate the next block id, append a block labelled
+// `<prefix><id>` (matching the Rust new_block labels: "then1", "else2",
+// "join3"), default Return{None} terminator. Returns the block's index in
+// func-blocks (== its id, since blocks are appended in id order).
+define function fb-new-block (b :: <fn-builder>, prefix :: <byte-string>)
+ => (index :: <integer>)
+  let id = fb-next-block(b);
+  fb-next-block(b) := id + 1;
+  let blk = make(<dfm-block>,
+                 id: id, label: concatenate(prefix, integer-to-string(id)),
+                 params: make(<stretchy-vector>),
+                 comps:  make(<stretchy-vector>),
+                 term: make-return-term(#f));
+  let blocks = func-blocks(fb-func(b));
+  let index = size(blocks);
+  add!(blocks, blk);
+  index
+end function;
+
+// switch_to — make `index` the current block.
+define function fb-switch-to (b :: <fn-builder>, index :: <integer>) => ()
+  fb-current(b) := index;
+end function;
+
+// Block label by index.
+define function fb-block-label (b :: <fn-builder>, index :: <integer>)
+ => (label :: <byte-string>)
+  block-label(func-blocks(fb-func(b))[index])
+end function;
+
+// add_block_param — append a fresh temp (typed `ty`) as a parameter of block
+// `index`; returns the temp id (the merged value at a join).
+define function fb-add-block-param (b :: <fn-builder>, index :: <integer>,
+                                    ty :: <byte-string>) => (temp :: <integer>)
+  let t = fb-fresh-temp(b, ty);
+  add!(block-params(func-blocks(fb-func(b))[index]), t);
+  t
+end function;
+
+// terminate the current block with `If <cnd> then-label else-label`.
+define function fb-terminate-if (b :: <fn-builder>, cnd :: <integer>,
+                                 then-lbl :: <byte-string>, else-lbl :: <byte-string>) => ()
+  let blk = func-blocks(fb-func(b))[fb-current(b)];
+  block-term(blk) := make(<dfm-term>, kind: "if", value: cnd,
+                          a: then-lbl, b: else-lbl, args: #f);
+end function;
+
+// terminate the current block with `Jump target(args…)`.
+define function fb-terminate-jump (b :: <fn-builder>, target :: <byte-string>,
+                                   args :: <stretchy-vector>) => ()
+  let blk = func-blocks(fb-func(b))[fb-current(b)];
+  block-term(blk) := make(<dfm-term>, kind: "jump", value: #f,
+                          a: target, b: #f, args: args);
 end function;
 
 // Shared temp-type lookup over a temp list.
@@ -174,6 +245,38 @@ define function pair-args (a :: <integer>, b :: <integer>)
   add!(v, a);
   add!(v, b);
   v
+end function;
+
+define function singleton-vec (a :: <integer>) => (v :: <stretchy-vector>)
+  let v = make(<stretchy-vector>);
+  add!(v, a);
+  v
+end function;
+
+// Is a type label GC-typed (needs a GC root / block-param threading across a
+// merge)? Immediate-scalar values (fixnum / boolean / character) are NOT;
+// everything else (strings, classes, floats(boxed), Top) conservatively is.
+// Used to gate `if`: env-merge threading of GC-typed bindings is a later 55a
+// step, so an `if` whose enclosing env holds a GC-typed binding bails to Rust.
+define function gc-typed-label? (label :: <byte-string>) => (yes? :: <boolean>)
+  ~ (label = "<integer>" | label = "<boolean>" | label = "<character>")
+end function;
+
+// Lattice join of two type labels for a merge param (TypeEstimate::join):
+// equal → that type; otherwise → Top. (Two distinct user classes both render
+// "<class>" via name(), so this is approximate for classes — a 55b concern;
+// no class values flow through `if` yet.)
+define function join-type-label (a :: <byte-string>, b :: <byte-string>)
+ => (label :: <byte-string>)
+  if (a = b) a else "<top>" end
+end function;
+
+// Const Bool(false) — the value of an `if` with no `else` arm.
+define function emit-false-const (b :: <fn-builder>) => (temp :: <integer>)
+  let t = fb-fresh-temp(b, "<boolean>");
+  fb-push(b, make(<dfm-comp>, kind: "const", dst: t, cval: "Bool(false)",
+                  op: #f, args: make(<stretchy-vector>), callee: #f));
+  t
 end function;
 
 // ─── Type mapping — mirrors type_from_expr (lower.rs) for scalar cases ─────
@@ -388,9 +491,17 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
         dst
       end
     end
+  elseif (instance?(node, <ast-statement>))
+    // Control-flow statements in expression position. 55a: `if`. Others
+    // (begin / while / until / case / method-literal) are later → #f.
+    if (token-source-text(stmt-word(node), source) = "if")
+      lower-if-expr(b, node, ret-map, source)
+    else
+      #f
+    end
   else
-    // Outside Phase-0 scope (local var refs, if/while, unary, floats, chars,
-    // symbols, make/instance?/%-prims, …): 55a+ territory.
+    // Outside the current subset (unary, floats, chars, symbols,
+    // make/instance?/%-prims, begin/loops, …): later → #f.
     #f
   end
 end function;
@@ -448,6 +559,122 @@ define function lower-body-stmt (b :: <fn-builder>, item :: <object>,
     lower-let(b, item, ret-map, source)
   else
     lower-expr(b, item, ret-map, source)
+  end
+end function;
+
+// Lower a range of body constituents [start, end) in order; the last value is
+// returned. #f if any is unsupported, or the range is empty.
+define function lower-stmt-range (b :: <fn-builder>, cs :: <stretchy-vector>,
+                                  start :: <integer>, ret-map :: <name-ret-map>,
+                                  source :: <byte-string>)
+ => (temp :: <object>)
+  let n = size(cs);
+  let i = start;
+  let last = #f;
+  let ok? = #t;
+  until (i >= n | ~ ok?)
+    let t = lower-body-stmt(b, cs[i], ret-map, source);
+    if (t) last := t; else ok? := #f; end;
+    i := i + 1;
+  end;
+  if (~ ok?) #f else last end
+end function;
+
+// Does the current env hold any GC-typed binding? (See gc-typed-label?.)
+define function env-has-gc-typed? (b :: <fn-builder>) => (yes? :: <boolean>)
+  let temps = fb-env-temps(b);
+  let n = size(temps);
+  let i = 0;
+  let found = #f;
+  until (i >= n | found)
+    if (gc-typed-label?(fb-temp-type(b, temps[i]))) found := #t; end;
+    i := i + 1;
+  end;
+  found
+end function;
+
+// ─── lower-if-expr — mirrors lower_if (the value-merge, non-mutating case) ──
+//
+// `if (cond) then-body [else else-body] end` → a 3-block diamond
+// (then/else/join) with the merged value as the single join block-param — the
+// shape Rust's lower_if produces when no arm assigns a variable and the
+// enclosing env holds no GC-typed binding (so nothing else threads through the
+// join). Block ids/labels and temp ids reproduce the Rust emission order:
+// cond temps (entry) → then-body temps → else-body temps → join param.
+//
+// Bails (#f, → Rust path) on: any GC-typed env binding (env-merge threading is
+// a later 55a step), `elseif` chains, or any unsupported arm expression
+// (e.g. an arm that assigns — `:=` isn't lowered yet, so it bails naturally).
+define function lower-if-expr (b :: <fn-builder>, stmt :: <ast-statement>,
+                               ret-map :: <name-ret-map>, source :: <byte-string>)
+ => (temp :: <object>)
+  if (env-has-gc-typed?(b))
+    #f
+  else
+    let scs = body-constituents(stmt-body(stmt));
+    // stmt-body = [cond, then-body…]; need at least the condition.
+    if (size(scs) < 1)
+      #f
+    else
+      // Resolve the else arm from the clauses: no clauses → no else; exactly
+      // one `else` clause → its body; anything else (elseif / multiple) bails.
+      let clauses = stmt-clauses(stmt);
+      let else-cs = #f;       // else-body constituents, or #f for "no else"
+      let bail? = #f;
+      if (instance?(clauses, <stretchy-vector>))
+        if (size(clauses) = 1)
+          let cl = clauses[0];
+          if (token-source-text(clause-word(cl), source) = "else")
+            else-cs := body-constituents(clause-body(cl));
+          else
+            bail? := #t;     // single `elseif` — later
+          end;
+        elseif (size(clauses) > 1)
+          bail? := #t;       // elseif chain — later
+        end;
+      end;
+      if (bail?)
+        #f
+      else
+        let cnd = lower-expr(b, scs[0], ret-map, source);
+        if (~ cnd)
+          #f
+        else
+          // Create then / else / join in id order (then=N, else=N+1, join=N+2).
+          let then-idx = fb-new-block(b, "then");
+          let else-idx = fb-new-block(b, "else");
+          let join-idx = fb-new-block(b, "join");
+          let join-lbl = fb-block-label(b, join-idx);
+          fb-terminate-if(b, cnd, fb-block-label(b, then-idx), fb-block-label(b, else-idx));
+          // then arm
+          fb-switch-to(b, then-idx);
+          let then-val = lower-stmt-range(b, scs, 1, ret-map, source);
+          if (~ then-val)
+            #f
+          else
+            let then-ty = fb-temp-type(b, then-val);
+            fb-terminate-jump(b, join-lbl, singleton-vec(then-val));
+            // else arm (synthesize #f when absent)
+            fb-switch-to(b, else-idx);
+            let else-val =
+              if (instance?(else-cs, <stretchy-vector>))
+                lower-stmt-range(b, else-cs, 0, ret-map, source)
+              else
+                emit-false-const(b)
+              end;
+            if (~ else-val)
+              #f
+            else
+              let else-ty = fb-temp-type(b, else-val);
+              fb-terminate-jump(b, join-lbl, singleton-vec(else-val));
+              // join: the merged value is the block param; continue here.
+              fb-switch-to(b, join-idx);
+              fb-add-block-param(b, join-idx, join-type-label(then-ty, else-ty))
+            end
+          end
+        end
+      end
+    end
   end
 end function;
 
@@ -603,13 +830,35 @@ define function fmt-computation (c :: <dfm-comp>, temps :: <stretchy-vector>)
   end
 end function;
 
-// fmt_terminator (format.rs), Phase-0 = Return only.
+// fmt_terminator (format.rs): Return / If / Jump.
 define function fmt-terminator (blk :: <dfm-block>) => (s :: <byte-string>)
-  let v = block-term-value(blk);
-  if (v)
-    concatenate("    Return t", concatenate(integer-to-string(v), "\n"))
+  let tm = block-term(blk);
+  let kind = term-kind(tm);
+  if (kind = "return")
+    let v = term-value(tm);
+    if (v)
+      concatenate("    Return t", concatenate(integer-to-string(v), "\n"))
+    else
+      "    Return\n"
+    end
+  elseif (kind = "if")
+    // `    If t<cond> <then-label> <else-label>`
+    concatenate("    If t",
+      concatenate(integer-to-string(term-value(tm)),
+        concatenate(" ", concatenate(term-a(tm),
+          concatenate(" ", concatenate(term-b(tm), "\n"))))))
   else
-    "    Return\n"
+    // `    Jump <target>(t.., t..)`
+    let line = concatenate("    Jump ", concatenate(term-a(tm), "("));
+    let args = term-args(tm);
+    let m = size(args);
+    let j = 0;
+    until (j >= m)
+      if (j > 0) line := concatenate(line, ", "); end;
+      line := concatenate(line, concatenate("t", integer-to-string(args[j])));
+      j := j + 1;
+    end;
+    concatenate(line, ")\n")
   end
 end function;
 

@@ -28,6 +28,15 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a: `if` — the block-parameter SSA core](2026-06-07-sprint-55a-if-control-flow.md)
+  — The brutal core: `if` lowers to a then/else/join block-param-SSA diamond,
+  byte-exact (block ids/labels, temp order, join merge-param, missing-else →
+  `Const Bool(false)`, lattice-join param type, continuation in the join block).
+  Bails to Rust on GC-typed env / elseif / `:=` (full env-merge lands with
+  loops). Two shim-compile bugs caught: `cond` is a reserved keyword (→ `cnd`),
+  and `make` caps at 8 keyword pairs (factored the terminator into `<dfm-term>`).
+  Gate → 8 fixtures incl. unlocked `factorial` (recursion + if) and
+  `jit_cache_sample_items`.
 - [2026-06-07 — Sprint 55a (first forms): `let` bindings + string-debug escaping](2026-06-07-sprint-55a-let-and-strings.md)
   — Grows the Dylan lowering: multi-statement bodies + `let` (a non-captured
   let is just a name→value-temp binding, no extra computation), and Rust-`{:?}`
