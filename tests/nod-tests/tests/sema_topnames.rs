@@ -334,6 +334,86 @@ fn dylan_sema_in_process_byte_match() {
     );
 }
 
+/// Sprint 54c — `nod-driver dump-dfm [--sema-with-dylan] <fx>`, returns
+/// `(stdout, stderr, success)`.
+fn run_dump_dfm(ws: &Path, input: &Path, sema_with_dylan: bool) -> (String, String, bool) {
+    let mut args: Vec<&str> = vec!["run", "--quiet", "--bin", "nod-driver", "--"];
+    if sema_with_dylan {
+        args.push("--sema-with-dylan");
+    }
+    args.push("dump-dfm");
+    args.push(input.to_str().unwrap());
+    let out = Command::new("cargo")
+        .current_dir(ws)
+        .args(&args)
+        .output()
+        .expect("spawn nod-driver dump-dfm");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Sprint 54c — THE load-bearing gate (the roadmap's Sprint 54 acceptance
+/// criterion): the back-end's DFM must be byte-identical whether the sema
+/// recording came from the Rust `analyse_module` or from the Dylan walk
+/// (`--sema-with-dylan`, reconstructed host-side from the in-process
+/// `dylan-sema-emit` model dump). Passing this means the Dylan sema is
+/// authoritative for codegen — Rust sema is retired from the `dump-dfm` path.
+/// Skips cleanly when the shim isn't statically linked.
+#[test]
+#[ignore]
+#[serial]
+fn dump_dfm_sema_with_dylan_byte_match() {
+    let ws = workspace_root();
+
+    // Probe: no shim ⇒ `--sema-with-dylan` warns + falls back to Rust (the run
+    // wouldn't exercise the Dylan path), so skip rather than pass vacuously.
+    let probe = fixtures_dir().join("hello.dylan");
+    let (_, probe_err, probe_ok) = run_dump_dfm(&ws, &probe, true);
+    if !probe_ok || probe_err.contains("not statically linked") {
+        eprintln!("SKIP dump_dfm_sema_with_dylan_byte_match: shim not linked.\n{probe_err}");
+        return;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for fx in FIXTURES {
+        let input = fixtures_dir().join(format!("{fx}.dylan"));
+        assert!(input.is_file(), "missing fixture {}", input.display());
+
+        let (rust_out, _, rust_ok) = run_dump_dfm(&ws, &input, false);
+        let (dyl_out, dyl_err, dyl_ok) = run_dump_dfm(&ws, &input, true);
+        assert!(rust_ok, "dump-dfm (rust sema) failed for {fx}");
+        assert!(
+            dyl_ok,
+            "dump-dfm --sema-with-dylan failed for {fx}:\nstderr:\n{dyl_err}"
+        );
+
+        let r = normalize(&rust_out);
+        let d = normalize(&dyl_out);
+        if r != d {
+            // DFM dumps are large; report the first divergent line pair.
+            let first = r
+                .lines()
+                .zip(d.lines())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| format!("  line {i}:\n    rust : {a}\n    dylan: {b}"))
+                .unwrap_or_else(|| "  (length differs)".to_string());
+            failures.push(format!("FIXTURE {fx} DFM MISMATCH (rust sema vs dylan sema)\n{first}"));
+        } else {
+            eprintln!("MATCH: {fx}");
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "DFM diverged between the Rust and Dylan sema recordings:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
 #[test]
 #[ignore]
 #[serial]

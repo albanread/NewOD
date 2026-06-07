@@ -160,10 +160,50 @@ pub fn dump_expanded_for_file(path: &Path) -> Result<String, DumpError> {
     Ok(nod_reader::format_ast_module(&module))
 }
 
+/// Sprint 54c — `--sema-with-dylan` provider. The driver installs a function
+/// that, given the source text, returns the Dylan-produced sema model dump
+/// (by calling the in-process `dylan-sema-emit` shim entry). When installed,
+/// opted-in lowering paths (currently `dump-dfm`) reconstruct the `SemaModel`
+/// from the Dylan dump via [`lower::analyse_module_from_dump`] and feed it to
+/// [`lower::lower_module_full_with_model`] — making the Dylan sema
+/// authoritative for the back-end. Not installed ⇒ the all-Rust
+/// [`lower_module_full`] path.
+static SEMA_DUMP_PROVIDER: std::sync::OnceLock<fn(&str) -> Result<String, String>> =
+    std::sync::OnceLock::new();
+
+/// Install the `--sema-with-dylan` model-dump provider (first install wins,
+/// like the parser override). `Err` returns the provider back if already set.
+pub fn set_sema_dump_provider(
+    f: fn(&str) -> Result<String, String>,
+) -> Result<(), fn(&str) -> Result<String, String>> {
+    SEMA_DUMP_PROVIDER.set(f)
+}
+
+/// Lower `module` (already parsed + expanded from `src`), choosing the sema
+/// recording source: when the `--sema-with-dylan` provider is installed, build
+/// the `SemaModel` from the Dylan walk's dump and feed it to lowering; else use
+/// the all-Rust recording. The single seam that makes the Dylan sema
+/// load-bearing for `dump-dfm` (and, later, the compile paths).
+fn lower_with_sema_choice(
+    src: &str,
+    module: &nod_reader::Module,
+) -> Result<LoweredModule, DumpError> {
+    match SEMA_DUMP_PROVIDER.get() {
+        Some(provider) => {
+            let dump = provider(src).map_err(DumpError::SemaDylan)?;
+            let model =
+                lower::analyse_module_from_dump(module, &dump).map_err(DumpError::SemaDylan)?;
+            lower::lower_module_full_with_model(module, model).map_err(DumpError::Lower)
+        }
+        None => lower_module_full(module).map_err(DumpError::Lower),
+    }
+}
+
 /// Driver helper: read a Dylan file, parse it, lower it, return the
 /// indented DFM dump. The driver will wire this into `dump-dfm` itself —
 /// this is the smallest function-shaped entry point that hides the
-/// SourceMap + parser plumbing from the driver.
+/// SourceMap + parser plumbing from the driver. Under `--sema-with-dylan`
+/// (provider installed), the recording comes from the Dylan walk (54c).
 pub fn dump_dfm_for_file(path: &Path) -> Result<String, DumpError> {
     stdlib::ensure_loaded();
     let src = std::fs::read_to_string(path).map_err(DumpError::Io)?;
@@ -173,7 +213,7 @@ pub fn dump_dfm_for_file(path: &Path) -> Result<String, DumpError> {
     let pre = nod_reader::scan_preamble(&src);
     let mut module = parse_user_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(DumpError::Macro)?;
-    let lm = lower_module_full(&module).map_err(DumpError::Lower)?;
+    let lm = lower_with_sema_choice(&src, &module)?;
     Ok(nod_dfm::format_dfm_module(&lm.functions))
 }
 
@@ -194,7 +234,7 @@ pub fn dump_sema_for_file(path: &Path) -> Result<String, DumpError> {
     let mut module = parse_user_module(&src, &toks, pre.as_ref()).map_err(DumpError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(DumpError::Macro)?;
     let lm = lower_module_full(&module).map_err(DumpError::Lower)?;
-    Ok(lower::format_sema_model(&lm))
+    Ok(lower::format_sema_model(&lm.sema_model()))
 }
 
 /// Driver helper: read a Dylan file, parse + lower + codegen, return the
@@ -2011,6 +2051,9 @@ pub enum DumpError {
     Macro(Vec<nod_macro::MacroError>),
     Lower(Vec<LoweringError>),
     Codegen(nod_llvm::CodegenError),
+    /// Sprint 54c — `--sema-with-dylan`: the Dylan sema provider failed, or
+    /// its model dump couldn't be reconstructed into a `SemaModel`.
+    SemaDylan(String),
 }
 
 impl std::fmt::Display for DumpError {
@@ -2034,6 +2077,7 @@ impl std::fmt::Display for DumpError {
                 Ok(())
             }
             DumpError::Codegen(e) => write!(f, "codegen: {e}"),
+            DumpError::SemaDylan(msg) => write!(f, "sema-with-dylan: {msg}"),
         }
     }
 }

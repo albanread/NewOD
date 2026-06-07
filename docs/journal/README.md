@@ -28,6 +28,16 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 54c: the Dylan sema goes load-bearing (`--sema-with-dylan`)](2026-06-07-sprint-54c-sema-load-bearing.md)
+  — Closes Sprint 54. The back-end now consumes the Dylan-produced sema model
+  instead of the Rust recompute, gated `dump-dfm` byte-identical (38/38, incl.
+  unified_ide's 5277 DFM lines). A hybrid by design: the host still registers
+  classes from the AST (ids are a runtime mechanism), while the Dylan walk owns
+  the name-keyed recording (top-names/generics/sealing), parsed back via
+  `parse_sema_dump` + `analyse_module_from_dump` and fed to
+  `lower_module_full_with_model`. Opt-in (`--sema-with-dylan`), so default paths
+  are untouched. Lexer + parser + macros + sema are now all Dylan, sema
+  load-bearing — next is lowering itself (Sprint 55).
 - [2026-06-07 — Sprint 54b: the Dylan sema walk goes in-process (shim-bundled)](2026-06-07-sprint-54b-sema-in-process-shim.md)
   — Bundle `dylan-c3.dylan` + `dylan-sema.dylan` into the statically-linked
   shim and export `dylan-sema-emit` (text model dump), so the host can run the

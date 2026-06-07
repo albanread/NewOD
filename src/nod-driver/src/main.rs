@@ -104,6 +104,15 @@ struct Cli {
     /// authoritative path for `compile`/`eval`/`build`.
     #[arg(long = "parse-with-rust", global = true)]
     parse_with_rust: bool,
+
+    /// Sprint 54c — make the Dylan sema recording load-bearing: the back-end
+    /// consumes the model the Dylan walk produces (in-process via the
+    /// `dylan-sema-emit` shim entry) instead of the Rust recompute. Also
+    /// settable via `NOD_SEMA_WITH_DYLAN=1`. Currently wired into `dump-dfm`
+    /// (gated `dump-dfm --sema-with-dylan` byte-identical to plain `dump-dfm`).
+    /// Requires the shim to be statically linked.
+    #[arg(long = "sema-with-dylan", global = true)]
+    sema_with_dylan: bool,
 }
 
 #[derive(Subcommand)]
@@ -502,6 +511,27 @@ fn main() -> ExitCode {
     if want_parse_with_dylan {
         // SAFETY: single-threaded process startup.
         unsafe { std::env::set_var("NOD_PARSE_WITH_DYLAN", "1"); }
+    }
+
+    // Sprint 54c — `--sema-with-dylan` makes the Dylan sema recording
+    // load-bearing for the back-end (currently `dump-dfm`). Install a provider
+    // that produces the model dump in-process via the `dylan-sema-emit` shim;
+    // `nod_sema`'s `lower_with_sema_choice` reconstructs a `SemaModel` from it
+    // and feeds the DFM construction. Requires the shim to be linked.
+    let want_sema_with_dylan = cli.sema_with_dylan
+        || std::env::var("NOD_SEMA_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
+    if want_sema_with_dylan {
+        if cfg!(dylan_lex_shim_linked) {
+            // SAFETY: single-threaded process startup.
+            unsafe { std::env::set_var("NOD_SEMA_WITH_DYLAN", "1"); }
+            let _ = nod_sema::set_sema_dump_provider(dylan_sema_dump_provider);
+        } else {
+            eprintln!(
+                "nod-driver: --sema-with-dylan requested but the dylan-lex-shim is \
+                 not statically linked; using the Rust sema. Build the shim to activate \
+                 the Dylan sema."
+            );
+        }
     }
 
     // Sprint 51e.6 — the Dylan parser is now the DEFAULT real-pipeline
@@ -1394,6 +1424,16 @@ fn run_dump_dylan_ast(input: &std::path::Path) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Sprint 54c — the `--sema-with-dylan` model-dump provider installed into
+/// `nod_sema::set_sema_dump_provider`. Given source text, fire the shared
+/// resolver once (`init`) then run the in-process Dylan sema walk via the
+/// `dylan-sema-emit` shim entry, returning its `dump-sema` model text;
+/// `nod_sema` reconstructs a `SemaModel` from it for the back-end.
+fn dylan_sema_dump_provider(src: &str) -> Result<String, String> {
+    dylan_lex_jit::init()?;
+    dylan_parse_wire::sema_emit_via_shim(src)
 }
 
 fn run_dump_dylan_sema(input: &std::path::Path) -> ExitCode {

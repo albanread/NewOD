@@ -677,6 +677,20 @@ impl SemaModel {
     }
 }
 
+impl LoweredModule {
+    /// Sprint 54 — a `SemaModel` view of the recording outputs captured on
+    /// this `LoweredModule` (the four `dump-sema` sections). Used by
+    /// [`format_sema_model`] / `dump-sema`.
+    pub fn sema_model(&self) -> SemaModel {
+        SemaModel {
+            top_names: self.top_names.clone(),
+            generics: self.generics.clone(),
+            classes: self.user_classes.clone(),
+            sealing: self.sealing.clone(),
+        }
+    }
+}
+
 /// GAP-004 — one `define variable` registration: the variable's source
 /// name and the symbol name of its codegen-emitted `__init-<name>`
 /// thunk (a zero-arg `extern "C-unwind" fn() -> u64` returning the
@@ -1447,6 +1461,63 @@ pub fn lower_module(m: &Module) -> Result<Vec<Function>, Vec<LoweringError>> {
 /// seed/runtime classes resolve) — `lower_module_full` does both before it
 /// calls this.
 pub fn analyse_module(m: &Module) -> Result<SemaModel, Vec<LoweringError>> {
+    let (user_class_registrations, user_classes) = register_module_classes(m)?;
+
+    // Phase 2: top-level function names (incl. auto-accessor names) +
+    // generic names (sorted for a deterministic dump / wire).
+    let top_names = collect_top_level_names(m, &user_classes);
+    let mut generics: Vec<String> = collect_generic_names(m).into_iter().collect();
+    generics.sort();
+
+    // Sealing facts — computation only. Installation (a global side effect)
+    // stays in `lower_module_full` at its historical point, just before
+    // dispatch resolution, to preserve behavior.
+    let sealing = crate::optimise::collect_sealing_facts(&m.items, &user_classes);
+
+    Ok(SemaModel {
+        top_names,
+        generics,
+        classes: user_class_registrations,
+        sealing,
+    })
+}
+
+/// Sprint 54c — the load-bearing variant of [`analyse_module`]. Registers the
+/// module's classes (the runtime mechanism that assigns `ClassId`s — kept in
+/// Rust because ids are process-global), then takes the rest of the recording
+/// (`top_names` / `generics` / `sealing`) from a Dylan-produced model **dump**
+/// (`dump-sema` text, emitted in-process by the `dylan-sema-emit` shim) rather
+/// than recomputing it in Rust. Class references inside the dump resolve
+/// against the just-registered classes (so registration must precede the
+/// parse — it does). This is what makes the Dylan sema authoritative for the
+/// back-end under `--sema-with-dylan`; gated `dump-dfm` byte-identical against
+/// the all-Rust path.
+pub fn analyse_module_from_dump(m: &Module, dump: &str) -> Result<SemaModel, String> {
+    let (classes, _user_classes) = register_module_classes(m).map_err(|errs| {
+        format!(
+            "sema-with-dylan: {} class-registration error(s) before model parse",
+            errs.len()
+        )
+    })?;
+    // Classes are now registered (ids assigned); the dump's `Class(<name>)` /
+    // `sealed-domain` references resolve through the class table.
+    let (top_names, generics, sealing) = parse_sema_dump(dump)?;
+    Ok(SemaModel {
+        top_names,
+        generics,
+        classes,
+        sealing,
+    })
+}
+
+/// Sprint 54c — Phase 1 of analysis, shared by [`analyse_module`] (Rust
+/// recording) and [`analyse_module_from_dump`] (Dylan recording): register
+/// every `define class` (assigning `ClassId`s + capturing AOT metadata) and
+/// flip sealed flags. Returns the registrations (declaration order) and the
+/// `name -> ClassId` map. `Err` if any class fails to register.
+fn register_module_classes(
+    m: &Module,
+) -> Result<(Vec<UserClassRegistration>, HashMap<String, ClassId>), Vec<LoweringError>> {
     let mut errors: Vec<LoweringError> = Vec::new();
     let mut user_classes: HashMap<String, ClassId> = HashMap::new();
     let mut user_class_registrations: Vec<UserClassRegistration> = Vec::new();
@@ -1510,26 +1581,30 @@ pub fn analyse_module(m: &Module) -> Result<SemaModel, Vec<LoweringError>> {
         }
     }
 
-    // Phase 2: top-level function names (incl. auto-accessor names) +
-    // generic names (sorted for a deterministic dump / wire).
-    let top_names = collect_top_level_names(m, &user_classes);
-    let mut generics: Vec<String> = collect_generic_names(m).into_iter().collect();
-    generics.sort();
-
-    // Sealing facts — computation only. Installation (a global side effect)
-    // stays in `lower_module_full` at its historical point, just before
-    // dispatch resolution, to preserve behavior.
-    let sealing = crate::optimise::collect_sealing_facts(&m.items, &user_classes);
-
-    Ok(SemaModel {
-        top_names,
-        generics,
-        classes: user_class_registrations,
-        sealing,
-    })
+    Ok((user_class_registrations, user_classes))
 }
 
 pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>> {
+    lower_module_full_inner(m, None)
+}
+
+/// Sprint 54c — lower a module whose recording `SemaModel` was produced
+/// EXTERNALLY (e.g. by the Dylan sema walk via [`analyse_module_from_dump`]),
+/// rather than recomputed by [`analyse_module`]. The injected model's classes
+/// must already be registered (the producer does that — ids must be live for
+/// DFM construction). This is the load-bearing seam: under `--sema-with-dylan`
+/// the host builds the model from the Dylan dump and feeds it here.
+pub fn lower_module_full_with_model(
+    m: &Module,
+    model: SemaModel,
+) -> Result<LoweredModule, Vec<LoweringError>> {
+    lower_module_full_inner(m, Some(model))
+}
+
+fn lower_module_full_inner(
+    m: &Module,
+    injected_model: Option<SemaModel>,
+) -> Result<LoweredModule, Vec<LoweringError>> {
     // Sprint 19: ensure the seed condition classes are registered
     // before lowering starts so `<error>` / `<simple-error>` / etc.
     // resolve via `find_class_id_by_name` during exception-clause
@@ -1583,9 +1658,13 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     // sealed flags, and collects top-names / generics / sealing into a
     // `SemaModel`; the DFM construction below consumes it. Rebuild the exact
     // locals the rest of this function already uses, so Phase 3/4 are
-    // unchanged. (Sprint 54c swaps the model's producer to the Dylan walk via
-    // the sema wire, behind `--sema-with-dylan`.)
-    let model = analyse_module(m)?;
+    // unchanged. Sprint 54c: when a model was injected (the Dylan walk produced
+    // it, off the `dylan-sema-emit` shim, under `--sema-with-dylan`), consume
+    // THAT instead of recomputing in Rust — its classes are already registered.
+    let model = match injected_model {
+        Some(model) => model,
+        None => analyse_module(m)?,
+    };
     let user_classes: HashMap<String, ClassId> = model.user_class_map();
     let user_class_registrations: Vec<UserClassRegistration> = model.classes.clone();
     let top_names: TopNames = model.top_names.clone();
@@ -2471,7 +2550,7 @@ fn sema_class_name(id: ClassId) -> String {
 /// This is the `dump-sema` oracle: the Dylan-computed model must
 /// byte-match this. Tables are sorted; classes are in registration
 /// order; class references are by name (see `sema_class_name`).
-pub fn format_sema_model(lm: &LoweredModule) -> String {
+pub fn format_sema_model(model: &SemaModel) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
 
@@ -2486,17 +2565,17 @@ pub fn format_sema_model(lm: &LoweredModule) -> String {
     // `variable <name>` lines for them, no `fn` line. Filter them out of
     // the `fns` listing here so the dump byte-matches the Dylan walk. The
     // `fns` recording itself is untouched (still load-bearing for codegen).
-    let mut fns: Vec<(&String, &TypeEstimate)> = lm
+    let mut fns: Vec<(&String, &TypeEstimate)> = model
         .top_names
         .fns
         .iter()
         .filter(|(name, _)| {
-            !lm.top_names.constants.contains(*name) && !lm.top_names.variables.contains(*name)
+            !model.top_names.constants.contains(*name) && !model.top_names.variables.contains(*name)
         })
         .collect();
     fns.sort_by(|a, b| a.0.cmp(b.0));
     for (name, est) in fns {
-        let arity = lm.top_names.fn_arity.get(name).copied().unwrap_or(0);
+        let arity = model.top_names.fn_arity.get(name).copied().unwrap_or(0);
         // Render the return estimate. A `Class` estimate prints the class by
         // NAME, not the raw process-global id: every other class reference in
         // this dump already goes through `sema_class_name` (parents / cpl /
@@ -2511,24 +2590,24 @@ pub fn format_sema_model(lm: &LoweredModule) -> String {
         };
         let _ = writeln!(s, "fn {name} arity={arity} return={ret}");
     }
-    let mut consts: Vec<&String> = lm.top_names.constants.iter().collect();
+    let mut consts: Vec<&String> = model.top_names.constants.iter().collect();
     consts.sort();
     for c in consts {
         let _ = writeln!(s, "constant {c}");
     }
-    let mut vars: Vec<&String> = lm.top_names.variables.iter().collect();
+    let mut vars: Vec<&String> = model.top_names.variables.iter().collect();
     vars.sort();
     for v in vars {
         let _ = writeln!(s, "variable {v}");
     }
 
     s.push_str("=== generics ===\n");
-    for g in &lm.generics {
+    for g in &model.generics {
         let _ = writeln!(s, "generic {g}");
     }
 
     s.push_str("=== classes ===\n");
-    for c in &lm.user_classes {
+    for c in &model.classes {
         let _ = writeln!(s, "class {}", c.name);
         let parents: Vec<String> = c.parents.iter().map(|&id| sema_class_name(id)).collect();
         let _ = writeln!(s, "  parents [{}]", parents.join(", "));
@@ -2545,17 +2624,17 @@ pub fn format_sema_model(lm: &LoweredModule) -> String {
     }
 
     s.push_str("=== sealing ===\n");
-    let mut sc: Vec<&String> = lm.sealing.sealed_classes.iter().collect();
+    let mut sc: Vec<&String> = model.sealing.sealed_classes.iter().collect();
     sc.sort();
     for c in sc {
         let _ = writeln!(s, "sealed-class {c}");
     }
-    let mut sg: Vec<&String> = lm.sealing.sealed_generics.iter().collect();
+    let mut sg: Vec<&String> = model.sealing.sealed_generics.iter().collect();
     sg.sort();
     for g in sg {
         let _ = writeln!(s, "sealed-generic {g}");
     }
-    let mut doms: Vec<(&String, &Vec<Vec<ClassId>>)> = lm.sealing.domains.iter().collect();
+    let mut doms: Vec<(&String, &Vec<Vec<ClassId>>)> = model.sealing.domains.iter().collect();
     doms.sort_by(|a, b| a.0.cmp(b.0));
     for (g, tuples) in doms {
         for t in tuples {
@@ -2565,6 +2644,124 @@ pub fn format_sema_model(lm: &LoweredModule) -> String {
     }
 
     s
+}
+
+/// Sprint 54c — inverse of [`format_sema_model`] for the name-keyed sections:
+/// parse a `dump-sema` model dump back into `(TopNames, generics,
+/// SealingFacts)`. This is how the host reconstructs the recording the Dylan
+/// walk produced (via the `dylan-sema-emit` shim, text transport) so the
+/// back-end can consume it under `--sema-with-dylan`.
+///
+/// Classes are NOT reconstructed here — the host registers them from the AST
+/// (a runtime mechanism that assigns `ClassId`s) and supplies the
+/// `classes` vector separately; this recovers only what crosses by name.
+/// Class references inside the recording (the `Class(<name>)` return estimate
+/// and `sealed-domain` specialisers) are resolved to `ClassId`s through the
+/// registered class table, so the caller MUST register the module's classes
+/// before calling (see [`analyse_module_from_dump`]).
+pub fn parse_sema_dump(
+    dump: &str,
+) -> Result<(TopNames, Vec<String>, crate::optimise::SealingFacts), String> {
+    let mut fns: HashMap<String, TypeEstimate> = HashMap::new();
+    let mut fn_arity: HashMap<String, usize> = HashMap::new();
+    let mut constants: HashSet<String> = HashSet::new();
+    let mut variables: HashSet<String> = HashSet::new();
+    let mut generics: Vec<String> = Vec::new();
+    let mut sealed_classes: HashSet<String> = HashSet::new();
+    let mut sealed_generics: HashSet<String> = HashSet::new();
+    let mut domains: HashMap<String, Vec<Vec<ClassId>>> = HashMap::new();
+
+    for raw in dump.lines() {
+        let line = raw.trim_end();
+        if let Some(rest) = line.strip_prefix("fn ") {
+            // `fn NAME arity=N return=EST` — names never contain " arity=".
+            let name_end = rest
+                .find(" arity=")
+                .ok_or_else(|| format!("malformed fn line: {line}"))?;
+            let name = rest[..name_end].to_string();
+            let after = &rest[name_end + " arity=".len()..];
+            let ret_at = after
+                .find(" return=")
+                .ok_or_else(|| format!("malformed fn line: {line}"))?;
+            let arity: usize = after[..ret_at]
+                .parse()
+                .map_err(|_| format!("bad arity in: {line}"))?;
+            let est_str = &after[ret_at + " return=".len()..];
+            fns.insert(name.clone(), est_from_dump(est_str));
+            fn_arity.insert(name, arity);
+        } else if let Some(name) = line.strip_prefix("constant ") {
+            // GAP-002 rule: `define constant` / `variable` ALSO live in `fns`
+            // (arity 0), but `format_sema_model` filters them out of the `fn`
+            // listing. Re-apply the rule so the reconstructed `TopNames`
+            // matches `collect_top_level_names`' population exactly.
+            constants.insert(name.to_string());
+            fns.entry(name.to_string()).or_insert(TypeEstimate::Top);
+            fn_arity.entry(name.to_string()).or_insert(0);
+        } else if let Some(name) = line.strip_prefix("variable ") {
+            variables.insert(name.to_string());
+            fns.entry(name.to_string()).or_insert(TypeEstimate::Top);
+            fn_arity.entry(name.to_string()).or_insert(0);
+        } else if let Some(name) = line.strip_prefix("generic ") {
+            generics.push(name.to_string());
+        } else if let Some(name) = line.strip_prefix("sealed-class ") {
+            sealed_classes.insert(name.to_string());
+        } else if let Some(name) = line.strip_prefix("sealed-generic ") {
+            sealed_generics.insert(name.to_string());
+        } else if let Some(rest) = line.strip_prefix("sealed-domain ") {
+            // `sealed-domain G (T1, T2, …)` — resolve specialiser names to ids.
+            let paren = rest
+                .find(" (")
+                .ok_or_else(|| format!("malformed sealed-domain: {line}"))?;
+            let g = rest[..paren].to_string();
+            let inner = rest[paren + 2..].trim_end_matches(')');
+            let tuple: Vec<ClassId> = inner
+                .split(", ")
+                .filter(|s| !s.is_empty())
+                .map(|n| resolve_class_id_by_name(n).unwrap_or(ClassId(0)))
+                .collect();
+            domains.entry(g).or_default().push(tuple);
+        }
+        // `=== … ===` headers and `class` / `  parents` / `  cpl` / `  slot`
+        // lines are ignored — classes come from the host's registration.
+    }
+
+    let top_names = TopNames {
+        fns,
+        fn_arity,
+        constants,
+        variables,
+    };
+    let sealing = crate::optimise::SealingFacts {
+        domains,
+        sealed_generics,
+        sealed_classes,
+    };
+    Ok((top_names, generics, sealing))
+}
+
+/// Map a `TypeEstimate` Debug name (as `format_sema_model` emits) back to the
+/// estimate. `Class(<name>)` resolves the class name to its `ClassId` via the
+/// registered table (caller must have registered classes first); an
+/// unresolvable / unknown estimate degrades to `Top` (informational only —
+/// codegen lowers a tagged Word regardless).
+fn est_from_dump(s: &str) -> TypeEstimate {
+    match s {
+        "Top" => TypeEstimate::Top,
+        "Bottom" => TypeEstimate::Bottom,
+        "Integer" => TypeEstimate::Integer,
+        "SingleFloat" => TypeEstimate::SingleFloat,
+        "DoubleFloat" => TypeEstimate::DoubleFloat,
+        "Character" => TypeEstimate::Character,
+        "Boolean" => TypeEstimate::Boolean,
+        "String" => TypeEstimate::String,
+        "Unit" => TypeEstimate::Unit,
+        other => other
+            .strip_prefix("Class(")
+            .and_then(|x| x.strip_suffix(')'))
+            .and_then(resolve_class_id_by_name)
+            .map(|id| TypeEstimate::Class(id.0))
+            .unwrap_or(TypeEstimate::Top),
+    }
 }
 
 /// Sprint 27: walk the AST collecting any call expressions whose
