@@ -1023,9 +1023,7 @@ define function lower-assign (b :: <fn-builder>, node :: <ast-binary-op>,
                               ret-map :: <name-ret-map>, source :: <byte-string>)
  => (temp :: <object>)
   let lhs = binop-left(node);
-  if (~ instance?(lhs, <ast-variable-ref>))
-    #f
-  else
+  if (instance?(lhs, <ast-variable-ref>))
     let name = token-source-text(varref-tok(lhs), source);
     if (~ fb-lookup(b, name))
       #f                                  // unbound name — module var / later
@@ -1038,6 +1036,35 @@ define function lower-assign (b :: <fn-builder>, node :: <ast-binary-op>,
         t
       end
     end
+  elseif (instance?(lhs, <ast-call>))
+    // `slot(obj) := v` -> `Dispatch <slot>-setter(obj, value)`. lower.rs's
+    // try_resolve_slot_offset always returns None, so a slot assignment is a
+    // setter Dispatch, never a StoreSlot. Obj args lower first, then the value;
+    // dst minted last (lower_assign unary case, args [obj, value]). Unary
+    // slot-setter only; an n-ary setter (value-first order) bails.
+    let callee-node = call-fn(lhs);
+    let arg-nodes = call-args(lhs);
+    if (~ instance?(callee-node, <ast-variable-ref>) | size(arg-nodes) ~= 1)
+      #f
+    else
+      let setter = concatenate(token-source-text(varref-tok(callee-node), source), "-setter");
+      let obj = lower-expr(b, unwrap-arg(arg-nodes[0]), ret-map, source);
+      if (~ obj)
+        #f
+      else
+        let val = lower-expr(b, binop-right(node), ret-map, source);
+        if (~ val)
+          #f
+        else
+          let dst = fb-fresh-temp(b, "<top>");
+          fb-push(b, make(<dfm-comp>, kind: "dispatch", dst: dst, cval: #f,
+                          op: #f, args: pair-args(obj, val), callee: setter));
+          dst
+        end
+      end
+    end
+  else
+    #f
   end
 end function;
 

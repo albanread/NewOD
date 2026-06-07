@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: slot-`:=` + the design/challenge roadmap](2026-06-07-sprint-55b-slot-assign-and-roadmap.md)
+  — `slot(obj) := v` → `Dispatch <slot>-setter(obj,val)` (no class-id; never a
+  StoreSlot at user sites). Also records the design→challenge→decide pass for the
+  remaining 55 lowering: the verified sealed-param `Class(0)` crux, the
+  build-generic-names gap, method-header-by-name resolution, and the decision to
+  fix the crux via the `<class:N>` format change (not a host re-stamp, which
+  would mask Dylan param-typing bugs). Order: slot-:= ✓ → define-method(open) →
+  %-prim map → B-i crux (architect-vetoable). 24 lowered, 0 mismatches.
 - [2026-06-07 — Sprint 55b: classifier primitives (`%is-generic?` / `%is-class?`)](2026-06-07-sprint-55b-classifier-primitives.md)
   — Two tiny shim-callable runtime primitives let the Dylan lowering query the
   registry: a call → Dispatch (generic) / DirectCall (function) / bail (%-prim),

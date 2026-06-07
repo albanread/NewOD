@@ -400,6 +400,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
     "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
     "translate-class",       // 55b: class + accessors + straight-line fns (real corpus)
+    "lower-slot-assign",     // 55b: slot(obj) := v -> <slot>-setter Dispatch
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries
