@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: slot-accessor emission (LoadSlot / StoreSlot)](2026-06-07-sprint-55b-slot-accessors.md)
+  — First 55b increment: `define class` lowers its synthesized getter/setter
+  accessors in Dylan, byte-identical to Rust. The id-free, pass-free island of
+  55b (offsets `8+8i`, `SlotTypeKind` from the declared type). Two-pass emit
+  (accessors before functions); bails on non-`<object>` super, `constant` slots,
+  and generic/intrinsic calls (so `point` stays on Rust). The make/dispatch rest
+  of 55b carries class-ids + post-passes — scoped to the DFM wire. Gate → 12.
 - [2026-06-07 — Sprint 55a: generalize the short-circuit env-merge](2026-06-07-sprint-55a-short-circuit-env-merge.md)
   — The `|`/`&` twin of the if env-merge fix: merge set (RHS-assigned ∪ GC-typed,
   sorted, value-first), sc_edge carries pre-RHS temps + sc_rhs post-RHS, join

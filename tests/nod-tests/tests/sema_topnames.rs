@@ -371,6 +371,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-loop",            // 55a: while/until loops + `:=` (env-merge phis)
     "factorial",             // 55a: recursion + `if` (real corpus fixture)
     "jit_cache_sample_items", // 55a: real corpus fixture, now fully lowered
+    "lower-class-accessors", // 55b: slot getter/setter emission (LoadSlot/StoreSlot)
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan

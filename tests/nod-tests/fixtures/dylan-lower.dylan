@@ -98,6 +98,12 @@ define class <fn-builder> (<object>)
   // bindings visible in the current scope (Phase 0: just the params).
   slot fb-env-names  :: <stretchy-vector>, init-keyword: env-names:;
   slot fb-env-temps  :: <stretchy-vector>, init-keyword: env-temps:;
+  // Names that are GENERICS in this module (slot getters/setters, define
+  // generic, define method). A call to one of these is a Dispatch in Rust
+  // (lower.rs 6060), not a DirectCall — until Dispatch lowering lands, such a
+  // call bails the whole function to the Rust path (so we never emit a wrong
+  // dump). Set by `lower-function`; empty in the synthesized accessor bodies.
+  slot fb-generics   :: <stretchy-vector>, init-keyword: generics:;
 end class;
 
 // FunctionBuilder::new — entry = BlockId(0) "entry", Return{None}, next_temp=0,
@@ -118,7 +124,8 @@ define function make-fn-builder (name :: <byte-string>) => (b :: <fn-builder>)
                   return-type: "<unit>");
   make(<fn-builder>,
        func: func, current: 0, next-temp: 0, next-block: 1, last-temp: #f,
-       env-names: make(<stretchy-vector>), env-temps: make(<stretchy-vector>))
+       env-names: make(<stretchy-vector>), env-temps: make(<stretchy-vector>),
+       generics: make(<stretchy-vector>))
 end function;
 
 // LocalEnv bind / lookup. `fb-lookup` returns the bound temp id (most-recent
@@ -491,28 +498,36 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
       #f
     else
       let name = token-source-text(varref-tok(callee-node), source);
-      // Args lower left-to-right BEFORE the dst is minted (dst id comes after
-      // all arg ids, matching lower.rs fresh_temp(ret) ordering).
-      let arg-nodes = call-args(node);
-      let n = size(arg-nodes);
-      let arg-temps = make(<stretchy-vector>);
-      let i = 0;
-      let ok? = #t;
-      until (i >= n | ~ ok?)
-        let an = arg-nodes[i];
-        let av = if (instance?(an, <ast-pos-arg>)) pos-arg-value(an) else an end;
-        let at = lower-expr(b, av, ret-map, source);
-        if (~ at) ok? := #f; else add!(arg-temps, at); end;
-        i := i + 1;
-      end;
-      if (~ ok?)
+      // A call to a slot/generic name is a Dispatch (lower.rs 6060), and
+      // `make`/`instance?` are intrinsics — none are plain DirectCalls. Until
+      // those forms land, bail the whole function to the Rust path so we never
+      // emit a wrong dump.
+      if (name-in-vec?(fb-generics(b), name) | is-lower-intrinsic?(name))
         #f
       else
-        let ret-label = nrm-lookup(ret-map, name);
-        let dst = fb-fresh-temp(b, ret-label);
-        fb-push(b, make(<dfm-comp>, kind: "directcall", dst: dst, cval: #f,
-                        op: #f, args: arg-temps, callee: name));
-        dst
+        // Args lower left-to-right BEFORE the dst is minted (dst id comes after
+        // all arg ids, matching lower.rs fresh_temp(ret) ordering).
+        let arg-nodes = call-args(node);
+        let n = size(arg-nodes);
+        let arg-temps = make(<stretchy-vector>);
+        let i = 0;
+        let ok? = #t;
+        until (i >= n | ~ ok?)
+          let an = arg-nodes[i];
+          let av = if (instance?(an, <ast-pos-arg>)) pos-arg-value(an) else an end;
+          let at = lower-expr(b, av, ret-map, source);
+          if (~ at) ok? := #f; else add!(arg-temps, at); end;
+          i := i + 1;
+        end;
+        if (~ ok?)
+          #f
+        else
+          let ret-label = nrm-lookup(ret-map, name);
+          let dst = fb-fresh-temp(b, ret-label);
+          fb-push(b, make(<dfm-comp>, kind: "directcall", dst: dst, cval: #f,
+                          op: #f, args: arg-temps, callee: name));
+          dst
+        end
       end
     end
   elseif (instance?(node, <ast-statement>))
@@ -1205,6 +1220,192 @@ define function lower-loop (b :: <fn-builder>, stmt :: <ast-statement>,
   end
 end function;
 
+// ─── 55b: slot-accessor emission (Phase 3) + generic-name table ────────────
+//
+// For each `define class`, the Rust lowering synthesizes a getter (and, unless
+// the slot is `constant`, a setter) per OWN slot, emitted BEFORE all user
+// functions (lower.rs Phase 3, builders build_slot_getter/build_slot_setter at
+// lower.rs 3371/3420). These bodies are the ONLY place `LoadSlot`/`StoreSlot`
+// appear — a user `slot(obj) := v` lowers to a `<slot>-setter` Dispatch, never
+// a StoreSlot (lower.rs try_resolve_slot_offset always returns None).
+//
+// Offsets are deterministic: own slot i sits at `8 + i*8` (runtime classes.rs;
+// the Dylan sema walk computes the same at dylan-sema.dylan). We only handle
+// classes whose sole super is `<object>` (no inherited slots → own slots start
+// at @8); anything else bails the module (offsets would shift).
+
+// String membership in a vector (for the generics table).
+define function name-in-vec? (v :: <stretchy-vector>, s :: <byte-string>)
+ => (yes? :: <boolean>)
+  let n = size(v);
+  let i = 0;
+  let found = #f;
+  until (i >= n | found)
+    if (v[i] = s) found := #t; end;
+    i := i + 1;
+  end;
+  found
+end function;
+
+// Names treated as intrinsics by lower_call (NOT plain DirectCalls). Until each
+// is ported, a call to one bails the function to Rust. `make`/`instance?` are
+// the 55b set; others are added as they're implemented.
+define function is-lower-intrinsic? (name :: <byte-string>) => (yes? :: <boolean>)
+  name = "make" | name = "instance?"
+end function;
+
+// SlotTypeKind label for the `[..]` annotation (lower.rs slot_type_to_dfm_kind:
+// Integer|Character -> Integer, else Object).
+define function slot-kind-label (type-name :: <byte-string>) => (k :: <byte-string>)
+  if (type-name = "<integer>" | type-name = "<character>") "Integer" else "Object" end
+end function;
+
+// Getter return-type label (lower.rs slot_type_to_estimate: Integer->Integer,
+// DoubleFloat->DoubleFloat, Boolean->Boolean, Character->Character,
+// String->String, else Top).
+define function slot-return-label (type-name :: <byte-string>)
+ => (label :: <byte-string>)
+  if (type-name = "<integer>")          "<integer>"
+  elseif (type-name = "<boolean>")      "<boolean>"
+  elseif (type-name = "<character>")    "<character>"
+  elseif (type-name = "<byte-string>")  "<string>"
+  elseif (type-name = "<string>")       "<string>"
+  elseif (type-name = "<double-float>") "<double-float>"
+  else                                  "<top>"
+  end
+end function;
+
+// A slot's declared type name ("<integer>" etc.), or "" when untyped (-> Top).
+define function slot-type-name (s :: <ast-slot-spec>, source :: <byte-string>)
+ => (tn :: <byte-string>)
+  if (instance?(slot-type(s), <ast-node>))
+    type-node-name(slot-type(s), source)
+  else
+    ""
+  end
+end function;
+
+// A class is handleable here iff (a) its sole super is `<object>` (so own slots
+// start at @8 — no inherited-slot offset shift) AND (b) it has no `constant`
+// slot. Rust lowering supports only `instance:` allocation and ERRORS on a
+// `Constant` slot (lower.rs), so a constant slot would make the Rust oracle
+// fail while we'd emit a getter — bail to keep the two sides aligned.
+define function class-is-simple? (cd :: <ast-class-definition>, source :: <byte-string>)
+ => (yes? :: <boolean>)
+  let supers = class-supers(cd);
+  if (~ (size(supers) = 1 & super-name(supers[0], source) = "<object>"))
+    #f
+  else
+    let slots = class-slots(cd);
+    let ns = size(slots);
+    let i = 0;
+    let ok? = #t;
+    until (i >= ns | ~ ok?)
+      let s = slots[i];
+      // slot-has-setter? is #f exactly for `constant` slots (the only
+      // unsupported allocation the parsed AST surfaces).
+      if (instance?(slot-name-tok(s), <token>) & ~ slot-has-setter?(s, source))
+        ok? := #f;
+      end;
+      i := i + 1;
+    end;
+    ok?
+  end
+end function;
+
+// The set of generic names introduced by the module's classes: every slot's
+// getter (its name) plus, when the slot has a setter, `<slot>-setter`. A call
+// to one of these is a Dispatch, not a DirectCall (lower.rs 6060) — so until
+// Dispatch lowering lands the call path bails on these names.
+define function build-generic-names (items :: <stretchy-vector>, source :: <byte-string>)
+ => (names :: <stretchy-vector>)
+  let names = make(<stretchy-vector>);
+  let n = size(items);
+  let i = 0;
+  until (i >= n)
+    let item = items[i];
+    if (instance?(item, <ast-class-definition>))
+      let slots = class-slots(item);
+      let ns = size(slots);
+      let si = 0;
+      until (si >= ns)
+        let s = slots[si];
+        if (instance?(slot-name-tok(s), <token>))
+          let sn = token-source-text(slot-name-tok(s), source);
+          add!(names, sn);
+          if (slot-has-setter?(s, source))
+            add!(names, concatenate(sn, "-setter"));
+          end;
+        end;
+        si := si + 1;
+      end;
+    end;
+    i := i + 1;
+  end;
+  names
+end function;
+
+// build_slot_getter (lower.rs 3371): `fn <C>-getter-<slot> (t0: <top>)
+// -> <ret>: entry: t1 = LoadSlot t0 @<off> [<kind>]; Return t1`.
+define function make-getter-fn (class-name :: <byte-string>, slot-name :: <byte-string>,
+                                offset :: <integer>, slot-kind :: <byte-string>,
+                                ret-label :: <byte-string>) => (f :: <dfm-func>)
+  let b = make-fn-builder(concatenate(class-name, concatenate("-getter-", slot-name)));
+  let t0 = fb-fresh-temp(b, "<top>");            // self
+  add!(func-params(fb-func(b)), t0);
+  let t1 = fb-fresh-temp(b, ret-label);          // loaded value
+  fb-push(b, make(<dfm-comp>, kind: "loadslot", dst: t1, cval: offset,
+                  op: slot-kind, args: singleton-vec(t0), callee: #f));
+  func-return-type(fb-func(b)) := ret-label;
+  fb-terminate-return(b, t1);
+  fb-func(b)
+end function;
+
+// build_slot_setter (lower.rs 3420): `fn <C>-setter-<slot> (t0: <top>, t1: <top>)
+// -> <top>: entry: t2 = StoreSlot t0 @<off> := t1 [<kind>]; Return t2`.
+define function make-setter-fn (class-name :: <byte-string>, slot-name :: <byte-string>,
+                                offset :: <integer>, slot-kind :: <byte-string>)
+ => (f :: <dfm-func>)
+  let b = make-fn-builder(concatenate(class-name, concatenate("-setter-", slot-name)));
+  let t0 = fb-fresh-temp(b, "<top>");   // self
+  add!(func-params(fb-func(b)), t0);
+  let t1 = fb-fresh-temp(b, "<top>");   // value
+  add!(func-params(fb-func(b)), t1);
+  let t2 = fb-fresh-temp(b, "<top>");   // store result
+  fb-push(b, make(<dfm-comp>, kind: "storeslot", dst: t2, cval: offset,
+                  op: slot-kind, args: pair-args(t0, t1), callee: #f));
+  func-return-type(fb-func(b)) := "<top>";
+  fb-terminate-return(b, t2);
+  fb-func(b)
+end function;
+
+// Append the getter/setter accessor functions for one class (own slots, source
+// order, getter-then-setter). Mirrors Phase 3 ordering.
+define function emit-class-accessors (cd :: <ast-class-definition>,
+                                      source :: <byte-string>,
+                                      funcs :: <stretchy-vector>) => ()
+  let cname = token-source-text(class-name(cd), source);
+  let slots = class-slots(cd);
+  let nsl = size(slots);
+  let sli = 0;
+  let idx = 0;                          // own-slot index -> offset 8 + idx*8
+  until (sli >= nsl)
+    let s = slots[sli];
+    if (instance?(slot-name-tok(s), <token>))
+      let sn = token-source-text(slot-name-tok(s), source);
+      let tn = slot-type-name(s, source);
+      let offset = 8 + idx * 8;
+      let kind = slot-kind-label(tn);
+      add!(funcs, make-getter-fn(cname, sn, offset, kind, slot-return-label(tn)));
+      if (slot-has-setter?(s, source))
+        add!(funcs, make-setter-fn(cname, sn, offset, kind));
+      end;
+      idx := idx + 1;
+    end;
+    sli := sli + 1;
+  end;
+end function;
+
 // ─── lower-function — mirrors lower_function_inner (straight-line case) ─────
 //
 // Builds a <dfm-func> for one `define function` whose body is a single
@@ -1214,7 +1415,8 @@ end function;
 // value; return_type = declared label if present, else the final temp's type.
 
 define function lower-function (defn :: <ast-body-definition>,
-                                ret-map :: <name-ret-map>, source :: <byte-string>)
+                                ret-map :: <name-ret-map>,
+                                gnames :: <stretchy-vector>, source :: <byte-string>)
  => (func :: <object>)
   let name-tok = defn-method-name(defn);
   if (~ name-tok)
@@ -1222,6 +1424,7 @@ define function lower-function (defn :: <ast-body-definition>,
   else
     let name = token-source-text(name-tok, source);
     let b = make-fn-builder(name);
+    fb-generics(b) := gnames;
     // (1) Parameters -> entry temps, declaration order.
     let params = defn-params(defn);
     if (params)
@@ -1347,6 +1550,25 @@ define function fmt-computation (c :: <dfm-comp>, temps :: <stretchy-vector>)
       i := i + 1;
     end;
     concatenate(line, "\n")
+  elseif (kind = "loadslot")
+    // `= LoadSlot t<inst> @<offset> [<kind>]` (format.rs 166-176). offset is in
+    // comp-cval, the SlotTypeKind label ("Integer"/"Object") in comp-op, the
+    // instance temp in args[0].
+    let inst = comp-args(c)[0];
+    concatenate(head,
+      concatenate(" = LoadSlot t", concatenate(integer-to-string(inst),
+        concatenate(" @", concatenate(integer-to-string(comp-cval(c)),
+          concatenate(" [", concatenate(comp-op(c), "]\n")))))))
+  elseif (kind = "storeslot")
+    // `= StoreSlot t<inst> @<offset> := t<value> [<kind>]` (format.rs 177-188).
+    // args[0] = instance, args[1] = value.
+    let inst = comp-args(c)[0];
+    let val  = comp-args(c)[1];
+    concatenate(head,
+      concatenate(" = StoreSlot t", concatenate(integer-to-string(inst),
+        concatenate(" @", concatenate(integer-to-string(comp-cval(c)),
+          concatenate(" := t", concatenate(integer-to-string(val),
+            concatenate(" [", concatenate(comp-op(c), "]\n")))))))))
   else
     // directcall: ` = DirectCall callee(t0, t1)`; empty safepoint + not
     // no_alloc -> nothing appended.
@@ -1477,24 +1699,43 @@ define function dylan-lower-emit (source :: <byte-string>)
   let ast    = parse-dylan-with-precedence(tokens, precedence-c-header?(source));
   let items  = body-constituents(ast);
   let ret-map = build-name-ret-map(items, source);
+  let gnames  = build-generic-names(items, source);
   let funcs  = make(<stretchy-vector>);
   let n = size(items);
-  let i = 0;
   let all-ok? = #t;
+  // Pass 1 (Phase 3): slot accessors for every class, in source order. All
+  // accessors precede all user functions in the dump, regardless of where the
+  // classes appear in source. Only simple (sole-super-<object>) classes are
+  // handled; anything else bails (inherited slots would shift offsets).
+  let i = 0;
+  until (i >= n | ~ all-ok?)
+    let item = items[i];
+    if (instance?(item, <ast-class-definition>))
+      if (class-is-simple?(item, source))
+        emit-class-accessors(item, source, funcs);
+      else
+        all-ok? := #f;
+      end;
+    end;
+    i := i + 1;
+  end;
+  // Pass 2 (Phase 4): user functions, source order. Any unsupported item bails.
+  i := 0;
   until (i >= n | ~ all-ok?)
     let item = items[i];
     if (instance?(item, <ast-body-definition>))
       let word = token-source-text(defn-word(item), source);
       if (word = "function")
-        let f = lower-function(item, ret-map, source);
+        let f = lower-function(item, ret-map, gnames, source);
         if (f) add!(funcs, f); else all-ok? := #f; end;
       else
-        all-ok? := #f;     // `define method` — outside Phase 0
+        all-ok? := #f;     // `define method` — 55b dispatch
       end;
+    elseif (instance?(item, <ast-class-definition>))
+      #f;                  // handled in pass 1
     elseif (instance?(item, <ast-list-definition>)
-              | instance?(item, <ast-class-definition>)
               | instance?(item, <ast-generic-definition>))
-      all-ok? := #f;       // constant / variable / class / generic — 55a/55b
+      all-ok? := #f;       // constant / variable / generic — later
     else
       // Preamble (`Module:` / `Precedence:` lexed as ordinary forms) or a bare
       // top-level expression. The Dylan parser keeps the preamble as items
