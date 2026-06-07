@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a: generalize the `if` env-merge](2026-06-07-sprint-55a-if-env-merge.md)
+  — Adding `:=` exposed two latent `if` bugs (confirmed vs Rust): assigned vars
+  weren't threaded through the join, and the join was created before the arms
+  (wrong block order for nested-control-flow arms). Fixed by giving `if` the
+  loops' full env-merge: merge set = assigned-in-arms ∪ GC-typed env (sorted,
+  value-param first), env snapshot/restore around arms, join created AFTER both
+  arms. Gate → 11 fixtures (+ `lower-if-merge`). Short-circuit has the same
+  latent shape — next.
 - [2026-06-07 — Sprint 55a: `while`/`until` loops + `:=` (the env-merge)](2026-06-07-sprint-55a-loops-and-assignment.md)
   — The hardest 55a step: loop-carried vars threaded through a `loop_header`
   block-param (carried set = assigned ∪ used ∪ GC-typed env, sorted — drives

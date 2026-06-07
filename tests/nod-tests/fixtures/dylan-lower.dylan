@@ -253,6 +253,18 @@ define function singleton-vec (a :: <integer>) => (v :: <stretchy-vector>)
   v
 end function;
 
+// Shallow copy of a stretchy-vector (for env snapshot / restore at a merge).
+define function copy-vec (v :: <stretchy-vector>) => (c :: <stretchy-vector>)
+  let c = make(<stretchy-vector>);
+  let n = size(v);
+  let i = 0;
+  until (i >= n)
+    add!(c, v[i]);
+    i := i + 1;
+  end;
+  c
+end function;
+
 // Is a type label GC-typed (needs a GC root / block-param threading across a
 // merge)? Immediate-scalar values (fixnum / boolean / character) are NOT;
 // everything else (strings, classes, floats(boxed), Top) conservatively is.
@@ -684,69 +696,132 @@ end function;
 define function lower-if-expr (b :: <fn-builder>, stmt :: <ast-statement>,
                                ret-map :: <name-ret-map>, source :: <byte-string>)
  => (temp :: <object>)
-  if (env-has-gc-typed?(b))
+  let scs = body-constituents(stmt-body(stmt));
+  if (size(scs) < 1)
     #f
   else
-    let scs = body-constituents(stmt-body(stmt));
-    // stmt-body = [cond, then-body…]; need at least the condition.
-    if (size(scs) < 1)
+    // Resolve the else arm: no clauses → none; one `else` clause → its body;
+    // elseif / multiple → bail.
+    let clauses = stmt-clauses(stmt);
+    let else-cs = #f;
+    let bail? = #f;
+    if (instance?(clauses, <stretchy-vector>))
+      if (size(clauses) = 1)
+        let cl = clauses[0];
+        if (token-source-text(clause-word(cl), source) = "else")
+          else-cs := body-constituents(clause-body(cl));
+        else
+          bail? := #t;
+        end;
+      elseif (size(clauses) > 1)
+        bail? := #t;
+      end;
+    end;
+    if (bail?)
       #f
     else
-      // Resolve the else arm from the clauses: no clauses → no else; exactly
-      // one `else` clause → its body; anything else (elseif / multiple) bails.
-      let clauses = stmt-clauses(stmt);
-      let else-cs = #f;       // else-body constituents, or #f for "no else"
-      let bail? = #f;
-      if (instance?(clauses, <stretchy-vector>))
-        if (size(clauses) = 1)
-          let cl = clauses[0];
-          if (token-source-text(clause-word(cl), source) = "else")
-            else-cs := body-constituents(clause-body(cl));
-          else
-            bail? := #t;     // single `elseif` — later
-          end;
-        elseif (size(clauses) > 1)
-          bail? := #t;       // elseif chain — later
+      // Merge set = vars assigned in either arm ∪ GC-typed env names, sorted.
+      // That order = join-param order = jump-arg order, value param FIRST.
+      let merge = make(<stretchy-vector>);
+      let ti = 1;
+      let tn = size(scs);
+      until (ti >= tn)
+        collect-assigned(b, scs[ti], source, merge);
+        ti := ti + 1;
+      end;
+      if (instance?(else-cs, <stretchy-vector>))
+        let ei = 0;
+        let en = size(else-cs);
+        until (ei >= en)
+          collect-assigned(b, else-cs[ei], source, merge);
+          ei := ei + 1;
         end;
       end;
-      if (bail?)
+      let enames = fb-env-names(b);
+      let etemps = fb-env-temps(b);
+      let ne = size(enames);
+      let gi = 0;
+      until (gi >= ne)
+        if (gc-typed-label?(fb-temp-type(b, etemps[gi])))
+          set-add!(merge, enames[gi]);
+        end;
+        gi := gi + 1;
+      end;
+      lower-sort-strings!(merge);
+      let nm = size(merge);
+      // Condition (lowered in the current block).
+      let cnd = lower-expr(b, scs[0], ret-map, source);
+      if (~ cnd)
         #f
       else
-        let cnd = lower-expr(b, scs[0], ret-map, source);
-        if (~ cnd)
+        let then-idx = fb-new-block(b, "then");
+        let else-idx = fb-new-block(b, "else");
+        fb-terminate-if(b, cnd, fb-block-label(b, then-idx), fb-block-label(b, else-idx));
+        // Snapshot env so the else arm starts from the pre-if bindings.
+        let snap-names = copy-vec(fb-env-names(b));
+        let snap-temps = copy-vec(fb-env-temps(b));
+        // then arm
+        fb-switch-to(b, then-idx);
+        let then-val = lower-stmt-range(b, scs, 1, ret-map, source);
+        if (~ then-val)
           #f
         else
-          // Create then / else / join in id order (then=N, else=N+1, join=N+2).
-          let then-idx = fb-new-block(b, "then");
-          let else-idx = fb-new-block(b, "else");
-          let join-idx = fb-new-block(b, "join");
-          let join-lbl = fb-block-label(b, join-idx);
-          fb-terminate-if(b, cnd, fb-block-label(b, then-idx), fb-block-label(b, else-idx));
-          // then arm
-          fb-switch-to(b, then-idx);
-          let then-val = lower-stmt-range(b, scs, 1, ret-map, source);
-          if (~ then-val)
+          let then-ty = fb-temp-type(b, then-val);
+          let then-end = fb-current(b);            // arm may have branched
+          let then-merge = make(<stretchy-vector>);
+          let mi = 0;
+          until (mi >= nm) add!(then-merge, fb-lookup(b, merge[mi])); mi := mi + 1; end;
+          // Restore env for the else arm.
+          fb-env-names(b) := copy-vec(snap-names);
+          fb-env-temps(b) := copy-vec(snap-temps);
+          fb-switch-to(b, else-idx);
+          let else-val =
+            if (instance?(else-cs, <stretchy-vector>))
+              lower-stmt-range(b, else-cs, 0, ret-map, source)
+            else
+              emit-false-const(b)
+            end;
+          if (~ else-val)
             #f
           else
-            let then-ty = fb-temp-type(b, then-val);
-            fb-terminate-jump(b, join-lbl, singleton-vec(then-val));
-            // else arm (synthesize #f when absent)
-            fb-switch-to(b, else-idx);
-            let else-val =
-              if (instance?(else-cs, <stretchy-vector>))
-                lower-stmt-range(b, else-cs, 0, ret-map, source)
-              else
-                emit-false-const(b)
-              end;
-            if (~ else-val)
-              #f
-            else
-              let else-ty = fb-temp-type(b, else-val);
-              fb-terminate-jump(b, join-lbl, singleton-vec(else-val));
-              // join: the merged value is the block param; continue here.
-              fb-switch-to(b, join-idx);
-              fb-add-block-param(b, join-idx, join-type-label(then-ty, else-ty))
-            end
+            let else-ty = fb-temp-type(b, else-val);
+            let else-end = fb-current(b);
+            let else-merge = make(<stretchy-vector>);
+            let mj = 0;
+            until (mj >= nm) add!(else-merge, fb-lookup(b, merge[mj])); mj := mj + 1; end;
+            // Join created AFTER both arms (GAP-010): its id follows any blocks
+            // a nested-control-flow arm created.
+            let join-idx = fb-new-block(b, "join");
+            let join-lbl = fb-block-label(b, join-idx);
+            // then-end → join(then-val, then-merge…)
+            let then-args = make(<stretchy-vector>);
+            add!(then-args, then-val);
+            let ai = 0;
+            until (ai >= nm) add!(then-args, then-merge[ai]); ai := ai + 1; end;
+            fb-switch-to(b, then-end);
+            fb-terminate-jump(b, join-lbl, then-args);
+            // else-end → join(else-val, else-merge…)
+            let else-args = make(<stretchy-vector>);
+            add!(else-args, else-val);
+            let aj = 0;
+            until (aj >= nm) add!(else-args, else-merge[aj]); aj := aj + 1; end;
+            fb-switch-to(b, else-end);
+            fb-terminate-jump(b, join-lbl, else-args);
+            // Join params: VALUE first, then merge vars (sorted). Then rebind
+            // env to pre-if + the merge vars' new join params.
+            fb-switch-to(b, join-idx);
+            let value-param =
+              fb-add-block-param(b, join-idx, join-type-label(then-ty, else-ty));
+            fb-env-names(b) := copy-vec(snap-names);
+            fb-env-temps(b) := copy-vec(snap-temps);
+            let pk = 0;
+            until (pk >= nm)
+              let pty = join-type-label(fb-temp-type(b, then-merge[pk]),
+                                        fb-temp-type(b, else-merge[pk]));
+              fb-bind(b, merge[pk], fb-add-block-param(b, join-idx, pty));
+              pk := pk + 1;
+            end;
+            value-param
           end
         end
       end

@@ -366,6 +366,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "gap011-jcs-min-crash",  // 40 fns, chained direct calls
     "lower-let",             // 55a: chained `let` bindings + arithmetic
     "lower-if",              // 55a: `let` + `if`/`else` (block-param SSA diamond)
+    "lower-if-merge",        // 55a: if env-merge (assigned-var threading + nesting)
     "lower-shortcircuit",    // 55a: `|` / `&` short-circuit diamonds
     "lower-loop",            // 55a: while/until loops + `:=` (env-merge phis)
     "factorial",             // 55a: recursion + `if` (real corpus fixture)
