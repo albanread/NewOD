@@ -646,6 +646,37 @@ pub struct LoweredModule {
     pub generics: Vec<String>,
 }
 
+/// Sprint 54 — the sema *recording* model: the authoritative record of what a
+/// module declares (the four `dump-sema` sections), separated from DFM/CFG
+/// construction. [`analyse_module`] produces it; the DFM construction in
+/// [`lower_module_full`] consumes it (54a). Sprint 54c flips the *producer* to
+/// the Dylan walk via the sema wire — the host then reconstructs a `SemaModel`
+/// off the wire instead of recomputing it here.
+///
+/// `classes` carries `ClassId`s (process-global, assigned by registration) so
+/// lowering can resolve class references; the dump and the wire deliberately
+/// key on names, not ids (see [`format_sema_model`] / `DYLAN_SEMA_WIRE.md`).
+#[derive(Clone, Debug)]
+pub struct SemaModel {
+    pub top_names: TopNames,
+    /// Sorted, deterministic — the dump / wire form.
+    pub generics: Vec<String>,
+    /// Registration order; each entry carries its name, `ClassId`, and layout.
+    pub classes: Vec<UserClassRegistration>,
+    pub sealing: crate::optimise::SealingFacts,
+}
+
+impl SemaModel {
+    /// The `name -> ClassId` map lowering uses to resolve class references,
+    /// rebuilt from `classes`.
+    pub fn user_class_map(&self) -> HashMap<String, ClassId> {
+        self.classes
+            .iter()
+            .map(|r| (r.name.clone(), r.class_id))
+            .collect()
+    }
+}
+
 /// GAP-004 — one `define variable` registration: the variable's source
 /// name and the symbol name of its codegen-emitted `__init-<name>`
 /// thunk (a zero-arg `extern "C-unwind" fn() -> u64` returning the
@@ -1402,6 +1433,102 @@ pub fn lower_module(m: &Module) -> Result<Vec<Function>, Vec<LoweringError>> {
     lower_module_full(m).map(|lm| lm.functions)
 }
 
+/// Sprint 54 — the recording phase. Walks the (already macro-expanded,
+/// anonymous-method-lifted) module and produces its [`SemaModel`]: registers
+/// every `define class` (a runtime side effect that assigns `ClassId`s),
+/// flips sealed flags, collects the top-level names + generic names, and
+/// computes (but does NOT install) the sealing facts. No DFM/CFG is built
+/// here — that is the DFM construction in [`lower_module_full`] (the named
+/// `lower_with_model` extraction is a later 54a step). Returns `Err` if any
+/// class fails to register.
+///
+/// Callers must have run the `ensure_*_registered` seed-registrations and the
+/// anonymous-method lift pre-pass first (so `__anon-method-N` are present and
+/// seed/runtime classes resolve) — `lower_module_full` does both before it
+/// calls this.
+pub fn analyse_module(m: &Module) -> Result<SemaModel, Vec<LoweringError>> {
+    let mut errors: Vec<LoweringError> = Vec::new();
+    let mut user_classes: HashMap<String, ClassId> = HashMap::new();
+    let mut user_class_registrations: Vec<UserClassRegistration> = Vec::new();
+
+    // Phase 1a: walk define-class items and register metadata. The sealing
+    // flag flip is deferred to Phase 1c so subclassing a sealed class WITHIN
+    // THIS analysis pass is allowed (in-library subclassing — spec 15 §6).
+    for item in &m.items {
+        if let Item::DefineClass { name, supers, slots, span, .. } = item {
+            match register_class(name, supers, slots, *span) {
+                Ok(id) => {
+                    user_classes.insert(name.clone(), id);
+                    // Snapshot the freshly-registered metadata for the AOT
+                    // pipeline, read from the canonical static-area entry so
+                    // offsets / CPL / slot_origin match what lowering resolves
+                    // through the class table — no parallel computation.
+                    let md_ptr = class_metadata_ptr(id);
+                    if !md_ptr.is_null() {
+                        // SAFETY: pointer is to static-area metadata
+                        // (process-lived); we just registered it.
+                        let md = unsafe { &*md_ptr };
+                        user_class_registrations.push(UserClassRegistration {
+                            name: md.name.clone(),
+                            class_id: id,
+                            parents: md.parents.clone(),
+                            cpl: md.cpl.clone(),
+                            slots: md.slots.clone(),
+                            slot_origin: md.slot_origin.clone(),
+                            own_slot_count: md.own_slot_count,
+                            inherited_slot_count: md.inherited_slot_count,
+                        });
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    // Phase 1c: flip sealed flags on classes + generics bearing the `sealed`
+    // modifier, AFTER every class in this pass is registered (so the
+    // cross-library refusal in `register_class` doesn't fire in-library).
+    for item in &m.items {
+        if let Item::DefineClass { name, modifiers, .. } = item
+            && modifiers.contains(&nod_reader::Modifier::Sealed)
+            && let Some(&id) = user_classes.get(name)
+        {
+            let p = class_metadata_ptr(id);
+            if !p.is_null() {
+                // SAFETY: static-area metadata.
+                unsafe { (*p).mark_sealed() };
+            }
+        }
+        if let Item::DefineGeneric { name, modifiers, .. } = item
+            && modifiers.contains(&nod_reader::Modifier::Sealed)
+        {
+            let g = nod_runtime::get_or_create_generic(name);
+            g.mark_sealed();
+        }
+    }
+
+    // Phase 2: top-level function names (incl. auto-accessor names) +
+    // generic names (sorted for a deterministic dump / wire).
+    let top_names = collect_top_level_names(m, &user_classes);
+    let mut generics: Vec<String> = collect_generic_names(m).into_iter().collect();
+    generics.sort();
+
+    // Sealing facts — computation only. Installation (a global side effect)
+    // stays in `lower_module_full` at its historical point, just before
+    // dispatch resolution, to preserve behavior.
+    let sealing = crate::optimise::collect_sealing_facts(&m.items, &user_classes);
+
+    Ok(SemaModel {
+        top_names,
+        generics,
+        classes: user_class_registrations,
+        sealing,
+    })
+}
+
 pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>> {
     // Sprint 19: ensure the seed condition classes are registered
     // before lowering starts so `<error>` / `<simple-error>` / etc.
@@ -1452,85 +1579,25 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     }
     let m: &Module = &m_owned;
 
+    // Sprint 54a — recording phase. `analyse_module` registers classes, flips
+    // sealed flags, and collects top-names / generics / sealing into a
+    // `SemaModel`; the DFM construction below consumes it. Rebuild the exact
+    // locals the rest of this function already uses, so Phase 3/4 are
+    // unchanged. (Sprint 54c swaps the model's producer to the Dylan walk via
+    // the sema wire, behind `--sema-with-dylan`.)
+    let model = analyse_module(m)?;
+    let user_classes: HashMap<String, ClassId> = model.user_class_map();
+    let user_class_registrations: Vec<UserClassRegistration> = model.classes.clone();
+    let top_names: TopNames = model.top_names.clone();
+    // Lowering consults generics as a set; the dump wants the sorted vec.
+    let generics: HashSet<String> = model.generics.iter().cloned().collect();
+    let generics_for_dump: Vec<String> = model.generics.clone();
+    // Sealing facts are computed in `analyse_module`; install happens below at
+    // the historical point (before dispatch resolution).
+    let sealing: crate::optimise::SealingFacts = model.sealing.clone();
+    // Phase 4 reuses this accumulator for per-item lowering errors; Phase 1's
+    // class-registration errors are handled inside `analyse_module`.
     let mut errors: Vec<LoweringError> = Vec::new();
-    let mut user_classes: HashMap<String, ClassId> = HashMap::new();
-    // Sprint 40a: capture each registered user class's metadata for
-    // the AOT pipeline. The JIT path ignores this; the driver / AOT
-    // codegen reads it through `LoweredModule::user_classes`.
-    let mut user_class_registrations: Vec<UserClassRegistration> = Vec::new();
-
-    // Phase 1a: walk define-class items and register metadata. The
-    // sealing flag flip is deferred to Phase 1c so subclassing a
-    // sealed class WITHIN THIS SAME `lower_module_full` call is
-    // allowed (in-library subclassing — see spec 15 §6 table). The
-    // cross-library refusal in `register_class` checks `is_sealed()`,
-    // so an in-call subclass registration runs before the parent's
-    // sealed bit is flipped; a later separate `lower_module_full`
-    // call sees the flag and refuses.
-    for item in &m.items {
-        if let Item::DefineClass { name, supers, slots, span, .. } = item {
-            match register_class(name, supers, slots, *span) {
-                Ok(id) => {
-                    user_classes.insert(name.clone(), id);
-                    // Sprint 40a: snapshot the freshly-registered
-                    // metadata for the AOT pipeline. Reading from the
-                    // canonical static-area entry guarantees the
-                    // persisted offsets / CPL / slot_origin match
-                    // exactly what the JIT path resolved through the
-                    // class table — no parallel computation, no drift.
-                    let md_ptr = class_metadata_ptr(id);
-                    if !md_ptr.is_null() {
-                        // SAFETY: pointer is to static-area metadata
-                        // (process-lived); we just registered it.
-                        let md = unsafe { &*md_ptr };
-                        user_class_registrations.push(UserClassRegistration {
-                            name: md.name.clone(),
-                            class_id: id,
-                            parents: md.parents.clone(),
-                            cpl: md.cpl.clone(),
-                            slots: md.slots.clone(),
-                            slot_origin: md.slot_origin.clone(),
-                            own_slot_count: md.own_slot_count,
-                            inherited_slot_count: md.inherited_slot_count,
-                        });
-                    }
-                }
-                Err(e) => errors.push(e),
-            }
-        }
-    }
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    // Phase 1c: flip sealed flags on classes + generics that bear the
-    // `sealed` modifier. Runs AFTER every class in this lowering call
-    // is registered (and after any in-library subclasses of a sealed
-    // parent are themselves registered), so the cross-library refusal
-    // in `register_class` doesn't fire for in-library use.
-    for item in &m.items {
-        if let Item::DefineClass { name, modifiers, .. } = item
-            && modifiers.contains(&nod_reader::Modifier::Sealed)
-            && let Some(&id) = user_classes.get(name)
-        {
-            let p = class_metadata_ptr(id);
-            if !p.is_null() {
-                // SAFETY: static-area metadata.
-                unsafe { (*p).mark_sealed() };
-            }
-        }
-        if let Item::DefineGeneric { name, modifiers, .. } = item
-            && modifiers.contains(&nod_reader::Modifier::Sealed)
-        {
-            let g = nod_runtime::get_or_create_generic(name);
-            g.mark_sealed();
-        }
-    }
-
-    // Phase 2: collect top-level function names (incl. auto-accessor
-    // names) and generic names.
-    let top_names = collect_top_level_names(m, &user_classes);
-    let generics = collect_generic_names(m);
 
     let mut out: Vec<Function> = Vec::new();
     let mut methods: Vec<MethodRegistration> = Vec::new();
@@ -2248,7 +2315,8 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
             });
         }
     }
-    let sealing = crate::optimise::collect_sealing_facts(&m.items, &user_classes_snapshot);
+    // `sealing` was computed in `analyse_module`; install it here (the
+    // historical point, before dispatch resolution) to preserve behavior.
     crate::optimise::install_sealing_facts(&sealing);
     let mut resolutions: Vec<crate::optimise::DispatchResolution> = Vec::new();
     for f in &mut out {
@@ -2363,12 +2431,9 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
     }
     let _ = materialized_call_names;
 
-    // Sprint 53 — snapshot the sema recording outputs. `top_names` and
-    // `generics` were computed in Phase 2; clone them (they were also
-    // read by lowering) plus sort the generic set for a stable dump.
-    let mut generics_sorted: Vec<String> = generics.iter().cloned().collect();
-    generics_sorted.sort();
-
+    // Sprint 54a — the recording outputs (`top_names` / `generics` / classes
+    // / sealing) came from `analyse_module`'s `SemaModel`; snapshot them onto
+    // the `LoweredModule` for `dump-sema` / the wire byte-match.
     Ok(LoweredModule {
         functions: out,
         methods,
@@ -2382,7 +2447,7 @@ pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>
         user_classes: user_class_registrations,
         variables: variable_registrations,
         top_names: top_names.clone(),
-        generics: generics_sorted,
+        generics: generics_for_dump,
     })
 }
 

@@ -28,6 +28,18 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 54a: the analyse | lower split (`analyse_module` → `SemaModel`)](2026-06-07-sprint-54a-analyse-module-split.md)
+  — Sprint 54 begins: make the Dylan sema model load-bearing. 54a is the
+  structural prerequisite — extract the recording phase out of the ~1000-line
+  fused `lower_module_full` into `analyse_module(m) -> SemaModel` (top-names,
+  generics, classes, sealing), then have lowering rebuild the same locals from
+  the model so DFM construction is byte-for-byte unchanged. Two behavior-
+  preserving subtleties: the shared `errors` accumulator (split into per-phase
+  vecs with their early-returns intact) and sealing (compute in `analyse`,
+  install at its historical point in `lower`). Verified: full sweep green bar
+  the known `lexer_oracle` parallel-build flake; `sema_topnames` 38/38 doubles
+  as the recording-output regression check. Sets up 54b (the wire) and 54c
+  (the flip).
 - [2026-06-07 — Consolidation: full sema-corpus survey after the 53.5 gaps closed](2026-06-07-consolidation-sema-survey.md)
   — Honest inventory, no feature work. Re-ran the whole-corpus byte-match
   survey: all 38 gated fixtures match, every ungated MATCH is a deliberately
