@@ -419,10 +419,13 @@ end function;
 define function primop-result-label (prim :: <byte-string>)
  => (label :: <byte-string>)
   if (prim = "AddInt" | prim = "SubInt" | prim = "MulInt"
-        | prim = "DivInt" | prim = "ModInt" | prim = "RemInt")
+        | prim = "DivInt" | prim = "ModInt" | prim = "RemInt" | prim = "NegInt")
     "<integer>"
+  elseif (prim = "AddFloat" | prim = "SubFloat" | prim = "MulFloat"
+            | prim = "DivFloat" | prim = "NegFloat")
+    "<double-float>"
   else
-    "<boolean>"
+    "<boolean>"             // comparisons + boolean ops -> <boolean>
   end
 end function;
 
@@ -491,6 +494,25 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
           dst
         end
       end
+    end
+  elseif (instance?(node, <ast-unary-op>))
+    // Prefix `- operand` -> PrimOp NegInt (integer) / NegFloat (float),
+    // mirroring lower.rs. `~` (not) and other prefixes are later -> #f.
+    let op = token-source-text(unary-op(node), source);
+    if (op = "-")
+      let operand = lower-expr(b, unary-operand(node), ret-map, source);
+      if (~ operand)
+        #f
+      else
+        let prim = if (fb-temp-type(b, operand) = "<double-float>") "NegFloat"
+                   else "NegInt" end;
+        let dst = fb-fresh-temp(b, primop-result-label(prim));
+        fb-push(b, make(<dfm-comp>, kind: "primop", dst: dst, cval: #f,
+                        op: prim, args: singleton-vec(operand), callee: #f));
+        dst
+      end
+    else
+      #f
     end
   elseif (instance?(node, <ast-call>))
     let callee-node = call-fn(node);
@@ -1448,6 +1470,67 @@ define function emit-class-accessors (cd :: <ast-class-definition>,
   end;
 end function;
 
+// Declared return label of a constant's binder: `*x* :: <integer> = …` gives
+// the typed-name's type label; a bare `*x* = …` gives #f (use the init type).
+define function constant-declared-label (lhs :: <object>, source :: <byte-string>)
+ => (label :: <object>)
+  if (instance?(lhs, <ast-typed-name>))
+    let ty = typed-name-type(lhs);
+    if (ty & instance?(ty, <ast-variable-ref>))
+      type-name-to-label(token-source-text(varref-tok(ty), source))
+    else
+      #f
+    end
+  else
+    #f
+  end
+end function;
+
+// `define constant NAME [:: <type>] = INIT` lowers to a 0-arg initializer
+// function `fn NAME () -> <ret>: <init>; Return t` (one thunk per constant, in
+// source order with the user functions). Single binder only; multi-binder or an
+// unsupported init returns #f (whole module bails).
+define function lower-constant-defn (ld :: <ast-list-definition>,
+                                     ret-map :: <name-ret-map>,
+                                     gnames :: <stretchy-vector>,
+                                     source :: <byte-string>) => (func :: <object>)
+  let cs = body-constituents(defn-list(ld));
+  if (size(cs) ~= 1)
+    #f                                  // `define constant a = 1, b = 2` — later
+  else
+    let node = cs[0];
+    if (~ instance?(node, <ast-binary-op>))
+      #f
+    else
+      let lhs = binop-left(node);
+      let name =
+        if (instance?(lhs, <ast-variable-ref>))
+          token-source-text(varref-tok(lhs), source)
+        elseif (instance?(lhs, <ast-typed-name>))
+          token-source-text(typed-name-tok(lhs), source)
+        else
+          #f
+        end;
+      if (~ name)
+        #f
+      else
+        let b = make-fn-builder(name);
+        fb-generics(b) := gnames;
+        let t = lower-expr(b, binop-right(node), ret-map, source);
+        if (~ t)
+          #f
+        else
+          let declared = constant-declared-label(lhs, source);
+          let ret-label = if (declared) declared else fb-temp-type(b, t) end;
+          func-return-type(fb-func(b)) := ret-label;
+          fb-terminate-return(b, t);
+          fb-func(b)
+        end
+      end
+    end
+  end
+end function;
+
 // ─── lower-function — mirrors lower_function_inner (straight-line case) ─────
 //
 // Builds a <dfm-func> for one `define function` whose body is a single
@@ -1511,8 +1594,15 @@ define function lower-function (defn :: <ast-body-definition>,
       end;
       ci := ci + 1;
     end;
-    if (~ ok? | ~ last-temp)
+    if (~ ok?)
       #f
+    elseif (~ last-temp)
+      // Void function: the body lowered but produced no value — a trailing
+      // loop, or a `=> ()` signature. Rust types these `<unit>` with a bare
+      // `Return` (no value). (lower.rs: a unit-valued body → Return{None}.)
+      func-return-type(fb-func(b)) := "<unit>";
+      fb-terminate-return(b, #f);
+      fb-func(b)
     else
       // (3) return_type: declared wins, else the final temp's type.
       let declared = defn-declared-return-label(defn, source);
@@ -1781,9 +1871,17 @@ define function dylan-lower-emit (source :: <byte-string>)
       end;
     elseif (instance?(item, <ast-class-definition>))
       #f;                  // handled in pass 1
-    elseif (instance?(item, <ast-list-definition>)
-              | instance?(item, <ast-generic-definition>))
-      all-ok? := #f;       // constant / variable / generic — later
+    elseif (instance?(item, <ast-list-definition>))
+      // `define constant` emits a 0-arg initializer function; `define variable`
+      // and anything else still bails.
+      if (token-source-text(defn-word(item), source) = "constant")
+        let f = lower-constant-defn(item, ret-map, gnames, source);
+        if (f) add!(funcs, f); else all-ok? := #f; end;
+      else
+        all-ok? := #f;
+      end;
+    elseif (instance?(item, <ast-generic-definition>))
+      all-ok? := #f;       // generic — later
     else
       // Preamble (`Module:` / `Precedence:` lexed as ordinary forms) or a bare
       // top-level expression. The Dylan parser keeps the preamble as items

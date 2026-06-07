@@ -398,6 +398,17 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "jit_cache_sample_items", // 55a: real corpus fixture, now fully lowered
     "lower-class-accessors", // 55b: slot getter/setter emission (LoadSlot/StoreSlot)
     "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
+    "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
+];
+
+/// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries
+/// post-pass effects (safepoint roots, dispatch resolution) that the *standalone*
+/// `dump-dylan-dfm` (pre-pass) can't reproduce. They are verified ONLY through
+/// the flip (`--lower-with-dylan`), where the host runs the same passes on the
+/// reconstructed DFM. Listed separately from PHASE0_LOWER_FIXTURES (which the
+/// standalone text gate also uses).
+const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
+    "translate-loop",        // 55a-tail: void (=> ()) functions + loop safepoints
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan
@@ -613,7 +624,10 @@ fn dump_dfm_lower_with_dylan_byte_match() {
     }
 
     let mut failures: Vec<String> = Vec::new();
-    for fx in PHASE0_LOWER_FIXTURES {
+    let all_flip_fixtures = PHASE0_LOWER_FIXTURES
+        .iter()
+        .chain(FLIP_ONLY_LOWER_FIXTURES.iter());
+    for fx in all_flip_fixtures {
         let input = fixtures_dir().join(format!("{fx}.dylan"));
         assert!(input.is_file(), "missing fixture {}", input.display());
 

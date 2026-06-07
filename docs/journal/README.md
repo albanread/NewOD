@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a-tail: unary `-`, `define constant`, void functions](2026-06-07-sprint-55a-tail-unary-constant-void.md)
+  — Three small forms: unary `-x`→NegInt/NegFloat, `define constant`→0-arg init
+  fn, void (`=> ()`) functions→`<unit>`+bare Return. `kernel-arith` joins the
+  text gate; `translate-loop` (void fns with loop safepoints) is the first
+  FLIP-ONLY fixture — verifiable only through `--lower-with-dylan` because the
+  host populates its safepoints. Establishes the text-gateable vs flip-only split.
 - [2026-06-07 — Sprint 55: the lowering flip (Dylan AST→DFM is load-bearing)](2026-06-07-sprint-55-lowering-flip-load-bearing.md)
   — The keystone: `--lower-with-dylan` replaces the Rust Phase-3/4 functions with
   the Dylan `dylan-lower-emit` DFM, reconstructed host-side (`parse_dfm_module`),
