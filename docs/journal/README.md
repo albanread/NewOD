@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a (first forms): `let` bindings + string-debug escaping](2026-06-07-sprint-55a-let-and-strings.md)
+  — Grows the Dylan lowering: multi-statement bodies + `let` (a non-captured
+  let is just a name→value-temp binding, no extra computation), and Rust-`{:?}`
+  string escaping in `format-dfm` (the only diff on `hello`). Lowering gate to 5
+  fixtures byte-identical: + `hello`, `gap011-jcs-min-crash` (40 fns), and a new
+  `lower-let` (chained lets). Next 55a form: `if` (block-param SSA core).
 - [2026-06-07 — Sprint 55 Phase 0: the Dylan AST→DFM lowering scaffold](2026-06-07-sprint-55-phase0-lowering-scaffold.md)
   — Stands up `dylan-lower.dylan` (DFM structs + FunctionBuilder + lower-expr +
   a byte-exact `format-dfm`) and proves the byte-match end-to-end: `dump-dylan-dfm`

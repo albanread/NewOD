@@ -355,10 +355,17 @@ fn run_dump_dfm(ws: &Path, input: &Path, sema_with_dylan: bool) -> (String, Stri
     )
 }
 
-/// Sprint 55 Phase 0 — fixtures whose every top-level item is a straight-line
-/// `define function` (literals / binops / direct calls, no control flow,
-/// classes, or closures) — the subset the Dylan-side lowering handles so far.
-const PHASE0_LOWER_FIXTURES: &[&str] = &["sprint09-add", "mutual"];
+/// Sprint 55 Phase 0 / 55a — fixtures the Dylan-side lowering reproduces
+/// byte-for-byte so far: straight-line `define function`s (literals / binops /
+/// direct calls / `let` bindings; no control flow, classes, or closures).
+/// Grows form-by-form as 55a adds `if` / loops / etc.
+const PHASE0_LOWER_FIXTURES: &[&str] = &[
+    "sprint09-add",          // params + binop
+    "mutual",                // 3 fns: direct calls + int consts + binops
+    "hello",                 // string literal (Rust `{:?}` escaping) + call
+    "gap011-jcs-min-crash",  // 40 fns, chained direct calls
+    "lower-let",             // 55a: chained `let` bindings + arithmetic
+];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan
 /// AST→DFM lowering via the `dylan-lower-emit` shim entry). Returns

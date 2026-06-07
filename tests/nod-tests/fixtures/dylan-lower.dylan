@@ -333,10 +333,8 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
     t
   elseif (instance?(node, <ast-string-lit>))
     let t = fb-fresh-temp(b, "<string>");
-    // NOTE: only ASCII strings with no quote/backslash/control chars match
-    // Rust `{:?}` here (Phase-0 corpus has none — see plan risks).
     let raw = lit-value(node);
-    let cval = concatenate("String(\"", concatenate(raw, "\")"));
+    let cval = concatenate("String(\"", concatenate(escape-string-debug(raw), "\")"));
     fb-push(b, make(<dfm-comp>, kind: "const", dst: t, cval: cval,
                     op: #f, args: make(<stretchy-vector>), callee: #f));
     t
@@ -397,6 +395,62 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
   end
 end function;
 
+// ─── lower-let — mirrors a Statement::Let with a single binder ─────────────
+//
+// `let binder = init` (an <ast-local-decl> whose ldecl-list is the binder
+// binop). Lowers the init expression and binds the binder name to its temp
+// (a non-captured let in Rust lowering is just a name->value-temp binding — no
+// extra computation; cell promotion for captured lets is 55c). Returns the
+// init temp, or #f if outside the Phase-0/55a subset (multi-binder destructure,
+// `let x` with no init, or an unsupported init).
+define function lower-let (b :: <fn-builder>, decl :: <ast-local-decl>,
+                           ret-map :: <name-ret-map>, source :: <byte-string>)
+ => (temp :: <object>)
+  let list = ldecl-list(decl);
+  let cs = body-constituents(list);
+  if (size(cs) ~= 1)
+    #f                                  // `let (a, b) = …` multi-binder — 55a+
+  else
+    let node = cs[0];
+    if (~ instance?(node, <ast-binary-op>))
+      #f                                // `let x` with no initialiser — bail
+    else
+      let lhs = binop-left(node);
+      let name =
+        if (instance?(lhs, <ast-variable-ref>))
+          token-source-text(varref-tok(lhs), source)
+        elseif (instance?(lhs, <ast-typed-name>))
+          token-source-text(typed-name-tok(lhs), source)
+        else
+          #f
+        end;
+      if (~ name)
+        #f
+      else
+        let t = lower-expr(b, binop-right(node), ret-map, source);
+        if (~ t)
+          #f
+        else
+          fb-bind(b, name, t);
+          t
+        end
+      end
+    end
+  end
+end function;
+
+// Lower one body constituent (a `let` decl or an expression). Returns its
+// value temp, or #f if unsupported.
+define function lower-body-stmt (b :: <fn-builder>, item :: <object>,
+                                 ret-map :: <name-ret-map>, source :: <byte-string>)
+ => (temp :: <object>)
+  if (instance?(item, <ast-local-decl>))
+    lower-let(b, item, ret-map, source)
+  else
+    lower-expr(b, item, ret-map, source)
+  end
+end function;
+
 // ─── lower-function — mirrors lower_function_inner (straight-line case) ─────
 //
 // Builds a <dfm-func> for one `define function` whose body is a single
@@ -436,29 +490,81 @@ define function lower-function (defn :: <ast-body-definition>,
         pi := pi + 1;
       end;
     end;
-    // (2) Body — single straight-line expression (Phase-0 restriction).
+    // (2) Body — a sequence of straight-line statements (let bindings +
+    // expressions). Each lowers in order; the LAST statement's value is the
+    // return value (lower_function_inner's last_temp). Any unsupported
+    // statement bails the whole function (-> Rust path).
     let body = defn-body(defn);
     let cs = body-constituents(body);
-    if (size(cs) ~= 1)
+    let nc = size(cs);
+    let ci = 0;
+    let last-temp = #f;
+    let ok? = #t;
+    until (ci >= nc | ~ ok?)
+      let t = lower-body-stmt(b, cs[ci], ret-map, source);
+      if (t) last-temp := t; else ok? := #f; end;
+      ci := ci + 1;
+    end;
+    if (~ ok? | ~ last-temp)
       #f
     else
-      let final-temp = lower-expr(b, cs[0], ret-map, source);
-      if (~ final-temp)
-        #f
-      else
-        // (3) return_type: declared wins, else the final temp's type.
-        let declared = defn-declared-return-label(defn, source);
-        let ret-label = if (declared) declared else fb-temp-type(b, final-temp) end;
-        func-return-type(fb-func(b)) := ret-label;
-        // (4) Return{value}.
-        fb-terminate-return(b, final-temp);
-        fb-func(b)
-      end
+      // (3) return_type: declared wins, else the final temp's type.
+      let declared = defn-declared-return-label(defn, source);
+      let ret-label = if (declared) declared else fb-temp-type(b, last-temp) end;
+      func-return-type(fb-func(b)) := ret-label;
+      // (4) Return{value}.
+      fb-terminate-return(b, last-temp);
+      fb-func(b)
     end
   end
 end function;
 
 // ─── format-dfm — mirrors nod-dfm/src/format.rs EXACTLY ────────────────────
+
+// Render one byte as a 1-char <byte-string>.
+define function byte-to-string-1 (c :: <integer>) => (s :: <byte-string>)
+  let s = %byte-string-allocate(1);
+  %byte-string-element-setter(c, s, 0);
+  s
+end function;
+
+// Lowercase hex of a byte value (no leading zero), for `\u{..}` escapes.
+define function byte-hex (c :: <integer>) => (s :: <byte-string>)
+  let digits = "0123456789abcdef";
+  let hi = c - (c / 16) * 16;        // low nibble
+  let lo-s = byte-to-string-1(%byte-string-element(digits, hi));
+  let high = c / 16;
+  if (high = 0)
+    lo-s
+  else
+    concatenate(byte-to-string-1(%byte-string-element(digits, high)), lo-s)
+  end
+end function;
+
+// Escape a string the way Rust's `{:?}` (str Debug / escape_debug) does, so
+// `String(<...>)` in the DFM dump matches `format.rs` byte-for-byte: `"` and
+// `\` are backslash-escaped, `\n` / `\t` / `\r` use their letter escapes,
+// printable ASCII passes through, and any other byte becomes `\u{<hex>}`.
+define function escape-string-debug (s :: <byte-string>) => (out :: <byte-string>)
+  let out = "";
+  let n = size(s);
+  let i = 0;
+  until (i >= n)
+    let c = %byte-string-element(s, i);
+    let piece =
+      if (c = 34)                   "\\\""        // "
+      elseif (c = 92)               "\\\\"        // backslash
+      elseif (c = 10)               "\\n"
+      elseif (c = 9)                "\\t"
+      elseif (c = 13)               "\\r"
+      elseif (c >= 32 & c <= 126)   byte-to-string-1(c)
+      else                          concatenate("\\u{", concatenate(byte-hex(c), "}"))
+      end;
+    out := concatenate(out, piece);
+    i := i + 1;
+  end;
+  out
+end function;
 
 // fmt_computation (format.rs), Phase-0 kinds. 4-space indent, newline-end.
 define function fmt-computation (c :: <dfm-comp>, temps :: <stretchy-vector>)
