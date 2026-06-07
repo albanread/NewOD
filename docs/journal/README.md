@@ -28,6 +28,17 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55 plan: porting AST→DFM lowering to Dylan](2026-06-07-sprint-55-lowering-plan.md)
+  — The plan for the last and densest front-end stage. Maps the target (a
+  block-parameter SSA CFG; lowering emits ~8 of 10 `Computation` variants —
+  never `SealedDirectCall`/`is_no_alloc`/`safepoint_roots`, the resolver +
+  liveness stay Rust), the `dump-dfm` byte-match oracle (frozen formatter =
+  JIT-cache key), the `--lower-with-dylan` flag + DFM wire, and the
+  sub-phasing: Phase 0 scaffold (FunctionBuilder + wire + gate, trivial fns) →
+  55a statements/exprs (the ~1.4k-LOC block-SSA + sorted env-merge core) → 55b
+  classes/dispatch → 55c closures/blocks. ~5k LOC, multi-session; FFI/winapi
+  deferred. Honest: the byte-exact temp/block-id + merge-param order is the
+  brutal part — sub-gate form by form.
 - [2026-06-07 — Sprint 54c: the Dylan sema goes load-bearing (`--sema-with-dylan`)](2026-06-07-sprint-54c-sema-load-bearing.md)
   — Closes Sprint 54. The back-end now consumes the Dylan-produced sema model
   instead of the Rust recompute, gated `dump-dfm` byte-identical (38/38, incl.
