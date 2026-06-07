@@ -28,6 +28,16 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 53.5d: implicit generics from bare `define method`](2026-06-07-sema-53-5d-implicit-method-generics.md)
+  — Closes the second of the three rope-family divergences 53.5b uncovered.
+  The oracle's `collect_generic_names` records a `generic <name>` per
+  `DefineMethod` name; the Dylan walk now does too (deduped against explicit
+  + slot generics). The rope family's `=== generics ===` section matches; the
+  three are now **one line** from gating, blocked only by `empty-rope`'s
+  `return=Class(<id>)` — a raw process-global class-id that is itself a
+  portability leak in `format_sema_model` (everything else refers to classes
+  by name). Fix options surfaced: render the return class by name, or wait
+  for the Sprint 54 class-id work.
 - [2026-06-07 — Sprint 53.5b: anonymous-method lifting (`__anon-method-N`)](2026-06-07-sema-53-5b-anon-method-lifting.md)
   — The Dylan sema walk now lifts `method (…) … end` literals in expression
   position to synthetic `__anon-method-N` top-level functions, mirroring the

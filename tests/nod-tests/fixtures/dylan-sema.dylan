@@ -581,16 +581,16 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
     let item = items[i];
     if (instance?(item, <ast-body-definition>))
       let word = token-source-text(defn-word(item), source);
-      // Only `define function` contributes a top-names `fn`. The oracle
-      // attaches `define method` bodies to their generic (the explicit
-      // `define generic`, recorded below), so a method emits NO `fn`
-      // line and must not duplicate the generic's entry.
-      //
-      // DEFERRED: a bare `define method` with no explicit `define generic`
-      // implicitly CREATES a generic of that name in the real sema model.
-      // No fixture here exercises that (richards' run-task generic is
-      // explicit), so implicit-generic creation from methods is left for a
-      // later sprint.
+      // Only `define function` contributes a top-names `fn`. A `define
+      // method` emits NO `fn` line (it attaches to its generic, not a
+      // standalone function) but DOES implicitly define a generic of its
+      // name — `collect_generic_names` (nod-sema/src/lower.rs) inserts
+      // every `DefineMethod` name, alongside `DefineGeneric` names and the
+      // slot accessors. Mirror that here so the `=== generics ===` section
+      // byte-matches even when a method has no explicit `define generic`.
+      // De-duped against the explicit generics / slot generics via
+      // `bs-member?`; lifted `__anon-method-N` thunks are `DefineFunction`s,
+      // not methods, so they are correctly excluded.
       if (word = "function")
         let name-tok = defn-method-name(item);
         if (name-tok)
@@ -601,6 +601,12 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
                         concatenate(" arity=", concatenate(integer-to-string(arity),
                           concatenate(" return=", est)))));
           add!(fns, make(<top-fn>, name: name, line: line));
+        end;
+      elseif (word = "method")
+        let name-tok = defn-method-name(item);
+        if (name-tok)
+          let name = token-source-text(name-tok, source);
+          if (~ bs-member?(generics, name)) add!(generics, name); end;
         end;
       end;
     elseif (instance?(item, <ast-list-definition>))

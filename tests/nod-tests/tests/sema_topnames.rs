@@ -83,16 +83,24 @@ fn fixtures_dir() -> PathBuf {
 /// depth-first source order. `nod-ide` (four such literals) now byte-matches
 /// end-to-end and joins the gate. Ground truth corrected the 53.5(1) survey,
 /// which had blamed the `rope` / `ide_rope` / `unified_ide` divergence solely
-/// on anon-methods: those three carry TWO further, independent gaps the
-/// anon-method work does not touch, so they stay ungated for now —
-///   * implicit generics from bare `define method` (the oracle records a
-///     `generic <name>` per method name; the Dylan walk only emits generics
-///     from `define generic` + slot accessors, per the DEFERRED note in
-///     `collect-top-names`), and
-///   * user-class return estimates (`empty-rope () => (r :: <rope-leaf>)`
-///     dumps `return=Class(<id>)` in the oracle vs `return=Top` here), which
-///     needs the runtime class-id reproduced in the Dylan walk — the Sprint
-///     54 class-id-determinism problem, not an anon-method concern.
+/// on anon-methods: those three actually carried TWO further, independent
+/// gaps the anon-method work does not touch.
+///
+/// Sprint 53.5d then closed the first of those two: implicit generics from
+/// bare `define method`. The oracle's `collect_generic_names` records a
+/// `generic <name>` per `DefineMethod` name (alongside `DefineGeneric` names
+/// and slot accessors); the Dylan walk now does the same, deduped against the
+/// explicit generics. The `rope` family's `=== generics ===` section now
+/// matches.
+///
+/// That leaves the rope family one line apart, still ungated: user-class
+/// return estimates. `empty-rope () => (r :: <rope-leaf>)` dumps
+/// `return=Class(<id>)` in the oracle (the *raw, process-global* class-id)
+/// vs `return=Top` here. Reproducing the id in the Dylan walk is the Sprint
+/// 54 class-id-determinism problem — and the raw id is itself a portability
+/// leak in `format_sema_model` (everything else in the dump refers to
+/// classes by name via `sema_class_name`), so the likely fix is to render
+/// the return class by name on both sides rather than chase the id.
 const FIXTURES: &[&str] = &[
     // 53.2 — class-free top-names (functions / constants / variables).
     "factorial",
