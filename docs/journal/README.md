@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: `instance?` → TypeCheck](2026-06-07-sprint-55b-instance-typecheck.md)
+  — Second id-free/pass-free 55b piece: `instance?(v, <class>)` → `TypeCheck v
+  <label>` (dst <boolean>). The label is `ClassCheck::name()`, not verbatim —
+  `<string>`/`<byte-string>` both print `<byte-string>`, `<vector>`/`<simple-
+  object-vector>` both print `<simple-object-vector>`; everything else (incl.
+  user classes) is the source name. Gate → 13. Closes the text-gateable surface
+  of 55b; the rest needs the DFM wire (class-ids + post-passes).
 - [2026-06-07 — Sprint 55b: slot-accessor emission (LoadSlot / StoreSlot)](2026-06-07-sprint-55b-slot-accessors.md)
   — First 55b increment: `define class` lowers its synthesized getter/setter
   accessors in Dylan, byte-identical to Rust. The id-free, pass-free island of

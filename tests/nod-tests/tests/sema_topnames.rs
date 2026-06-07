@@ -372,6 +372,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "factorial",             // 55a: recursion + `if` (real corpus fixture)
     "jit_cache_sample_items", // 55a: real corpus fixture, now fully lowered
     "lower-class-accessors", // 55b: slot getter/setter emission (LoadSlot/StoreSlot)
+    "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan

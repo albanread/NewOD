@@ -498,11 +498,35 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
       #f
     else
       let name = token-source-text(varref-tok(callee-node), source);
-      // A call to a slot/generic name is a Dispatch (lower.rs 6060), and
-      // `make`/`instance?` are intrinsics — none are plain DirectCalls. Until
-      // those forms land, bail the whole function to the Rust path so we never
-      // emit a wrong dump.
-      if (name-in-vec?(fb-generics(b), name) | is-lower-intrinsic?(name))
+      // `instance?(value, <class>)` -> `TypeCheck value <label>` dst <boolean>
+      // (lower_instance_check, lower.rs 6467): lower the value, mint the dst
+      // last. The class arg must be a bare class name (a variable-ref); a
+      // complex type expression bails.
+      if (name = "instance?")
+        let arg-nodes = call-args(node);
+        if (size(arg-nodes) ~= 2)
+          #f
+        else
+          let cls-node = unwrap-arg(arg-nodes[1]);
+          if (~ instance?(cls-node, <ast-variable-ref>))
+            #f
+          else
+            let v = lower-expr(b, unwrap-arg(arg-nodes[0]), ret-map, source);
+            if (~ v)
+              #f
+            else
+              let label = instance-check-label(token-source-text(varref-tok(cls-node), source));
+              let dst = fb-fresh-temp(b, "<boolean>");
+              fb-push(b, make(<dfm-comp>, kind: "typecheck", dst: dst, cval: label,
+                              op: #f, args: singleton-vec(v), callee: #f));
+              dst
+            end
+          end
+        end
+      // A call to a slot/generic name is a Dispatch (lower.rs 6060), and `make`
+      // is an intrinsic — neither is a plain DirectCall. Until those forms land,
+      // bail the whole function to the Rust path so we never emit a wrong dump.
+      elseif (name-in-vec?(fb-generics(b), name) | is-lower-intrinsic?(name))
         #f
       else
         // Args lower left-to-right BEFORE the dst is minted (dst id comes after
@@ -1248,10 +1272,28 @@ define function name-in-vec? (v :: <stretchy-vector>, s :: <byte-string>)
 end function;
 
 // Names treated as intrinsics by lower_call (NOT plain DirectCalls). Until each
-// is ported, a call to one bails the function to Rust. `make`/`instance?` are
-// the 55b set; others are added as they're implemented.
+// is ported, a call to one bails the function to Rust. `instance?` is now
+// handled (TypeCheck); `make` still bails.
 define function is-lower-intrinsic? (name :: <byte-string>) => (yes? :: <boolean>)
-  name = "make" | name = "instance?"
+  name = "make"
+end function;
+
+// ClassCheck::name() — the label printed for a `TypeCheck`. Most class names
+// pass through verbatim (builtins like <integer>/<boolean>/<character>/<symbol>,
+// <object>, and user classes by source name), but two builtins normalize to
+// their canonical class: <string> -> <byte-string>, <vector> ->
+// <simple-object-vector> (ir.rs ClassCheck variants String / Vector).
+define function instance-check-label (name :: <byte-string>)
+ => (label :: <byte-string>)
+  if (name = "<string>")     "<byte-string>"
+  elseif (name = "<vector>") "<simple-object-vector>"
+  else                       name
+  end
+end function;
+
+// Unwrap a call argument node (positional args are wrapped in <ast-pos-arg>).
+define function unwrap-arg (an :: <object>) => (v :: <object>)
+  if (instance?(an, <ast-pos-arg>)) pos-arg-value(an) else an end
 end function;
 
 // SlotTypeKind label for the `[..]` annotation (lower.rs slot_type_to_dfm_kind:
@@ -1569,6 +1611,12 @@ define function fmt-computation (c :: <dfm-comp>, temps :: <stretchy-vector>)
         concatenate(" @", concatenate(integer-to-string(comp-cval(c)),
           concatenate(" := t", concatenate(integer-to-string(val),
             concatenate(" [", concatenate(comp-op(c), "]\n")))))))))
+  elseif (kind = "typecheck")
+    // `= TypeCheck t<value> <class-label>` (format.rs 146-155). The class label
+    // (ClassCheck::name()) is in comp-cval; the value temp in args[0].
+    concatenate(head,
+      concatenate(" = TypeCheck t", concatenate(integer-to-string(comp-args(c)[0]),
+        concatenate(" ", concatenate(comp-cval(c), "\n")))))
   else
     // directcall: ` = DirectCall callee(t0, t1)`; empty safepoint + not
     // no_alloc -> nothing appended.
