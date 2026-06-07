@@ -28,6 +28,15 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 53.5e: user-class return estimates, dumped by name](2026-06-07-sema-53-5e-class-return-by-name.md)
+  — Closes the last rope-family divergence. `format_sema_model` rendered a
+  function's class return as `Class(<raw-id>)` — a process-global id that
+  leaked into the otherwise by-name dump (non-deterministic across builds, and
+  unreproducible by the Dylan walk). Now it renders by name
+  (`return=Class(<rope-leaf>)`) and the Dylan walk maps user-class returns to
+  the same. `rope` / `ide_rope` / `unified_ide` join the gate (38 total); every
+  fixture the 53.5(1) survey flagged is byte-matched. Stdlib-class returns +
+  cross-process id stability remain Sprint 54.
 - [2026-06-07 — Sprint 53.5d: implicit generics from bare `define method`](2026-06-07-sema-53-5d-implicit-method-generics.md)
   — Closes the second of the three rope-family divergences 53.5b uncovered.
   The oracle's `collect_generic_names` records a `generic <name>` per

@@ -37,9 +37,17 @@ define function type-node-name (node :: <object>, source :: <byte-string>)
   end
 end function;
 
-// The return-type estimate for a body-definition.
+// The return-type estimate for a body-definition. `class-names` is the set
+// of user `define class` names in the module; a return type that names one of
+// them estimates as `Class(<name>)` — matching the oracle, which resolves a
+// `<foo>`-shaped return type to its registered class and (since Sprint 53.5e)
+// dumps it by name rather than as a raw process-global id. Builtin scalar
+// types still map to their dedicated estimate (Integer / String / …) and
+// `<object>` / `<top>` / unknown types stay Top, exactly as `type_from_expr`
+// does on the Rust side.
 define function defn-return-estimate (defn :: <ast-body-definition>,
-                                      source :: <byte-string>)
+                                      source :: <byte-string>,
+                                      class-names :: <stretchy-vector>)
  => (est :: <byte-string>)
   let rspec = defn-return(defn);
   if (~ rspec)
@@ -57,7 +65,17 @@ define function defn-return-estimate (defn :: <ast-body-definition>,
         else
           token-source-text(typed-name-tok(tn), source)   // bare `<type>`
         end;
-      map-type-estimate(type-name)
+      let est = map-type-estimate(type-name);
+      // A user-class return type maps to `Class(<name>)`. `map-type-estimate`
+      // returns "Top" for any non-scalar type; promote it to `Class(<name>)`
+      // only when the name is a known user class and not `<object>`/`<top>`
+      // (which the oracle pins to Top).
+      if (est = "Top" & type-name ~= "<object>" & type-name ~= "<top>"
+            & bs-member?(class-names, type-name))
+        concatenate("Class(", concatenate(type-name, ")"))
+      else
+        est
+      end
     end
   end
 end function;
@@ -576,6 +594,27 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
 
   let items  = body-constituents(ast);
   let n = size(items);
+
+  // Pre-collect every `define class` name so a function's return-type
+  // estimate can resolve a user-class return to `Class(<name>)` whether the
+  // class is declared before or after the function — the Rust oracle
+  // registers all classes before lowering any function body, so resolution
+  // there is order-independent too.
+  let class-names = make(<stretchy-vector>);
+  begin
+    let ci = 0;
+    until (ci = n)
+      let it = items[ci];
+      if (instance?(it, <ast-class-definition>))
+        let nt = class-name(it);
+        if (instance?(nt, <token>))
+          add!(class-names, token-source-text(nt, source));
+        end;
+      end;
+      ci := ci + 1;
+    end;
+  end;
+
   let i = 0;
   until (i = n)
     let item = items[i];
@@ -596,7 +635,7 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
         if (name-tok)
           let name  = token-source-text(name-tok, source);
           let arity = defn-arity(item);
-          let est   = defn-return-estimate(item, source);
+          let est   = defn-return-estimate(item, source, class-names);
           let line  = concatenate("fn ", concatenate(name,
                         concatenate(" arity=", concatenate(integer-to-string(arity),
                           concatenate(" return=", est)))));

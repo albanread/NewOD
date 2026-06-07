@@ -2432,7 +2432,19 @@ pub fn format_sema_model(lm: &LoweredModule) -> String {
     fns.sort_by(|a, b| a.0.cmp(b.0));
     for (name, est) in fns {
         let arity = lm.top_names.fn_arity.get(name).copied().unwrap_or(0);
-        let _ = writeln!(s, "fn {name} arity={arity} return={est:?}");
+        // Render the return estimate. A `Class` estimate prints the class by
+        // NAME, not the raw process-global id: every other class reference in
+        // this dump already goes through `sema_class_name` (parents / cpl /
+        // slot origin / sealing) precisely because ids are process-global
+        // (53.1). A raw `Class(<id>)` here made the dump non-deterministic
+        // across builds that register classes in a different order, and gave
+        // the Dylan-side walk an id it has no way to reproduce. By name, both
+        // sides agree. Other estimates keep their `TypeEstimate` Debug name.
+        let ret = match est {
+            TypeEstimate::Class(id) => format!("Class({})", sema_class_name(ClassId(*id))),
+            other => format!("{other:?}"),
+        };
+        let _ = writeln!(s, "fn {name} arity={arity} return={ret}");
     }
     let mut consts: Vec<&String> = lm.top_names.constants.iter().collect();
     consts.sort();

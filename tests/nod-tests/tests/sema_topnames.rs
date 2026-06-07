@@ -93,14 +93,15 @@ fn fixtures_dir() -> PathBuf {
 /// explicit generics. The `rope` family's `=== generics ===` section now
 /// matches.
 ///
-/// That leaves the rope family one line apart, still ungated: user-class
-/// return estimates. `empty-rope () => (r :: <rope-leaf>)` dumps
-/// `return=Class(<id>)` in the oracle (the *raw, process-global* class-id)
-/// vs `return=Top` here. Reproducing the id in the Dylan walk is the Sprint
-/// 54 class-id-determinism problem — and the raw id is itself a portability
-/// leak in `format_sema_model` (everything else in the dump refers to
-/// classes by name via `sema_class_name`), so the likely fix is to render
-/// the return class by name on both sides rather than chase the id.
+/// Sprint 53.5e then closed the last one: user-class return estimates.
+/// `empty-rope () => (r :: <rope-leaf>)` dumped `return=Class(<id>)` in the
+/// oracle (a *raw, process-global* class-id — a portability leak, since
+/// everything else in the dump refers to classes by name via
+/// `sema_class_name`) vs `return=Top` here. `format_sema_model` now renders a
+/// `Class` return by NAME (`return=Class(<rope-leaf>)`), and the Dylan walk
+/// maps a user-class return type to the same. With all three gaps closed the
+/// rope family — `rope`, `ide_rope`, `unified_ide` — joins the gate, so every
+/// fixture the 53.5(1) survey flagged is now byte-matched and gated.
 const FIXTURES: &[&str] = &[
     // 53.2 — class-free top-names (functions / constants / variables).
     "factorial",
@@ -147,6 +148,12 @@ const FIXTURES: &[&str] = &[
     // 53.5b — anonymous-method lifting (`__anon-method-N`). `nod-ide` has
     // four `method (…) … end` literals and now byte-matches end-to-end.
     "nod-ide",
+    // 53.5b/d/e — the rope family: anon-method literal + implicit method
+    // generics + user-class return (`empty-rope () => (r :: <rope-leaf>)`
+    // now dumps `return=Class(<rope-leaf>)` by name on both sides).
+    "rope",
+    "ide_rope",
+    "unified_ide",
 ];
 
 /// Normalize a top-names block the same way on both sides: CRLF -> LF,
