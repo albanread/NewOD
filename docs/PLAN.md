@@ -727,10 +727,17 @@ the same division `rustc` and GHC draw:
   empirical lesson — *the same DFM produces the same LLVM produces the
   same machine code* — means the back-end never needs to leave Rust,
   and the front-end can move to Dylan years earlier than guessed.
-- **Sprints 52+ :** The remaining front-end phases — macro expander,
-  sema/namespace, AST → DFM lowering — migrate to Dylan one at a
-  time, each validated in verify-mode against its Rust counterpart
-  before becoming the default.
+- **Sprints 52–55 (done / in progress):** The remaining front-end
+  phases migrate to Dylan one at a time, each validated by `dump-*`
+  byte-match against its Rust counterpart before becoming load-bearing:
+  macro expander (52, opt-in `NOD_EXPAND_WITH_DYLAN`); sema/namespace
+  (53 recording walk; 54 **load-bearing** via `--sema-with-dylan`,
+  38/38 byte-identical); AST → DFM lowering (55 **load-bearing
+  (opt-in)** via `--lower-with-dylan` — 55a stmts/exprs + 55b
+  slots/`instance?` done, 55b dispatch/55c closures remaining). Sprint
+  56 consolidates the per-stage shims into one front-end and flips the
+  Dylan path to default. Live status:
+  [`docs/journal/README.md`](journal/README.md).
 
 The end state: **the front-end is Dylan, compiled by a Rust + LLVM
 back-end that stays Rust forever.** Codegen, GC, JIT, and the linker

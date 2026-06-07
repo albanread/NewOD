@@ -105,8 +105,8 @@ DFM), with the back-end held constant.
 | **Lexer**        | ✅ live (`--lex-with-dylan`)     | `tests/nod-tests/fixtures/dylan-lexer.dylan`   |
 | **Parser**       | ✅ **default** in the real pipeline (`--parse-with-rust` opts out; Rust = fall-back + verify oracle) | `…/dylan-parser.dylan` |
 | **Macro expander** | ✅ Rust default; Dylan port **live (opt-in)** via `NOD_EXPAND_WITH_DYLAN` (Sprint 52) | `…/dylan-macro*.dylan` |
-| **Sema / namespace** | ◐ Rust authoritative; Dylan **oracle live** (`dump-sema` + `DYLAN_SEMA_WIRE.md`) + recording walk in progress (Sprint 53) | `…/dylan-sema.dylan` (WIP) |
-| **AST → DFM lowering** | ⏳ Rust today; the last stage to migrate (Sprint 55; Sprint 54 makes the Dylan sema authoritative first) | —     |
+| **Sema / namespace** | ✅ **load-bearing (opt-in)** via `--sema-with-dylan` / `NOD_SEMA_WITH_DYLAN` (Sprint 54): the back-end consumes the Dylan `SemaModel`, gated by `dump-sema` byte-match (38/38). Rust stays the default until Sprint 56. | `…/dylan-sema.dylan` |
+| **AST → DFM lowering** | ◐ **load-bearing (opt-in)** via `--lower-with-dylan` / `NOD_LOWER_WITH_DYLAN` (Sprint 55): the Dylan lowering emits DFM (as `dump-dfm` text, re-parsed host-side) that the same Rust back-end passes consume. 55a stmts/exprs + 55b slot accessors / `instance?` byte-match (≈15 corpus fixtures, 0 wrong dumps); 55b `make`/dispatch + 55c closures/blocks still fall back to Rust. | `…/dylan-lower.dylan` |
 
 The front-end's eventual home is Dylan source compiled by our own
 back-end. Until each phase lands in Dylan, its Rust implementation
@@ -237,8 +237,8 @@ that earned their place:
 | 51e         | parser → **default** in the real pipeline | Dylan parser is the default; Rust = fall-back + verify oracle; 28/36 corpus byte-identical (macro fixtures close in 52); full sweep green |
 | 52+         | macro expander → Dylan          | verify-mode against Rust expander     |
 | 53+         | sema / namespace → Dylan        | verify-mode against Rust sema         |
-| 54          | sema authoritative (`lower_with_model`) | DFM byte-identical from the Dylan sema model |
-| 55          | AST → DFM lowering → Dylan (55a stmts/exprs, 55b classes/dispatch, 55c closures/blocks) | `dump-dfm` byte-identical Dylan-vs-Rust |
+| 54 ✅       | sema **load-bearing** (`--sema-with-dylan`); back-end consumes the Dylan `SemaModel` | **done** — `dump-dfm` byte-identical from the Dylan sema model (38/38) |
+| 55 ◐        | AST → DFM lowering → Dylan; flip **load-bearing** via `--lower-with-dylan`. 55a stmts/exprs ✅, 55b slots/`instance?` ✅ (`make`/dispatch remaining), 55c closures/blocks remaining | `dump-dfm` byte-identical Dylan-vs-Rust on ≈15 fixtures; the rest fall back to Rust |
 | 56          | consolidation: one DFM handoff, `--…-with-dylan` flags retired | full sweep green at default; the per-stage shim round-trips (the ~50× cost) gone |
 | —           | **front-end fully self-hosted** | every phase Dylan, back-end unchanged |
 

@@ -12,9 +12,18 @@ back-end split, ratified at Sprint 51).*
 > (`--lex-with-dylan`, `--verify-parse`, `dump-dylan-ast`). The
 > project's permanent shape is now a **Dylan front-end on a Rust+LLVM
 > back-end, split at DFM IR** — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
-> Sprints 52+ migrate the remaining front-end phases (macros, sema,
-> lowering) to Dylan; the back-end (codegen, GC, JIT, linker) stays
-> Rust forever.
+> Sprints 52+ migrate the remaining front-end phases to Dylan; the
+> back-end (codegen, GC, JIT, linker) stays Rust forever. **Status
+> (2026-06-07):** macros (52, opt-in `NOD_EXPAND_WITH_DYLAN`) and sema
+> (53 recording walk; 54 **load-bearing** via `--sema-with-dylan`) are
+> done; AST→DFM lowering (55) is **load-bearing (opt-in)** via
+> `--lower-with-dylan` with 55a/early-55b complete and 55b
+> dispatch/55c closures remaining; 56 (consolidation, flip-to-default)
+> is planned. The live, detailed status for the 53–56 self-hosting line
+> lives in [`journal/README.md`](journal/README.md) and the
+> `journal/2026-06-07-sprint-55-*` entries — **not** in the sprint
+> bodies below, which predate it. [`ARCHITECTURE.md`](ARCHITECTURE.md)
+> has the phase-by-phase status table.
 
 ## Preamble
 
