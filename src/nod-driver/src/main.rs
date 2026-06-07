@@ -239,6 +239,15 @@ enum Command {
         /// Path to a `.dylan` source file.
         input: PathBuf,
     },
+    /// Sprint 54b — run the Dylan-side sema recording walk IN-PROCESS (via the
+    /// statically-linked `dylan-sema-emit` shim entry) and print its
+    /// four-section model dump. Byte-identical to `dump-sema --parse-with-rust`
+    /// (the Rust oracle) on the gated corpus — this is the in-process verify
+    /// of the load-bearing Dylan sema path. Requires the shim to be linked.
+    DumpDylanSema {
+        /// Path to a `.dylan` source file.
+        input: PathBuf,
+    },
     /// Run the Dylan-in-Dylan parser over a source file and print the AST dump.
     ///
     /// Builds [dylan-lexer.dylan, dylan-parser.dylan] into a cached EXE,
@@ -650,6 +659,7 @@ fn main() -> ExitCode {
         Some(Command::Eval { expr }) => run_eval(&expr),
         Some(Command::DumpDylanTokens { input, gc_stats }) => run_dump_dylan_tokens(&input, gc_stats),
         Some(Command::DumpDylanAst { input }) => run_dump_dylan_ast(&input),
+        Some(Command::DumpDylanSema { input }) => run_dump_dylan_sema(&input),
         Some(Command::ParseDylan { input, time }) => {
             let stopwatch = if time { Some(std::time::Instant::now()) } else { None };
             let code = run_parse_dylan(&input);
@@ -1381,6 +1391,33 @@ fn run_dump_dylan_ast(input: &std::path::Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("nod-driver dump-dylan-ast: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_dump_dylan_sema(input: &std::path::Path) -> ExitCode {
+    // Sprint 54b — exercise the in-process Dylan sema walk end-to-end. Fire
+    // the shim's resolver if it hasn't already, then call `dylan-sema-emit`
+    // and print its model dump verbatim.
+    if let Err(e) = dylan_lex_jit::init() {
+        eprintln!("nod-driver dump-dylan-sema: shim init failed: {e}");
+        return ExitCode::from(1);
+    }
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-sema: read {}: {e}", input.display());
+            return ExitCode::from(2);
+        }
+    };
+    match dylan_parse_wire::sema_emit_via_shim(&src) {
+        Ok(model) => {
+            print!("{model}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("nod-driver dump-dylan-sema: {e}");
             ExitCode::from(1)
         }
     }

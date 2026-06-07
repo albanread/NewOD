@@ -253,6 +253,87 @@ fn run_oracle(ws: &Path, input: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Sprint 54b — run the IN-PROCESS Dylan sema walk via the statically-linked
+/// `dylan-sema-emit` shim entry (`nod-driver dump-dylan-sema <fx>`), returning
+/// `(stdout, stderr, success)`. The model dump lands on stdout; the
+/// "override installed" startup log goes to stderr.
+fn run_in_process_sema(ws: &Path, input: &Path) -> (String, String, bool) {
+    let out = Command::new("cargo")
+        .current_dir(ws)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "nod-driver",
+            "--",
+            "dump-dylan-sema",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn nod-driver dump-dylan-sema");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Sprint 54b — the IN-PROCESS load-bearing path: the Dylan sema recording
+/// walk runs INSIDE the host via the statically-linked `dylan-sema-emit` shim
+/// entry (`dump-dylan-sema`), not the standalone EXE. Its model dump must
+/// byte-match the Rust oracle (`dump-sema --parse-with-rust`) across the same
+/// gated corpus the standalone gate covers. Sibling of
+/// `dylan_sema_top_names_byte_match` (which exercises the standalone EXE) —
+/// together they prove the same Dylan `collect-top-names` matches the oracle
+/// whether run as an EXE or in-process through the shim.
+///
+/// Skips cleanly when the shim isn't statically linked (the
+/// `dylan-lex-shim.lib.obj` wasn't built — `dump-dylan-sema` then fails with a
+/// "shim init" message). Build it via the bootstrap, then re-run.
+#[test]
+#[ignore]
+#[serial]
+fn dylan_sema_in_process_byte_match() {
+    let ws = workspace_root();
+
+    // Probe once: no shim linked ⇒ "shim init failed" ⇒ skip the whole gate.
+    let probe = fixtures_dir().join("hello.dylan");
+    let (_, probe_err, probe_ok) = run_in_process_sema(&ws, &probe);
+    if !probe_ok && probe_err.contains("shim init") {
+        eprintln!(
+            "SKIP dylan_sema_in_process_byte_match: dylan-lex-shim.lib.obj not linked.\n{probe_err}"
+        );
+        return;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for fx in FIXTURES {
+        let input = fixtures_dir().join(format!("{fx}.dylan"));
+        assert!(input.is_file(), "missing fixture {}", input.display());
+
+        let (ip_out, ip_err, ip_ok) = run_in_process_sema(&ws, &input);
+        assert!(ip_ok, "dump-dylan-sema failed for {fx}:\nstderr:\n{ip_err}");
+        let ip = normalize(&ip_out);
+        let orc = normalize(&run_oracle(&ws, &input));
+        if ip != orc {
+            failures.push(format!(
+                "FIXTURE {fx} MISMATCH (in-process Dylan sema vs oracle)\n\
+                 ----- dump-dylan-sema (in-process shim) -----\n{ip}\n\
+                 ----- oracle (--parse-with-rust dump-sema) -----\n{orc}\n\
+                 --------------------------------------"
+            ));
+        } else {
+            eprintln!("MATCH: {fx}");
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "In-process Dylan sema walk diverged from the Rust oracle:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
 #[test]
 #[ignore]
 #[serial]

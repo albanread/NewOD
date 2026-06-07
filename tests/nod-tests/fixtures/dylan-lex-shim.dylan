@@ -1299,6 +1299,25 @@ define function dylan-parse-emit (source :: <byte-string>)
   out
 end function;
 
+// ─── dylan-sema-emit — Sprint 54b: in-process Dylan sema recording walk ──
+//
+// Lex + parse (honouring the `Precedence: c` pragma exactly as
+// `dylan-parse-emit`) then run the Dylan-side sema recording walk
+// (`collect-top-names`, bundled from `dylan-sema.dylan`) and return its
+// deterministic four-section model dump as a `<byte-string>` — byte-identical
+// to the Rust oracle's `nod_sema::format_sema_model` / `dump-sema`. The host
+// calls this under `--sema-with-dylan`; 54b uses it for an in-process verify
+// gate, 54c will parse it back into a `SemaModel` to make lowering consume it.
+// Text transport mirrors `dylan-expand-source` (the macro engine's seam); the
+// model dump is our own line-oriented format, so it round-trips losslessly
+// (unlike source text — the Sprint 52.6 lesson).
+define function dylan-sema-emit (source :: <byte-string>)
+ => (model-text :: <byte-string>)
+  let tokens = lex(source);
+  let ast = parse-dylan-with-precedence(tokens, precedence-c-header?(source));
+  collect-top-names(ast, source)
+end function;
+
 // ─── dylan-expand-source — Sprint 52.6 locus-(B) macro expander ──────────
 //
 // Expand every macro call in `source` to fixpoint — using the stdlib

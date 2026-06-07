@@ -94,6 +94,37 @@ pub fn expand_source_via_shim(src: &str, stdlib_src: &str) -> Result<String, Str
     read_dylan_byte_string(out_bs)
 }
 
+#[cfg(dylan_lex_shim_linked)]
+unsafe extern "C" {
+    /// Sprint 54b — `define function dylan-sema-emit (source) => (model-text
+    /// :: <byte-string>)` from `dylan-lex-shim.dylan`. Lexes + parses
+    /// (honouring `Precedence: c`) then runs the Dylan-side sema recording
+    /// walk (`collect-top-names`) and returns its four-section model dump,
+    /// byte-identical to `nod_sema::format_sema_model`. Word in (a
+    /// `<byte-string>`), Word out (a `<byte-string>`).
+    #[link_name = "dylan-sema-emit"]
+    fn dylan_sema_emit(source: u64) -> u64;
+}
+
+#[cfg(not(dylan_lex_shim_linked))]
+unsafe extern "C" fn dylan_sema_emit(_source: u64) -> u64 {
+    unreachable!("dylan_lex_shim_linked is not set")
+}
+
+/// Sprint 54b — run the Dylan-side sema recording walk in-process via the
+/// statically-linked `dylan-sema-emit` shim entry, returning its model dump
+/// (the `=== top-names ===` … `=== sealing ===` text). Caller must have run
+/// [`crate::dylan_lex_jit::init`] first (it fires the one-time
+/// `nod_aot_resolve_relocs`). Used by `dump-dylan-sema` and the
+/// `--sema-with-dylan` verify path.
+pub fn sema_emit_via_shim(src: &str) -> Result<String, String> {
+    let src_bs = alloc_dylan_byte_string(src.as_bytes())?;
+    // SAFETY: src_bs is a live <byte-string>; the entry is the statically-
+    // linked sema walk, called after init()'s nod_aot_resolve_relocs.
+    let out_bs = unsafe { dylan_sema_emit(src_bs) };
+    read_dylan_byte_string(out_bs)
+}
+
 /// AST kind codes — must match `docs/DYLAN_AST_WIRE.md` §3 and the
 /// `$ast-kind-*` constants in `dylan-lex-shim.dylan`.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

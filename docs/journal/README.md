@@ -28,6 +28,16 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 54b: the Dylan sema walk goes in-process (shim-bundled)](2026-06-07-sprint-54b-sema-in-process-shim.md)
+  — Bundle `dylan-c3.dylan` + `dylan-sema.dylan` into the statically-linked
+  shim and export `dylan-sema-emit` (text model dump), so the host can run the
+  Dylan sema walk IN-PROCESS — the channel 54c flips load-bearing. Zero new
+  export infrastructure (AOT StaticLibrary keeps the symbol name + the shared
+  resolver covers it); text transport reuses `collect-top-names` and round-trips
+  losslessly (the dump is our own format). New `dump-dylan-sema` subcommand +
+  `dylan_sema_in_process_byte_match` gate: **38/38 MATCH** vs the oracle,
+  in-process. No regressions (parser/lexer/codegen shim paths green; `.obj`
+  rebuilt with 0 redefinition lines).
 - [2026-06-07 — Sprint 54a: the analyse | lower split (`analyse_module` → `SemaModel`)](2026-06-07-sprint-54a-analyse-module-split.md)
   — Sprint 54 begins: make the Dylan sema model load-bearing. 54a is the
   structural prerequisite — extract the recording phase out of the ~1000-line
