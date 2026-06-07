@@ -130,7 +130,7 @@ fn parse_function(
         .split_first()
         .ok_or_else(|| "internal: empty function chunk".to_string())?;
 
-    let (name, params_src, return_type) = parse_function_header(hdr_lno, hdr)?;
+    let (name, params_src, return_type) = parse_function_header(hdr_lno, hdr, resolve_class)?;
 
     // Classify each body line by its indentation. `fmt_function` emits block
     // headers at 2 spaces (L61-62) and `fmt_computation`/`fmt_terminator`
@@ -290,7 +290,18 @@ fn parse_function(
 ///
 /// Returns `(name, params_src, return_type)` where `params_src` is the raw
 /// (possibly empty) `t..: <..>, ..` substring between `(` and `)`.
-fn parse_function_header(lno: usize, line: &str) -> Result<(String, &str, TypeEstimate), String> {
+///
+/// A Dylan-side lowering wire dump emits a `define method` body's name with the
+/// specialiser classes BY NAME (`g$<idler>_<integer>`); it can't know the
+/// host-assigned class ids at lowering time. We resolve those `$<class>`
+/// suffixes to the numeric scheme (`g$1082_1`) via `resolve_class` here — the
+/// same seam/precedent as `ClassMetadataPtr`-by-name in `parse_const`. A numeric
+/// suffix passes through unchanged (the human dump round-trips identically).
+fn parse_function_header<'a>(
+    lno: usize,
+    line: &'a str,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
+) -> Result<(String, &'a str, TypeEstimate), String> {
     // `format!("fn {} (", name)` — note the literal " (" after the name,
     // emitted even with zero params, then `) -> ` and a trailing ':'.
     let after_fn = line
@@ -301,7 +312,7 @@ fn parse_function_header(lno: usize, line: &str) -> Result<(String, &str, TypeEs
     let name_end = after_fn
         .find(" (")
         .ok_or_else(|| format!("line {lno}: malformed function header (no ` (`): {line:?}"))?;
-    let name = after_fn[..name_end].to_string();
+    let name = resolve_method_name_suffix(lno, &after_fn[..name_end], resolve_class)?;
     let rest = &after_fn[name_end + 2..]; // skip " ("
 
     // Params run up to the literal ") -> " (param list contains no ')').
@@ -318,6 +329,47 @@ fn parse_function_header(lno: usize, line: &str) -> Result<(String, &str, TypeEs
     let return_type = parse_type(lno, rty_src)?;
 
     Ok((name, params_src, return_type))
+}
+
+/// Resolve a `define method` body name's by-name specialiser suffix to the
+/// numeric scheme. A Dylan-side lowering dump names a method body
+/// `g$<idler>_<integer>` (specialisers by class NAME — it can't know the ids at
+/// lowering time); the Rust lowering names it `g$1082_1` (numeric `ClassId`s,
+/// `lower_method_item` ~L3567). We split on the FIRST `$` into
+/// `(generic, suffix)`, then resolve each `_`-separated suffix token: a `<…>`
+/// token (a class label, which by construction contains no `_`) is mapped
+/// through `resolve_class` to its id; a numeric token passes through unchanged
+/// (so the human dump round-trips); any other token also passes through (a
+/// non-method `$` name — e.g. a lifted closure body — is left intact). An
+/// unresolvable `<…>` token is a hard error (we never silently emit a wrong
+/// callee/header). A name with no `$` is returned verbatim.
+fn resolve_method_name_suffix(
+    lno: usize,
+    name: &str,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
+) -> Result<String, String> {
+    let Some((generic, suffix)) = name.split_once('$') else {
+        return Ok(name.to_string());
+    };
+    let mut out = String::with_capacity(name.len());
+    out.push_str(generic);
+    out.push('$');
+    for (i, tok) in suffix.split('_').enumerate() {
+        if i > 0 {
+            out.push('_');
+        }
+        // A `<…>` token is a class label emitted by name; resolve it. Anything
+        // else (a numeric id, or a non-class token) passes through unchanged.
+        if tok.starts_with('<') && tok.ends_with('>') {
+            let id = resolve_class(tok).ok_or_else(|| {
+                format!("line {lno}: unresolved class name in method body name suffix: {tok:?}")
+            })?;
+            out.push_str(&id.to_string());
+        } else {
+            out.push_str(tok);
+        }
+    }
+    Ok(out)
 }
 
 /// Parse a block header (2-space-stripped), inverse of `fmt_function`
@@ -1672,6 +1724,42 @@ mod tests {
             other => panic!("expected ClassMetadataPtr, got {other:?}"),
         }
         // An unresolvable name is a descriptive error, not a panic.
+        assert!(parse_dfm_module(text, &|_| None).is_err());
+    }
+
+    /// A Dylan-side lowering dump names a `define method` body with its
+    /// specialiser classes BY NAME (`g$<idler>_<integer>`); the reconstruction
+    /// resolves each `$<class>` suffix to the numeric `ClassId` scheme
+    /// (`g$1082_1`) via `resolve_class`. A numeric suffix round-trips unchanged
+    /// (see `roundtrip_edge_cases`'s `run-task$1082_1`).
+    #[test]
+    fn method_body_name_suffix_resolves() {
+        let text = "fn run-task$<idler>_<integer> () -> <top>:\n  \
+                    entry:\n    \
+                    Return\n";
+        let resolver = |name: &str| match name {
+            "<idler>" => Some(1082),
+            "<integer>" => Some(1),
+            _ => None,
+        };
+        let fns = parse_dfm_module(text, &resolver).unwrap();
+        assert_eq!(fns[0].name, "run-task$1082_1");
+
+        // A single-specialiser method has no trailing `_` (e.g. `rope-size$N`).
+        let text1 = "fn rope-size$<rope> () -> <top>:\n  entry:\n    Return\n";
+        let fns1 = parse_dfm_module(text1, &|n: &str| {
+            if n == "<rope>" { Some(2001) } else { None }
+        })
+        .unwrap();
+        assert_eq!(fns1[0].name, "rope-size$2001");
+
+        // An unannotated specialiser is `<object>` -> id 0; an already-numeric
+        // suffix round-trips unchanged.
+        let text2 = "fn f$1082_1 () -> <top>:\n  entry:\n    Return\n";
+        let fns2 = parse_dfm_module(text2, &|_| None).unwrap();
+        assert_eq!(fns2[0].name, "f$1082_1");
+
+        // An unresolvable `<class>` suffix is a descriptive error, not a panic.
         assert!(parse_dfm_module(text, &|_| None).is_err());
     }
 

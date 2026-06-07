@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: `define method` / `define generic` (open scope)](2026-06-07-sprint-55b-define-method-open.md)
+  — Method machinery: `define generic`→no-op, `define method`→body fn named
+  `g$<spec>_…` (by class name; parser resolves to numeric at the seam).
+  build-generic-names extended (load-bearing). Unlocks `richards-shape-open`;
+  also needed list builtins (head/tail/…→%pair-*) and zero-inherited-slot
+  superclasses. Sealed stays bailing (the `Class(0)` param crux → next: B-i).
+  26 lowered, 0 mismatches.
 - [2026-06-07 — Sprint 55b: slot-`:=` + the design/challenge roadmap](2026-06-07-sprint-55b-slot-assign-and-roadmap.md)
   — `slot(obj) := v` → `Dispatch <slot>-setter(obj,val)` (no class-id; never a
   StoreSlot at user sites). Also records the design→challenge→decide pass for the

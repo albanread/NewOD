@@ -607,6 +607,34 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
             end
           end
         end
+      // `pair`/`head`/`tail`/`empty?`/`nil` -> a `%pair*`/`%nil`/`%empty?`
+      // DirectCall (lower.rs lower_list_builtin, checked BEFORE dispatch and not
+      // shadowed by a user name). Args lower left-to-right, dst minted last; dst
+      // type per the builtin. Wrong arity is an invalid program (Rust errors) —
+      // bail so we never emit a malformed call.
+      elseif (list-builtin-callee(name))
+        let arg-nodes = call-args(node);
+        let n = size(arg-nodes);
+        if (n ~= list-builtin-arity(name))
+          #f
+        else
+          let arg-temps = make(<stretchy-vector>);
+          let i = 0;
+          let ok? = #t;
+          until (i >= n | ~ ok?)
+            let at = lower-expr(b, unwrap-arg(arg-nodes[i]), ret-map, source);
+            if (~ at) ok? := #f; else add!(arg-temps, at); end;
+            i := i + 1;
+          end;
+          if (~ ok?)
+            #f
+          else
+            let dst = fb-fresh-temp(b, list-builtin-result-label(name));
+            fb-push(b, make(<dfm-comp>, kind: "directcall", dst: dst, cval: #f,
+                            op: #f, args: arg-temps, callee: list-builtin-callee(name)));
+            dst
+          end
+        end
       // A call to a generic -> `Dispatch g(args)` dst <top>, EMPTY safepoint set
       // (the host liveness pass populates it; the resolver may later rewrite to
       // Direct/SealedDirectCall). A name is a generic if it's a module slot
@@ -1401,6 +1429,28 @@ define function name-in-vec? (v :: <stretchy-vector>, s :: <byte-string>)
   found
 end function;
 
+// Does a definition's modifier vector contain `sealed`? Sealed generics /
+// methods are OUT OF SCOPE for the Dylan lowering: a class-typed param
+// reconstructs as `Class(0)` (the dump drops the id), so a SEALED dispatch on a
+// param receiver mismatches (Rust resolves to a DirectCall; the flip stays a
+// Dispatch). Open/unsealed generics keep Dispatch→Dispatch on both sides, so
+// they're safe. A sealed definition bails the whole module.
+define function has-sealed-modifier? (mods :: <object>, source :: <byte-string>)
+ => (yes? :: <boolean>)
+  if (~ instance?(mods, <stretchy-vector>))
+    #f
+  else
+    let n = size(mods);
+    let i = 0;
+    let found = #f;
+    until (i >= n | found)
+      if (token-source-text(mods[i], source) = "sealed") found := #t; end;
+      i := i + 1;
+    end;
+    found
+  end
+end function;
+
 // Does `name` start with `%` (a primitive call, e.g. `%make-stretchy-vector`)?
 // ('%' is byte 37.)
 define function starts-with-percent? (name :: <byte-string>) => (yes? :: <boolean>)
@@ -1423,6 +1473,42 @@ end function;
 // Unwrap a call argument node (positional args are wrapped in <ast-pos-arg>).
 define function unwrap-arg (an :: <object>) => (v :: <object>)
   if (instance?(an, <ast-pos-arg>)) pos-arg-value(an) else an end
+end function;
+
+// ── <pair> / <list> builtins (lower.rs Sprint 16, ListBuiltin) ─────────────
+// `pair` / `head` / `tail` / `empty?` / `nil` lower to a DirectCall against a
+// synthetic `%pair*` / `%nil` / `%empty?` runtime-shim callee (codegen turns
+// these into the matching `nod_runtime` shim). The Rust lowering checks these
+// BEFORE the generic/top-name dispatch decision and is NOT shadowed by a
+// user-defined name, so we mirror that precedence. `list-builtin-callee`
+// returns the `%…` callee for one of these names, else #f.
+define function list-builtin-callee (name :: <byte-string>) => (callee :: <object>)
+  if (name = "pair")        "%pair-alloc"
+  elseif (name = "head")    "%pair-head"
+  elseif (name = "tail")    "%pair-tail"
+  elseif (name = "empty?")  "%empty?"
+  elseif (name = "nil")     "%nil"
+  else                      #f
+  end
+end function;
+
+// Required arity of a list builtin (ListBuiltin::arity): pair=2, nil=0, else 1.
+define function list-builtin-arity (name :: <byte-string>) => (n :: <integer>)
+  if (name = "pair")     2
+  elseif (name = "nil")  0
+  else                   1
+  end
+end function;
+
+// Result-type label of a list builtin (lower.rs lower_list_builtin result_ty):
+// pair -> Class(<pair>) (`<class>`), nil -> Class(<empty-list>) (`<class>`),
+// empty? -> Boolean (`<boolean>`), head/tail -> Top (`<top>`).
+define function list-builtin-result-label (name :: <byte-string>) => (label :: <byte-string>)
+  if (name = "pair")        "<class>"
+  elseif (name = "nil")     "<class>"
+  elseif (name = "empty?")  "<boolean>"
+  else                      "<top>"
+  end
 end function;
 
 // SlotTypeKind label for the `[..]` annotation (lower.rs slot_type_to_dfm_kind:
@@ -1456,16 +1542,83 @@ define function slot-type-name (s :: <ast-slot-spec>, source :: <byte-string>)
   end
 end function;
 
-// A class is handleable here iff (a) its sole super is `<object>` (so own slots
-// start at @8 — no inherited-slot offset shift) AND (b) it has no `constant`
-// slot. Rust lowering supports only `instance:` allocation and ERRORS on a
-// `Constant` slot (lower.rs), so a constant slot would make the Rust oracle
-// fail while we'd emit a getter — bail to keep the two sides aligned.
-define function class-is-simple? (cd :: <ast-class-definition>, source :: <byte-string>)
- => (yes? :: <boolean>)
+// Count the OWN slots of a class definition (slots with a real name token).
+define function class-own-slot-count (cd :: <ast-class-definition>) => (n :: <integer>)
+  let slots = class-slots(cd);
+  let ns = size(slots);
+  let i = 0;
+  let count = 0;
+  until (i >= ns)
+    if (instance?(slot-name-tok(slots[i]), <token>)) count := count + 1; end;
+    i := i + 1;
+  end;
+  count
+end function;
+
+// Find the module's `define class` whose name is `name`, or #f if none (i.e.
+// the name is a builtin / out-of-module class).
+define function module-class-by-name (items :: <stretchy-vector>, name :: <byte-string>,
+                                      source :: <byte-string>) => (cd :: <object>)
+  let n = size(items);
+  let i = 0;
+  let found = #f;
+  until (i >= n | found)
+    let item = items[i];
+    if (instance?(item, <ast-class-definition>)
+          & instance?(class-name(item), <token>)
+          & token-source-text(class-name(item), source) = name)
+      found := item;
+    end;
+    i := i + 1;
+  end;
+  found
+end function;
+
+// Total inherited slot count for a class: walk its SINGLE-inheritance super
+// chain through the module's user classes, summing each ancestor's own slots.
+// Returns the count, or #f if the layout can't be determined safely here:
+//   * multiple supers (MI — slot merge order is most-specific-first; not
+//     reimplemented), or
+//   * a super that is neither `<object>` nor a module user class (a
+//     slot-bearing builtin would shift offsets we can't see).
+// `<object>` terminates the chain with 0 inherited slots.
+define function class-inherited-slot-count (cd :: <ast-class-definition>,
+                                            items :: <stretchy-vector>,
+                                            source :: <byte-string>)
+ => (count :: <object>)
   let supers = class-supers(cd);
-  if (~ (size(supers) = 1 & super-name(supers[0], source) = "<object>"))
-    #f
+  if (size(supers) ~= 1)
+    #f                                  // MI (or no supers) — out of scope
+  else
+    let sname = super-name(supers[0], source);
+    if (sname = "<object>")
+      0
+    else
+      let scd = module-class-by-name(items, sname, source);
+      if (~ scd)
+        #f                              // super is a builtin/unknown class
+      else
+        let rest = class-inherited-slot-count(scd, items, source);
+        if (~ rest) #f else rest + class-own-slot-count(scd) end
+      end
+    end
+  end
+end function;
+
+// A class is handleable here iff (a) its super chain contributes ZERO inherited
+// slots — its sole super is `<object>`, or a chain of module user classes that
+// all have no slots — so own slots still start at @8 (we don't reimplement the
+// runtime's most-specific-first inherited-slot layout) AND (b) it has no
+// `constant` slot. Rust lowering supports only `instance:` allocation and ERRORS
+// on a `Constant` slot (lower.rs), so a constant slot would make the Rust oracle
+// fail while we'd emit a getter — bail to keep the two sides aligned.
+define function class-is-simple? (cd :: <ast-class-definition>,
+                                  items :: <stretchy-vector>,
+                                  source :: <byte-string>)
+ => (yes? :: <boolean>)
+  let inherited = class-inherited-slot-count(cd, items, source);
+  if (~ inherited | inherited ~= 0)
+    #f                                  // undeterminable layout or shifted offsets
   else
     let slots = class-slots(cd);
     let ns = size(slots);
@@ -1484,10 +1637,14 @@ define function class-is-simple? (cd :: <ast-class-definition>, source :: <byte-
   end
 end function;
 
-// The set of generic names introduced by the module's classes: every slot's
-// getter (its name) plus, when the slot has a setter, `<slot>-setter`. A call
-// to one of these is a Dispatch, not a DirectCall (lower.rs 6060) — so until
-// Dispatch lowering lands the call path bails on these names.
+// The set of generic names in the module: every class slot's getter (its name)
+// plus, when the slot has a setter, `<slot>-setter`, AND every `define generic`
+// name and `define method` name (mirrors Rust `collect_generic_names`, lower.rs
+// ~4733-4742). A call to one of these is a Dispatch, not a DirectCall (lower.rs
+// 6108). The generic/method names are LOAD-BEARING here: when this lowering
+// runs, the host hasn't registered the module's own generics yet, so
+// `%is-generic?` returns #f for `run-task` etc.; without seeding them a call to
+// a same-module method body would wrongly emit a DirectCall.
 define function build-generic-names (items :: <stretchy-vector>, source :: <byte-string>)
  => (names :: <stretchy-vector>)
   let names = make(<stretchy-vector>);
@@ -1509,6 +1666,17 @@ define function build-generic-names (items :: <stretchy-vector>, source :: <byte
           end;
         end;
         si := si + 1;
+      end;
+    elseif (instance?(item, <ast-generic-definition>))
+      // `define generic g …` — `g` is a generic.
+      if (instance?(gen-name(item), <token>))
+        set-add!(names, token-source-text(gen-name(item), source));
+      end;
+    elseif (instance?(item, <ast-body-definition>))
+      // `define method g …` — `g` is a generic (its body is one method).
+      if (token-source-text(defn-word(item), source) = "method"
+            & instance?(defn-method-name(item), <token>))
+        set-add!(names, token-source-text(defn-method-name(item), source));
       end;
     end;
     i := i + 1;
@@ -1685,13 +1853,97 @@ define function lower-constant-defn (ld :: <ast-list-definition>,
   end
 end function;
 
-// ─── lower-function — mirrors lower_function_inner (straight-line case) ─────
+// ─── lower-function / lower-method — mirror lower_function_inner ────────────
 //
-// Builds a <dfm-func> for one `define function` whose body is a single
-// straight-line expression. Returns the <dfm-func>, or #f if outside scope.
-// Order mirrored from lower.rs: params get fresh temps in declaration order
-// (t0,t1,…) BEFORE the body; the body's single expression's temp is the Return
-// value; return_type = declared label if present, else the final temp's type.
+// Builds a <dfm-func> for one `define function` / `define method` whose body is
+// a straight-line / 55a-control-flow statement sequence. Returns the
+// <dfm-func>, or #f if outside scope. Order mirrored from lower.rs: params get
+// fresh temps in declaration order (t0,t1,…) BEFORE the body; the body's last
+// statement's value is the Return value; return_type = declared label if
+// present, else the final temp's type. The ONLY difference between a function
+// and a method is the function NAME (a method body is named `g$spec_spec…`,
+// computed by the caller); the body lowering is identical, so both delegate to
+// `lower-defn-body-into` with a builder whose name is already set.
+
+// Lower `defn`'s params + body + return into the already-named builder `b`.
+// `defn` is an <ast-body-definition> (function or method). Returns the
+// <dfm-func>, or #f on any unsupported form.
+define function lower-defn-body-into (b :: <fn-builder>,
+                                      defn :: <ast-body-definition>,
+                                      ret-map :: <name-ret-map>,
+                                      user-classes :: <stretchy-vector>,
+                                      source :: <byte-string>)
+ => (func :: <object>)
+  // (1) Parameters -> entry temps, declaration order.
+  let params = defn-params(defn);
+  if (params)
+    let reqs = params-required(params);
+    let np = size(reqs);
+    let pi = 0;
+    until (pi >= np)
+      let tn = reqs[pi];
+      let ty = typed-name-type(tn);
+      let type-name =
+        if (ty & instance?(ty, <ast-variable-ref>))
+          token-source-text(varref-tok(ty), source)
+        else
+          ""
+        end;
+      let t = fb-fresh-temp(b, label-for-type-name(type-name, user-classes));
+      add!(func-params(fb-func(b)), t);
+      // Bind the param name so body var-refs resolve to its temp.
+      fb-bind(b, token-source-text(typed-name-tok(tn), source), t);
+      pi := pi + 1;
+    end;
+  end;
+  // (2) Body — a sequence of straight-line statements (let bindings +
+  // expressions). Each lowers in order; the LAST statement's value is the
+  // return value (lower_function_inner's last_temp). Any unsupported
+  // statement bails the whole function (-> Rust path).
+  let body = defn-body(defn);
+  let cs = body-constituents(body);
+  let nc = size(cs);
+  let ci = 0;
+  let last-temp = #f;
+  let ok? = #t;
+  until (ci >= nc | ~ ok?)
+    let t = lower-body-stmt(b, cs[ci], ret-map, source);
+    // #f → bail; <integer> temp → the running return value; void marker (a
+    // loop) → lowered for effect, does NOT become the return value (so
+    // `until(...)...end; result` returns `result`, not the loop).
+    if (~ t)
+      ok? := #f;
+    elseif (instance?(t, <integer>))
+      last-temp := t;
+    else
+      // Void statement (a loop's void marker): the function's value is THIS
+      // last statement, so reset — a trailing loop makes the function void
+      // even if an earlier `let` produced a temp. (Rust returns the value of
+      // the LAST statement; `=> ()` is NOT what makes it void — a `=> ()`
+      // function whose body is an expression still returns that expression's
+      // value, e.g. `hello`'s `format-out(...)`.)
+      last-temp := #f;
+    end;
+    ci := ci + 1;
+  end;
+  if (~ ok?)
+    #f
+  elseif (~ last-temp)
+    // Void function: the last statement produced no value (a trailing loop).
+    // Rust types these `<unit>` with a bare `Return` (Return{None}).
+    func-return-type(fb-func(b)) := "<unit>";
+    fb-terminate-return(b, #f);
+    fb-func(b)
+  else
+    // (3) return_type: declared wins, else the final temp's type.
+    let declared = defn-declared-return-label(defn, user-classes, source);
+    let ret-label = if (declared) declared else fb-temp-type(b, last-temp) end;
+    func-return-type(fb-func(b)) := ret-label;
+    // (4) Return{value}.
+    fb-terminate-return(b, last-temp);
+    fb-func(b)
+  end
+end function;
 
 define function lower-function (defn :: <ast-body-definition>,
                                 ret-map :: <name-ret-map>,
@@ -1703,77 +1955,82 @@ define function lower-function (defn :: <ast-body-definition>,
   if (~ name-tok)
     #f
   else
-    let name = token-source-text(name-tok, source);
-    let b = make-fn-builder(name);
+    let b = make-fn-builder(token-source-text(name-tok, source));
     fb-generics(b) := gnames;
-    // (1) Parameters -> entry temps, declaration order.
-    let params = defn-params(defn);
-    if (params)
-      let reqs = params-required(params);
-      let np = size(reqs);
+    lower-defn-body-into(b, defn, ret-map, user-classes, source)
+  end
+end function;
+
+// Build a method body's function name: `{generic}$` + the specialiser ids of
+// the REQUIRED params joined by `_`, mirroring lower.rs `lower_method_item`
+// (~3567): `body_fn_name = format!("{name}${suffix}")`, suffix = specialiser
+// ids joined by "_". Each specialiser is emitted BY NAME (the class's source
+// text, e.g. `<idler>`) — classes aren't registered when this runs, so
+// `parse_function_header` resolves the `$<class>` suffix to the numeric id at
+// the reconstruction seam. An UNANNOTATED required param contributes `<object>`
+// (ClassId::OBJECT == 0). Returns #f (bail) if a required specialiser is not a
+// bare class-name type ref (a singleton/union/expression specialiser) — we
+// never emit a dubious header.
+define function method-body-name (generic :: <byte-string>,
+                                  params :: <object>,
+                                  source :: <byte-string>)
+ => (name :: <object>)
+  if (~ params)
+    #f                                  // a method needs >= 1 required param
+  else
+    let reqs = params-required(params);
+    let np = size(reqs);
+    if (np = 0)
+      #f
+    else
+      let suffix = "";
       let pi = 0;
-      until (pi >= np)
+      let ok? = #t;
+      until (pi >= np | ~ ok?)
         let tn = reqs[pi];
         let ty = typed-name-type(tn);
-        let type-name =
-          if (ty & instance?(ty, <ast-variable-ref>))
-            token-source-text(varref-tok(ty), source)
+        let spec =
+          if (~ ty)
+            "<object>"                  // unannotated required param
+          elseif (instance?(ty, <ast-variable-ref>))
+            token-source-text(varref-tok(ty), source)   // bare class name
           else
-            ""
+            #f                          // singleton / union / expr — bail
           end;
-        let t = fb-fresh-temp(b, label-for-type-name(type-name, user-classes));
-        add!(func-params(fb-func(b)), t);
-        // Bind the param name so body var-refs resolve to its temp.
-        fb-bind(b, token-source-text(typed-name-tok(tn), source), t);
+        if (~ spec)
+          ok? := #f;
+        else
+          suffix := if (pi = 0) spec else concatenate(suffix, concatenate("_", spec)) end;
+        end;
         pi := pi + 1;
       end;
-    end;
-    // (2) Body — a sequence of straight-line statements (let bindings +
-    // expressions). Each lowers in order; the LAST statement's value is the
-    // return value (lower_function_inner's last_temp). Any unsupported
-    // statement bails the whole function (-> Rust path).
-    let body = defn-body(defn);
-    let cs = body-constituents(body);
-    let nc = size(cs);
-    let ci = 0;
-    let last-temp = #f;
-    let ok? = #t;
-    until (ci >= nc | ~ ok?)
-      let t = lower-body-stmt(b, cs[ci], ret-map, source);
-      // #f → bail; <integer> temp → the running return value; void marker (a
-      // loop) → lowered for effect, does NOT become the return value (so
-      // `until(...)...end; result` returns `result`, not the loop).
-      if (~ t)
-        ok? := #f;
-      elseif (instance?(t, <integer>))
-        last-temp := t;
-      else
-        // Void statement (a loop's void marker): the function's value is THIS
-        // last statement, so reset — a trailing loop makes the function void
-        // even if an earlier `let` produced a temp. (Rust returns the value of
-        // the LAST statement; `=> ()` is NOT what makes it void — a `=> ()`
-        // function whose body is an expression still returns that expression's
-        // value, e.g. `hello`'s `format-out(...)`.)
-        last-temp := #f;
-      end;
-      ci := ci + 1;
-    end;
-    if (~ ok?)
+      if (~ ok?) #f else concatenate(generic, concatenate("$", suffix)) end
+    end
+  end
+end function;
+
+// Lower a `define method` to its method-body function (named `g$spec_spec…`).
+// The body lowering is identical to a function's (lower-defn-body-into); only
+// the name differs. Returns the <dfm-func>, or #f (bail) if the method name is
+// missing or a specialiser isn't a bare class name (method-body-name -> #f).
+define function lower-method (defn :: <ast-body-definition>,
+                              ret-map :: <name-ret-map>,
+                              gnames :: <stretchy-vector>,
+                              user-classes :: <stretchy-vector>,
+                              source :: <byte-string>)
+ => (func :: <object>)
+  let name-tok = defn-method-name(defn);
+  if (~ instance?(name-tok, <token>))
+    #f
+  else
+    let generic = token-source-text(name-tok, source);
+    let fname = method-body-name(generic, defn-params(defn), source);
+    if (~ fname)
       #f
-    elseif (~ last-temp)
-      // Void function: the last statement produced no value (a trailing loop).
-      // Rust types these `<unit>` with a bare `Return` (Return{None}).
-      func-return-type(fb-func(b)) := "<unit>";
-      fb-terminate-return(b, #f);
-      fb-func(b)
     else
-      // (3) return_type: declared wins, else the final temp's type.
-      let declared = defn-declared-return-label(defn, user-classes, source);
-      let ret-label = if (declared) declared else fb-temp-type(b, last-temp) end;
-      func-return-type(fb-func(b)) := ret-label;
-      // (4) Return{value}.
-      fb-terminate-return(b, last-temp);
-      fb-func(b)
+      let b = make-fn-builder(fname);
+      fb-generics(b) := gnames;
+      lower-defn-body-into(b, defn, ret-map, user-classes, source)
     end
   end
 end function;
@@ -2028,7 +2285,11 @@ define function dylan-lower-emit (source :: <byte-string>)
   until (i >= n | ~ all-ok?)
     let item = items[i];
     if (instance?(item, <ast-class-definition>))
-      if (class-is-simple?(item, source))
+      // OPEN/unsealed scope only: a sealed class is out of scope (sealed
+      // dispatch + the Class(0) param crux). Bail the module.
+      if (has-sealed-modifier?(defn-modifiers(item), source))
+        all-ok? := #f;
+      elseif (class-is-simple?(item, items, source))
         emit-class-accessors(item, source, funcs);
       else
         all-ok? := #f;
@@ -2045,8 +2306,18 @@ define function dylan-lower-emit (source :: <byte-string>)
       if (word = "function")
         let f = lower-function(item, ret-map, gnames, user-classes, source);
         if (f) add!(funcs, f); else all-ok? := #f; end;
+      elseif (word = "method")
+        // `define method g (…) … end` -> a method-body function named
+        // `g$spec_spec…`. OPEN/unsealed only: a sealed method bails (the
+        // Class(0) param crux breaks sealed dispatch in the flip).
+        if (has-sealed-modifier?(defn-modifiers(item), source))
+          all-ok? := #f;
+        else
+          let f = lower-method(item, ret-map, gnames, user-classes, source);
+          if (f) add!(funcs, f); else all-ok? := #f; end;
+        end;
       else
-        all-ok? := #f;     // `define method` — 55b dispatch
+        all-ok? := #f;     // other body-definition words — later
       end;
     elseif (instance?(item, <ast-class-definition>))
       #f;                  // handled in pass 1
@@ -2060,7 +2331,15 @@ define function dylan-lower-emit (source :: <byte-string>)
         all-ok? := #f;
       end;
     elseif (instance?(item, <ast-generic-definition>))
-      all-ok? := #f;       // generic — later
+      // `define generic g (…) => (…);` — the host registers the generic from the
+      // AST; the lowering emits NO function for it (it has no body). A NO-OP, not
+      // a bail. OPEN/unsealed only: a sealed generic bails (sealed dispatch +
+      // the Class(0) param crux are out of scope).
+      if (has-sealed-modifier?(defn-modifiers(item), source))
+        all-ok? := #f;
+      else
+        #f;                // no-op: no function emitted for the generic
+      end;
     else
       // Preamble (`Module:` / `Precedence:` lexed as ordinary forms) or a bare
       // top-level expression. The Dylan parser keeps the preamble as items

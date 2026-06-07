@@ -415,6 +415,8 @@ const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "translate-loop",        // 55a-tail: void (=> ()) functions + loop safepoints
     "gap011-repro",          // 55b: make(<stretchy-vector>) + size/add! generics + void
     "gap011-repro2",         // 55b: user + builtin makes + generics
+    "lower-method-open",     // 55b: define generic + define method (open) -> g$class_int
+    "richards-shape-open",   // 55b: open generic + methods + inheritance + list builtins
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan
