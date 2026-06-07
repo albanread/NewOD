@@ -776,19 +776,6 @@ define function lower-stmt-range (b :: <fn-builder>, cs :: <stretchy-vector>,
   if (~ ok?) #f else last end
 end function;
 
-// Does the current env hold any GC-typed binding? (See gc-typed-label?.)
-define function env-has-gc-typed? (b :: <fn-builder>) => (yes? :: <boolean>)
-  let temps = fb-env-temps(b);
-  let n = size(temps);
-  let i = 0;
-  let found = #f;
-  until (i >= n | found)
-    if (gc-typed-label?(fb-temp-type(b, temps[i]))) found := #t; end;
-    i := i + 1;
-  end;
-  found
-end function;
-
 // ─── lower-short-circuit — mirrors lower_short_circuit (`|` / `&`) ──────────
 //
 // `a | b` / `a & b` lower to an sc_edge / sc_rhs / sc_join diamond. The LHS is
