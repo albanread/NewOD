@@ -38,11 +38,14 @@
 //!   trips, the contents do not.
 //! * **Bare `<class>` / `<singleton>` ids.** `TypeEstimate::name()` prints
 //!   `<class>` and `<singleton>` with no payload, while `type_label()`
-//!   prints `<class:N>` / `<singleton:0xHEX>`. A temp whose type was
-//!   rendered by `name()` (params, block-params, and every computation
-//!   `dst` except `Dispatch`/`SealedDirectCall`, which use `type_label`)
-//!   loses its id and parses back as `Class(0)` / `Singleton(0)`. Again
-//!   invisible to the round-trip, since `name()` drops the id anyway.
+//!   prints `<class:N>` / `<singleton:0xHEX>`. As of B-i, params, returns,
+//!   block-params, and the `Dispatch`/`SealedDirectCall` `dst` all render
+//!   via `type_label`, so their ids are LOSSLESS; the remaining computation
+//!   `dst`s still use `name()` and lose the id (parsing back as
+//!   `Class(0)` / `Singleton(0)`) — invisible to the round-trip, since
+//!   `name()` drops the id anyway. A Dylan wire dump emits class types BY
+//!   NAME (`<class:<idler>>`); `parse_type` resolves the non-numeric payload
+//!   through `resolve_class`.
 //! * **`ClassCheck::UserClass` / `TypeEstimate::Class` ids generally.** The
 //!   class label resolves through the caller-supplied `resolve_class`; when
 //!   it returns `None` we store `0`. `ClassCheck::name()` prints the name,
@@ -159,7 +162,7 @@ fn parse_function(
     let mut temps: Vec<Temporary> = Vec::new();
 
     // Function params come from the header (`fmt_function` L54-59).
-    let params = parse_temp_decls(hdr_lno, params_src, &mut temps)?;
+    let params = parse_temp_decls(hdr_lno, params_src, &mut temps, resolve_class)?;
 
     // Split body_lines into per-block groups: each group is one BlockHeader
     // followed by its Stmts (computations + one terminator).
@@ -173,7 +176,7 @@ fn parse_function(
     for bl in &body_lines {
         match *bl {
             BodyLine::BlockHeader(lno, hdr) => {
-                let (label, bparams) = parse_block_header(lno, hdr, &mut temps)?;
+                let (label, bparams) = parse_block_header(lno, hdr, &mut temps, resolve_class)?;
                 raw_blocks.push(RawBlock {
                     lno,
                     label,
@@ -326,7 +329,7 @@ fn parse_function_header<'a>(
     let rty_src = after_params.strip_suffix(':').ok_or_else(|| {
         format!("line {lno}: function header must end with ':': {line:?}")
     })?;
-    let return_type = parse_type(lno, rty_src)?;
+    let return_type = parse_type(lno, rty_src, resolve_class)?;
 
     Ok((name, params_src, return_type))
 }
@@ -379,6 +382,7 @@ fn parse_block_header(
     lno: usize,
     line: &str,
     temps: &mut Vec<Temporary>,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<(String, Vec<TempId>), String> {
     let body = line
         .strip_suffix(':')
@@ -392,7 +396,7 @@ fn parse_block_header(
         let inner = body[open + 1..].strip_suffix(')').ok_or_else(|| {
             format!("line {lno}: block param list missing closing ')': {line:?}")
         })?;
-        let params = parse_temp_decls(lno, inner, temps)?;
+        let params = parse_temp_decls(lno, inner, temps, resolve_class)?;
         Ok((label, params))
     } else {
         Ok((body.to_string(), Vec::new()))
@@ -406,13 +410,14 @@ fn parse_temp_decls(
     lno: usize,
     src: &str,
     temps: &mut Vec<Temporary>,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<Vec<TempId>, String> {
     if src.is_empty() {
         return Ok(Vec::new());
     }
     let mut ids = Vec::new();
     for decl in src.split(", ") {
-        let (id, ty) = parse_temp_decl(lno, decl)?;
+        let (id, ty) = parse_temp_decl(lno, decl, resolve_class)?;
         record_temp(temps, id, ty);
         ids.push(id);
     }
@@ -420,13 +425,17 @@ fn parse_temp_decls(
 }
 
 /// Parse a single `t{id}: {type}` declaration. Inverse of
-/// `write!(out, "t{}: {}", p.0, ty.name())`.
-fn parse_temp_decl(lno: usize, decl: &str) -> Result<(TempId, TypeEstimate), String> {
+/// `write!(out, "t{}: {}", p.0, type_label(ty))`.
+fn parse_temp_decl(
+    lno: usize,
+    decl: &str,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
+) -> Result<(TempId, TypeEstimate), String> {
     let (lhs, rhs) = decl
         .split_once(": ")
         .ok_or_else(|| format!("line {lno}: malformed temp decl (no `: `): {decl:?}"))?;
     let id = parse_temp_ref(lno, lhs)?;
-    let ty = parse_type(lno, rhs)?;
+    let ty = parse_type(lno, rhs, resolve_class)?;
     Ok((id, ty))
 }
 
@@ -469,7 +478,22 @@ fn record_temp(temps: &mut Vec<Temporary>, id: TempId, ty: TypeEstimate) {
 /// (id dropped); `type_label()` renders `<class:N>` / `<singleton:0xHEX>`.
 /// We accept all four shapes. Bare `<class>`/`<singleton>` parse to
 /// `Class(0)`/`Singleton(0)` — see module-level "Known lossy points".
-fn parse_type(lno: usize, s: &str) -> Result<TypeEstimate, String> {
+///
+/// B-i: params/returns/block-params are now formatted with `type_label`, so a
+/// class-typed temp dumps `<class:N>` (id present, LOSSLESS) — the Rust human
+/// dump uses a numeric `N`. A Dylan-side lowering wire dump, which can't know
+/// the host-assigned ids at lowering time, instead emits the class BY NAME
+/// (`<class:<idler>>`); we resolve the non-numeric payload through
+/// `resolve_class` at the reconstruction seam (the same precedent as
+/// `ClassMetadataPtr`-by-name in `parse_const` and the method-name suffix in
+/// `parse_function_header`). The encoding nests one `<…>` inside the other:
+/// `strip_prefix("<class:")` then a single `strip_suffix('>')` yields the
+/// payload `<idler>` (the class label, which still carries its own `>`).
+fn parse_type(
+    lno: usize,
+    s: &str,
+    resolve_class: &dyn Fn(&str) -> Option<u32>,
+) -> Result<TypeEstimate, String> {
     let ty = match s {
         "<top>" => TypeEstimate::Top,
         "<bottom>" => TypeEstimate::Bottom,
@@ -487,9 +511,15 @@ fn parse_type(lno: usize, s: &str) -> Result<TypeEstimate, String> {
                 let n = rest.strip_suffix('>').ok_or_else(|| {
                     format!("line {lno}: malformed <class:…> type: {s:?}")
                 })?;
-                let id: u32 = n
-                    .parse()
-                    .map_err(|_| format!("line {lno}: bad class id in type {s:?}"))?;
+                // Numeric payload → the human/Rust dump (id round-trips as-is).
+                // Non-numeric payload → a Dylan wire dump's class NAME (e.g.
+                // `<idler>`), resolved at the seam.
+                let id: u32 = match n.parse::<u32>() {
+                    Ok(id) => id,
+                    Err(_) => resolve_class(n).ok_or_else(|| {
+                        format!("line {lno}: unresolved class name in type {s:?}")
+                    })?,
+                };
                 TypeEstimate::Class(id)
             } else if let Some(rest) = s.strip_prefix("<singleton:") {
                 let n = rest.strip_suffix('>').ok_or_else(|| {
@@ -524,7 +554,7 @@ fn parse_computation(
     let (lhs, after_eq) = s
         .split_once(" = ")
         .ok_or_else(|| format!("line {lno}: computation missing ` = `: {s:?}"))?;
-    let (dst, dst_ty) = parse_temp_decl(lno, lhs)?;
+    let (dst, dst_ty) = parse_temp_decl(lno, lhs, resolve_class)?;
     record_temp(temps, dst, dst_ty);
 
     // The variant keyword is the first whitespace-delimited token of the RHS
@@ -1327,9 +1357,10 @@ mod tests {
     /// Function 1: exercises every TypeEstimate variant (params + block
     /// params + a Const dst), and the Return-with-value terminator.
     fn fn_types() -> Function {
-        // Cover every TypeEstimate. Note Class/Singleton printed via `name()`
-        // here (params/block-params), so they round-trip as <class>/<singleton>
-        // regardless of payload.
+        // Cover every TypeEstimate. As of B-i, params/block-params render via
+        // `type_label`, so Class(5)/Singleton(0xdeadbeef) print LOSSLESSLY as
+        // `<class:5>` / `<singleton:0xdeadbeef>` and round-trip with their ids
+        // intact (the numeric `<class:N>` parse path, no resolver needed).
         let tys = [
             TypeEstimate::Top,
             TypeEstimate::Bottom,
@@ -1760,6 +1791,53 @@ mod tests {
         assert_eq!(fns2[0].name, "f$1082_1");
 
         // An unresolvable `<class>` suffix is a descriptive error, not a panic.
+        assert!(parse_dfm_module(text, &|_| None).is_err());
+    }
+
+    /// B-i: a class-typed param/return/block-param now dumps `<class:N>`. The
+    /// Rust dump uses a numeric `N` (round-trips unchanged); a Dylan wire dump
+    /// emits the class BY NAME (`<class:<idler>>`), which `parse_type` resolves
+    /// through `resolve_class`. After resolution the temp reformats (via
+    /// `type_label`) to the numeric `<class:N>` form — exactly matching the Rust
+    /// dump, which is the whole point of B-i (lossless class-typed params for
+    /// SEALED dispatch resolution in the `--lower-with-dylan` flip).
+    #[test]
+    fn class_type_by_name_resolves() {
+        let text = "fn step (t0: <class:<idler>>) -> <class:<task>>:\n  \
+                    entry:\n    \
+                    Return t0\n";
+        let resolver = |name: &str| match name {
+            "<idler>" => Some(1082),
+            "<task>" => Some(7),
+            _ => None,
+        };
+        let fns = parse_dfm_module(text, &resolver).unwrap();
+        // The class-by-name payloads resolved to their ids.
+        assert_eq!(fns[0].temp_type(TempId(0)), TypeEstimate::Class(1082));
+        assert_eq!(fns[0].return_type, TypeEstimate::Class(7));
+        // Reformat (via `type_label`) yields the numeric `<class:N>` form that
+        // matches the Rust dump byte-for-byte.
+        let reformatted = format_dfm_module(&fns);
+        assert_eq!(
+            reformatted,
+            "fn step (t0: <class:1082>) -> <class:7>:\n  entry:\n    Return t0\n"
+        );
+
+        // A block-param carries a class-by-name too.
+        let bp_text = "fn f () -> <unit>:\n  \
+                       entry:\n    \
+                       Jump join0\n  \
+                       join0(t0: <class:<idler>>):\n    \
+                       Return\n";
+        let bp = parse_dfm_module(bp_text, &resolver).unwrap();
+        assert_eq!(bp[0].temp_type(TempId(0)), TypeEstimate::Class(1082));
+
+        // A numeric payload (the human/Rust dump) round-trips without a resolver.
+        let num_text = "fn step (t0: <class:1082>) -> <top>:\n  entry:\n    Return t0\n";
+        let num = parse_dfm_module(num_text, &|_| None).unwrap();
+        assert_eq!(num[0].temp_type(TempId(0)), TypeEstimate::Class(1082));
+
+        // An unresolvable class NAME is a descriptive error, not a panic.
         assert!(parse_dfm_module(text, &|_| None).is_err());
     }
 

@@ -1429,28 +1429,6 @@ define function name-in-vec? (v :: <stretchy-vector>, s :: <byte-string>)
   found
 end function;
 
-// Does a definition's modifier vector contain `sealed`? Sealed generics /
-// methods are OUT OF SCOPE for the Dylan lowering: a class-typed param
-// reconstructs as `Class(0)` (the dump drops the id), so a SEALED dispatch on a
-// param receiver mismatches (Rust resolves to a DirectCall; the flip stays a
-// Dispatch). Open/unsealed generics keep Dispatch→Dispatch on both sides, so
-// they're safe. A sealed definition bails the whole module.
-define function has-sealed-modifier? (mods :: <object>, source :: <byte-string>)
- => (yes? :: <boolean>)
-  if (~ instance?(mods, <stretchy-vector>))
-    #f
-  else
-    let n = size(mods);
-    let i = 0;
-    let found = #f;
-    until (i >= n | found)
-      if (token-source-text(mods[i], source) = "sealed") found := #t; end;
-      i := i + 1;
-    end;
-    found
-  end
-end function;
-
 // Does `name` start with `%` (a primitive call, e.g. `%make-stretchy-vector`)?
 // ('%' is byte 37.)
 define function starts-with-percent? (name :: <byte-string>) => (yes? :: <boolean>)
@@ -1767,15 +1745,26 @@ end function;
 
 // Map a declared type name to its DFM label. A class — user (from the AST set,
 // since user classes aren't registered yet when this runs) or a registered
-// builtin (`<stretchy-vector>`, … via `%is-class?`) — is `TypeEstimate::Class`
-// (`name()` -> `<class>`). The universal `<object>` is `Top` (-> `<top>`).
-// Scalars (`<integer>`/`<boolean>`/…) keep their estimate; anything else
-// genuinely unknown is `<top>`.
+// builtin (`<stretchy-vector>`, … via `%is-class?`) — is `TypeEstimate::Class`.
+//
+// B-i: params/returns/block-params now dump `<class:N>` (id present) via
+// `type_label`, so the lowering must emit class types BY NAME — it can't know
+// the host-assigned ids at lowering time. We emit `<class:<NAME>>` (e.g.
+// `<class:<idler>>`); `parse_type` resolves the inner class name through the
+// live registry at the `--lower-with-dylan` seam, yielding `Class(id)` which
+// reformats to the numeric `<class:N>` = byte-identical to the Rust dump. This
+// is the load-bearing flip that lets SEALED dispatch on a class-typed param
+// resolve identically on both sides (the crux that kept `richards-shape`
+// bailing).
+//
+// The universal `<object>` is `Top` (-> `<top>`). Scalars
+// (`<integer>`/`<boolean>`/…) keep their estimate; anything else genuinely
+// unknown is `<top>`.
 define function label-for-type-name (type-name :: <byte-string>,
                                      user-classes :: <stretchy-vector>)
  => (label :: <byte-string>)
   if (name-in-vec?(user-classes, type-name))
-    "<class>"
+    concatenate("<class:", concatenate(type-name, ">"))   // user class, BY NAME
   else
     let scalar = type-name-to-label(type-name);
     if (scalar ~= "<top>")
@@ -1783,7 +1772,7 @@ define function label-for-type-name (type-name :: <byte-string>,
     elseif (type-name = "<object>")
       "<top>"                            // the universal class -> Top
     elseif (%is-class?(type-name))
-      "<class>"                          // a registered (builtin) class
+      concatenate("<class:", concatenate(type-name, ">"))  // registered (builtin) class, BY NAME
     else
       "<top>"                            // genuinely unknown type
     end
@@ -2285,11 +2274,12 @@ define function dylan-lower-emit (source :: <byte-string>)
   until (i >= n | ~ all-ok?)
     let item = items[i];
     if (instance?(item, <ast-class-definition>))
-      // OPEN/unsealed scope only: a sealed class is out of scope (sealed
-      // dispatch + the Class(0) param crux). Bail the module.
-      if (has-sealed-modifier?(defn-modifiers(item), source))
-        all-ok? := #f;
-      elseif (class-is-simple?(item, items, source))
+      // B-i: sealed classes are now IN SCOPE. With class-typed params dumped as
+      // `<class:N>` (lossless), SEALED dispatch on a class-typed param receiver
+      // resolves identically on both sides of the flip, so we no longer bail on
+      // the `sealed` modifier. Other shape limits still apply (simple class
+      // only — `class-is-simple?` guards MI / slot-bearing supers / etc.).
+      if (class-is-simple?(item, items, source))
         emit-class-accessors(item, source, funcs);
       else
         all-ok? := #f;
@@ -2308,14 +2298,11 @@ define function dylan-lower-emit (source :: <byte-string>)
         if (f) add!(funcs, f); else all-ok? := #f; end;
       elseif (word = "method")
         // `define method g (…) … end` -> a method-body function named
-        // `g$spec_spec…`. OPEN/unsealed only: a sealed method bails (the
-        // Class(0) param crux breaks sealed dispatch in the flip).
-        if (has-sealed-modifier?(defn-modifiers(item), source))
-          all-ok? := #f;
-        else
-          let f = lower-method(item, ret-map, gnames, user-classes, source);
-          if (f) add!(funcs, f); else all-ok? := #f; end;
-        end;
+        // `g$spec_spec…`. B-i: sealed methods are now IN SCOPE — class-typed
+        // params dump as `<class:N>` (lossless), so SEALED dispatch on a param
+        // receiver resolves identically on both sides of the flip.
+        let f = lower-method(item, ret-map, gnames, user-classes, source);
+        if (f) add!(funcs, f); else all-ok? := #f; end;
       else
         all-ok? := #f;     // other body-definition words — later
       end;
@@ -2333,13 +2320,10 @@ define function dylan-lower-emit (source :: <byte-string>)
     elseif (instance?(item, <ast-generic-definition>))
       // `define generic g (…) => (…);` — the host registers the generic from the
       // AST; the lowering emits NO function for it (it has no body). A NO-OP, not
-      // a bail. OPEN/unsealed only: a sealed generic bails (sealed dispatch +
-      // the Class(0) param crux are out of scope).
-      if (has-sealed-modifier?(defn-modifiers(item), source))
-        all-ok? := #f;
-      else
-        #f;                // no-op: no function emitted for the generic
-      end;
+      // a bail. B-i: sealed generics are now IN SCOPE too — the `<class:N>`
+      // param format makes SEALED dispatch resolve identically on both sides of
+      // the flip, so we no longer bail on the `sealed` modifier.
+      #f;                  // no-op: no function emitted for the generic
     else
       // Preamble (`Module:` / `Precedence:` lexed as ordinary forms) or a bare
       // top-level expression. The Dylan parser keeps the preamble as items

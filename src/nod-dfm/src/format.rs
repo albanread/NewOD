@@ -55,9 +55,9 @@ fn fmt_function(f: &Function, out: &mut String) {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "t{}: {}", p.0, f.temp_type(*p).name());
+        let _ = write!(out, "t{}: {}", p.0, type_label(f.temp_type(*p)));
     }
-    let _ = writeln!(out, ") -> {}:", f.return_type.name());
+    let _ = writeln!(out, ") -> {}:", type_label(f.return_type));
     for block in &f.blocks {
         out.push_str("  ");
         let _ = write!(out, "{}", block.label);
@@ -67,7 +67,7 @@ fn fmt_function(f: &Function, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                let _ = write!(out, "t{}: {}", bp.0, f.temp_type(*bp).name());
+                let _ = write!(out, "t{}: {}", bp.0, type_label(f.temp_type(*bp)));
             }
             out.push(')');
         }

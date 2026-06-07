@@ -399,8 +399,6 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-class-accessors", // 55b: slot getter/setter emission (LoadSlot/StoreSlot)
     "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
     "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
-    "translate-class",       // 55b: class + accessors + straight-line fns (real corpus)
-    "lower-slot-assign",     // 55b: slot(obj) := v -> <slot>-setter Dispatch
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries
@@ -409,6 +407,15 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
 /// the flip (`--lower-with-dylan`), where the host runs the same passes on the
 /// reconstructed DFM. Listed separately from PHASE0_LOWER_FIXTURES (which the
 /// standalone text gate also uses).
+///
+/// B-i: a fixture with a class-typed param/return/block-param now dumps
+/// `<class:N>` (by id) via the Rust `dump-dfm`, while the standalone
+/// `dump-dylan-dfm` emits `<class:<name>>` (by name — it can't know ids at
+/// lowering time). The two reconcile ONLY through the flip (which resolves the
+/// name at the reconstruction seam), so any such fixture moves PHASE0→here:
+/// `translate-class` (`get-x` takes `<counter>`/user class), `lower-slot-assign`
+/// (`set-counter` takes `<counter>`), and `richards-shape` (sealed generic +
+/// methods on class-typed params — the crux B-i unblocks).
 const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "point",                 // 55b: make + slot-getter Dispatch + class-typed param
     "gc_precise_two_makes",  // 55b: two makes + dispatch + populated safepoints
@@ -417,6 +424,9 @@ const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "gap011-repro2",         // 55b: user + builtin makes + generics
     "lower-method-open",     // 55b: define generic + define method (open) -> g$class_int
     "richards-shape-open",   // 55b: open generic + methods + inheritance + list builtins
+    "translate-class",       // B-i: class-typed param `<class:N>` (was PHASE0)
+    "lower-slot-assign",     // B-i: class-typed param `<class:N>` (was PHASE0)
+    "richards-shape",        // B-i: SEALED generic/methods on class-typed params now flip-match
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan

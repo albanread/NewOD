@@ -75,7 +75,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// via [`crate::symbols::RelocKind`]. Old Sprint 37 cache entries
 /// would crash if re-loaded against the Sprint 38 codegen, so we make
 /// the invalidation explicit via the ABI version bump.
-pub const NOD_RUNTIME_ABI_VERSION: u32 = 2;
+/// Sprint 55b (B-i) bumps this from 2 to 3: the DFM dump format used by
+/// [`nod_dfm::format_for_cache_key`] changed — function params, return
+/// types, and block-params now render class types as `<class:N>` (id
+/// present) instead of the id-dropping `<class>`. The cache key is the
+/// dump text, so the same source now hashes to a new key; the bump makes
+/// invalidation of pre-B-i cached objects explicit.
+pub const NOD_RUNTIME_ABI_VERSION: u32 = 3;
 
 /// LLVM major version we link against. Sourced from
 /// `llvm_sys::LLVM_VERSION_MAJOR` at compile time. Bump in lockstep

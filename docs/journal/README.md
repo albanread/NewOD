@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b (B-i): class ids in the DFM dump → sealed dispatch flips](2026-06-07-sprint-55b-class-id-in-dump-Bi.md)
+  — The decided crux fix: params/returns/block-params now dump `<class:N>` (via
+  `type_label`, was id-dropping `<class>`); Dylan emits `<class:<name>>`, parser
+  resolves at the seam. Unblocks SEALED dispatch — `richards-shape` (sealed)
+  flip-matches. Chose the format change over a host re-stamp (which would mask
+  Dylan param-typing bugs). Cache key bumped 2→3; translate-class/lower-slot-assign/
+  richards-shape → FLIP_ONLY. 27 lowered, 0 mismatches.
 - [2026-06-07 — Sprint 55b: `define method` / `define generic` (open scope)](2026-06-07-sprint-55b-define-method-open.md)
   — Method machinery: `define generic`→no-op, `define method`→body fn named
   `g$<spec>_…` (by class name; parser resolves to numeric at the seam).
