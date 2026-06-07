@@ -372,15 +372,6 @@ define function defn-declared-return-label (defn :: <ast-body-definition>,
   end
 end function;
 
-// Is the definition declared void (`=> ()` — a return spec with zero values)?
-// Such a function returns `<unit>` with a bare `Return`, even if its body
-// produced a value temp (e.g. `let i = 0; while … end`, where the last
-// non-void statement was the `let`, not the loop).
-define function defn-is-void? (defn :: <ast-body-definition>) => (yes? :: <boolean>)
-  let rspec = defn-return(defn);
-  if (rspec) size(ret-values(rspec)) = 0 else #f end
-end function;
-
 // Build name -> declared-return-label map over top-level `define function`s.
 define function build-name-ret-map (items :: <stretchy-vector>,
                                     user-classes :: <stretchy-vector>,
@@ -616,10 +607,16 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
             end
           end
         end
-      // A call to a known generic (a slot getter, etc.) -> `Dispatch g(args)`
-      // dst <top>, EMPTY safepoint set (the host liveness pass populates it; the
-      // resolver may later rewrite it to Direct/SealedDirectCall). lower.rs 6060.
-      elseif (name-in-vec?(fb-generics(b), name))
+      // A call to a generic -> `Dispatch g(args)` dst <top>, EMPTY safepoint set
+      // (the host liveness pass populates it; the resolver may later rewrite to
+      // Direct/SealedDirectCall). A name is a generic if it's a module slot
+      // getter (fb-generics) OR a registered generic (`%is-generic?`, which sees
+      // stdlib generics like `size`/`add!` — they're registered before lowering
+      // runs). But a name that is ALSO a known top-level function is a
+      // DirectCall, not a Dispatch (Rust checks top_names first), hence the
+      // `~ nrm-contains?` guard. lower.rs 6045-6068.
+      elseif (~ nrm-contains?(ret-map, name)
+                & (name-in-vec?(fb-generics(b), name) | %is-generic?(name)))
         let arg-nodes = call-args(node);
         let n = size(arg-nodes);
         let arg-temps = make(<stretchy-vector>);
@@ -638,18 +635,18 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
                           op: #f, args: arg-temps, callee: name));
           dst
         end
-      elseif (~ nrm-contains?(ret-map, name))
-        // Not a known top-level function — a stdlib function (DirectCall),
-        // generic (Dispatch), or `%`-primitive (DirectCall to a `nod_…` name).
-        // The Dylan side can't yet classify which, and emitting the wrong shape
-        // would be a miscompile, so bail to the Rust path. (The old Phase-0
-        // "unknown ident -> DirectCall" was unsound for generics / %-prims; it
-        // only happened to work for non-generic stdlib functions.)
+      elseif (starts-with-percent?(name))
+        // A `%`-primitive call (e.g. `%make-stretchy-vector`) lowers in Rust to
+        // a DirectCall against a `nod_…` runtime name (LOWER_PRIMITIVE_TABLE).
+        // The Dylan side doesn't carry that name map yet, so bail rather than
+        // emit a wrong `%foo` callee. (Deferred: mirror the prim table.)
         #f
       else
-        // A known top-level `define function` -> DirectCall. Args lower
-        // left-to-right BEFORE the dst is minted (dst id comes after all arg
-        // ids, matching lower.rs fresh_temp(ret) ordering).
+        // Either a known top-level `define function` (declared return) or a
+        // non-generic stdlib function / unknown ident (dst falls back to
+        // <top>) — both are plain DirectCalls (`nrm-lookup` gives the right
+        // dst either way). Args lower left-to-right BEFORE the dst is minted
+        // (dst id comes after all arg ids, matching lower.rs fresh_temp(ret)).
         let arg-nodes = call-args(node);
         let n = size(arg-nodes);
         let arg-temps = make(<stretchy-vector>);
@@ -1377,6 +1374,12 @@ define function name-in-vec? (v :: <stretchy-vector>, s :: <byte-string>)
   found
 end function;
 
+// Does `name` start with `%` (a primitive call, e.g. `%make-stretchy-vector`)?
+// ('%' is byte 37.)
+define function starts-with-percent? (name :: <byte-string>) => (yes? :: <boolean>)
+  size(name) > 0 & %byte-string-element(name, 0) = 37
+end function;
+
 // ClassCheck::name() — the label printed for a `TypeCheck`. Most class names
 // pass through verbatim (builtins like <integer>/<boolean>/<character>/<symbol>,
 // <object>, and user classes by source name), but two builtins normalize to
@@ -1567,16 +1570,28 @@ define function build-user-class-names (items :: <stretchy-vector>, source :: <b
   names
 end function;
 
-// Map a declared type name to its DFM label, treating any user class as
-// `<class>` (TypeEstimate::Class, which `name()` renders `<class>`); other names
-// go through the scalar `type-name-to-label` (-> `<top>` for the unknown rest).
+// Map a declared type name to its DFM label. A class — user (from the AST set,
+// since user classes aren't registered yet when this runs) or a registered
+// builtin (`<stretchy-vector>`, … via `%is-class?`) — is `TypeEstimate::Class`
+// (`name()` -> `<class>`). The universal `<object>` is `Top` (-> `<top>`).
+// Scalars (`<integer>`/`<boolean>`/…) keep their estimate; anything else
+// genuinely unknown is `<top>`.
 define function label-for-type-name (type-name :: <byte-string>,
                                      user-classes :: <stretchy-vector>)
  => (label :: <byte-string>)
   if (name-in-vec?(user-classes, type-name))
     "<class>"
   else
-    type-name-to-label(type-name)
+    let scalar = type-name-to-label(type-name);
+    if (scalar ~= "<top>")
+      scalar                              // known scalar (<integer>, <string>, …)
+    elseif (type-name = "<object>")
+      "<top>"                            // the universal class -> Top
+    elseif (%is-class?(type-name))
+      "<class>"                          // a registered (builtin) class
+    else
+      "<top>"                            // genuinely unknown type
+    end
   end
 end function;
 
@@ -1705,18 +1720,22 @@ define function lower-function (defn :: <ast-body-definition>,
         ok? := #f;
       elseif (instance?(t, <integer>))
         last-temp := t;
+      else
+        // Void statement (a loop's void marker): the function's value is THIS
+        // last statement, so reset — a trailing loop makes the function void
+        // even if an earlier `let` produced a temp. (Rust returns the value of
+        // the LAST statement; `=> ()` is NOT what makes it void — a `=> ()`
+        // function whose body is an expression still returns that expression's
+        // value, e.g. `hello`'s `format-out(...)`.)
+        last-temp := #f;
       end;
       ci := ci + 1;
     end;
     if (~ ok?)
       #f
-    elseif (defn-is-void?(defn) | ~ last-temp)
-      // Void function: declared `=> ()` (value discarded), or the body produced
-      // no value (a trailing loop with no prior binding). Rust types these
-      // `<unit>` with a bare `Return`. (lower.rs: a unit-valued body →
-      // Return{None}.) Checking `defn-is-void?` — not just `~ last-temp` — is
-      // essential: `let i = 0; while … end` leaves `last-temp` at the `let`'s
-      // temp, but a `=> ()` function still returns void.
+    elseif (~ last-temp)
+      // Void function: the last statement produced no value (a trailing loop).
+      // Rust types these `<unit>` with a bare `Return` (Return{None}).
       func-return-type(fb-func(b)) := "<unit>";
       fb-terminate-return(b, #f);
       fb-func(b)

@@ -121,6 +121,15 @@ pub const NOD_NEXT_METHOD_SYMBOL: &str = "nod_next_method";
 /// method in the chain.
 pub const NOD_HAS_NEXT_METHOD_SYMBOL: &str = "nod_has_next_method";
 
+/// Sprint 55: `%is-generic?(name)` — `#t` iff `name` is a registered generic.
+/// Called only by the Dylan-side lowering shim (to classify a callee as
+/// Dispatch vs DirectCall).
+pub const NOD_IS_GENERIC_DEFINED_SYMBOL: &str = "nod_is_generic_defined";
+
+/// Sprint 55: `%is-class?(name)` — `#t` iff `name` is a registered class.
+/// Called only by the Dylan-side lowering shim (to type a param as `<class>`).
+pub const NOD_IS_CLASS_DEFINED_SYMBOL: &str = "nod_is_class_defined";
+
 /// Sprint 15: push a `next-method` chain frame on entry to a
 /// sealed-direct multimethod call. Codegen emits a call to this just
 /// before the resolved-method direct call so `next-method()` walks
@@ -475,6 +484,9 @@ const SPRINT_20B_PRIMITIVES: &[(&str, &str, usize)] = &[
     ("nod_byte_string_element", NOD_BYTE_STRING_ELEMENT_SYMBOL, 2),
     ("nod_byte_string_element_setter", NOD_BYTE_STRING_ELEMENT_SETTER_SYMBOL, 3),
     ("nod_byte_string_copy_bytes", NOD_BYTE_STRING_COPY_BYTES_SYMBOL, 5),
+    // Sprint 55 — generic-name + class-name classifiers for the Dylan shim.
+    ("nod_is_generic_defined", NOD_IS_GENERIC_DEFINED_SYMBOL, 1),
+    ("nod_is_class_defined", NOD_IS_CLASS_DEFINED_SYMBOL, 1),
     // Sprint 24 — closures.
     ("nod_make_cell", NOD_MAKE_CELL_SYMBOL, 1),
     ("nod_cell_get", NOD_CELL_GET_SYMBOL, 1),

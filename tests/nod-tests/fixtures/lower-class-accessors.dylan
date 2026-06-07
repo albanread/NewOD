@@ -14,7 +14,7 @@ Module: kernel-arith
 //   * a trailing straight-line function (Phase 4) that does NOT touch the
 //     classes — proving all accessors precede all user functions in the dump.
 
-define class <pt> (<object>)
+define class <coord> (<object>)
   slot px :: <integer>, init-keyword: px:;
   slot py :: <integer>, init-keyword: py:;
 end class;

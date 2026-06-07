@@ -358,6 +358,12 @@ const LOWER_PRIMITIVE_TABLE: &[(&str, &str, usize, TypeEstimate)] = &[
     ("%byte-string-element", "nod_byte_string_element", 2, TypeEstimate::Integer),
     ("%byte-string-element-setter", "nod_byte_string_element_setter", 3, TypeEstimate::Integer),
     ("%byte-string-copy!", "nod_byte_string_copy_bytes", 5, TypeEstimate::Integer),
+    // Sprint 55 — the Dylan-side lowering (shim) calls these to classify a
+    // non-local callee as a generic (-> Dispatch) vs a plain function
+    // (-> DirectCall), and a param type as a class (-> <class>) vs not.
+    // Host-side they're no-ops (no user code calls them).
+    ("%is-generic?", "nod_is_generic_defined", 1, TypeEstimate::Boolean),
+    ("%is-class?", "nod_is_class_defined", 1, TypeEstimate::Boolean),
     // Sprint 22 — <table> + hashing.
     ("%make-table", "nod_make_table", 1, TypeEstimate::Top),
     ("%table-size", "nod_table_size", 1, TypeEstimate::Integer),

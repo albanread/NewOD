@@ -387,12 +387,7 @@ fn run_dump_dfm_lower_with_dylan(ws: &Path, input: &Path) -> (String, String, bo
 const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "sprint09-add",          // params + binop
     "mutual",                // 3 fns: direct calls + int consts + binops
-    // NOTE: `hello` (format-out) and `translate-loop` (done/consume) were here
-    // but now correctly BAIL: the Dylan call path only DirectCalls KNOWN
-    // top-level functions; a call to a stdlib function/generic/%-primitive can't
-    // yet be classified (DirectCall vs Dispatch vs nod_-name), so it bails
-    // rather than risk a wrong dump. They return once a generic-name primitive
-    // (+ %-prim name mapping) lands.
+    "hello",                 // string literal + DirectCall to a stdlib function
     "gap011-jcs-min-crash",  // 40 fns, chained direct calls
     "lower-let",             // 55a: chained `let` bindings + arithmetic
     "lower-if",              // 55a: `let` + `if`/`else` (block-param SSA diamond)
@@ -404,6 +399,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-class-accessors", // 55b: slot getter/setter emission (LoadSlot/StoreSlot)
     "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
     "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
+    "translate-class",       // 55b: class + accessors + straight-line fns (real corpus)
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries
@@ -415,7 +411,9 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
 const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "point",                 // 55b: make + slot-getter Dispatch + class-typed param
     "gc_precise_two_makes",  // 55b: two makes + dispatch + populated safepoints
-    "translate-class",       // 55b: class + make/dispatch (real corpus fixture)
+    "translate-loop",        // 55a-tail: void (=> ()) functions + loop safepoints
+    "gap011-repro",          // 55b: make(<stretchy-vector>) + size/add! generics + void
+    "gap011-repro2",         // 55b: user + builtin makes + generics
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan

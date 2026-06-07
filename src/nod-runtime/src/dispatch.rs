@@ -989,6 +989,43 @@ pub unsafe extern "C" fn nod_has_next_method() -> u64 {
     }
 }
 
+/// Sprint 55 — `%is-generic?(name :: <byte-string>) => <boolean>`: is `name`
+/// the name of a registered generic function? The Dylan-side AST→DFM lowering
+/// (load-bearing under `--lower-with-dylan`) calls this to decide whether a call
+/// to a non-local name is a `Dispatch` (generic) or a `DirectCall` (a plain
+/// function). The runtime generic registry is live by the time the lowering runs
+/// (`stdlib::ensure_loaded` precedes it), so stdlib generics like `size` / `add!`
+/// resolve correctly.
+///
+/// # Safety
+/// `name_raw` must be a pointer-tagged `<byte-string>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_is_generic_defined(name_raw: u64) -> u64 {
+    let imm = crate::literal_pool_immediates();
+    let yes = decode_byte_string_to_string(Word::from_raw(name_raw))
+        .map(|s| is_generic_defined(&s))
+        .unwrap_or(false);
+    if yes { imm.true_.raw() } else { imm.false_.raw() }
+}
+
+/// Sprint 55 — `%is-class?(name :: <byte-string>) => <boolean>`: is `name` the
+/// name of a registered class? The Dylan-side lowering uses this to type a
+/// non-scalar param/return whose name it doesn't recognize as a builtin class
+/// (`Class` → `<class>`) vs a genuinely unknown type (`Top` → `<top>`). Builtin
+/// classes (`<stretchy-vector>`, …) are registered before lowering runs; the
+/// universal `<object>` is special-cased to `<top>` on the Dylan side.
+///
+/// # Safety
+/// `name_raw` must be a pointer-tagged `<byte-string>` Word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nod_is_class_defined(name_raw: u64) -> u64 {
+    let imm = crate::literal_pool_immediates();
+    let yes = decode_byte_string_to_string(Word::from_raw(name_raw))
+        .map(|s| crate::classes::find_class_id_by_name(&s).is_some())
+        .unwrap_or(false);
+    if yes { imm.true_.raw() } else { imm.false_.raw() }
+}
+
 /// Test helper: clear the `next-method` chain stack. Useful for tests
 /// that exercise `next-method` and want a clean slate. Not called in
 /// production.

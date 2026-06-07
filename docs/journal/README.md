@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55b: classifier primitives (`%is-generic?` / `%is-class?`)](2026-06-07-sprint-55b-classifier-primitives.md)
+  — Two tiny shim-callable runtime primitives let the Dylan lowering query the
+  registry: a call → Dispatch (generic) / DirectCall (function) / bail (%-prim),
+  and a param → `<class>` (user/builtin class) / `<top>`. Restores hello +
+  translate-loop, unlocks gap011 + builtin-class params. Also corrects the void
+  rule (last-statement value, not `=> ()`). 0 corpus mismatches, 23 lowered.
 - [2026-06-07 — Sprint 55b: call-path soundness (the unknown→DirectCall trap)](2026-06-07-sprint-55b-call-path-soundness.md)
   — A whole-corpus survey caught 4 NEW mismatches after make/dispatch: enabling
   `make` let the gap repros lower into a latent unsoundness — Phase-0 emitted
