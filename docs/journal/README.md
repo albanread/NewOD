@@ -28,6 +28,17 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Consolidation: full sema-corpus survey after the 53.5 gaps closed](2026-06-07-consolidation-sema-survey.md)
+  — Honest inventory, no feature work. Re-ran the whole-corpus byte-match
+  survey: all 38 gated fixtures match, every ungated MATCH is a deliberately
+  skipped transient/variant (gate is comprehensive over distinct real shapes),
+  and the only DIFFERs are `dylan-c3-smoke` / `dylan-macro-smoke` (the
+  stdlib-class-return gap — `<stretchy-vector>` returns) plus a scratch
+  `_tmp_when_macro` (expand-before-sema). Both residual gaps are structural to
+  the standalone verify EXE (no host class-registry, no expand step) and
+  dissolve at the Sprint 54 wire — not walk bugs, so deferred not patched.
+  Also: the old `dump-dfm` `aot.rs:1037` panic is fixed (class-id-drift fix);
+  re-verified it's a reliable health signal again.
 - [2026-06-07 — Sprint 53.5e: user-class return estimates, dumped by name](2026-06-07-sema-53-5e-class-return-by-name.md)
   — Closes the last rope-family divergence. `format_sema_model` rendered a
   function's class return as `Class(<raw-id>)` — a process-global id that
