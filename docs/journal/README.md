@@ -28,6 +28,11 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-07 — Sprint 55a: generalize the short-circuit env-merge](2026-06-07-sprint-55a-short-circuit-env-merge.md)
+  — The `|`/`&` twin of the if env-merge fix: merge set (RHS-assigned ∪ GC-typed,
+  sorted, value-first), sc_edge carries pre-RHS temps + sc_rhs post-RHS, join
+  created after the RHS. All three control-flow forms (if, short-circuit, loops)
+  now carry the full env-merge. Verified `a|(x:=5)` + `a|(b&c)`; gate holds at 11.
 - [2026-06-07 — Sprint 55a: generalize the `if` env-merge](2026-06-07-sprint-55a-if-env-merge.md)
   — Adding `:=` exposed two latent `if` bugs (confirmed vs Rust): assigned vars
   weren't threaded through the join, and the join was created before the arms

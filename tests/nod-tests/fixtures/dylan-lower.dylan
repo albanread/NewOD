@@ -639,44 +639,83 @@ end function;
 // and jumps with its value; sc_join's block-param is the result.
 //   `|`: LHS true  → sc_edge (value = LHS); false → sc_rhs.  (If lhs edge rhs)
 //   `&`: LHS true  → sc_rhs;  false → sc_edge (value = LHS). (If lhs rhs edge)
-// Same env-merge guard as `if` (bail to Rust on GC-typed env).
+// Like `if`, the join carries the result (first param) plus any var assigned in
+// the RHS (or GC-typed in env) — sorted. The sc_edge arm (short-circuit, RHS not
+// run) carries the PRE-rhs values; sc_rhs carries the post-rhs values. The join
+// is created AFTER the RHS (so a nested-control-flow RHS orders right). RHS is an
+// expression (no lets to evict), so no env snapshot/restore is needed.
 define function lower-short-circuit (b :: <fn-builder>, node :: <ast-binary-op>,
                                      op :: <byte-string>, ret-map :: <name-ret-map>,
                                      source :: <byte-string>)
  => (temp :: <object>)
-  if (env-has-gc-typed?(b))
+  let lhs = lower-expr(b, binop-left(node), ret-map, source);
+  if (~ lhs)
     #f
   else
-    let lhs = lower-expr(b, binop-left(node), ret-map, source);
-    if (~ lhs)
+    let lhs-ty = fb-temp-type(b, lhs);
+    // Merge set = vars assigned in the RHS ∪ GC-typed env names, sorted.
+    let merge = make(<stretchy-vector>);
+    collect-assigned(b, binop-right(node), source, merge);
+    let enames = fb-env-names(b);
+    let etemps = fb-env-temps(b);
+    let ne = size(enames);
+    let gi = 0;
+    until (gi >= ne)
+      if (gc-typed-label?(fb-temp-type(b, etemps[gi]))) set-add!(merge, enames[gi]); end;
+      gi := gi + 1;
+    end;
+    lower-sort-strings!(merge);
+    let nm = size(merge);
+    // Capture the PRE-rhs merge temps (for the short-circuit edge).
+    let edge-merge = make(<stretchy-vector>);
+    let ci = 0;
+    until (ci >= nm) add!(edge-merge, fb-lookup(b, merge[ci])); ci := ci + 1; end;
+    let edge-idx = fb-new-block(b, "sc_edge");
+    let rhs-idx = fb-new-block(b, "sc_rhs");
+    if (op = "|")
+      fb-terminate-if(b, lhs, fb-block-label(b, edge-idx), fb-block-label(b, rhs-idx));
+    else
+      fb-terminate-if(b, lhs, fb-block-label(b, rhs-idx), fb-block-label(b, edge-idx));
+    end;
+    // sc_rhs: evaluate the RHS.
+    fb-switch-to(b, rhs-idx);
+    let rhs = lower-expr(b, binop-right(node), ret-map, source);
+    if (~ rhs)
       #f
     else
-      let lhs-ty = fb-temp-type(b, lhs);
-      let edge-idx = fb-new-block(b, "sc_edge");
-      let rhs-idx = fb-new-block(b, "sc_rhs");
+      let rhs-ty = fb-temp-type(b, rhs);
+      let rhs-end = fb-current(b);
+      let rhs-merge = make(<stretchy-vector>);
+      let mj = 0;
+      until (mj >= nm) add!(rhs-merge, fb-lookup(b, merge[mj])); mj := mj + 1; end;
+      // Join after the RHS.
       let join-idx = fb-new-block(b, "sc_join");
-      let edge-lbl = fb-block-label(b, edge-idx);
-      let rhs-lbl = fb-block-label(b, rhs-idx);
       let join-lbl = fb-block-label(b, join-idx);
-      if (op = "|")
-        fb-terminate-if(b, lhs, edge-lbl, rhs-lbl);
-      else
-        fb-terminate-if(b, lhs, rhs-lbl, edge-lbl);
-      end;
-      // sc_edge: short-circuit — carry the LHS value.
+      // sc_edge → join([lhs] + pre-rhs merge…)
+      let edge-args = make(<stretchy-vector>);
+      add!(edge-args, lhs);
+      let ei = 0;
+      until (ei >= nm) add!(edge-args, edge-merge[ei]); ei := ei + 1; end;
       fb-switch-to(b, edge-idx);
-      fb-terminate-jump(b, join-lbl, singleton-vec(lhs));
-      // sc_rhs: evaluate the RHS.
-      fb-switch-to(b, rhs-idx);
-      let rhs = lower-expr(b, binop-right(node), ret-map, source);
-      if (~ rhs)
-        #f
-      else
-        let rhs-ty = fb-temp-type(b, rhs);
-        fb-terminate-jump(b, join-lbl, singleton-vec(rhs));
-        fb-switch-to(b, join-idx);
-        fb-add-block-param(b, join-idx, join-type-label(lhs-ty, rhs-ty))
-      end
+      fb-terminate-jump(b, join-lbl, edge-args);
+      // sc_rhs → join([rhs] + post-rhs merge…)
+      let rhs-args = make(<stretchy-vector>);
+      add!(rhs-args, rhs);
+      let ri = 0;
+      until (ri >= nm) add!(rhs-args, rhs-merge[ri]); ri := ri + 1; end;
+      fb-switch-to(b, rhs-end);
+      fb-terminate-jump(b, join-lbl, rhs-args);
+      // Join params: value first, then merge vars; rebind env to the params.
+      fb-switch-to(b, join-idx);
+      let value-param = fb-add-block-param(b, join-idx, join-type-label(lhs-ty, rhs-ty));
+      let pk = 0;
+      until (pk >= nm)
+        let pty = join-type-label(fb-temp-type(b, edge-merge[pk]),
+                                  fb-temp-type(b, rhs-merge[pk]));
+        fb-bind(b, merge[pk], fb-add-block-param(b, join-idx, pty));
+        pk := pk + 1;
+      end;
+      value-param
     end
   end
 end function;
