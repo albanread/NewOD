@@ -254,6 +254,86 @@ define function slot-has-setter? (s :: <ast-slot-spec>, source :: <byte-string>)
   ~ is-constant?
 end function;
 
+// ─── Sprint 56a-WIRE: the four grown SlotInfo fields ─────────────────────
+//
+// `type=` label, `init-keyword=`, `required=`, `default=` — each derived to
+// byte-match the Rust emitter (`slot_type_label` / `slot_default_tag` and the
+// `register_class` partial literal recognition in nod-sema/src/lower.rs).
+
+// Canonical `type=` label for a slot. Mirrors `slot_type_from_expr` ->
+// `slot_type_label`: the scalar buckets collapse to a canonical source name
+// (`<byte-string>`->`<string>`, `<single-float>`/`<float>`->`<double-float>`,
+// `<simple-object-vector>`->`<vector>`); `<object>`/`<top>`/untyped -> `<top>`;
+// a user-class-typed slot keeps the class NAME (Rust resolves it to
+// `Class(id)` whose `sema_class_name` IS that source name). A type naming a
+// non-user, non-scalar class is `<top>` here — the gated corpus has none, and
+// the live `verify_dylan_classes` would catch any divergence loudly.
+define function slot-type-label (s :: <ast-slot-spec>,
+                                 source :: <byte-string>,
+                                 class-names :: <stretchy-vector>)
+ => (label :: <byte-string>)
+  if (~ instance?(slot-type(s), <ast-node>))
+    "<top>"
+  else
+    let tn = type-node-name(slot-type(s), source);
+    if (tn = "<integer>")                                "<integer>"
+    elseif (tn = "<single-float>" | tn = "<double-float>" | tn = "<float>")
+                                                         "<double-float>"
+    elseif (tn = "<boolean>")                            "<boolean>"
+    elseif (tn = "<character>")                          "<character>"
+    elseif (tn = "<string>" | tn = "<byte-string>")      "<string>"
+    elseif (tn = "<symbol>")                             "<symbol>"
+    elseif (tn = "<simple-object-vector>" | tn = "<vector>")  "<vector>"
+    elseif (tn = "<object>" | tn = "<top>")              "<top>"
+    elseif (bs-member?(class-names, tn))                 tn
+    else                                                 "<top>"
+    end
+  end
+end function;
+
+// `init-keyword=` value: the keyword's colon-free name (matching the Rust
+// reader's `trim_end_matches(':')`), or "-" when the slot has no
+// init-keyword / required-init-keyword. `keyword-name-token-name` is already
+// colon-free (the lexer strips the trailing `:`).
+define function slot-initkw-text (s :: <ast-slot-spec>) => (kw :: <byte-string>)
+  if (instance?(slot-init-kw(s), <keyword-name-token>))
+    keyword-name-token-name(slot-init-kw(s))
+  else
+    "-"
+  end
+end function;
+
+// `required=` flag: #t only for `required-init-keyword:`.
+define function slot-required-flag (s :: <ast-slot-spec>) => (yes? :: <boolean>)
+  if (slot-required?(s)) #t else #f end
+end function;
+
+// GAP-009 `default=` tag. Mirrors `register_class`'s partial literal
+// recognition: only an integer or boolean LITERAL `init-value:` (or the
+// `= default` shorthand) becomes a value; an `init-function:` thunk never
+// does (`slot-init-fn?` set), and any non-literal init -> `unbound`.
+//
+// The fixnum encoding is `value:<n << 1>` (`Word::from_fixnum`, raw u64
+// bits). The host <integer> is itself a fixnum (±2^62), so any literal that
+// survives as an <ast-integer-lit> is already in range — Rust's
+// `from_fixnum`/`try_into` overflow->Unbound edge is unreachable from a
+// Dylan-parsed literal, so it needs no explicit guard here. For non-negative
+// `n`, `n << 1 == n * 2` and the host can compute it directly. (Negative
+// defaults would need the u64 two's-complement <<1 bit pattern, which no
+// gated fixture exercises; `verify_dylan_classes` would catch a divergence.)
+define function slot-default-tag (s :: <ast-slot-spec>) => (tag :: <byte-string>)
+  let init = slot-init(s);
+  if (~ instance?(init, <ast-node>) | slot-init-fn?(s))
+    "unbound"
+  elseif (instance?(init, <ast-integer-lit>))
+    concatenate("value:", integer-to-string(lit-value(init) * 2))
+  elseif (instance?(init, <ast-boolean-lit>))
+    if (lit-value(init)) "true" else "false" end
+  else
+    "unbound"
+  end
+end function;
+
 // Does a definition's `define`-modifier vector contain `sealed`? Mirrors
 // `slot-has-setter?`: scan the modifier tokens, comparing the source-text
 // slice (so the match works whether `sealed` lexes as an identifier or a
@@ -281,6 +361,13 @@ define class <class-rec> (<object>)
   slot rec-slot-names  :: <stretchy-vector>, init-keyword: slot-names:;
   slot rec-slot-ests   :: <stretchy-vector>, init-keyword: slot-ests:;
   slot rec-slot-setters :: <stretchy-vector>, init-keyword: slot-setters:;
+  // Sprint 56a-WIRE — the four previously-lossy SlotInfo fields, parallel to
+  // `rec-slot-names`: the canonical type= label, the init-keyword string (or
+  // "-"), the required-init-keyword flag, and the GAP-009 default tag.
+  slot rec-slot-types  :: <stretchy-vector>, init-keyword: slot-types:;
+  slot rec-slot-initkws :: <stretchy-vector>, init-keyword: slot-initkws:;
+  slot rec-slot-reqs   :: <stretchy-vector>, init-keyword: slot-reqs:;
+  slot rec-slot-defaults :: <stretchy-vector>, init-keyword: slot-defaults:;
 end class;
 
 // CPL registry: parallel name / cpl vectors. Seeded with `<object>`.
@@ -315,7 +402,8 @@ end function;
 define function build-class-rec (cd :: <ast-class-definition>,
                                  source :: <byte-string>,
                                  reg-names :: <stretchy-vector>,
-                                 reg-cpls  :: <stretchy-vector>)
+                                 reg-cpls  :: <stretchy-vector>,
+                                 class-names :: <stretchy-vector>)
  => (rec :: <class-rec>)
   let cname = token-source-text(class-name(cd), source);
 
@@ -346,6 +434,11 @@ define function build-class-rec (cd :: <ast-class-definition>,
   let slot-names   = make(<stretchy-vector>);
   let slot-ests    = make(<stretchy-vector>);
   let slot-setters = make(<stretchy-vector>);
+  // Sprint 56a-WIRE — parallel vectors for the four grown fields.
+  let slot-types    = make(<stretchy-vector>);
+  let slot-initkws  = make(<stretchy-vector>);
+  let slot-reqs     = make(<stretchy-vector>);
+  let slot-defaults = make(<stretchy-vector>);
   let slots = class-slots(cd);
   let nsl = size(slots);
   let sli = 0;
@@ -355,6 +448,10 @@ define function build-class-rec (cd :: <ast-class-definition>,
       add!(slot-names,   token-source-text(slot-name-tok(s), source));
       add!(slot-ests,    slot-est(s, source));
       add!(slot-setters, slot-has-setter?(s, source));
+      add!(slot-types,    slot-type-label(s, source, class-names));
+      add!(slot-initkws,  slot-initkw-text(s));
+      add!(slot-reqs,     slot-required-flag(s));
+      add!(slot-defaults, slot-default-tag(s));
     end;
     sli := sli + 1;
   end;
@@ -363,10 +460,17 @@ define function build-class-rec (cd :: <ast-class-definition>,
   add!(reg-names, cname);
   add!(reg-cpls, cpl);
 
-  make(<class-rec>,
-       name: cname, parents: parents, cpl: cpl,
-       slot-names: slot-names, slot-ests: slot-ests,
-       slot-setters: slot-setters)
+  // The shim's `make` caps at 8 keyword pairs (Sprint 12), so construct with
+  // the original six and set the four Sprint 56a-WIRE vectors via setters.
+  let rec = make(<class-rec>,
+                 name: cname, parents: parents, cpl: cpl,
+                 slot-names: slot-names, slot-ests: slot-ests,
+                 slot-setters: slot-setters);
+  rec-slot-types(rec)    := slot-types;
+  rec-slot-initkws(rec)  := slot-initkws;
+  rec-slot-reqs(rec)     := slot-reqs;
+  rec-slot-defaults(rec) := slot-defaults;
+  rec
 end function;
 
 // Join a vector of byte-strings with ", " (for parents / cpl listings).
@@ -657,7 +761,7 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
     elseif (instance?(item, <ast-class-definition>))
       // Build the class record (computes + registers its CPL), then emit
       // the slot accessors into `fns` and the slot generics.
-      let rec = build-class-rec(item, source, reg-names, reg-cpls);
+      let rec = build-class-rec(item, source, reg-names, reg-cpls, class-names);
       add!(classes, rec);
       // `define sealed class` → a `sealed-class <name>` entry.
       if (modifiers-has-sealed?(defn-modifiers(item), source))
@@ -762,20 +866,27 @@ define function collect-top-names (ast :: <ast-body>, source :: <byte-string>)
     // inherited slots to place first; origin is always the class itself.)
     let snames   = rec-slot-names(rec);
     let ssetters = rec-slot-setters(rec);
+    // Sprint 56a-WIRE — parallel vectors for the four grown fields.
+    let stypes    = rec-slot-types(rec);
+    let sinitkws  = rec-slot-initkws(rec);
+    let sreqs     = rec-slot-reqs(rec);
+    let sdefaults = rec-slot-defaults(rec);
     let nsl = size(snames);
     let sk = 0;
     until (sk >= nsl)
       let offset = 8 + (sk * 8);
       let setter-str = if (ssetters[sk]) "true" else "false" end;
-      out := concatenate(out,
-               concatenate("  slot ",
-                 concatenate(snames[sk],
-                   concatenate(" @",
-                     concatenate(integer-to-string(offset),
-                       concatenate(" setter=",
-                         concatenate(setter-str,
-                           concatenate(" origin=",
-                             concatenate(rec-name(rec), "\n")))))))));
+      let req-str    = if (sreqs[sk]) "true" else "false" end;
+      // `  slot NAME @OFF setter=B origin=C type=T init-keyword=K required=B default=D`
+      let line = concatenate("  slot ", snames[sk]);
+      line := concatenate(line, concatenate(" @", integer-to-string(offset)));
+      line := concatenate(line, concatenate(" setter=", setter-str));
+      line := concatenate(line, concatenate(" origin=", rec-name(rec)));
+      line := concatenate(line, concatenate(" type=", stypes[sk]));
+      line := concatenate(line, concatenate(" init-keyword=", sinitkws[sk]));
+      line := concatenate(line, concatenate(" required=", req-str));
+      line := concatenate(line, concatenate(" default=", sdefaults[sk]));
+      out := concatenate(out, concatenate(line, "\n"));
       sk := sk + 1;
     end;
     cli := cli + 1;

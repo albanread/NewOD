@@ -2756,10 +2756,24 @@ pub fn format_sema_model(model: &SemaModel) -> String {
         let _ = writeln!(s, "  cpl [{}]", cpl.join(", "));
         for (i, slot) in c.slots.iter().enumerate() {
             let origin = sema_class_name(c.slot_origin[i]);
+            // Sprint 56a-WIRE — the four previously-lossy SlotInfo fields the
+            // class consume (`nod_make` / GC / AOT) needs, appended after the
+            // original four tokens. `type` is the canonical SlotType label
+            // (class slots BY NAME via `sema_class_name`, never a numeric id —
+            // 53.5e id-nondeterminism); `init-keyword` is the keyword string or
+            // `-`; `required` is the required-init-keyword flag; `default` is
+            // the GAP-009 tag the AOT serializer uses (lib.rs:1355-1360).
             let _ = writeln!(
                 s,
-                "  slot {} @{} setter={} origin={}",
-                slot.name, slot.offset, slot.has_setter, origin
+                "  slot {} @{} setter={} origin={} type={} init-keyword={} required={} default={}",
+                slot.name,
+                slot.offset,
+                slot.has_setter,
+                origin,
+                slot_type_label(slot.type_kind),
+                slot.init_keyword.as_deref().unwrap_or("-"),
+                slot.required_init_keyword,
+                slot_default_tag(slot.default_init),
             );
         }
     }
@@ -2894,13 +2908,24 @@ pub struct ParsedSemaClass {
 }
 
 /// Sprint 56a — one slot of a [`ParsedSemaClass`]: `slot NAME @OFFSET
-/// setter=BOOL origin=ORIGIN`.
+/// setter=BOOL origin=ORIGIN type=<KIND> init-keyword=<KW|-> required=<BOOL>
+/// default=<TAG>`. Sprint 56a-WIRE grew the four trailing fields so the dump
+/// carries everything `SlotInfo` does (type-kind / init-keyword /
+/// required-init-keyword / default-init), the precondition for installing
+/// classes from the Dylan records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedSemaSlot {
     pub name: String,
     pub offset: usize,
     pub has_setter: bool,
     pub origin: String,
+    /// Canonical SlotType label (class slots BY NAME); see `slot_type_label`.
+    pub type_kind: String,
+    /// The init-keyword string, or `None` when the dump printed `-`.
+    pub init_keyword: Option<String>,
+    pub required_init_keyword: bool,
+    /// GAP-009 default-init tag text; see `slot_default_tag`.
+    pub default_tag: String,
 }
 
 /// Sprint 56a — parse the `=== classes ===` section of a `dump-sema` model
@@ -2975,31 +3000,53 @@ pub fn parse_sema_classes(dump: &str) -> Result<Vec<ParsedSemaClass>, String> {
     Ok(classes)
 }
 
-/// Parse the tail of a `  slot ` line: `NAME @OFFSET setter=BOOL
-/// origin=ORIGIN` (slot names are identifiers — no spaces).
+/// Parse the tail of a `  slot ` line: `NAME @OFFSET setter=BOOL origin=ORIGIN
+/// type=<KIND> init-keyword=<KW|-> required=<BOOL> default=<TAG>` (slot names,
+/// class names, type labels and the default tag are single tokens — no spaces).
+/// Sprint 56a-WIRE — the inverse of the widened slot line in `format_sema_model`.
 fn parse_sema_slot_line(rest: &str) -> Result<ParsedSemaSlot, String> {
     let err = || format!("sema dump: malformed slot line: `slot {rest}`");
     let at = rest.find(" @").ok_or_else(err)?;
     let name = rest[..at].to_string();
-    let after = &rest[at + 2..]; // OFFSET setter=BOOL origin=ORIGIN
+    let after = &rest[at + 2..]; // OFFSET setter=… origin=… type=… …
     let sp = after.find(' ').ok_or_else(err)?;
     let offset: usize = after[..sp].parse().map_err(|_| err())?;
-    let after = after[sp + 1..].strip_prefix("setter=").ok_or_else(err)?; // BOOL origin=ORIGIN
+    let after = after[sp + 1..].strip_prefix("setter=").ok_or_else(err)?;
     let sp = after.find(' ').ok_or_else(err)?;
     let has_setter = match &after[..sp] {
         "true" => true,
         "false" => false,
         _ => return Err(err()),
     };
-    let origin = after[sp + 1..]
-        .strip_prefix("origin=")
-        .ok_or_else(err)?
-        .to_string();
+    let after = after[sp + 1..].strip_prefix("origin=").ok_or_else(err)?;
+    let sp = after.find(' ').ok_or_else(err)?;
+    let origin = after[..sp].to_string();
+    let after = after[sp + 1..].strip_prefix("type=").ok_or_else(err)?;
+    let sp = after.find(' ').ok_or_else(err)?;
+    let type_kind = after[..sp].to_string();
+    let after = after[sp + 1..].strip_prefix("init-keyword=").ok_or_else(err)?;
+    let sp = after.find(' ').ok_or_else(err)?;
+    let init_keyword = match &after[..sp] {
+        "-" => None,
+        kw => Some(kw.to_string()),
+    };
+    let after = after[sp + 1..].strip_prefix("required=").ok_or_else(err)?;
+    let sp = after.find(' ').ok_or_else(err)?;
+    let required_init_keyword = match &after[..sp] {
+        "true" => true,
+        "false" => false,
+        _ => return Err(err()),
+    };
+    let default_tag = after[sp + 1..].strip_prefix("default=").ok_or_else(err)?.to_string();
     Ok(ParsedSemaSlot {
         name,
         offset,
         has_setter,
         origin,
+        type_kind,
+        init_keyword,
+        required_init_keyword,
+        default_tag,
     })
 }
 
@@ -3055,16 +3102,32 @@ fn verify_dylan_classes(
         }
         for (i, (rs, ds)) in r.slots.iter().zip(d.slots.iter()).enumerate() {
             let r_origin = sema_class_name(r.slot_origin[i]);
+            // Sprint 56a-WIRE — the four grown fields are checked through the
+            // SAME label / tag mapping the emitter uses, so a Dylan-vs-Rust
+            // divergence in type-kind / init-keyword / required / default fails
+            // loudly on the live `--sema-with-dylan` path, not just in bytes.
+            let r_type = slot_type_label(rs.type_kind);
+            let r_init_kw = rs.init_keyword.as_deref();
+            let d_init_kw = ds.init_keyword.as_deref();
+            let r_default = slot_default_tag(rs.default_init);
             if rs.name != ds.name
                 || rs.offset != ds.offset
                 || rs.has_setter != ds.has_setter
                 || r_origin != ds.origin
+                || r_type != ds.type_kind
+                || r_init_kw != d_init_kw
+                || rs.required_init_keyword != ds.required_init_keyword
+                || r_default != ds.default_tag
             {
                 return Err(format!(
-                    "class {} slot[{i}] mismatch — host (name={}, @{}, setter={}, origin={}), \
-                     Dylan (name={}, @{}, setter={}, origin={})",
+                    "class {} slot[{i}] mismatch — host (name={}, @{}, setter={}, origin={}, \
+                     type={}, init-keyword={:?}, required={}, default={}), \
+                     Dylan (name={}, @{}, setter={}, origin={}, type={}, init-keyword={:?}, \
+                     required={}, default={})",
                     r.name, rs.name, rs.offset, rs.has_setter, r_origin,
-                    ds.name, ds.offset, ds.has_setter, ds.origin
+                    r_type, r_init_kw, rs.required_init_keyword, r_default,
+                    ds.name, ds.offset, ds.has_setter, ds.origin, ds.type_kind,
+                    d_init_kw, ds.required_init_keyword, ds.default_tag
                 ));
             }
         }
@@ -3970,6 +4033,56 @@ fn slot_type_to_estimate(t: SlotType) -> TypeEstimate {
         SlotType::Character => TypeEstimate::Character,
         SlotType::String => TypeEstimate::String,
         _ => TypeEstimate::Top,
+    }
+}
+
+/// Sprint 56a-WIRE — canonical, name-stable `type=` label for a slot in the
+/// `=== classes ===` dump. The scalar variants map to their canonical source
+/// type name (the SAME bucket the Dylan-side `slot-type-label` produces from
+/// the slot's declared type, mirroring `slot_type_from_expr`'s collapsing —
+/// e.g. `<byte-string>`→`<string>`, `<simple-object-vector>`→`<vector>`,
+/// `<single-float>`/`<float>`→`<double-float>`). A `Class`-typed slot is
+/// rendered BY NAME via `sema_class_name`, NOT its numeric `ClassId` (ids are
+/// process-global and won't agree across the Rust and Dylan derivations —
+/// the 53.5e id-nondeterminism trap); the name IS the slot's source type
+/// text, which is exactly what the Dylan side emits, so both sides agree.
+fn slot_type_label(t: SlotType) -> String {
+    match t {
+        SlotType::Integer => "<integer>".to_string(),
+        SlotType::DoubleFloat => "<double-float>".to_string(),
+        SlotType::Boolean => "<boolean>".to_string(),
+        SlotType::Character => "<character>".to_string(),
+        SlotType::String => "<string>".to_string(),
+        SlotType::Symbol => "<symbol>".to_string(),
+        SlotType::Vector => "<vector>".to_string(),
+        SlotType::Object => "<object>".to_string(),
+        SlotType::Top => "<top>".to_string(),
+        SlotType::Class(id) => sema_class_name(id),
+    }
+}
+
+/// Sprint 56a-WIRE — GAP-009 default-init tag for a slot in the `=== classes ===`
+/// dump. The tag space is the SAME the AOT slot serializer uses
+/// (`nod-sema/src/lib.rs` ~1355-1360): `unbound` / `true` / `false` / `nil` /
+/// `value:<bits>`. `register_class` (lower.rs) only ever derives `Value` from
+/// an integer or boolean LITERAL (with the fixnum-overflow→Unbound edge), so in
+/// practice only `unbound` / `true` / `false` / `value:<bits>` arise here; the
+/// `nil` arm is carried for tag-space completeness / the parser's inverse.
+fn slot_default_tag(d: SlotDefault) -> String {
+    match d {
+        SlotDefault::Unbound => "unbound".to_string(),
+        SlotDefault::Value(w) => {
+            let imm = nod_runtime::literal_pool_immediates();
+            if w.raw() == imm.true_.raw() {
+                "true".to_string()
+            } else if w.raw() == imm.false_.raw() {
+                "false".to_string()
+            } else if w.raw() == imm.nil.raw() {
+                "nil".to_string()
+            } else {
+                format!("value:{}", w.raw())
+            }
+        }
     }
 }
 
@@ -8839,8 +8952,8 @@ generic y
 class <user-point>
   parents [<object>]
   cpl [<user-point>, <object>]
-  slot x @8 setter=true origin=<user-point>
-  slot y @16 setter=false origin=<user-point>
+  slot x @8 setter=true origin=<user-point> type=<integer> init-keyword=x required=false default=unbound
+  slot y @16 setter=false origin=<user-point> type=<integer> init-keyword=- required=false default=unbound
 === sealing ===
 ";
 
@@ -8860,6 +8973,10 @@ class <user-point>
                 offset: 8,
                 has_setter: true,
                 origin: "<user-point>".to_string(),
+                type_kind: "<integer>".to_string(),
+                init_keyword: Some("x".to_string()),
+                required_init_keyword: false,
+                default_tag: "unbound".to_string(),
             }
         );
         // `setter=false` must parse as false (not defaulted to true).
@@ -8867,6 +8984,49 @@ class <user-point>
         assert_eq!(c.slots[1].offset, 16);
         assert!(!c.slots[1].has_setter);
         assert_eq!(c.slots[1].origin, "<user-point>");
+        // `init-keyword=-` must parse back to `None`.
+        assert_eq!(c.slots[1].init_keyword, None);
+        assert_eq!(c.slots[1].type_kind, "<integer>");
+        assert_eq!(c.slots[1].default_tag, "unbound");
+    }
+
+    /// Sprint 56a-WIRE — a slot carrying all four grown fields: an
+    /// init-keyword, `required=true`, and an integer-literal default
+    /// (`value:<bits>` = the source int shifted left one, per the fixnum
+    /// encoding `Word::from_fixnum`).
+    #[test]
+    fn parses_widened_slot_with_required_and_int_default() {
+        let dump = "\
+=== classes ===
+class <cfg>
+  parents [<object>]
+  cpl [<cfg>, <object>]
+  slot timeout @8 setter=true origin=<cfg> type=<integer> init-keyword=timeout required=true default=value:84
+  slot flag @16 setter=true origin=<cfg> type=<boolean> init-keyword=- required=false default=true
+=== sealing ===
+";
+        let classes = parse_sema_classes(dump).expect("parse");
+        assert_eq!(classes.len(), 1);
+        let c = &classes[0];
+        assert_eq!(c.slots.len(), 2);
+        assert_eq!(
+            c.slots[0],
+            ParsedSemaSlot {
+                name: "timeout".to_string(),
+                offset: 8,
+                has_setter: true,
+                origin: "<cfg>".to_string(),
+                type_kind: "<integer>".to_string(),
+                init_keyword: Some("timeout".to_string()),
+                required_init_keyword: true,
+                // 42 encodes as the fixnum Word 42<<1 = 84.
+                default_tag: "value:84".to_string(),
+            }
+        );
+        assert_eq!(c.slots[1].type_kind, "<boolean>");
+        assert_eq!(c.slots[1].init_keyword, None);
+        assert!(!c.slots[1].required_init_keyword);
+        assert_eq!(c.slots[1].default_tag, "true");
     }
 
     #[test]
@@ -8879,12 +9039,12 @@ class <user-point>
 class <animal>
   parents [<object>]
   cpl [<animal>, <object>]
-  slot name @8 setter=true origin=<animal>
+  slot name @8 setter=true origin=<animal> type=<string> init-keyword=name required=false default=unbound
 class <dog>
   parents [<animal>]
   cpl [<dog>, <animal>, <object>]
-  slot name @8 setter=true origin=<animal>
-  slot breed @16 setter=true origin=<dog>
+  slot name @8 setter=true origin=<animal> type=<string> init-keyword=name required=false default=unbound
+  slot breed @16 setter=true origin=<dog> type=<string> init-keyword=breed required=false default=unbound
 === sealing ===
 ";
         let classes = parse_sema_classes(dump).expect("parse");

@@ -757,6 +757,12 @@ define class <ast-slot-spec> (<ast-node>)
   slot slot-init-kw    :: <object>, init-keyword: init-kw:;    // <token> or #f
   slot slot-required?  :: <object>, init-keyword: required?:;  // #f / #t
   slot slot-init       :: <object>, init-keyword: init:;       // <ast-node> or #f
+  // #t when `slot-init` came from `init-function:` (a thunk to CALL), as
+  // opposed to `init-value:` / the `= default` shorthand (a value to USE).
+  // The Rust reader keeps only `init-value` in `SlotDef.init_value` and
+  // DISCARDS `init-function`; the Sprint 56a default-tag derivation mirrors
+  // that — an `init-function:` init never becomes a slot default.
+  slot slot-init-fn?   :: <object>, init-keyword: init-fn?:;   // #f / #t
 end class;
 
 // `define [modifiers] class NAME (super, ...) slot-spec ... end [class] [NAME]`
@@ -880,7 +886,7 @@ define function make-ast-slot-spec () => (s :: <ast-slot-spec>)
   make(<ast-slot-spec>,
        adjectives: make(<stretchy-vector>),
        word: #f, name-tok: #f, type: #f,
-       init-kw: #f, required?: #f, init: #f)
+       init-kw: #f, required?: #f, init: #f, init-fn?: #f)
 end function;
 
 // A fresh class definition with empty modifier/super/slot vectors.
@@ -1508,6 +1514,7 @@ define function parse-slot-init-option (ts :: <token-stream>,
     slot-init(s) := parse-expression(ts);
   elseif (key = "init-function")
     slot-init(s) := parse-expression(ts);
+    slot-init-fn?(s) := #t;
   else
     // Unknown option (setter:, type:, …) — consume its value, don't record.
     parse-expression(ts);
