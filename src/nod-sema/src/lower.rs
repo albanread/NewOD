@@ -2393,6 +2393,54 @@ fn lower_module_full_inner(
         return Err(errors);
     }
 
+    // Sprint 56c (CONSUME) — under the combined front-end flag
+    // (`--frontend-with-dylan` ⇒ `NOD_FRONTEND_WITH_DYLAN=1`), build the
+    // `methods` table FROM the Dylan lowering's `=== methods ===` section
+    // instead of from the Rust AST walk above, then make it load-bearing for
+    // the downstream dispatch pre-registration + `register_methods`. This MUST
+    // run BEFORE the pre-registration loop below (which consumes `methods`),
+    // and therefore well before the Sprint-55 dfm-dump seam.
+    //
+    // Behaviour-PRESERVING safety net: before replacing the table we assert the
+    // Dylan-built one equals the Rust-built one FIELD BY FIELD
+    // (`assert_methods_consume_equal`). A mismatch is a real reconstruction bug
+    // (e.g. a body-fn id-form divergence) and fails the compile loudly. The
+    // non-frontend `--lower-with-dylan` path is UNCHANGED here (it stays
+    // verify-only at the seam below, using the Rust `methods` table).
+    //
+    // `methods` is fully built at this point (Phase 3 accessors + Phase 4 user
+    // methods, in walk order), so the consume can replace it wholesale.
+    let mut methods_consumed = false;
+    if std::env::var("NOD_FRONTEND_WITH_DYLAN").as_deref() == Ok("1")
+        && let Some(dump) = dfm_dump
+        && !dump.trim().is_empty()
+        && let (_, Some(methods_section)) = split_methods_section(dump)
+    {
+        let dylan_parsed = parse_dylan_methods(methods_section).map_err(|e| {
+            vec![LoweringError::Unsupported {
+                span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
+                message: format!("frontend-with-dylan (methods-consume parse): {e}"),
+            }]
+        })?;
+        let dylan_methods = build_methods_from_dylan(&dylan_parsed).map_err(|e| {
+            vec![LoweringError::Unsupported {
+                span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
+                message: format!("frontend-with-dylan (methods-consume build): {e}"),
+            }]
+        })?;
+        assert_methods_consume_equal(&methods, &dylan_methods).map_err(|e| {
+            vec![LoweringError::Unsupported {
+                span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
+                message: format!("methods-consume mismatch: {e}"),
+            }]
+        })?;
+        // Replace the Rust-built table with the Dylan-sourced one so the
+        // dispatch pre-registration below + `register_methods` are fed from
+        // the Dylan lowering.
+        methods = dylan_methods;
+        methods_consumed = true;
+    }
+
     // Sprint 15 — sealing analysis + dispatch resolution. Runs BEFORE
     // the precise-roots post-pass so any Dispatch → DirectCall (or
     // SealedDirectCall) rewrite happens before liveness sees the
@@ -2447,11 +2495,7 @@ fn lower_module_full_inner(
         // the unchanged DFM funcs dump. The right part (the methods table) is
         // parsed below and VERIFIED against the Rust `methods` table — NOT
         // consumed (the dump-dfm OUTPUT is unchanged; only the verify runs).
-        const METHODS_SEP: &str = "\n=== methods ===\n";
-        let (funcs_dump, methods_dump): (&str, Option<&str>) = match dump.split_once(METHODS_SEP) {
-            Some((funcs, methods)) => (funcs, Some(methods)),
-            None => (dump, None),
-        };
+        let (funcs_dump, methods_dump): (&str, Option<&str>) = split_methods_section(dump);
         let parsed = nod_dfm::parse_dfm_module(funcs_dump, &|name| {
             resolve_class_id_by_name(name).map(|c| c.0)
         })
@@ -2467,7 +2511,15 @@ fn lower_module_full_inner(
         // Verify the Dylan method table against the Rust `methods` table (built
         // above in WALK ORDER). A mismatch is a Dylan-vs-Rust method-derivation
         // bug; fail the compile loudly rather than silently trusting Rust.
-        if let Some(methods_section) = methods_dump {
+        //
+        // Sprint 56c (CONSUME): when the front-end flag already CONSUMED the
+        // methods table above (`methods_consumed`), `methods` IS the Dylan-built
+        // table and was asserted equal to the Rust one there — re-verifying here
+        // is redundant, so skip it. This leaves the non-frontend
+        // `--lower-with-dylan` verify-only path exactly as in 56c-T.
+        if let Some(methods_section) = methods_dump
+            && !methods_consumed
+        {
             let dylan_methods = parse_dylan_methods(methods_section).map_err(|e| {
                 vec![LoweringError::Unsupported {
                     span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
@@ -3035,6 +3087,22 @@ pub struct ParsedMethod {
     pub specialisers: Vec<String>,
 }
 
+/// Sprint 56c-T — the literal boundary the Dylan lowering inserts between the
+/// function dump and the `=== methods ===` table. Splitting a `--lower-with-dylan`
+/// DFM dump here yields `(funcs_dump, Some(methods_section))`, or `(dump, None)`
+/// when the lowering emitted no methods section.
+const METHODS_SEP: &str = "\n=== methods ===\n";
+
+/// Split a `--lower-with-dylan` DFM dump at [`METHODS_SEP`] into the function
+/// dump (left, fed to `parse_dfm_module`) and the optional `=== methods ===`
+/// section (right, fed to [`parse_dylan_methods`]).
+fn split_methods_section(dump: &str) -> (&str, Option<&str>) {
+    match dump.split_once(METHODS_SEP) {
+        Some((funcs, methods)) => (funcs, Some(methods)),
+        None => (dump, None),
+    }
+}
+
 /// Sprint 56c-T — parse the `=== methods ===` section emitted by the Dylan
 /// lowering (`dylan-lower-emit`, appended after the function dump) into
 /// [`ParsedMethod`] records, in dump (walk) order. Each line is:
@@ -3175,6 +3243,110 @@ fn verify_dylan_methods(
             return Err(format!(
                 "method {} body-fn mismatch — host {:?} (raw {:?}), Dylan {:?}",
                 r.generic_name, r_body, r.body_fn_name, d.body_fn_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Sprint 56c (CONSUME) — build the host's `Vec<MethodRegistration>` table FROM
+/// the Dylan lowering's `=== methods ===` section ([`ParsedMethod`]s) instead of
+/// from the Rust AST walk. This is the consume counterpart to the 56c-T
+/// [`verify_dylan_methods`]: behaviour-preserving (the caller asserts the result
+/// equals the Rust-built table field-by-field before using it), it proves the
+/// reconstruction is correct ahead of the later skip-Phase-3/4 work.
+///
+/// For each [`ParsedMethod`]:
+///   * `specialisers` — each specialiser NAME resolved through
+///     [`resolve_class_id_by_name`] (classes are registered by this point;
+///     an unknown name is an `Err`).
+///   * `body_fn_name` — the FORWARD of [`expected_dylan_body_fn_name`]. A USER
+///     method's `body_fn_name` arrives by-name (`run-task$<idler>_<integer>`,
+///     starting with `<generic>$`); reconstruct the NUMERIC-id form
+///     (`run-task$1082_1`) that matches the reconstructed function names by
+///     joining the resolved specialiser ids with `_`. A slot ACCESSOR body name
+///     (no `$`) is kept as-is — it already byte-matches.
+///   * `generic_name` / `param_count` — copied through.
+fn build_methods_from_dylan(
+    parsed: &[ParsedMethod],
+) -> Result<Vec<MethodRegistration>, String> {
+    let mut out: Vec<MethodRegistration> = Vec::with_capacity(parsed.len());
+    for pm in parsed {
+        let mut spec_ids: Vec<ClassId> = Vec::with_capacity(pm.specialisers.len());
+        for name in &pm.specialisers {
+            let id = resolve_class_id_by_name(name).ok_or_else(|| {
+                format!(
+                    "methods-consume: unknown specialiser class `{name}` for method `{}`",
+                    pm.generic_name
+                )
+            })?;
+            spec_ids.push(id);
+        }
+        let user_method_prefix = format!("{}$", pm.generic_name);
+        let body_fn_name = if pm.body_fn_name.starts_with(&user_method_prefix) {
+            format!(
+                "{}{}",
+                user_method_prefix,
+                spec_ids
+                    .iter()
+                    .map(|c| c.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
+        } else {
+            pm.body_fn_name.clone()
+        };
+        out.push(MethodRegistration {
+            generic_name: pm.generic_name.clone(),
+            specialisers: spec_ids,
+            body_fn_name,
+            param_count: pm.param_count,
+        });
+    }
+    Ok(out)
+}
+
+/// Sprint 56c (CONSUME) — assert the Dylan-built method table
+/// ([`build_methods_from_dylan`]) equals the Rust AST-built one FIELD BY FIELD.
+/// The safety net that keeps the consume behaviour-preserving: same count, then
+/// per-method equal `generic_name`, `specialisers` (`Vec<ClassId>` by `==`),
+/// `body_fn_name`, and `param_count`. A mismatch is a real reconstruction bug.
+fn assert_methods_consume_equal(
+    rust: &[MethodRegistration],
+    dylan: &[MethodRegistration],
+) -> Result<(), String> {
+    if rust.len() != dylan.len() {
+        return Err(format!(
+            "method count mismatch — host built {}, Dylan built {}",
+            rust.len(),
+            dylan.len()
+        ));
+    }
+    for (r, d) in rust.iter().zip(dylan.iter()) {
+        if r.generic_name != d.generic_name {
+            return Err(format!(
+                "method order/generic mismatch — host {:?}, Dylan {:?}",
+                r.generic_name, d.generic_name
+            ));
+        }
+        if r.specialisers != d.specialisers {
+            return Err(format!(
+                "method {} specialisers mismatch — host {:?}, Dylan {:?}",
+                r.generic_name,
+                r.specialisers.iter().map(|c| c.0).collect::<Vec<_>>(),
+                d.specialisers.iter().map(|c| c.0).collect::<Vec<_>>()
+            ));
+        }
+        if r.body_fn_name != d.body_fn_name {
+            return Err(format!(
+                "method {} body-fn mismatch — host {:?}, Dylan {:?}",
+                r.generic_name, r.body_fn_name, d.body_fn_name
+            ));
+        }
+        if r.param_count != d.param_count {
+            return Err(format!(
+                "method {} param-count mismatch — host {}, Dylan {}",
+                r.generic_name, r.param_count, d.param_count
             ));
         }
     }

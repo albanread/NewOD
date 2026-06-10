@@ -557,6 +557,11 @@ fn main() -> ExitCode {
     if want_frontend_with_dylan {
         // SAFETY: single-threaded process startup.
         unsafe { std::env::set_var("NOD_EXPAND_WITH_DYLAN", "1"); }
+        // Sprint 56c (CONSUME) — propagate the combined flag into the env so
+        // the lowering (`nod_sema::lower`) builds its `methods` table FROM the
+        // Dylan `=== methods ===` section instead of the Rust AST walk. The
+        // CLI flag alone wouldn't reach `lower.rs`, which reads this var.
+        unsafe { std::env::set_var("NOD_FRONTEND_WITH_DYLAN", "1"); }
     }
 
     let want_sema_with_dylan = cli.sema_with_dylan
