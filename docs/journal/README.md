@@ -28,6 +28,12 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-10 — Sprint 56 (axis-1): `#(…)` list literals in Dylan lowering](2026-06-10-sprint-56-list-literals.md)
+  — `#(a,b,c)` lowers to the `%nil`/`%pair-alloc` cons chain (elements source-order,
+  then nil, then pairs reverse — `<class>` dsts). Unlocks `stdlib-size-call` (PHASE0).
+  Trap: `dump-ast` renders it as `Call(#list,…)` but the parser builds a distinct
+  `<ast-list-lit>` node — handle it at the `lower-expr` dispatch level, not in the
+  call chain. Survey 0 mismatches; lowered 30→31/62.
 - [2026-06-10 — Sprint 56 (axis-1): `%`-primitive lowering in Dylan](2026-06-10-sprint-56-percent-prim-lowering.md)
   — The Dylan AST→DFM lowering stops bailing on `%`-prim calls: `prim-callee` /
   `prim-arity` / `prim-result-label` mirror the Rust `LOWER_PRIMITIVE_TABLE` (127

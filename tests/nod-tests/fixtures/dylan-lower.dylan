@@ -473,6 +473,48 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
     fb-push(b, make(<dfm-comp>, kind: "const", dst: t, cval: cval,
                     op: #f, args: make(<stretchy-vector>), callee: #f));
     t
+  elseif (instance?(node, <ast-list-lit>))
+    // `#(a, b, c)` literal list (lower.rs 5994-6042). The parser builds an
+    // <ast-list-lit>; lower each element left-to-right, then the cons chain
+    // RIGHT-to-left: `tail = %nil()`, then `%pair-alloc(elt, tail)` per element
+    // in reverse. dst type `<class>` for both `%nil` (Class(EMPTY_LIST)) and
+    // `%pair-alloc` (Class(PAIR)). Empty `#()` -> just `%nil()`. Temp order:
+    // elements (source), nil, pairs (reverse) — matches Rust's fresh_temp
+    // sequence exactly. An improper list (`#(a . b)`, lit-tail set) bails —
+    // Rust represents it differently.
+    if (lit-tail(node))
+      #f
+    else
+      let elems = lit-elems(node);
+      let n = size(elems);
+      let elem-temps = make(<stretchy-vector>);
+      let i = 0;
+      let ok? = #t;
+      until (i >= n | ~ ok?)
+        let et = lower-expr(b, elems[i], ret-map, source);
+        if (~ et) ok? := #f; else add!(elem-temps, et); end;
+        i := i + 1;
+      end;
+      if (~ ok?)
+        #f
+      else
+        let tail = fb-fresh-temp(b, "<class>");
+        fb-push(b, make(<dfm-comp>, kind: "directcall", dst: tail, cval: #f,
+                        op: #f, args: make(<stretchy-vector>), callee: "%nil"));
+        let j = size(elem-temps) - 1;
+        until (j < 0)
+          let pair-dst = fb-fresh-temp(b, "<class>");
+          let pargs = make(<stretchy-vector>);
+          add!(pargs, elem-temps[j]);
+          add!(pargs, tail);
+          fb-push(b, make(<dfm-comp>, kind: "directcall", dst: pair-dst, cval: #f,
+                          op: #f, args: pargs, callee: "%pair-alloc"));
+          tail := pair-dst;
+          j := j - 1;
+        end;
+        tail
+      end
+    end
   elseif (instance?(node, <ast-binary-op>))
     let op-text = token-source-text(binop-operator(node), source);
     if (op-text = ":=")

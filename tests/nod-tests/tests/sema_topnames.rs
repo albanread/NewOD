@@ -399,6 +399,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-class-accessors", // 55b: slot getter/setter emission (LoadSlot/StoreSlot)
     "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
     "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
+    "stdlib-size-call",      // 56: `#(…)` list literal (%nil/%pair-alloc chain) + size Dispatch
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries
