@@ -563,6 +563,18 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
                         op: prim, args: singleton-vec(operand), callee: #f));
         dst
       end
+    elseif (op = "~")
+      // `~ operand` -> PrimOp BoolNot, dst <boolean> (lower.rs). Mirrors the
+      // `-` branch; primop-result-label("BoolNot") -> <boolean> (else branch).
+      let operand = lower-expr(b, unary-operand(node), ret-map, source);
+      if (~ operand)
+        #f
+      else
+        let dst = fb-fresh-temp(b, primop-result-label("BoolNot"));
+        fb-push(b, make(<dfm-comp>, kind: "primop", dst: dst, cval: #f,
+                        op: "BoolNot", args: singleton-vec(operand), callee: #f));
+        dst
+      end
     else
       #f
     end
@@ -773,7 +785,10 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
     end
   elseif (instance?(node, <ast-statement>))
     // Control-flow statements in expression position. 55a: `if`, `while`,
-    // `until`. Others (begin / case / method-literal) are later → #f.
+    // `until`. Others (begin / case / block / method-literal) are later → #f.
+    // (`begin` is transparent BUT a non-tail void loop inside it must
+    // materialize `Const Bool(false)` at loop_exit, which lower-stmt-range does
+    // not yet do — deferred with the void-marker materialization work.)
     let word = token-source-text(stmt-word(node), source);
     if (word = "if")
       lower-if-expr(b, node, ret-map, source)

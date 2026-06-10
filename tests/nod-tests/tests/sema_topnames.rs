@@ -401,6 +401,9 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
     "stdlib-size-call",      // 56: `#(…)` list literal (%nil/%pair-alloc chain) + size Dispatch
     "lower-elseif",          // 56: if/elseif/else -> nested ifs (multi-arm + assign threading)
+    "macro-when-only",       // 56b: macro expanded Dylan-side (when -> if) before lowering
+    "macros-unless",         // 56b: unless macro -> if (~ cond) ... ; exercises `~` (BoolNot)
+    "expand-pipeline-smoke", // 56b: macro expansion + `~` (BoolNot) + if
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries

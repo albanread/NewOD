@@ -28,6 +28,18 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-10 — Roadmap: retiring the Rust front-end (agent-planned)](2026-06-10-roadmap-retire-rust-frontend.md)
+  — The authoritative forward plan, produced by a 4-agent planning workflow (3 parallel
+  code-grounded investigations + synthesis). Ordered sprints to the cutover: 56b-EXPAND
+  (expander into lowering) → 56b-T/56c-T (verify the function-side tables) → 56a-WIRE/
+  CONSUME (retire register_module_classes) → 56d-56f (combined flag → skip Phase-3/4 →
+  default + delete Rust). Includes a cutover checklist + open questions.
+- [2026-06-10 — Sprint 56b: the expander goes into the lowering path](2026-06-10-sprint-56b-expander-into-lowering.md)
+  — `dylan_expand_then_lower_emit` expands Dylan-side (via the gated Sprint-52 expander)
+  before the Dylan lowering, so macro fixtures reach the lowering as kernel AST instead of
+  bailing. Host-seam change, no shim rebuild. Found expansion is necessary-but-not-sufficient
+  (expanded forms hit `~`/`begin`/`block`); `macro-when-only` unlocks immediately. Survey 0
+  mismatches. Also capped `[build] jobs = 6` to stop the workspace-test linker OOM.
 - [2026-06-10 — Sprint 56 (axis-1): `if / elseif / else` in Dylan lowering](2026-06-10-sprint-56-elseif-nested-if.md)
   — `elseif` (ubiquitous) desugars to NESTED ifs, reusing the byte-matched single-if
   machinery: the elseif clause becomes a synthetic nested `if` for the else-arm.

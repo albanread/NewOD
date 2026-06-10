@@ -1484,9 +1484,32 @@ fn dylan_sema_dump_provider(src: &str) -> Result<String, String> {
 /// `dylan-lower-emit` shim entry, returning its `dump-dfm`-format text (or `""`
 /// when the Dylan lowering bails on an unsupported form); `nod_sema`
 /// reconstructs `Vec<Function>` from it and runs the back-end passes.
+/// Sprint 56b — the Dylan front-end's expand→lower step (the shim resolver must
+/// already be fired). Expand the source Dylan-side so macro-call forms
+/// (`unless` / `when` / `cond` / `for-each`) become kernel AST, THEN run the
+/// Dylan AST→DFM lowering. The Rust oracle (plain `dump-dfm`, no
+/// `--lower-with-dylan`) always expands via `expand_with_stdlib_macros`, so the
+/// Dylan lowering path MUST expand too to stay byte-identical. This is
+/// INDEPENDENT of `NOD_EXPAND_WITH_DYLAN` (which gates the PARSE-path expander);
+/// both call the same shim entry. On expansion error, fall back to the raw
+/// source — a macro-free file expands to itself (idempotent after the
+/// whitespace-insensitive re-lex); a genuine failure then bails the lowering.
+/// Shared by the `--lower-with-dylan` provider and the standalone
+/// `dump-dylan-dfm` command so both reflect the full front-end.
+fn dylan_expand_then_lower_emit(src: &str) -> Result<String, String> {
+    let expanded = match dylan_parse_wire::expand_source_via_shim(
+        src,
+        nod_sema::stdlib::stdlib_macro_source(),
+    ) {
+        Ok(exp) => exp,
+        Err(_) => src.to_string(),
+    };
+    dylan_parse_wire::lower_emit_via_shim(&expanded)
+}
+
 fn dylan_dfm_dump_provider(src: &str) -> Result<String, String> {
     dylan_lex_jit::init()?;
-    dylan_parse_wire::lower_emit_via_shim(src)
+    dylan_expand_then_lower_emit(src)
 }
 
 fn run_dump_dylan_dfm(input: &std::path::Path) -> ExitCode {
@@ -1504,7 +1527,7 @@ fn run_dump_dylan_dfm(input: &std::path::Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match dylan_parse_wire::lower_emit_via_shim(&src) {
+    match dylan_expand_then_lower_emit(&src) {
         Ok(dfm) => {
             print!("{dfm}");
             ExitCode::SUCCESS
