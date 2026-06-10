@@ -404,6 +404,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "macro-when-only",       // 56b: macro expanded Dylan-side (when -> if) before lowering
     "macros-unless",         // 56b: unless macro -> if (~ cond) ... ; exercises `~` (BoolNot)
     "expand-pipeline-smoke", // 56b: macro expansion + `~` (BoolNot) + if
+    "lower-begin",           // 56: begin transparent body + void-loop <unit> materialisation
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries

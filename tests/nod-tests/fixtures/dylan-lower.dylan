@@ -298,6 +298,18 @@ define function emit-false-const (b :: <fn-builder>) => (temp :: <integer>)
   t
 end function;
 
+// Const Bool(false) typed `<unit>` — the materialised void value
+// FunctionBuilder::unit_temp emits whenever a loop (or any void `Expr::Stmt`)
+// is lowered in EXPRESSION position (e.g. as a constituent of a `begin`). Same
+// `Const Bool(false)` comp as emit-false-const, but the temp's type is `<unit>`
+// (TypeEstimate::Unit) so the surrounding context knows the value is void.
+define function emit-unit-const (b :: <fn-builder>) => (temp :: <integer>)
+  let t = fb-fresh-temp(b, "<unit>");
+  fb-push(b, make(<dfm-comp>, kind: "const", dst: t, cval: "Bool(false)",
+                  op: #f, args: make(<stretchy-vector>), callee: #f));
+  t
+end function;
+
 // ─── Type mapping — mirrors type_from_expr (lower.rs) for scalar cases ─────
 
 define function type-name-to-label (type-name :: <byte-string>)
@@ -785,10 +797,7 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
     end
   elseif (instance?(node, <ast-statement>))
     // Control-flow statements in expression position. 55a: `if`, `while`,
-    // `until`. Others (begin / case / block / method-literal) are later → #f.
-    // (`begin` is transparent BUT a non-tail void loop inside it must
-    // materialize `Const Bool(false)` at loop_exit, which lower-stmt-range does
-    // not yet do — deferred with the void-marker materialization work.)
+    // `until`. 56: `begin`. Others (case / block / method-literal) are later → #f.
     let word = token-source-text(stmt-word(node), source);
     if (word = "if")
       lower-if-expr(b, node, ret-map, source)
@@ -796,6 +805,11 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
       lower-loop(b, node, #f, ret-map, source)
     elseif (word = "until")
       lower-loop(b, node, #t, ret-map, source)
+    elseif (word = "begin")
+      // `begin S1; … Sn end` is a TRANSPARENT body sequence (lower.rs Expr::Begin,
+      // no block/scope wrapper in the DFM); value = last statement's value. Its
+      // stmt-body carries NO leading condition, so lower all constituents.
+      lower-block-value(b, body-constituents(stmt-body(node)), ret-map, source)
     else
       #f
     end
@@ -887,6 +901,41 @@ define function lower-stmt-range (b :: <fn-builder>, cs :: <stretchy-vector>,
     i := i + 1;
   end;
   if (~ ok?) #f else last end
+end function;
+
+// ─── lower-block-value — mirrors `Expr::Begin` (lower_expr) ────────────────
+// A `begin … end` is a block EXPRESSION whose value is the LAST statement's
+// value. Unlike lower-stmt-range (a function-body helper that lowers a loop for
+// effect and tracks the last INTEGER value), a `begin` constituent in
+// expression position materialises a loop's void value: Rust's `unit_temp`
+// emits a `<unit>` Const Bool(false) at the loop_exit (per loop, interior ones
+// too), and that const IS the constituent's value. So a trailing void loop
+// yields a real `<unit>` temp, not #f.
+define function lower-block-value (b :: <fn-builder>, cs :: <stretchy-vector>,
+                                   ret-map :: <name-ret-map>, source :: <byte-string>)
+ => (temp :: <object>)
+  let n = size(cs);
+  if (n = 0)
+    #f                                   // empty `begin` — Rust raises; bail.
+  else
+    let i = 0;
+    let last = #f;
+    let ok? = #t;
+    until (i >= n | ~ ok?)
+      let t = lower-body-stmt(b, cs[i], ret-map, source);
+      if (~ t)
+        ok? := #f;
+      elseif (instance?(t, <integer>))
+        last := t;                       // a value constituent.
+      else
+        // Void marker (a loop): in expression position the materialised value
+        // is a `<unit>` Const Bool(false) after the loop (lands in loop_exit).
+        last := emit-unit-const(b);
+      end;
+      i := i + 1;
+    end;
+    if (~ ok?) #f else last end
+  end
 end function;
 
 // ─── lower-short-circuit — mirrors lower_short_circuit (`|` / `&`) ──────────

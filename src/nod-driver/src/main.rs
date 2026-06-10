@@ -1557,7 +1557,13 @@ fn run_dump_dylan_dfm(input: &std::path::Path) -> ExitCode {
     };
     match dylan_expand_then_lower_emit(&src) {
         Ok(dfm) => {
-            print!("{dfm}");
+            // Sprint 56c-T appended a `=== methods ===` section to the lowering
+            // dump (consumed/verified host-side). Plain `dump-dfm` (the byte-match
+            // oracle) does NOT print it, so for the standalone DFM view print only
+            // the functions part — split off the methods section (and any later
+            // `=== … ===` sections) so `dump-dylan-dfm` stays byte-comparable.
+            let functions = dfm.split("\n=== ").next().unwrap_or(&dfm);
+            print!("{functions}");
             ExitCode::SUCCESS
         }
         Err(e) => {
