@@ -1010,7 +1010,33 @@ pub fn compile_file_for_aot(path: &Path) -> Result<LoweredModule, EvalError> {
     let mut module =
         parse_user_module(&src, &toks, pre.as_ref()).map_err(EvalError::Parse)?;
     expand_with_stdlib_macros(&mut module, &sm).map_err(EvalError::Macro)?;
-    let mut lm = lower_module_full(&module).map_err(EvalError::Lower)?;
+    // Sprint 56a-CONSUME — under the combined `--frontend-with-dylan` flag,
+    // route the AOT path through the Dylan front-end seam
+    // (`lower_with_sema_choice`) so the EXE is built from the Dylan-derived
+    // sema/lowering — including the CONSUMED class table
+    // (`install_dylan_classes`). Without this reroute the AOT path used
+    // `lower_module_full` directly and never reached the consume, so the
+    // class derivation was reachable only from `dump-dfm`; this makes it
+    // load-bearing for an actual EXE. The eager `nod_runtime_init` above +
+    // `merge_stdlib_into_user_module` below are preserved exactly, so the
+    // host/EXE seed-registration ordering (and the AOT class-id-drift assert)
+    // is unchanged. An empty Dylan lowering dump still falls back to the Rust
+    // Phase-3/4 inside the seam, module-granular.
+    let mut lm = if std::env::var("NOD_FRONTEND_WITH_DYLAN").as_deref() == Ok("1") {
+        lower_with_sema_choice(&src, &module).map_err(|e| match e {
+            DumpError::Io(e) => EvalError::Io(e),
+            DumpError::SourceMap(e) => EvalError::SourceMap(e),
+            DumpError::Parse(d) => EvalError::Parse(d),
+            DumpError::Macro(m) => EvalError::Macro(m),
+            DumpError::Lower(l) => EvalError::Lower(l),
+            DumpError::Codegen(c) => EvalError::Codegen(c),
+            DumpError::SemaDylan(s) | DumpError::LowerDylan(s) => {
+                EvalError::FrontendWithDylan(s)
+            }
+        })?
+    } else {
+        lower_module_full(&module).map_err(EvalError::Lower)?
+    };
     merge_stdlib_into_user_module(&mut lm);
     Ok(lm)
 }
@@ -1228,11 +1254,43 @@ pub fn compile_files_for_aot_with_shape(
     if library {
         nod_runtime::set_shim_class_band_active(true);
     }
-    let lowered = lower_module_full(&module);
+    // Sprint 56a-CONSUME — under `--frontend-with-dylan`, route the (single-file)
+    // AOT build through the Dylan front-end seam (`lower_with_sema_choice`) so the
+    // EXE is built from the CONSUMED Dylan class table (`install_dylan_classes`),
+    // making the Dylan class derivation load-bearing for an actual EXE rather than
+    // only `dump-dfm`. The seam re-runs the Dylan sema/lower shim on the source
+    // text; for the single-file case the merged module IS that one source, so we
+    // re-read it. Multi-file builds keep the Rust path (the seam's provider
+    // contract is `fn(&str)`; concatenated multi-file source isn't reconstructed
+    // here). Empty Dylan dumps still fall back to Rust Phase-3/4 module-granular
+    // inside the seam. The eager init + shim-band toggle above are preserved, so
+    // the host/EXE seed ordering (and the AOT drift assert) is unchanged.
+    let consume_single = std::env::var("NOD_FRONTEND_WITH_DYLAN").as_deref() == Ok("1")
+        && paths.len() == 1
+        // Never route a front-end-shim static-library build (`--library`)
+        // through the consume: the shim's own classes are minted from the
+        // disjoint shim band and aren't emitted in the `=== classes ===` dump
+        // format the consume parses. The shim build never sets the flag, but
+        // guard anyway so the band toggle above stays the only shim path.
+        && !library;
+    let lowered = if consume_single {
+        let src = std::fs::read_to_string(paths[0]).map_err(EvalError::Io)?;
+        lower_with_sema_choice(&src, &module).map_err(|e| match e {
+            DumpError::Io(e) => EvalError::Io(e),
+            DumpError::SourceMap(e) => EvalError::SourceMap(e),
+            DumpError::Parse(d) => EvalError::Parse(d),
+            DumpError::Macro(m) => EvalError::Macro(m),
+            DumpError::Lower(l) => EvalError::Lower(l),
+            DumpError::Codegen(c) => EvalError::Codegen(c),
+            DumpError::SemaDylan(s) | DumpError::LowerDylan(s) => EvalError::FrontendWithDylan(s),
+        })
+    } else {
+        lower_module_full(&module).map_err(EvalError::Lower)
+    };
     if library {
         nod_runtime::set_shim_class_band_active(false);
     }
-    let mut lm = lowered.map_err(EvalError::Lower)?;
+    let mut lm = lowered?;
     merge_stdlib_into_user_module(&mut lm);
     Ok(lm)
 }
@@ -2162,6 +2220,11 @@ pub enum EvalError {
         first_path: std::path::PathBuf,
         second_path: std::path::PathBuf,
     },
+    /// Sprint 56a-CONSUME — under `--frontend-with-dylan`, the AOT path routes
+    /// through the Dylan front-end seam (`lower_with_sema_choice`); the Dylan
+    /// sema/lower provider or the dump reconstruction failed. Carries the
+    /// rendered cause.
+    FrontendWithDylan(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -2213,6 +2276,7 @@ impl std::fmt::Display for EvalError {
                 first_path.display(),
                 second_path.display(),
             ),
+            EvalError::FrontendWithDylan(msg) => write!(f, "frontend-with-dylan: {msg}"),
         }
     }
 }

@@ -1499,27 +1499,92 @@ pub fn analyse_module(m: &Module) -> Result<SemaModel, Vec<LoweringError>> {
 /// back-end under `--sema-with-dylan`; gated `dump-dfm` byte-identical against
 /// the all-Rust path.
 pub fn analyse_module_from_dump(m: &Module, dump: &str) -> Result<SemaModel, String> {
-    let (classes, _user_classes) = register_module_classes(m).map_err(|errs| {
-        format!(
-            "sema-with-dylan: {} class-registration error(s) before model parse",
-            errs.len()
-        )
-    })?;
+    // Sprint 56a-CONSUME — under the combined front-end flag
+    // (`--frontend-with-dylan` ⇒ `NOD_FRONTEND_WITH_DYLAN=1`), the Dylan class
+    // derivation becomes LOAD-BEARING: install the module's classes FROM the
+    // dump's lossless `=== classes ===` records (`install_dylan_classes`)
+    // instead of re-deriving them in Rust (`register_module_classes`). The
+    // byte-match (56a-WIRE) already proves the records equal the Rust
+    // derivation, so the installed registry is identical. MI (or any case the
+    // install can't faithfully reconstruct) returns `Err` → fall back to the
+    // Rust derivation rather than install a wrong class.
+    let consume = std::env::var("NOD_FRONTEND_WITH_DYLAN").as_deref() == Ok("1");
+
+    let dylan_classes = parse_sema_classes(dump)?;
+
+    let (classes, consumed) = if consume {
+        match install_dylan_classes(&dylan_classes) {
+            Ok(installed) => (installed, true),
+            Err(e) => {
+                // Faithful reconstruction failed (MI / unknown name / drift) —
+                // fall back to the Rust derivation. This keeps the consume
+                // safe: a partial/wrong install is never used. The fall-back
+                // re-runs the full Rust registration + verify path below.
+                eprintln!(
+                    "frontend-with-dylan: install_dylan_classes bailed ({e}); \
+                     falling back to register_module_classes"
+                );
+                let (classes, _user_classes) = register_module_classes(m).map_err(|errs| {
+                    format!(
+                        "frontend-with-dylan: {} class-registration error(s) on fallback",
+                        errs.len()
+                    )
+                })?;
+                (classes, false)
+            }
+        }
+    } else {
+        let (classes, _user_classes) = register_module_classes(m).map_err(|errs| {
+            format!(
+                "sema-with-dylan: {} class-registration error(s) before model parse",
+                errs.len()
+            )
+        })?;
+        (classes, false)
+    };
+
     // Classes are now registered (ids assigned); the dump's `Class(<name>)` /
     // `sealed-domain` references resolve through the class table.
     let (top_names, generics, sealing) = parse_sema_dump(dump)?;
-    // Sprint 56a — make the Dylan class derivation a CHECKED input on the
-    // load-bearing path: the dump's `=== classes ===` section (parents / CPL /
-    // slot layout, all by name) must match the host's registration. A
-    // divergence is a Dylan-vs-Rust class-derivation bug; fail loudly rather
-    // than silently trust Rust. The host still owns `ClassId` allocation
-    // (Sprint 56's principle: ids are a runtime mechanism), so this verifies
-    // the *derivation* — the precondition for retiring `register_module_classes`
-    // (Sprint 56b+). It promotes the offline 53.3/53.4 byte-match oracle to a
-    // live invariant on `--sema-with-dylan`.
-    let dylan_classes = parse_sema_classes(dump)?;
-    verify_dylan_classes(&classes, &dylan_classes)
-        .map_err(|e| format!("sema-with-dylan: {e}"))?;
+
+    if consumed {
+        // Sprint 56a-CONSUME — `install_dylan_classes` does NOT flip sealed
+        // flags (it uses the explicit-shape runtime entry directly). Replay the
+        // sealed-flag flip that `register_module_classes` Phase 1c performed,
+        // driven by the dump's `=== sealing ===` facts: `sealed-class` →
+        // `mark_sealed()` on the installed class metadata; `sealed-generic` →
+        // `mark_sealed()` on the generic. This MUST happen after all classes are
+        // installed (so in-library subclassing of a sealed class is allowed),
+        // exactly as Phase 1c runs after registration.
+        for name in &sealing.sealed_classes {
+            if let Some(id) = resolve_class_id_by_name(name) {
+                let p = class_metadata_ptr(id);
+                if !p.is_null() {
+                    // SAFETY: static-area metadata.
+                    unsafe { (*p).mark_sealed() };
+                }
+            }
+        }
+        for name in &sealing.sealed_generics {
+            nod_runtime::get_or_create_generic(name).mark_sealed();
+        }
+        // When CONSUMING, the dump's class records ARE the source of truth, so
+        // `verify_dylan_classes` would compare Dylan-to-Dylan (vacuous) — skip
+        // it.
+    } else {
+        // Sprint 56a (verify-only) — make the Dylan class derivation a CHECKED
+        // input on the load-bearing path: the dump's `=== classes ===` section
+        // (parents / CPL / slot layout, all by name) must match the host's
+        // registration. A divergence is a Dylan-vs-Rust class-derivation bug;
+        // fail loudly rather than silently trust Rust. The host still owns
+        // `ClassId` allocation, so this verifies the *derivation* — the
+        // precondition for retiring `register_module_classes`. It promotes the
+        // offline 53.3/53.4 byte-match oracle to a live invariant on
+        // `--sema-with-dylan` (kept EXACTLY as-is for the non-consume path).
+        verify_dylan_classes(&classes, &dylan_classes)
+            .map_err(|e| format!("sema-with-dylan: {e}"))?;
+    }
+
     Ok(SemaModel {
         top_names,
         generics,
@@ -1600,6 +1665,270 @@ fn register_module_classes(
     }
 
     Ok((user_class_registrations, user_classes))
+}
+
+/// Sprint 56a-CONSUME — the INVERSE of [`slot_type_label`]: reconstruct a
+/// [`SlotType`] from the canonical `type=` label the `=== classes ===` dump
+/// carries. Scalar labels map back to their `SlotType` variant exactly as
+/// `slot_type_from_expr` produces them (so the round-trip
+/// `slot_type_from_expr → slot_type_label → slot_type_from_label` is the
+/// identity on every label the emitter can print). A class NAME (any token not
+/// in the scalar bucket) resolves to `SlotType::Class(id)` via
+/// [`resolve_class_id_by_name`] — the class must already be registered (its
+/// type-name appears in the dump only because it was declared earlier in the
+/// module, and classes install in declaration order), so an unknown name is an
+/// `Err`.
+fn slot_type_from_label(label: &str) -> Result<SlotType, String> {
+    Ok(match label {
+        "<integer>" => SlotType::Integer,
+        "<double-float>" => SlotType::DoubleFloat,
+        "<boolean>" => SlotType::Boolean,
+        "<character>" => SlotType::Character,
+        "<string>" => SlotType::String,
+        "<symbol>" => SlotType::Symbol,
+        "<vector>" => SlotType::Vector,
+        "<object>" => SlotType::Object,
+        "<top>" => SlotType::Top,
+        // Anything else is a class-typed slot rendered BY NAME — resolve it.
+        // NOTE: the scalar arms above match what `slot_type_label` emits;
+        // `<object>` → `Object` and `<top>` → `Top` are distinct variants
+        // (both pointer-shaped, identical to the GC scanner), reproducing the
+        // exact `SlotType` `slot_type_from_expr` would have built.
+        name => SlotType::Class(resolve_class_id_by_name(name).ok_or_else(|| {
+            format!("install-dylan-classes: unknown class `{name}` in slot type label")
+        })?),
+    })
+}
+
+/// Sprint 56a-CONSUME — the INVERSE of [`slot_default_tag`]: reconstruct a
+/// [`SlotDefault`] from the GAP-009 tag text the dump carries
+/// (`unbound`/`true`/`false`/`nil`/`value:<bits>`). The boolean/nil immediates
+/// are resolved from THIS process's live literal pool (matching how the AOT
+/// registrar re-resolves tags 2/3/4, aot.rs ~982-986) — never baked bits —
+/// while `value:<bits>` is a process-stable raw `Word` (fixnums; tag 1).
+fn slot_default_from_tag(tag: &str) -> Result<SlotDefault, String> {
+    let imm = nod_runtime::literal_pool_immediates();
+    Ok(match tag {
+        "unbound" => SlotDefault::Unbound,
+        "true" => SlotDefault::Value(imm.true_),
+        "false" => SlotDefault::Value(imm.false_),
+        "nil" => SlotDefault::Value(imm.nil),
+        other => {
+            let bits = other.strip_prefix("value:").ok_or_else(|| {
+                format!("install-dylan-classes: malformed default tag `{other}`")
+            })?;
+            let raw: u64 = bits.parse().map_err(|_| {
+                format!("install-dylan-classes: malformed default value bits `{bits}`")
+            })?;
+            SlotDefault::Value(nod_runtime::Word::from_raw(raw))
+        }
+    })
+}
+
+/// Sprint 56a-CONSUME — INSTALL the module's classes FROM the Dylan-derived
+/// `=== classes ===` records (the lossless dump parsed by [`parse_sema_classes`])
+/// instead of re-deriving them in Rust via [`register_module_classes`]. This is
+/// the load-bearing flip: under `--frontend-with-dylan` the Dylan class
+/// derivation becomes the source of truth for the runtime registry, retiring the
+/// last Rust front-end class logic on that path.
+///
+/// Classes install in dump DECLARATION ORDER (= the order
+/// [`register_module_classes`] walked `m.items`), which is exactly what the AOT
+/// replay (`nod_aot_register_user_class`) expects — `allocate_user_class_id` is
+/// monotonic from the same seed, so the minted ids equal the Rust-derived ids
+/// (the byte-match already proved the records equal the Rust derivation).
+/// Parents/ancestors and class-typed slot origins resolve by NAME against
+/// classes registered earlier in this very loop (plus the pre-existing
+/// `<object>` / scalar / seed classes); an unknown name is an `Err`.
+///
+/// SCOPE: single-inheritance only. A class with `parents.len() > 1` (MI) is
+/// reconstructed faithfully here too (the dump carries the merged slot list +
+/// per-slot origin + C3 CPL), but the corpus has ZERO real MI, and the merge /
+/// offset-patch invariants are subtle — so MI returns `Err` to force the caller
+/// to fall back to `register_module_classes` rather than install a wrong class.
+///
+/// Returns the registrations shaped exactly like [`register_module_classes`]'s
+/// output (declaration order), so the caller's `SemaModel.classes` is identical
+/// whether the host derived them or the Dylan walk did.
+fn install_dylan_classes(
+    classes: &[ParsedSemaClass],
+) -> Result<Vec<UserClassRegistration>, String> {
+    let self_sentinel = ClassId(u32::MAX);
+    let mut out: Vec<UserClassRegistration> = Vec::with_capacity(classes.len());
+    // The id the FIRST class in this module mints — captured on the first
+    // iteration. Subsequent classes must mint exactly `base + decl_idx`
+    // (monotonic from the same seed). We anchor on the observed first id rather
+    // than a hard `FIRST_USER` constant because seed-registration (run before
+    // this loop on BOTH host + EXE) may have already minted user-band ids, so
+    // the module's first class is not necessarily at `FIRST_USER`.
+    let mut base_id: Option<u32> = None;
+
+    for (decl_idx, c) in classes.iter().enumerate() {
+        // Resolve direct parents by name (registered earlier in this loop, or a
+        // pre-existing seed/scalar class such as `<object>`).
+        let parents: Vec<ClassId> = c
+            .parents
+            .iter()
+            .map(|n| {
+                resolve_class_id_by_name(n).ok_or_else(|| {
+                    format!(
+                        "install-dylan-classes: class `{}` has unknown parent `{n}`",
+                        c.name
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // SCOPE GUARD — SI only. Bail (Err) on MI so the caller falls back to
+        // the Rust derivation rather than risk a wrong slot-merge / offset.
+        if parents.len() > 1 {
+            return Err(format!(
+                "install-dylan-classes: class `{}` is multiple-inheritance \
+                 (parents.len()={}); MI is out of scope — falling back to Rust",
+                c.name,
+                parents.len()
+            ));
+        }
+
+        // Reconstruct the C3 CPL by name. The first entry is SELF (the class
+        // isn't registered yet, so its name can't resolve) → use the
+        // `ClassId(u32::MAX)` self-sentinel that `register_mi_user_class`
+        // patches to the freshly minted id (mirrors `register_class`).
+        let mut cpl: Vec<ClassId> = Vec::with_capacity(c.cpl.len());
+        for (i, n) in c.cpl.iter().enumerate() {
+            if i == 0 {
+                // cpl[0] is the class itself.
+                if *n != c.name {
+                    return Err(format!(
+                        "install-dylan-classes: class `{}` cpl[0] is `{n}`, expected self",
+                        c.name
+                    ));
+                }
+                cpl.push(self_sentinel);
+            } else {
+                cpl.push(resolve_class_id_by_name(n).ok_or_else(|| {
+                    format!(
+                        "install-dylan-classes: class `{}` has unknown CPL ancestor `{n}`",
+                        c.name
+                    )
+                })?);
+            }
+        }
+
+        // Reconstruct the full (own + inherited) slot list with offsets, types,
+        // init-keywords, required flags and defaults straight from the dump —
+        // the INVERSES of the WIRE helpers. Own-slot origins (origin == self
+        // name) become the self-sentinel; inherited-slot origins resolve to the
+        // ancestor's id by name.
+        let mut slots: Vec<SlotInfo> = Vec::with_capacity(c.slots.len());
+        let mut slot_origin: Vec<ClassId> = Vec::with_capacity(c.slots.len());
+        let mut own_slot_count = 0usize;
+        let mut inherited_slot_count = 0usize;
+        for s in &c.slots {
+            let type_kind = slot_type_from_label(&s.type_kind)
+                .map_err(|e| format!("class `{}` slot `{}`: {e}", c.name, s.name))?;
+            let default_init = slot_default_from_tag(&s.default_tag)
+                .map_err(|e| format!("class `{}` slot `{}`: {e}", c.name, s.name))?;
+            slots.push(SlotInfo {
+                name: s.name.clone(),
+                offset: s.offset,
+                type_kind,
+                init_keyword: s.init_keyword.clone(),
+                required_init_keyword: s.required_init_keyword,
+                default_init,
+                has_setter: s.has_setter,
+            });
+            if s.origin == c.name {
+                slot_origin.push(self_sentinel);
+                own_slot_count += 1;
+            } else {
+                let origin_id = resolve_class_id_by_name(&s.origin).ok_or_else(|| {
+                    format!(
+                        "install-dylan-classes: class `{}` slot `{}` has unknown origin `{}`",
+                        c.name, s.name, s.origin
+                    )
+                })?;
+                slot_origin.push(origin_id);
+                inherited_slot_count += 1;
+            }
+        }
+
+        // Install via the explicit-shape runtime entry (the SAME one
+        // `register_class`'s MI branch + `nod_aot_register_user_class` build a
+        // `UserClassSpec` for): it mints the id, pins the metadata, and patches
+        // the `cpl[0]` + own-slot-origin sentinels to the minted id. The SI
+        // shape (`parents.len() == 1`) is identical to what
+        // `register_simple_user_class` would have produced — same merged slots,
+        // same cpl, same origins.
+        let (id, _md_ptr) = nod_runtime::register_mi_user_class(
+            &c.name,
+            parents.clone(),
+            cpl.clone(),
+            slots.clone(),
+            slot_origin.clone(),
+            own_slot_count,
+            inherited_slot_count,
+        );
+
+        // B3 — the canonical-order invariant, asserted at compile time (the
+        // compile-time analogue of the AOT drift assert, aot.rs:1088). Ids must
+        // be MONOTONIC in declaration order from the same seed: the first class
+        // anchors `base_id`, each subsequent class must mint exactly
+        // `base_id + decl_idx`. The host and EXE both seed-register the same
+        // classes before this loop, so this catches an install order that
+        // diverged from `register_module_classes`'s `m.items` walk.
+        let base = *base_id.get_or_insert(id.0);
+        let expected = base + decl_idx as u32;
+        if id.0 != expected {
+            return Err(format!(
+                "install-dylan-classes: class-id drift — class `{}` (decl #{decl_idx}) \
+                 minted id {} but expected {expected} (monotonic from base {base}). The \
+                 install order diverged from register_module_classes' walk.",
+                c.name, id.0
+            ));
+        }
+
+        // Register direct-subclass links so the dispatch resolver can enumerate
+        // bounded subclass sets when a parent is sealed (mirrors
+        // `register_class`'s `register_direct_subclass` calls).
+        for &parent_id in &parents {
+            register_direct_subclass(parent_id, id);
+        }
+
+        // Re-read the now-patched metadata (cpl[0] + own-slot origins point at
+        // `id`) so the captured `UserClassRegistration` is byte-identical to
+        // what `register_module_classes` snapshots from the static area.
+        let md_ptr = class_metadata_ptr(id);
+        if md_ptr.is_null() {
+            return Err(format!(
+                "install-dylan-classes: class `{}` registered but metadata is null",
+                c.name
+            ));
+        }
+        // SAFETY: static-area metadata, just registered, process-lived.
+        let md = unsafe { &*md_ptr };
+        out.push(UserClassRegistration {
+            name: md.name.clone(),
+            class_id: id,
+            parents: md.parents.clone(),
+            cpl: md.cpl.clone(),
+            slots: md.slots.clone(),
+            slot_origin: md.slot_origin.clone(),
+            own_slot_count: md.own_slot_count,
+            inherited_slot_count: md.inherited_slot_count,
+        });
+    }
+
+    // Opt-in diagnostic (env-gated, silent by default) — confirms the consume
+    // ran non-vacuously and prints the installed class ids for drift debugging.
+    if std::env::var("NOD_DEBUG_INSTALL_CLASSES").as_deref() == Ok("1") {
+        eprintln!(
+            "[install_dylan_classes] installed {} class(es): {:?}",
+            out.len(),
+            out.iter().map(|c| (c.name.as_str(), c.class_id.0)).collect::<Vec<_>>()
+        );
+    }
+    Ok(out)
 }
 
 pub fn lower_module_full(m: &Module) -> Result<LoweredModule, Vec<LoweringError>> {
@@ -9097,6 +9426,54 @@ class <bad>
 === sealing ===
 ";
         assert!(parse_sema_classes(dump).is_err());
+    }
+
+    /// Sprint 56a-CONSUME — `slot_type_from_label` is the exact inverse of
+    /// `slot_type_label` on every scalar bucket the emitter can print, so the
+    /// round-trip `label → type → label` is the identity. (The `Class(id)` arm
+    /// needs the runtime registry and is covered by the live consume gates +
+    /// the EXE compile-and-run.)
+    #[test]
+    fn slot_type_label_round_trips_scalars() {
+        for t in [
+            SlotType::Integer,
+            SlotType::DoubleFloat,
+            SlotType::Boolean,
+            SlotType::Character,
+            SlotType::String,
+            SlotType::Symbol,
+            SlotType::Vector,
+            SlotType::Object,
+            SlotType::Top,
+        ] {
+            let label = slot_type_label(t);
+            let back = slot_type_from_label(&label).expect("inverse");
+            assert_eq!(back, t, "round-trip failed for label {label:?}");
+        }
+    }
+
+    /// Sprint 56a-CONSUME — `slot_default_from_tag` is the inverse of
+    /// `slot_default_tag` for the process-stable tags. `unbound` round-trips
+    /// exactly; a `value:<bits>` fixnum reconstructs the same raw Word. (The
+    /// `true`/`false`/`nil` immediates need the live literal pool and are
+    /// covered by the compile-and-run gate.) A malformed tag is an `Err`.
+    #[test]
+    fn slot_default_tag_round_trips_value_and_unbound() {
+        assert_eq!(
+            slot_default_from_tag("unbound").expect("inverse"),
+            SlotDefault::Unbound
+        );
+        // A fixnum default tag (`value:<raw>`) reconstructs the same Word and
+        // tags back identically.
+        let w = Word::from_fixnum(42).expect("fixnum");
+        let tag = slot_default_tag(SlotDefault::Value(w));
+        assert_eq!(tag, "value:84");
+        match slot_default_from_tag(&tag).expect("inverse") {
+            SlotDefault::Value(got) => assert_eq!(got.raw(), w.raw()),
+            other => panic!("expected Value, got {other:?}"),
+        }
+        assert!(slot_default_from_tag("value:not-a-number").is_err());
+        assert!(slot_default_from_tag("garbage").is_err());
     }
 }
 
