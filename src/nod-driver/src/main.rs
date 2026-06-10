@@ -124,6 +124,15 @@ struct Cli {
     /// shim to be statically linked.
     #[arg(long = "lower-with-dylan", global = true)]
     lower_with_dylan: bool,
+
+    /// Sprint 56 — the combined front-end flag: compose `--sema-with-dylan` +
+    /// `--lower-with-dylan` + Dylan macro expansion (`NOD_EXPAND_WITH_DYLAN`) so
+    /// the WHOLE front-end (lex / parse / expand / sema / AST→DFM lowering) runs
+    /// in Dylan, with the back-end consuming a single Dylan-produced handoff.
+    /// The lowering still bails per-module to Rust on any uncovered form. Also
+    /// settable via `NOD_FRONTEND_WITH_DYLAN=1`. Requires the shim to be linked.
+    #[arg(long = "frontend-with-dylan", global = true)]
+    frontend_with_dylan: bool,
 }
 
 #[derive(Subcommand)]
@@ -538,7 +547,20 @@ fn main() -> ExitCode {
     // that produces the model dump in-process via the `dylan-sema-emit` shim;
     // `nod_sema`'s `lower_with_sema_choice` reconstructs a `SemaModel` from it
     // and feeds the DFM construction. Requires the shim to be linked.
+    // Sprint 56 — the combined `--frontend-with-dylan` flag implies all three
+    // front-end opt-ins (sema + lower + Dylan expansion), so the back-end takes
+    // a single all-Dylan front-end handoff. Setting NOD_EXPAND_WITH_DYLAN here
+    // (before the parse path reads it) routes the parse-path expander to Dylan
+    // too; the lowering path already expands Dylan-side under --lower-with-dylan.
+    let want_frontend_with_dylan = cli.frontend_with_dylan
+        || std::env::var("NOD_FRONTEND_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
+    if want_frontend_with_dylan {
+        // SAFETY: single-threaded process startup.
+        unsafe { std::env::set_var("NOD_EXPAND_WITH_DYLAN", "1"); }
+    }
+
     let want_sema_with_dylan = cli.sema_with_dylan
+        || want_frontend_with_dylan
         || std::env::var("NOD_SEMA_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
     if want_sema_with_dylan {
         if cfg!(dylan_lex_shim_linked) {
@@ -560,6 +582,7 @@ fn main() -> ExitCode {
     // `nod_sema`'s `lower_with_sema_choice` reconstructs `Vec<Function>` from it
     // (when non-empty) and runs the back-end passes on it. Requires the shim.
     let want_lower_with_dylan = cli.lower_with_dylan
+        || want_frontend_with_dylan
         || std::env::var("NOD_LOWER_WITH_DYLAN").map(|v| v == "1").unwrap_or(false);
     if want_lower_with_dylan {
         if cfg!(dylan_lex_shim_linked) {
