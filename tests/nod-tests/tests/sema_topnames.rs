@@ -427,6 +427,11 @@ const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "translate-class",       // B-i: class-typed param `<class:N>` (was PHASE0)
     "lower-slot-assign",     // B-i: class-typed param `<class:N>` (was PHASE0)
     "richards-shape",        // B-i: SEALED generic/methods on class-typed params now flip-match
+    // 56: `%`-primitive lowering (prim-callee/arity/result-label mirror
+    // LOWER_PRIMITIVE_TABLE). All carry host-populated safepoints, so flip-only.
+    "gap-007-repro",         // %make/size/element/push stretchy-vector prims + loops
+    "gap-007-repro-ir",      // same prims, the -ir reference shape
+    "dylan-macro-file",      // %-prim(s) were the last blocker; now lowers end-to-end
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan

@@ -664,11 +664,42 @@ define function lower-expr (b :: <fn-builder>, node :: <object>,
           dst
         end
       elseif (starts-with-percent?(name))
-        // A `%`-primitive call (e.g. `%make-stretchy-vector`) lowers in Rust to
-        // a DirectCall against a `nod_…` runtime name (LOWER_PRIMITIVE_TABLE).
-        // The Dylan side doesn't carry that name map yet, so bail rather than
-        // emit a wrong `%foo` callee. (Deferred: mirror the prim table.)
-        #f
+        // A `%`-primitive call -> DirectCall against the `nod_…` runtime symbol
+        // (`prim-callee`/`prim-arity`/`prim-result-label` mirror lower.rs
+        // LOWER_PRIMITIVE_TABLE). An UNKNOWN `%`-prim (not in the table) BAILS
+        // rather than fall through to the plain-DirectCall else below — which
+        // would emit the raw `%foo` callee (wrong). Args lower left-to-right,
+        // dst minted last (matches fresh_temp(ret) ordering); empty safepoint
+        // set (the host liveness pass populates it post-flip), so flip-only.
+        let pcallee = prim-callee(name);
+        if (~ pcallee)
+          #f
+        else
+          let parity = prim-arity(name);
+          let plabel = prim-result-label(name);
+          let arg-nodes = call-args(node);
+          let n = size(arg-nodes);
+          if (n ~= parity)
+            #f
+          else
+            let arg-temps = make(<stretchy-vector>);
+            let i = 0;
+            let ok? = #t;
+            until (i >= n | ~ ok?)
+              let at = lower-expr(b, unwrap-arg(arg-nodes[i]), ret-map, source);
+              if (~ at) ok? := #f; else add!(arg-temps, at); end;
+              i := i + 1;
+            end;
+            if (~ ok?)
+              #f
+            else
+              let dst = fb-fresh-temp(b, plabel);
+              fb-push(b, make(<dfm-comp>, kind: "directcall", dst: dst, cval: #f,
+                              op: #f, args: arg-temps, callee: pcallee));
+              dst
+            end
+          end
+        end
       else
         // Either a known top-level `define function` (declared return) or a
         // non-generic stdlib function / unknown ident (dst falls back to
@@ -1486,6 +1517,412 @@ define function list-builtin-result-label (name :: <byte-string>) => (label :: <
   elseif (name = "nil")     "<class>"
   elseif (name = "empty?")  "<boolean>"
   else                      "<top>"
+  end
+end function;
+
+// ── `%`-primitive table (lower.rs LOWER_PRIMITIVE_TABLE) ───────────────────
+// A `%`-prefixed primitive call lowers to a DirectCall against the `nod_…`
+// runtime symbol, with the table's arity + return-type label. The name map is
+// LITERAL (no mechanical `%foo`->`nod_foo` transform — e.g. `%vector-size`->
+// `nod_sov_size`), so this mirrors the Rust table verbatim. Generated from
+// `src/nod-sema/src/lower.rs` (see docs/journal/2026-06-10). Returns
+// `vector(callee :: <byte-string>, arity :: <integer>, label :: <byte-string>)`
+// or #f. The host liveness pass adds safepoint roots post-flip (lowering emits
+// an empty set), and NO primitive carries `[no_alloc]` on the live path, so
+// these are FLIP-ONLY fixtures.
+define function prim-callee (name :: <byte-string>) => (callee :: <object>)
+  if (name = "%error") "nod_error"
+  elseif (name = "%values-clear") "nod_values_clear"
+  elseif (name = "%values-set!") "nod_values_set"
+  elseif (name = "%values-get") "nod_values_get"
+  elseif (name = "%values-count") "nod_values_count"
+  elseif (name = "%collection-size") "nod_collection_size"
+  elseif (name = "%collection-concatenate") "nod_collection_concatenate"
+  elseif (name = "%range-from") "nod_range_from"
+  elseif (name = "%range-to") "nod_range_to"
+  elseif (name = "%range-by") "nod_range_by"
+  elseif (name = "%vector-size") "nod_sov_size"
+  elseif (name = "%vector-element") "nod_sov_element"
+  elseif (name = "%vector-element-setter") "nod_sov_element_setter"
+  elseif (name = "%stretchy-vector-size") "nod_stretchy_vector_size"
+  elseif (name = "%stretchy-vector-element") "nod_stretchy_vector_element"
+  elseif (name = "%stretchy-vector-push") "nod_stretchy_vector_push"
+  elseif (name = "%fip-init") "nod_fip_init"
+  elseif (name = "%fip-finished?") "nod_fip_finished_p"
+  elseif (name = "%fip-current-element") "nod_fip_current_element"
+  elseif (name = "%fip-advance!") "nod_fip_advance"
+  elseif (name = "%make-range") "nod_make_range"
+  elseif (name = "%make-stretchy-vector") "nod_make_stretchy_vector"
+  elseif (name = "%funcall0") "nod_funcall0"
+  elseif (name = "%funcall1") "nod_funcall1"
+  elseif (name = "%funcall2") "nod_funcall2"
+  elseif (name = "%funcall3") "nod_funcall3"
+  elseif (name = "%funcall4") "nod_funcall4"
+  elseif (name = "%funcall5") "nod_funcall5"
+  elseif (name = "%apply") "nod_apply"
+  elseif (name = "%make-sov") "nod_make_sov_len"
+  elseif (name = "%make-cell") "nod_make_cell"
+  elseif (name = "%cell-get") "nod_cell_get"
+  elseif (name = "%cell-set!") "nod_cell_set"
+  elseif (name = "%env-cell") "nod_env_cell"
+  elseif (name = "%make-environment") "nod_make_environment"
+  elseif (name = "%make-closure") "nod_make_closure"
+  elseif (name = "%byte-string-allocate") "nod_byte_string_allocate"
+  elseif (name = "%byte-string-size") "nod_byte_string_size"
+  elseif (name = "%byte-string-element") "nod_byte_string_element"
+  elseif (name = "%byte-string-element-setter") "nod_byte_string_element_setter"
+  elseif (name = "%byte-string-copy!") "nod_byte_string_copy_bytes"
+  elseif (name = "%is-generic?") "nod_is_generic_defined"
+  elseif (name = "%is-class?") "nod_is_class_defined"
+  elseif (name = "%make-table") "nod_make_table"
+  elseif (name = "%table-size") "nod_table_size"
+  elseif (name = "%table-element") "nod_table_element"
+  elseif (name = "%table-element-or-default") "nod_table_element_or_default"
+  elseif (name = "%table-element-setter") "nod_table_element_setter"
+  elseif (name = "%table-remove-key") "nod_table_remove_key"
+  elseif (name = "%table-keys") "nod_table_keys"
+  elseif (name = "%table-values") "nod_table_values"
+  elseif (name = "%object-hash") "nod_object_hash"
+  elseif (name = "%object-equal?") "nod_object_equal_p"
+  elseif (name = "%register-wndproc") "nod_register_wndproc"
+  elseif (name = "%register-wndenumproc") "nod_register_wndenumproc"
+  elseif (name = "%struct-get-i32") "nod_struct_get_i32"
+  elseif (name = "%struct-set-i32") "nod_struct_set_i32"
+  elseif (name = "%struct-get-i64") "nod_struct_get_i64"
+  elseif (name = "%struct-set-i64") "nod_struct_set_i64"
+  elseif (name = "%struct-get-u16") "nod_struct_get_u16"
+  elseif (name = "%struct-set-u16") "nod_struct_set_u16"
+  elseif (name = "%struct-get-u32") "nod_struct_get_u32"
+  elseif (name = "%struct-set-u32") "nod_struct_set_u32"
+  elseif (name = "%struct-get-u64") "nod_struct_get_u64"
+  elseif (name = "%struct-set-u64") "nod_struct_set_u64"
+  elseif (name = "%struct-get-pointer") "nod_struct_get_pointer"
+  elseif (name = "%struct-set-pointer") "nod_struct_set_pointer"
+  elseif (name = "%com-release") "nod_com_release"
+  elseif (name = "%com-registry-len") "nod_com_registry_len"
+  elseif (name = "%com-last-hresult") "nod_com_last_hresult"
+  elseif (name = "%com-clear-last-hresult") "nod_com_clear_last_hresult"
+  elseif (name = "%dxgi-create-factory") "nod_dxgi_create_factory"
+  elseif (name = "%dxgi-device-from-d3d-device") "nod_dxgi_device_from_d3d_device"
+  elseif (name = "%dxgi-create-surface-from-texture") "nod_dxgi_create_surface_from_texture"
+  elseif (name = "%d3d11-create-device") "nod_d3d11_create_device"
+  elseif (name = "%d3d11-get-immediate-context") "nod_d3d11_get_immediate_context"
+  elseif (name = "%d3d11-create-texture-2d") "nod_d3d11_create_texture_2d"
+  elseif (name = "%d3d11-copy-to-staging-and-map") "nod_d3d11_copy_to_staging_and_map"
+  elseif (name = "%d3d11-last-staging-handle") "nod_d3d11_last_staging_handle"
+  elseif (name = "%d3d11-last-mapped-row-pitch") "nod_d3d11_last_mapped_row_pitch"
+  elseif (name = "%d3d11-unmap") "nod_d3d11_unmap"
+  elseif (name = "%d2d-create-factory") "nod_d2d_create_factory"
+  elseif (name = "%d2d-create-device") "nod_d2d_create_device"
+  elseif (name = "%d2d-create-device-context") "nod_d2d_create_device_context"
+  elseif (name = "%d2d-create-bitmap-for-target") "nod_d2d_create_bitmap_for_target"
+  elseif (name = "%d2d-set-target") "nod_d2d_set_target"
+  elseif (name = "%d2d-begin-draw") "nod_d2d_begin_draw"
+  elseif (name = "%d2d-end-draw") "nod_d2d_end_draw"
+  elseif (name = "%d2d-clear") "nod_d2d_clear"
+  elseif (name = "%d2d-set-transform-identity") "nod_d2d_set_transform_identity"
+  elseif (name = "%d2d-create-solid-color-brush") "nod_d2d_create_solid_color_brush"
+  elseif (name = "%d2d-draw-text-layout") "nod_d2d_draw_text_layout"
+  elseif (name = "%d2d-draw-rectangle") "nod_d2d_draw_rectangle"
+  elseif (name = "%d2d-fill-rectangle") "nod_d2d_fill_rectangle"
+  elseif (name = "%dwrite-create-factory") "nod_dwrite_create_factory"
+  elseif (name = "%dwrite-create-text-format") "nod_dwrite_create_text_format"
+  elseif (name = "%dwrite-create-text-layout") "nod_dwrite_create_text_layout"
+  elseif (name = "%dwrite-get-layout-metrics") "nod_dwrite_get_layout_metrics"
+  elseif (name = "%dwrite-hit-test-position") "nod_dwrite_hit_test_text_position"
+  elseif (name = "%dwrite-hit-test-point") "nod_dwrite_hit_test_point"
+  elseif (name = "%dwrite-set-drawing-effect") "nod_dwrite_set_drawing_effect"
+  elseif (name = "%dwrite-set-line-spacing") "nod_dwrite_set_line_spacing"
+  elseif (name = "%count-non-zero-red") "nod_count_non_zero_red"
+  elseif (name = "%dxgi-factory-from-d3d-device") "nod_dxgi_factory_from_d3d_device"
+  elseif (name = "%dxgi-create-swap-chain-for-hwnd") "nod_dxgi_create_swap_chain_for_hwnd"
+  elseif (name = "%d2d-create-bitmap-from-swap-chain") "nod_d2d_create_bitmap_from_swap_chain"
+  elseif (name = "%dxgi-swap-chain-present") "nod_dxgi_swap_chain_present"
+  elseif (name = "%dxgi-swap-chain-resize-buffers") "nod_dxgi_swap_chain_resize_buffers"
+  elseif (name = "%register-window-class") "nod_register_window_class"
+  elseif (name = "%create-message-only-window") "nod_create_message_only_window"
+  elseif (name = "%create-hidden-window") "nod_create_hidden_window"
+  elseif (name = "%destroy-window") "nod_destroy_window"
+  elseif (name = "%post-message") "nod_post_message"
+  elseif (name = "%pump-one-message") "nod_pump_one_message"
+  elseif (name = "%run-message-loop") "nod_run_message_loop"
+  elseif (name = "%def-window-proc") "nod_def_window_proc"
+  elseif (name = "%read-file") "nod_read_file_to_string"
+  elseif (name = "%argv1") "nod_get_argv1"
+  elseif (name = "%argv2") "nod_get_argv2"
+  elseif (name = "%print-gc-stats") "nod_print_gc_stats"
+  elseif (name = "%lo-word") "nod_lo_word"
+  elseif (name = "%hi-word") "nod_hi_word"
+  elseif (name = "%set-scroll-info") "nod_set_scroll_info"
+  elseif (name = "%get-scroll-pos") "nod_get_scroll_pos"
+  elseif (name = "%show-open-file-dialog") "nod_show_open_file_dialog"
+  elseif (name = "%write-file") "nod_write_file_from_string"
+  elseif (name = "%show-save-file-dialog") "nod_show_save_file_dialog"
+  else #f
+  end
+end function;
+
+define function prim-arity (name :: <byte-string>) => (n :: <integer>)
+  if (name = "%error") 1
+  elseif (name = "%values-clear") 0
+  elseif (name = "%values-set!") 2
+  elseif (name = "%values-get") 1
+  elseif (name = "%values-count") 0
+  elseif (name = "%collection-size") 1
+  elseif (name = "%collection-concatenate") 2
+  elseif (name = "%range-from") 1
+  elseif (name = "%range-to") 1
+  elseif (name = "%range-by") 1
+  elseif (name = "%vector-size") 1
+  elseif (name = "%vector-element") 2
+  elseif (name = "%vector-element-setter") 3
+  elseif (name = "%stretchy-vector-size") 1
+  elseif (name = "%stretchy-vector-element") 2
+  elseif (name = "%stretchy-vector-push") 2
+  elseif (name = "%fip-init") 1
+  elseif (name = "%fip-finished?") 1
+  elseif (name = "%fip-current-element") 1
+  elseif (name = "%fip-advance!") 1
+  elseif (name = "%make-range") 3
+  elseif (name = "%make-stretchy-vector") 1
+  elseif (name = "%funcall0") 1
+  elseif (name = "%funcall1") 2
+  elseif (name = "%funcall2") 3
+  elseif (name = "%funcall3") 4
+  elseif (name = "%funcall4") 5
+  elseif (name = "%funcall5") 6
+  elseif (name = "%apply") 2
+  elseif (name = "%make-sov") 1
+  elseif (name = "%make-cell") 1
+  elseif (name = "%cell-get") 1
+  elseif (name = "%cell-set!") 2
+  elseif (name = "%env-cell") 2
+  elseif (name = "%make-environment") 1
+  elseif (name = "%make-closure") 3
+  elseif (name = "%byte-string-allocate") 1
+  elseif (name = "%byte-string-size") 1
+  elseif (name = "%byte-string-element") 2
+  elseif (name = "%byte-string-element-setter") 3
+  elseif (name = "%byte-string-copy!") 5
+  elseif (name = "%is-generic?") 1
+  elseif (name = "%is-class?") 1
+  elseif (name = "%make-table") 1
+  elseif (name = "%table-size") 1
+  elseif (name = "%table-element") 2
+  elseif (name = "%table-element-or-default") 3
+  elseif (name = "%table-element-setter") 3
+  elseif (name = "%table-remove-key") 2
+  elseif (name = "%table-keys") 1
+  elseif (name = "%table-values") 1
+  elseif (name = "%object-hash") 1
+  elseif (name = "%object-equal?") 2
+  elseif (name = "%register-wndproc") 1
+  elseif (name = "%register-wndenumproc") 1
+  elseif (name = "%struct-get-i32") 2
+  elseif (name = "%struct-set-i32") 3
+  elseif (name = "%struct-get-i64") 2
+  elseif (name = "%struct-set-i64") 3
+  elseif (name = "%struct-get-u16") 2
+  elseif (name = "%struct-set-u16") 3
+  elseif (name = "%struct-get-u32") 2
+  elseif (name = "%struct-set-u32") 3
+  elseif (name = "%struct-get-u64") 2
+  elseif (name = "%struct-set-u64") 3
+  elseif (name = "%struct-get-pointer") 2
+  elseif (name = "%struct-set-pointer") 3
+  elseif (name = "%com-release") 1
+  elseif (name = "%com-registry-len") 0
+  elseif (name = "%com-last-hresult") 0
+  elseif (name = "%com-clear-last-hresult") 0
+  elseif (name = "%dxgi-create-factory") 0
+  elseif (name = "%dxgi-device-from-d3d-device") 1
+  elseif (name = "%dxgi-create-surface-from-texture") 1
+  elseif (name = "%d3d11-create-device") 0
+  elseif (name = "%d3d11-get-immediate-context") 1
+  elseif (name = "%d3d11-create-texture-2d") 4
+  elseif (name = "%d3d11-copy-to-staging-and-map") 5
+  elseif (name = "%d3d11-last-staging-handle") 0
+  elseif (name = "%d3d11-last-mapped-row-pitch") 0
+  elseif (name = "%d3d11-unmap") 2
+  elseif (name = "%d2d-create-factory") 0
+  elseif (name = "%d2d-create-device") 2
+  elseif (name = "%d2d-create-device-context") 1
+  elseif (name = "%d2d-create-bitmap-for-target") 2
+  elseif (name = "%d2d-set-target") 2
+  elseif (name = "%d2d-begin-draw") 1
+  elseif (name = "%d2d-end-draw") 1
+  elseif (name = "%d2d-clear") 5
+  elseif (name = "%d2d-set-transform-identity") 1
+  elseif (name = "%d2d-create-solid-color-brush") 5
+  elseif (name = "%d2d-draw-text-layout") 5
+  elseif (name = "%d2d-draw-rectangle") 7
+  elseif (name = "%d2d-fill-rectangle") 6
+  elseif (name = "%dwrite-create-factory") 0
+  elseif (name = "%dwrite-create-text-format") 4
+  elseif (name = "%dwrite-create-text-layout") 5
+  elseif (name = "%dwrite-get-layout-metrics") 1
+  elseif (name = "%dwrite-hit-test-position") 3
+  elseif (name = "%dwrite-hit-test-point") 3
+  elseif (name = "%dwrite-set-drawing-effect") 4
+  elseif (name = "%dwrite-set-line-spacing") 3
+  elseif (name = "%count-non-zero-red") 4
+  elseif (name = "%dxgi-factory-from-d3d-device") 1
+  elseif (name = "%dxgi-create-swap-chain-for-hwnd") 5
+  elseif (name = "%d2d-create-bitmap-from-swap-chain") 2
+  elseif (name = "%dxgi-swap-chain-present") 1
+  elseif (name = "%dxgi-swap-chain-resize-buffers") 3
+  elseif (name = "%register-window-class") 2
+  elseif (name = "%create-message-only-window") 1
+  elseif (name = "%create-hidden-window") 1
+  elseif (name = "%destroy-window") 1
+  elseif (name = "%post-message") 4
+  elseif (name = "%pump-one-message") 1
+  elseif (name = "%run-message-loop") 0
+  elseif (name = "%def-window-proc") 4
+  elseif (name = "%read-file") 1
+  elseif (name = "%argv1") 0
+  elseif (name = "%argv2") 0
+  elseif (name = "%print-gc-stats") 0
+  elseif (name = "%lo-word") 1
+  elseif (name = "%hi-word") 1
+  elseif (name = "%set-scroll-info") 7
+  elseif (name = "%get-scroll-pos") 2
+  elseif (name = "%show-open-file-dialog") 1
+  elseif (name = "%write-file") 2
+  elseif (name = "%show-save-file-dialog") 1
+  else -1
+  end
+end function;
+
+define function prim-result-label (name :: <byte-string>) => (label :: <byte-string>)
+  if (name = "%error") "<top>"
+  elseif (name = "%values-clear") "<top>"
+  elseif (name = "%values-set!") "<top>"
+  elseif (name = "%values-get") "<top>"
+  elseif (name = "%values-count") "<integer>"
+  elseif (name = "%collection-size") "<integer>"
+  elseif (name = "%collection-concatenate") "<top>"
+  elseif (name = "%range-from") "<integer>"
+  elseif (name = "%range-to") "<integer>"
+  elseif (name = "%range-by") "<integer>"
+  elseif (name = "%vector-size") "<integer>"
+  elseif (name = "%vector-element") "<top>"
+  elseif (name = "%vector-element-setter") "<top>"
+  elseif (name = "%stretchy-vector-size") "<integer>"
+  elseif (name = "%stretchy-vector-element") "<top>"
+  elseif (name = "%stretchy-vector-push") "<top>"
+  elseif (name = "%fip-init") "<top>"
+  elseif (name = "%fip-finished?") "<boolean>"
+  elseif (name = "%fip-current-element") "<top>"
+  elseif (name = "%fip-advance!") "<top>"
+  elseif (name = "%make-range") "<top>"
+  elseif (name = "%make-stretchy-vector") "<top>"
+  elseif (name = "%funcall0") "<top>"
+  elseif (name = "%funcall1") "<top>"
+  elseif (name = "%funcall2") "<top>"
+  elseif (name = "%funcall3") "<top>"
+  elseif (name = "%funcall4") "<top>"
+  elseif (name = "%funcall5") "<top>"
+  elseif (name = "%apply") "<top>"
+  elseif (name = "%make-sov") "<top>"
+  elseif (name = "%make-cell") "<top>"
+  elseif (name = "%cell-get") "<top>"
+  elseif (name = "%cell-set!") "<top>"
+  elseif (name = "%env-cell") "<top>"
+  elseif (name = "%make-environment") "<top>"
+  elseif (name = "%make-closure") "<top>"
+  elseif (name = "%byte-string-allocate") "<top>"
+  elseif (name = "%byte-string-size") "<integer>"
+  elseif (name = "%byte-string-element") "<integer>"
+  elseif (name = "%byte-string-element-setter") "<integer>"
+  elseif (name = "%byte-string-copy!") "<integer>"
+  elseif (name = "%is-generic?") "<boolean>"
+  elseif (name = "%is-class?") "<boolean>"
+  elseif (name = "%make-table") "<top>"
+  elseif (name = "%table-size") "<integer>"
+  elseif (name = "%table-element") "<top>"
+  elseif (name = "%table-element-or-default") "<top>"
+  elseif (name = "%table-element-setter") "<top>"
+  elseif (name = "%table-remove-key") "<top>"
+  elseif (name = "%table-keys") "<top>"
+  elseif (name = "%table-values") "<top>"
+  elseif (name = "%object-hash") "<integer>"
+  elseif (name = "%object-equal?") "<boolean>"
+  elseif (name = "%register-wndproc") "<top>"
+  elseif (name = "%register-wndenumproc") "<top>"
+  elseif (name = "%struct-get-i32") "<integer>"
+  elseif (name = "%struct-set-i32") "<integer>"
+  elseif (name = "%struct-get-i64") "<integer>"
+  elseif (name = "%struct-set-i64") "<integer>"
+  elseif (name = "%struct-get-u16") "<integer>"
+  elseif (name = "%struct-set-u16") "<integer>"
+  elseif (name = "%struct-get-u32") "<integer>"
+  elseif (name = "%struct-set-u32") "<integer>"
+  elseif (name = "%struct-get-u64") "<integer>"
+  elseif (name = "%struct-set-u64") "<integer>"
+  elseif (name = "%struct-get-pointer") "<integer>"
+  elseif (name = "%struct-set-pointer") "<integer>"
+  elseif (name = "%com-release") "<integer>"
+  elseif (name = "%com-registry-len") "<integer>"
+  elseif (name = "%com-last-hresult") "<integer>"
+  elseif (name = "%com-clear-last-hresult") "<integer>"
+  elseif (name = "%dxgi-create-factory") "<integer>"
+  elseif (name = "%dxgi-device-from-d3d-device") "<integer>"
+  elseif (name = "%dxgi-create-surface-from-texture") "<integer>"
+  elseif (name = "%d3d11-create-device") "<integer>"
+  elseif (name = "%d3d11-get-immediate-context") "<integer>"
+  elseif (name = "%d3d11-create-texture-2d") "<integer>"
+  elseif (name = "%d3d11-copy-to-staging-and-map") "<integer>"
+  elseif (name = "%d3d11-last-staging-handle") "<integer>"
+  elseif (name = "%d3d11-last-mapped-row-pitch") "<integer>"
+  elseif (name = "%d3d11-unmap") "<integer>"
+  elseif (name = "%d2d-create-factory") "<integer>"
+  elseif (name = "%d2d-create-device") "<integer>"
+  elseif (name = "%d2d-create-device-context") "<integer>"
+  elseif (name = "%d2d-create-bitmap-for-target") "<integer>"
+  elseif (name = "%d2d-set-target") "<integer>"
+  elseif (name = "%d2d-begin-draw") "<integer>"
+  elseif (name = "%d2d-end-draw") "<integer>"
+  elseif (name = "%d2d-clear") "<integer>"
+  elseif (name = "%d2d-set-transform-identity") "<integer>"
+  elseif (name = "%d2d-create-solid-color-brush") "<integer>"
+  elseif (name = "%d2d-draw-text-layout") "<integer>"
+  elseif (name = "%d2d-draw-rectangle") "<integer>"
+  elseif (name = "%d2d-fill-rectangle") "<integer>"
+  elseif (name = "%dwrite-create-factory") "<integer>"
+  elseif (name = "%dwrite-create-text-format") "<integer>"
+  elseif (name = "%dwrite-create-text-layout") "<integer>"
+  elseif (name = "%dwrite-get-layout-metrics") "<integer>"
+  elseif (name = "%dwrite-hit-test-position") "<integer>"
+  elseif (name = "%dwrite-hit-test-point") "<integer>"
+  elseif (name = "%dwrite-set-drawing-effect") "<integer>"
+  elseif (name = "%dwrite-set-line-spacing") "<integer>"
+  elseif (name = "%count-non-zero-red") "<integer>"
+  elseif (name = "%dxgi-factory-from-d3d-device") "<integer>"
+  elseif (name = "%dxgi-create-swap-chain-for-hwnd") "<integer>"
+  elseif (name = "%d2d-create-bitmap-from-swap-chain") "<integer>"
+  elseif (name = "%dxgi-swap-chain-present") "<integer>"
+  elseif (name = "%dxgi-swap-chain-resize-buffers") "<integer>"
+  elseif (name = "%register-window-class") "<integer>"
+  elseif (name = "%create-message-only-window") "<integer>"
+  elseif (name = "%create-hidden-window") "<integer>"
+  elseif (name = "%destroy-window") "<integer>"
+  elseif (name = "%post-message") "<integer>"
+  elseif (name = "%pump-one-message") "<integer>"
+  elseif (name = "%run-message-loop") "<integer>"
+  elseif (name = "%def-window-proc") "<integer>"
+  elseif (name = "%read-file") "<top>"
+  elseif (name = "%argv1") "<top>"
+  elseif (name = "%argv2") "<top>"
+  elseif (name = "%print-gc-stats") "<top>"
+  elseif (name = "%lo-word") "<integer>"
+  elseif (name = "%hi-word") "<integer>"
+  elseif (name = "%set-scroll-info") "<integer>"
+  elseif (name = "%get-scroll-pos") "<integer>"
+  elseif (name = "%show-open-file-dialog") "<top>"
+  elseif (name = "%write-file") "<integer>"
+  elseif (name = "%show-save-file-dialog") "<top>"
+  else "<top>"
   end
 end function;
 

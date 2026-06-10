@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-10 — Sprint 56 (axis-1): `%`-primitive lowering in Dylan](2026-06-10-sprint-56-percent-prim-lowering.md)
+  — The Dylan AST→DFM lowering stops bailing on `%`-prim calls: `prim-callee` /
+  `prim-arity` / `prim-result-label` mirror the Rust `LOWER_PRIMITIVE_TABLE` (127
+  rows, generated from the Rust source to avoid transcription error) and emit the
+  `nod_…` DirectCall. Unknown `%`-prims still bail (soundness). Closes
+  `gap-007-repro` + 2 more through the flip; standalone lowered 27→30/62. Found
+  `[no_alloc]` is never emitted on the live path (no `<dfm-comp>` field needed).
+  Whole-corpus survey 0 mismatches; full gate suite 6/6.
 - [2026-06-10 — Sprint 56a (step 1): the Dylan class derivation becomes a checked input on the live path](2026-06-10-sprint-56a-class-derivation-live-verify.md)
   — First increment of the "make classes load-bearing" centerpiece. `parse_sema_classes`
   recovers the dump's `=== classes ===` section (parents / CPL / slot layout, all by
