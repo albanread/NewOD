@@ -2441,7 +2441,18 @@ fn lower_module_full_inner(
     if let Some(dump) = dfm_dump
         && !dump.trim().is_empty()
     {
-        let parsed = nod_dfm::parse_dfm_module(dump, &|name| {
+        // Sprint 56c-T — the Dylan lowering appends a `=== methods ===` section
+        // after the function dump. SPLIT it off at the literal `\n=== methods
+        // ===\n` boundary so `parse_dfm_module` never sees it; the left part is
+        // the unchanged DFM funcs dump. The right part (the methods table) is
+        // parsed below and VERIFIED against the Rust `methods` table — NOT
+        // consumed (the dump-dfm OUTPUT is unchanged; only the verify runs).
+        const METHODS_SEP: &str = "\n=== methods ===\n";
+        let (funcs_dump, methods_dump): (&str, Option<&str>) = match dump.split_once(METHODS_SEP) {
+            Some((funcs, methods)) => (funcs, Some(methods)),
+            None => (dump, None),
+        };
+        let parsed = nod_dfm::parse_dfm_module(funcs_dump, &|name| {
             resolve_class_id_by_name(name).map(|c| c.0)
         })
         .map_err(|e| {
@@ -2452,6 +2463,24 @@ fn lower_module_full_inner(
         })?;
         out = parsed;
         lift_sink.functions.clear();
+
+        // Verify the Dylan method table against the Rust `methods` table (built
+        // above in WALK ORDER). A mismatch is a Dylan-vs-Rust method-derivation
+        // bug; fail the compile loudly rather than silently trusting Rust.
+        if let Some(methods_section) = methods_dump {
+            let dylan_methods = parse_dylan_methods(methods_section).map_err(|e| {
+                vec![LoweringError::Unsupported {
+                    span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
+                    message: format!("lower-with-dylan: {e}"),
+                }]
+            })?;
+            verify_dylan_methods(&methods, &dylan_methods).map_err(|e| {
+                vec![LoweringError::Unsupported {
+                    span: Span { file_id: nod_reader::FileId(0), lo: 0, hi: 0 },
+                    message: format!("lower-with-dylan: {e}"),
+                }]
+            })?;
+        }
     }
 
     // `sealing` was computed in `analyse_module`; install it here (the
@@ -2986,6 +3015,167 @@ fn verify_dylan_classes(
                     ds.name, ds.offset, ds.has_setter, ds.origin
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Sprint 56c-T — a parsed `=== methods ===` record from a `--lower-with-dylan`
+/// DFM dump (the Dylan lowering walk's method table). Mirrors one Rust
+/// [`MethodRegistration`]: generic name, body-fn name, param count, and the
+/// specialiser class NAMES (one per required param, `<object>` for unannotated /
+/// the setter's value position). Carries everything BY NAME — the Rust `ClassId`s
+/// are resolved through `sema_class_name` at verify time, so `ClassId`
+/// correctness rides the 56a class byte-match, not this comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedMethod {
+    pub generic_name: String,
+    pub body_fn_name: String,
+    pub param_count: usize,
+    pub specialisers: Vec<String>,
+}
+
+/// Sprint 56c-T — parse the `=== methods ===` section emitted by the Dylan
+/// lowering (`dylan-lower-emit`, appended after the function dump) into
+/// [`ParsedMethod`] records, in dump (walk) order. Each line is:
+/// `method GENERIC body=BODY params=N specialisers=[<a>, <b>, ...]`.
+/// The section is the tail produced by splitting the lowering dump at the
+/// literal `\n=== methods ===\n`; this parser receives that tail (which begins
+/// with the `=== methods ===` header line or the lines after it). Lines before
+/// the header are ignored; `Err` on a malformed `method` line.
+pub fn parse_dylan_methods(section: &str) -> Result<Vec<ParsedMethod>, String> {
+    let mut methods: Vec<ParsedMethod> = Vec::new();
+    let mut in_methods = false;
+    for raw in section.lines() {
+        let line = raw.trim_end();
+        if line == "=== methods ===" {
+            in_methods = true;
+            continue;
+        }
+        if line.starts_with("=== ") {
+            in_methods = false;
+            continue;
+        }
+        if !in_methods {
+            // Tolerate a tail that omits the header (the host passes the
+            // post-delimiter slice, whose first line is the first `method`).
+            if line.starts_with("method ") {
+                in_methods = true;
+            } else {
+                continue;
+            }
+        }
+        if line.is_empty() {
+            continue;
+        }
+        methods.push(parse_dylan_method_line(line)?);
+    }
+    Ok(methods)
+}
+
+/// Parse one `method GENERIC body=BODY params=N specialisers=[<a>, <b>, ...]`
+/// line. Generic / body names are identifiers (no spaces); the specialiser list
+/// is a comma-space-joined bracketed list of class names.
+fn parse_dylan_method_line(line: &str) -> Result<ParsedMethod, String> {
+    let err = || format!("methods dump: malformed method line: `{line}`");
+    let rest = line.strip_prefix("method ").ok_or_else(err)?;
+    // GENERIC ends at " body=".
+    let bpos = rest.find(" body=").ok_or_else(err)?;
+    let generic_name = rest[..bpos].to_string();
+    let after = &rest[bpos + " body=".len()..]; // BODY params=N specialisers=[...]
+    let ppos = after.find(" params=").ok_or_else(err)?;
+    let body_fn_name = after[..ppos].to_string();
+    let after = &after[ppos + " params=".len()..]; // N specialisers=[...]
+    let spos = after.find(" specialisers=[").ok_or_else(err)?;
+    let param_count: usize = after[..spos].parse().map_err(|_| err())?;
+    let after = &after[spos + " specialisers=[".len()..]; // <a>, <b>, ...]
+    let inner = after.strip_suffix(']').ok_or_else(err)?;
+    let specialisers: Vec<String> = inner
+        .split(", ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(ParsedMethod {
+        generic_name,
+        body_fn_name,
+        param_count,
+        specialisers,
+    })
+}
+
+/// The expected Dylan-side body-fn name for a Rust [`MethodRegistration`],
+/// resolving any numeric class-id suffix to class NAMES so it matches the
+/// by-name form the Dylan lowering emits.
+///
+/// A USER method's Rust `body_fn_name` is `format!("{generic}${id1}_{id2}…")`
+/// (lower.rs `lower_method_item`) — the specialiser `ClassId`s rendered numeric.
+/// The Dylan side can't know the ids at lowering time, so it emits the same
+/// `{generic}$…` shape with class NAMES (`method-body-name`, dylan-lower.dylan),
+/// and `parse_function_header` resolves the suffix back to numbers at the
+/// reconstruction seam. To compare the two method TABLES we therefore canonicalise
+/// the Rust user-method body name to its by-name form (`{generic}$` + the
+/// specialiser names joined by `_`). A slot ACCESSOR body name (`<C>-getter-x` /
+/// `<C>-setter-x`) carries no such suffix and is returned unchanged — it already
+/// byte-matches the Dylan accessor name.
+fn expected_dylan_body_fn_name(r: &MethodRegistration, r_specs: &[String]) -> String {
+    let user_method_prefix = format!("{}$", r.generic_name);
+    if r.body_fn_name.starts_with(&user_method_prefix) {
+        format!("{}{}", user_method_prefix, r_specs.join("_"))
+    } else {
+        r.body_fn_name.clone()
+    }
+}
+
+/// Sprint 56c-T — verify that the Dylan lowering walk's method table (the dump's
+/// `=== methods ===` section, [`parse_dylan_methods`]) structurally matches the
+/// host's Rust [`MethodRegistration`] table built in `lower_module_full_inner`,
+/// comparing by NAME: same count, same WALK ORDER, per-method equal
+/// `generic_name` / `body_fn_name` / `param_count`, and specialisers compared BY
+/// NAME (the Rust `ClassId`s resolved through [`sema_class_name`]). The
+/// `body_fn_name` is compared in its by-name canonical form (see
+/// [`expected_dylan_body_fn_name`]) so a user method's numeric class-id suffix
+/// (`run-task$1082_1`) matches the Dylan by-name suffix (`run-task$<idler>_<integer>`).
+/// This is the 56c-T verify-only step — the method table is still Rust-computed;
+/// a Dylan-vs-Rust divergence fails the compile loudly here rather than being
+/// silently masked. `ClassId` correctness itself rides the 56a class byte-match.
+fn verify_dylan_methods(
+    rust: &[MethodRegistration],
+    dylan: &[ParsedMethod],
+) -> Result<(), String> {
+    if rust.len() != dylan.len() {
+        return Err(format!(
+            "method count mismatch — host built {}, Dylan dumped {}",
+            rust.len(),
+            dylan.len()
+        ));
+    }
+    for (r, d) in rust.iter().zip(dylan.iter()) {
+        if r.generic_name != d.generic_name {
+            return Err(format!(
+                "method order/generic mismatch — host {:?}, Dylan {:?}",
+                r.generic_name, d.generic_name
+            ));
+        }
+        if r.param_count != d.param_count {
+            return Err(format!(
+                "method {} param-count mismatch — host {}, Dylan {}",
+                r.generic_name, r.param_count, d.param_count
+            ));
+        }
+        let r_specs: Vec<String> = r.specialisers.iter().map(|&id| sema_class_name(id)).collect();
+        if r_specs != d.specialisers {
+            return Err(format!(
+                "method {} specialisers mismatch — host {:?}, Dylan {:?}",
+                r.generic_name, r_specs, d.specialisers
+            ));
+        }
+        let r_body = expected_dylan_body_fn_name(r, &r_specs);
+        if r_body != d.body_fn_name {
+            return Err(format!(
+                "method {} body-fn mismatch — host {:?} (raw {:?}), Dylan {:?}",
+                r.generic_name, r_body, r.body_fn_name, d.body_fn_name
+            ));
         }
     }
     Ok(())
@@ -8575,5 +8765,147 @@ class <bad>
 === sealing ===
 ";
         assert!(parse_sema_classes(dump).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sprint56c_method_parse_tests {
+    //! Sprint 56c-T — pure-Rust coverage for [`parse_dylan_methods`], the inverse
+    //! of the `=== methods ===` section emitted by `dylan-lower-emit`. The
+    //! end-to-end live verification (`verify_dylan_methods` at the dfm-dump seam)
+    //! is exercised by the `--lower-with-dylan` byte-match gates on `point` /
+    //! `richards-shape`; these tests pin the text grammar without the shim.
+    use super::*;
+
+    // A `point`-shaped table: two slot getters + two setters (the pass-1
+    // accessor walk, getter-then-setter per own slot), then a `richards`-shaped
+    // user method block (one generic with multiple specialiser tuples).
+    const METHODS_DUMP: &str = "\
+=== methods ===
+method x body=<user-point>-getter-x params=1 specialisers=[<user-point>]
+method x-setter body=<user-point>-setter-x params=2 specialisers=[<user-point>, <object>]
+method y body=<user-point>-getter-y params=1 specialisers=[<user-point>]
+method y-setter body=<user-point>-setter-y params=2 specialisers=[<user-point>, <object>]
+method run-task body=run-task$<idler>_<integer> params=2 specialisers=[<idler>, <integer>]
+";
+
+    #[test]
+    fn parses_accessor_and_user_methods() {
+        let methods = parse_dylan_methods(METHODS_DUMP).expect("parse");
+        assert_eq!(methods.len(), 5);
+        assert_eq!(
+            methods[0],
+            ParsedMethod {
+                generic_name: "x".to_string(),
+                body_fn_name: "<user-point>-getter-x".to_string(),
+                param_count: 1,
+                specialisers: vec!["<user-point>".to_string()],
+            }
+        );
+        assert_eq!(
+            methods[1],
+            ParsedMethod {
+                generic_name: "x-setter".to_string(),
+                body_fn_name: "<user-point>-setter-x".to_string(),
+                param_count: 2,
+                specialisers: vec!["<user-point>".to_string(), "<object>".to_string()],
+            }
+        );
+        // A multi-arg user method: two specialisers, body name carries both.
+        assert_eq!(
+            methods[4],
+            ParsedMethod {
+                generic_name: "run-task".to_string(),
+                body_fn_name: "run-task$<idler>_<integer>".to_string(),
+                param_count: 2,
+                specialisers: vec!["<idler>".to_string(), "<integer>".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tail_without_header() {
+        // The host passes the slice AFTER the `\n=== methods ===\n` delimiter,
+        // whose first line is the first `method` (no header line). The parser
+        // tolerates that.
+        let tail = "\
+method id body=<thing>-getter-id params=1 specialisers=[<thing>]
+";
+        let methods = parse_dylan_methods(tail).expect("parse");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].generic_name, "id");
+        assert_eq!(methods[0].body_fn_name, "<thing>-getter-id");
+        assert_eq!(methods[0].param_count, 1);
+        assert_eq!(methods[0].specialisers, vec!["<thing>".to_string()]);
+    }
+
+    #[test]
+    fn empty_methods_section_is_empty() {
+        let methods = parse_dylan_methods("=== methods ===\n").expect("parse");
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn malformed_method_line_errors() {
+        // Missing the ` body=` field.
+        let dump = "\
+=== methods ===
+method broken params=1 specialisers=[<x>]
+";
+        assert!(parse_dylan_methods(dump).is_err());
+    }
+
+    #[test]
+    fn verify_matches_equal_tables() {
+        // A Rust table whose names resolve via the seeded `<object>` /
+        // `<integer>` classes (always registered) verifies against a Dylan dump
+        // that reproduces those names.
+        let rust = vec![
+            MethodRegistration {
+                generic_name: "f".to_string(),
+                specialisers: vec![ClassId::INTEGER],
+                body_fn_name: "f$<integer>".to_string(),
+                param_count: 1,
+            },
+            MethodRegistration {
+                generic_name: "g-setter".to_string(),
+                specialisers: vec![ClassId::INTEGER, ClassId::OBJECT],
+                body_fn_name: "<c>-setter-g".to_string(),
+                param_count: 2,
+            },
+        ];
+        let dylan = vec![
+            ParsedMethod {
+                generic_name: "f".to_string(),
+                body_fn_name: "f$<integer>".to_string(),
+                param_count: 1,
+                specialisers: vec!["<integer>".to_string()],
+            },
+            ParsedMethod {
+                generic_name: "g-setter".to_string(),
+                body_fn_name: "<c>-setter-g".to_string(),
+                param_count: 2,
+                specialisers: vec!["<integer>".to_string(), "<object>".to_string()],
+            },
+        ];
+        nod_runtime::ensure_conditions_registered();
+        assert!(verify_dylan_methods(&rust, &dylan).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_specialiser_mismatch() {
+        let rust = vec![MethodRegistration {
+            generic_name: "f".to_string(),
+            specialisers: vec![ClassId::INTEGER],
+            body_fn_name: "f$<integer>".to_string(),
+            param_count: 1,
+        }];
+        let dylan = vec![ParsedMethod {
+            generic_name: "f".to_string(),
+            body_fn_name: "f$<integer>".to_string(),
+            param_count: 1,
+            specialisers: vec!["<object>".to_string()], // wrong — host has <integer>
+        }];
+        assert!(verify_dylan_methods(&rust, &dylan).is_err());
     }
 }

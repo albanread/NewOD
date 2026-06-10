@@ -28,6 +28,13 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-10 — Sprint 56c-T: the methods table becomes a checked input](2026-06-10-sprint-56c-methods-table-verify.md)
+  — The Dylan lowering emits a `=== methods ===` section (slot accessors + user methods,
+  walk order, specialisers by name), verified against the Rust `methods` table at the
+  dfm-dump seam (`split_once` peels it off before `parse_dfm_module`). Finding: user-method
+  `body_fn_name` is id-encoded in Rust (`run-task$1082_1`) vs by-name in Dylan — verify
+  canonicalises to by-name. 11 unit tests; point/richards-shape + 5 more byte-match.
+  Precondition for consuming the methods table (retiring Rust's method build).
 - [2026-06-10 — Roadmap: retiring the Rust front-end (agent-planned)](2026-06-10-roadmap-retire-rust-frontend.md)
   — The authoritative forward plan, produced by a 4-agent planning workflow (3 parallel
   code-grounded investigations + synthesis). Ordered sprints to the cutover: 56b-EXPAND

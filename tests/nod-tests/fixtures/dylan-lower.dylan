@@ -2218,10 +2218,17 @@ define function make-setter-fn (class-name :: <byte-string>, slot-name :: <byte-
 end function;
 
 // Append the getter/setter accessor functions for one class (own slots, source
-// order, getter-then-setter). Mirrors Phase 3 ordering.
+// order, getter-then-setter). Mirrors Phase 3 ordering. Also records the
+// matching method registrations into `methods` (Sprint 56c-T), in the SAME walk
+// order as Rust's accessor pass (lower.rs ~1779/1795): per own slot, a getter
+// `MethodRegistration{ generic=<slot>, specialisers=[<C>], body=<C>-getter-<slot>,
+// param_count=1 }`, then (iff the slot has a setter) a setter `{ generic=
+// <slot>-setter, specialisers=[<C>, <object>], body=<C>-setter-<slot>,
+// param_count=2 }`.
 define function emit-class-accessors (cd :: <ast-class-definition>,
                                       source :: <byte-string>,
-                                      funcs :: <stretchy-vector>) => ()
+                                      funcs :: <stretchy-vector>,
+                                      methods :: <stretchy-vector>) => ()
   let cname = token-source-text(class-name(cd), source);
   let slots = class-slots(cd);
   let nsl = size(slots);
@@ -2235,8 +2242,20 @@ define function emit-class-accessors (cd :: <ast-class-definition>,
       let offset = 8 + idx * 8;
       let kind = slot-kind-label(tn);
       add!(funcs, make-getter-fn(cname, sn, offset, kind, slot-return-label(tn)));
+      // Getter registration: generic = slot name, sole specialiser = <C>.
+      let g-specs = make(<stretchy-vector>);
+      add!(g-specs, cname);
+      add!(methods, make-method-reg(sn, concatenate(cname, concatenate("-getter-", sn)),
+                                    1, g-specs));
       if (slot-has-setter?(s, source))
         add!(funcs, make-setter-fn(cname, sn, offset, kind));
+        // Setter registration: generic = <slot>-setter, specialisers = [<C>, <object>].
+        let s-specs = make(<stretchy-vector>);
+        add!(s-specs, cname);
+        add!(s-specs, "<object>");
+        add!(methods, make-method-reg(concatenate(sn, "-setter"),
+                                      concatenate(cname, concatenate("-setter-", sn)),
+                                      2, s-specs));
       end;
       idx := idx + 1;
     end;
@@ -2770,6 +2789,98 @@ define function format-dfm-module (funcs :: <stretchy-vector>)
   out
 end function;
 
+// ─── methods table (Sprint 56c-T) — shadow-emit, verified host-side ────────
+//
+// Mirrors the Rust `methods: Vec<MethodRegistration>` built in
+// `lower_module_full_inner` (lower.rs) in WALK ORDER: pass-1 records slot
+// accessor getter/setter registrations (per class, per own slot, getter then
+// setter), pass-2 records user `define method` registrations. Each entry is a
+// 4-element `<stretchy-vector>`: #[generic-name, body-fn-name, param-count,
+// specialiser-names], where specialiser-names is itself a `<stretchy-vector>`
+// of class-name strings. The host splits the dump at `\n=== methods ===\n`,
+// parses these lines into `ParsedMethod`, and verifies them against the Rust
+// `MethodRegistration` table (by generic-name / body-fn-name / param-count and
+// specialisers BY NAME). It is NOT consumed — the dump-dfm output is unchanged.
+
+// Build one method-registration record. `specialisers` is a <stretchy-vector>
+// of class-name strings.
+define function make-method-reg (generic :: <byte-string>, body :: <byte-string>,
+                                 param-count :: <integer>,
+                                 specialisers :: <stretchy-vector>)
+ => (reg :: <stretchy-vector>)
+  let v = make(<stretchy-vector>);
+  add!(v, generic);
+  add!(v, body);
+  add!(v, param-count);
+  add!(v, specialisers);
+  v
+end function;
+
+// The specialiser class NAMES of a method's REQUIRED params, mirroring the
+// names that `method-body-name` already derives for the body-fn suffix: an
+// unannotated required param contributes `<object>`; a bare class-name type ref
+// contributes the source text. (method-body-name has already returned #f for
+// singleton/union/expr specialisers, so this only runs on accepted methods.)
+define function method-specialiser-names (params :: <object>, source :: <byte-string>)
+ => (names :: <stretchy-vector>)
+  let names = make(<stretchy-vector>);
+  if (params)
+    let reqs = params-required(params);
+    let np = size(reqs);
+    let pi = 0;
+    until (pi >= np)
+      let tn = reqs[pi];
+      let ty = typed-name-type(tn);
+      let spec =
+        if (~ ty)
+          "<object>"
+        elseif (instance?(ty, <ast-variable-ref>))
+          token-source-text(varref-tok(ty), source)
+        else
+          "<object>"                       // unreachable: method already accepted
+        end;
+      add!(names, spec);
+      pi := pi + 1;
+    end;
+  end;
+  names
+end function;
+
+// Format one method line:
+//   `method <generic> body=<body> params=<N> specialisers=[<a>, <b>, ...]`
+// (same comma-space join as the classes section in format_sema_model).
+define function fmt-method-reg (reg :: <stretchy-vector>) => (s :: <byte-string>)
+  let generic = reg[0];
+  let body    = reg[1];
+  let pcount  = reg[2];
+  let specs   = reg[3];
+  let line = concatenate("method ", generic);
+  line := concatenate(line, concatenate(" body=", body));
+  line := concatenate(line, concatenate(" params=", integer-to-string(pcount)));
+  line := concatenate(line, " specialisers=[");
+  let ns = size(specs);
+  let i = 0;
+  until (i >= ns)
+    if (i > 0) line := concatenate(line, ", "); end;
+    line := concatenate(line, specs[i]);
+    i := i + 1;
+  end;
+  concatenate(line, "]")
+end function;
+
+// Render the `=== methods ===` section (one line per method, '\n'-terminated).
+define function format-methods-section (methods :: <stretchy-vector>)
+ => (s :: <byte-string>)
+  let out = "=== methods ===\n";
+  let n = size(methods);
+  let i = 0;
+  until (i >= n)
+    out := concatenate(out, concatenate(fmt-method-reg(methods[i]), "\n"));
+    i := i + 1;
+  end;
+  out
+end function;
+
 // ─── Top-level entry — lex -> parse -> lower -> format ─────────────────────
 //
 // Returns the dump-dfm text, or "" if ANY top-level item is outside Phase-0
@@ -2785,6 +2896,9 @@ define function dylan-lower-emit (source :: <byte-string>)
   let ret-map = build-name-ret-map(items, user-classes, source);
   let gnames  = build-generic-names(items, source);
   let funcs  = make(<stretchy-vector>);
+  // Sprint 56c-T: shadow methods table, in Rust WALK ORDER (accessors pass-1,
+  // then user methods pass-2). Verified host-side, not consumed.
+  let methods = make(<stretchy-vector>);
   let n = size(items);
   let all-ok? = #t;
   // Pass 1 (Phase 3): slot accessors for every class, in source order. All
@@ -2801,7 +2915,7 @@ define function dylan-lower-emit (source :: <byte-string>)
       // the `sealed` modifier. Other shape limits still apply (simple class
       // only — `class-is-simple?` guards MI / slot-bearing supers / etc.).
       if (class-is-simple?(item, items, source))
-        emit-class-accessors(item, source, funcs);
+        emit-class-accessors(item, source, funcs, methods);
       else
         all-ok? := #f;
       end;
@@ -2823,7 +2937,20 @@ define function dylan-lower-emit (source :: <byte-string>)
         // params dump as `<class:N>` (lossless), so SEALED dispatch on a param
         // receiver resolves identically on both sides of the flip.
         let f = lower-method(item, ret-map, gnames, user-classes, source);
-        if (f) add!(funcs, f); else all-ok? := #f; end;
+        if (f)
+          add!(funcs, f);
+          // Sprint 56c-T: record the user-method registration in WALK ORDER
+          // (mirrors Rust `methods.push(method.registration)`, lower.rs ~2190).
+          // generic = method name; body = method-body-name; specialisers + count
+          // from the REQUIRED params (method-body-name already vetted the shapes,
+          // so all-ok? here implies a clean specialiser list).
+          let gname = token-source-text(defn-method-name(item), source);
+          let bname = method-body-name(gname, defn-params(item), source);
+          let specs = method-specialiser-names(defn-params(item), source);
+          add!(methods, make-method-reg(gname, bname, size(specs), specs));
+        else
+          all-ok? := #f;
+        end;
       else
         all-ok? := #f;     // other body-definition words — later
       end;
@@ -2855,5 +2982,16 @@ define function dylan-lower-emit (source :: <byte-string>)
     end;
     i := i + 1;
   end;
-  if (all-ok?) format-dfm-module(funcs) else "" end
+  // On success, append the shadow `=== methods ===` section after the function
+  // dump, separated by a single '\n' so the host can SPLIT the dump at the
+  // literal `\n=== methods ===\n` boundary: the left part is the unchanged DFM
+  // funcs dump (fed to parse_dfm_module), the right part the methods table
+  // (parsed + verified against the Rust MethodRegistration table, not printed).
+  // A bail still returns "".
+  if (all-ok?)
+    concatenate(format-dfm-module(funcs),
+                concatenate("\n", format-methods-section(methods)))
+  else
+    ""
+  end
 end function;
