@@ -1508,6 +1508,18 @@ pub fn analyse_module_from_dump(m: &Module, dump: &str) -> Result<SemaModel, Str
     // Classes are now registered (ids assigned); the dump's `Class(<name>)` /
     // `sealed-domain` references resolve through the class table.
     let (top_names, generics, sealing) = parse_sema_dump(dump)?;
+    // Sprint 56a — make the Dylan class derivation a CHECKED input on the
+    // load-bearing path: the dump's `=== classes ===` section (parents / CPL /
+    // slot layout, all by name) must match the host's registration. A
+    // divergence is a Dylan-vs-Rust class-derivation bug; fail loudly rather
+    // than silently trust Rust. The host still owns `ClassId` allocation
+    // (Sprint 56's principle: ids are a runtime mechanism), so this verifies
+    // the *derivation* — the precondition for retiring `register_module_classes`
+    // (Sprint 56b+). It promotes the offline 53.3/53.4 byte-match oracle to a
+    // live invariant on `--sema-with-dylan`.
+    let dylan_classes = parse_sema_classes(dump)?;
+    verify_dylan_classes(&classes, &dylan_classes)
+        .map_err(|e| format!("sema-with-dylan: {e}"))?;
     Ok(SemaModel {
         top_names,
         generics,
@@ -2785,6 +2797,198 @@ pub fn parse_sema_dump(
         sealed_classes,
     };
     Ok((top_names, generics, sealing))
+}
+
+/// Sprint 56a — a parsed `=== classes ===` record from a `dump-sema` model
+/// dump (the Dylan sema walk's class derivation). Carries exactly what
+/// [`format_sema_model`] prints per class: the name, the direct parents (by
+/// name), the C3 CPL (by name, self first), and the slot layout (name /
+/// offset / setter / origin class, all by name).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedSemaClass {
+    pub name: String,
+    pub parents: Vec<String>,
+    pub cpl: Vec<String>,
+    pub slots: Vec<ParsedSemaSlot>,
+}
+
+/// Sprint 56a — one slot of a [`ParsedSemaClass`]: `slot NAME @OFFSET
+/// setter=BOOL origin=ORIGIN`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedSemaSlot {
+    pub name: String,
+    pub offset: usize,
+    pub has_setter: bool,
+    pub origin: String,
+}
+
+/// Sprint 56a — parse the `=== classes ===` section of a `dump-sema` model
+/// dump into [`ParsedSemaClass`] records, in dump (declaration) order. The
+/// inverse of the classes block of [`format_sema_model`].
+///
+/// Unlike [`parse_sema_dump`] — which deliberately ignores classes because the
+/// host registers them from the AST — this recovers the Dylan-derived
+/// derivation so [`analyse_module_from_dump`] can VERIFY it against the host
+/// registration on the load-bearing path. Lines outside `=== classes ===` are
+/// ignored; `Err` on a malformed `class` / `slot` line.
+pub fn parse_sema_classes(dump: &str) -> Result<Vec<ParsedSemaClass>, String> {
+    fn split_name_list(inner: &str) -> Vec<String> {
+        inner
+            .split(", ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    let mut classes: Vec<ParsedSemaClass> = Vec::new();
+    let mut cur: Option<ParsedSemaClass> = None;
+    let mut in_classes = false;
+    for raw in dump.lines() {
+        let line = raw.trim_end();
+        if line == "=== classes ===" {
+            in_classes = true;
+            continue;
+        }
+        if line.starts_with("=== ") {
+            // Any other section header closes the classes block.
+            if let Some(c) = cur.take() {
+                classes.push(c);
+            }
+            in_classes = false;
+            continue;
+        }
+        if !in_classes {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("class ") {
+            if let Some(c) = cur.take() {
+                classes.push(c);
+            }
+            cur = Some(ParsedSemaClass {
+                name: name.to_string(),
+                parents: Vec::new(),
+                cpl: Vec::new(),
+                slots: Vec::new(),
+            });
+        } else if let Some(rest) = line.strip_prefix("  parents [") {
+            let c = cur
+                .as_mut()
+                .ok_or_else(|| format!("sema dump: `parents` before any `class`: {line}"))?;
+            c.parents = split_name_list(rest.trim_end_matches(']'));
+        } else if let Some(rest) = line.strip_prefix("  cpl [") {
+            let c = cur
+                .as_mut()
+                .ok_or_else(|| format!("sema dump: `cpl` before any `class`: {line}"))?;
+            c.cpl = split_name_list(rest.trim_end_matches(']'));
+        } else if let Some(rest) = line.strip_prefix("  slot ") {
+            let c = cur
+                .as_mut()
+                .ok_or_else(|| format!("sema dump: `slot` before any `class`: {line}"))?;
+            c.slots.push(parse_sema_slot_line(rest)?);
+        }
+    }
+    if let Some(c) = cur.take() {
+        classes.push(c);
+    }
+    Ok(classes)
+}
+
+/// Parse the tail of a `  slot ` line: `NAME @OFFSET setter=BOOL
+/// origin=ORIGIN` (slot names are identifiers — no spaces).
+fn parse_sema_slot_line(rest: &str) -> Result<ParsedSemaSlot, String> {
+    let err = || format!("sema dump: malformed slot line: `slot {rest}`");
+    let at = rest.find(" @").ok_or_else(err)?;
+    let name = rest[..at].to_string();
+    let after = &rest[at + 2..]; // OFFSET setter=BOOL origin=ORIGIN
+    let sp = after.find(' ').ok_or_else(err)?;
+    let offset: usize = after[..sp].parse().map_err(|_| err())?;
+    let after = after[sp + 1..].strip_prefix("setter=").ok_or_else(err)?; // BOOL origin=ORIGIN
+    let sp = after.find(' ').ok_or_else(err)?;
+    let has_setter = match &after[..sp] {
+        "true" => true,
+        "false" => false,
+        _ => return Err(err()),
+    };
+    let origin = after[sp + 1..]
+        .strip_prefix("origin=")
+        .ok_or_else(err)?
+        .to_string();
+    Ok(ParsedSemaSlot {
+        name,
+        offset,
+        has_setter,
+        origin,
+    })
+}
+
+/// Sprint 56a — verify that the Dylan sema walk's class derivation (the dump's
+/// `=== classes ===` section, [`parse_sema_classes`]) structurally matches the
+/// host's `register_module_classes` output, comparing everything by NAME:
+/// declaration order + name, direct parents, the C3 CPL, and the slot layout
+/// (name / offset / setter / origin). This promotes the offline 53.3/53.4
+/// byte-match oracle to a LIVE invariant on the `--sema-with-dylan` path: if
+/// the Dylan and Rust class derivations ever diverge, the compile fails loudly
+/// here rather than silently trusting Rust. The host still allocates the
+/// `ClassId`s — this checks the derivation, the precondition for retiring the
+/// Rust class derivation (Sprint 56b+).
+fn verify_dylan_classes(
+    rust: &[UserClassRegistration],
+    dylan: &[ParsedSemaClass],
+) -> Result<(), String> {
+    if rust.len() != dylan.len() {
+        return Err(format!(
+            "class count mismatch — host registered {}, Dylan dumped {}",
+            rust.len(),
+            dylan.len()
+        ));
+    }
+    for (r, d) in rust.iter().zip(dylan.iter()) {
+        if r.name != d.name {
+            return Err(format!(
+                "class order/name mismatch — host {:?}, Dylan {:?}",
+                r.name, d.name
+            ));
+        }
+        let r_parents: Vec<String> = r.parents.iter().map(|&id| sema_class_name(id)).collect();
+        if r_parents != d.parents {
+            return Err(format!(
+                "class {} parents mismatch — host {:?}, Dylan {:?}",
+                r.name, r_parents, d.parents
+            ));
+        }
+        let r_cpl: Vec<String> = r.cpl.iter().map(|&id| sema_class_name(id)).collect();
+        if r_cpl != d.cpl {
+            return Err(format!(
+                "class {} cpl mismatch — host {:?}, Dylan {:?}",
+                r.name, r_cpl, d.cpl
+            ));
+        }
+        if r.slots.len() != d.slots.len() {
+            return Err(format!(
+                "class {} slot count mismatch — host {}, Dylan {}",
+                r.name,
+                r.slots.len(),
+                d.slots.len()
+            ));
+        }
+        for (i, (rs, ds)) in r.slots.iter().zip(d.slots.iter()).enumerate() {
+            let r_origin = sema_class_name(r.slot_origin[i]);
+            if rs.name != ds.name
+                || rs.offset != ds.offset
+                || rs.has_setter != ds.has_setter
+                || r_origin != ds.origin
+            {
+                return Err(format!(
+                    "class {} slot[{i}] mismatch — host (name={}, @{}, setter={}, origin={}), \
+                     Dylan (name={}, @{}, setter={}, origin={})",
+                    r.name, rs.name, rs.offset, rs.has_setter, r_origin,
+                    ds.name, ds.offset, ds.has_setter, ds.origin
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Map a `TypeEstimate` Debug name (as `format_sema_model` emits) back to the
@@ -8251,5 +8455,125 @@ mod sprint31_tests {
                 eprintln!("EnumWindows actually materialized with sig {signature:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sprint56a_class_parse_tests {
+    //! Sprint 56a — pure-Rust coverage for [`parse_sema_classes`], the inverse
+    //! of the classes block of `format_sema_model`. The end-to-end live
+    //! verification (`verify_dylan_classes` inside `analyse_module_from_dump`)
+    //! is exercised by `dump_dfm_sema_with_dylan_byte_match` over the 38-fixture
+    //! corpus; these tests pin the text grammar without needing the shim.
+    use super::*;
+
+    const POINT_DUMP: &str = "\
+=== top-names ===
+fn distance-squared arity=1 return=Top
+=== generics ===
+generic x
+generic y
+=== classes ===
+class <user-point>
+  parents [<object>]
+  cpl [<user-point>, <object>]
+  slot x @8 setter=true origin=<user-point>
+  slot y @16 setter=false origin=<user-point>
+=== sealing ===
+";
+
+    #[test]
+    fn parses_single_class_with_slots() {
+        let classes = parse_sema_classes(POINT_DUMP).expect("parse");
+        assert_eq!(classes.len(), 1);
+        let c = &classes[0];
+        assert_eq!(c.name, "<user-point>");
+        assert_eq!(c.parents, vec!["<object>".to_string()]);
+        assert_eq!(c.cpl, vec!["<user-point>".to_string(), "<object>".to_string()]);
+        assert_eq!(c.slots.len(), 2);
+        assert_eq!(
+            c.slots[0],
+            ParsedSemaSlot {
+                name: "x".to_string(),
+                offset: 8,
+                has_setter: true,
+                origin: "<user-point>".to_string(),
+            }
+        );
+        // `setter=false` must parse as false (not defaulted to true).
+        assert_eq!(c.slots[1].name, "y");
+        assert_eq!(c.slots[1].offset, 16);
+        assert!(!c.slots[1].has_setter);
+        assert_eq!(c.slots[1].origin, "<user-point>");
+    }
+
+    #[test]
+    fn parses_hierarchy_with_inherited_slot_origin() {
+        // A two-class hierarchy: the child inherits the parent's slot, so its
+        // origin is the parent — the exact case the live verifier checks
+        // against `slot_origin`.
+        let dump = "\
+=== classes ===
+class <animal>
+  parents [<object>]
+  cpl [<animal>, <object>]
+  slot name @8 setter=true origin=<animal>
+class <dog>
+  parents [<animal>]
+  cpl [<dog>, <animal>, <object>]
+  slot name @8 setter=true origin=<animal>
+  slot breed @16 setter=true origin=<dog>
+=== sealing ===
+";
+        let classes = parse_sema_classes(dump).expect("parse");
+        assert_eq!(classes.len(), 2);
+        assert_eq!(classes[0].name, "<animal>");
+        assert_eq!(classes[1].name, "<dog>");
+        assert_eq!(
+            classes[1].cpl,
+            vec!["<dog>".to_string(), "<animal>".to_string(), "<object>".to_string()]
+        );
+        // Inherited slot carries the ancestor's origin.
+        assert_eq!(classes[1].slots[0].origin, "<animal>");
+        assert_eq!(classes[1].slots[1].origin, "<dog>");
+    }
+
+    #[test]
+    fn no_classes_section_is_empty() {
+        let dump = "\
+=== top-names ===
+fn f arity=0 return=Top
+=== generics ===
+=== classes ===
+=== sealing ===
+";
+        assert!(parse_sema_classes(dump).expect("parse").is_empty());
+    }
+
+    #[test]
+    fn class_with_no_slots() {
+        let dump = "\
+=== classes ===
+class <marker>
+  parents [<object>]
+  cpl [<marker>, <object>]
+=== sealing ===
+";
+        let classes = parse_sema_classes(dump).expect("parse");
+        assert_eq!(classes.len(), 1);
+        assert!(classes[0].slots.is_empty());
+    }
+
+    #[test]
+    fn malformed_slot_line_errors() {
+        let dump = "\
+=== classes ===
+class <bad>
+  parents [<object>]
+  cpl [<bad>, <object>]
+  slot broken-no-offset setter=true origin=<bad>
+=== sealing ===
+";
+        assert!(parse_sema_classes(dump).is_err());
     }
 }

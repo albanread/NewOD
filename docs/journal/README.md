@@ -28,6 +28,15 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-10 — Sprint 56a (step 1): the Dylan class derivation becomes a checked input on the live path](2026-06-10-sprint-56a-class-derivation-live-verify.md)
+  — First increment of the "make classes load-bearing" centerpiece. `parse_sema_classes`
+  recovers the dump's `=== classes ===` section (parents / CPL / slot layout, all by
+  name); `verify_dylan_classes` asserts it matches the host's `register_module_classes`
+  inside `analyse_module_from_dump`, so a Dylan-vs-Rust class-derivation divergence now
+  fails the `--sema-with-dylan` compile loudly instead of being silently masked by Rust.
+  Promotes the offline 53.3/53.4 byte-match oracle to a live invariant. 38/38 load-bearing
+  gate MATCH; 5 pure-Rust parser unit tests. Found the dump is lossy for a *full* consume
+  (no slot type-kinds / init-keywords) — retiring Rust (56b+) needs the wire to grow first.
 - [2026-06-07 — Sprint 55b (B-i): class ids in the DFM dump → sealed dispatch flips](2026-06-07-sprint-55b-class-id-in-dump-Bi.md)
   — The decided crux fix: params/returns/block-params now dump `<class:N>` (via
   `type_label`, was id-dropping `<class>`); Dylan emits `<class:<name>>`, parser
