@@ -1497,12 +1497,14 @@ mod tests {
                         callee: "alloc_a".to_string(),
                         args: vec![TempId(0)],
                         safepoint_roots: vec![TempId(0)],
+                        is_no_alloc: false,
                     },
                     Computation::DirectCall {
                         dst: TempId(3),
                         callee: "alloc_b".to_string(),
                         args: vec![TempId(0), TempId(2)],
                         safepoint_roots: vec![TempId(0), TempId(2)],
+                        is_no_alloc: false,
                     },
                 ],
                 terminator: Terminator::Return {
@@ -1579,6 +1581,7 @@ mod tests {
                         callee: "alloc_after_dispatch".to_string(),
                         args: vec![TempId(1)],
                         safepoint_roots: vec![TempId(0), TempId(1)],
+                        is_no_alloc: false,
                     },
                 ],
                 terminator: Terminator::Return {
@@ -1664,6 +1667,7 @@ mod tests {
                         callee: "alloc_a".to_string(),
                         args: vec![TempId(0)],
                         safepoint_roots: vec![TempId(0)],
+                        is_no_alloc: false,
                     },
                     Computation::Dispatch {
                         dst: TempId(2),
@@ -1741,6 +1745,7 @@ mod tests {
                         callee: "alloc_a".to_string(),
                         args: vec![TempId(0)],
                         safepoint_roots: vec![TempId(0)],
+                        is_no_alloc: false,
                     },
                     Computation::Dispatch {
                         dst: TempId(2),
@@ -1835,6 +1840,7 @@ mod tests {
                     callee: "alloc_a".to_string(),
                     args: vec![TempId(0)],
                     safepoint_roots: vec![TempId(0)],
+                    is_no_alloc: false,
                 }],
                 terminator: Terminator::Return {
                     value: Some(TempId(1)),
@@ -1989,6 +1995,7 @@ mod tests {
                     callee: "alloc_no_roots".to_string(),
                     args: vec![TempId(0)],
                     safepoint_roots: vec![],
+                    is_no_alloc: false,
                 }],
                 terminator: Terminator::Return {
                     value: Some(TempId(1)),
