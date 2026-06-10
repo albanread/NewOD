@@ -90,3 +90,28 @@ to carry slot type-kinds / init-keywords / defaults, then flip the runtime
 install to consume the Dylan-derived CPL + slot layout (host still allocating
 `ClassId`s by name in canonical order). MI stays on the Rust bail path (zero MI
 in stdlib + corpus, per the design challenge).
+
+## Follow-on (same session): the whole-corpus lowering-flip survey is now a gate
+
+The lowering memory + several journal entries keep invoking a discipline —
+*"after any change that widens what's accepted, run the whole-corpus survey
+(dump-dfm vs dump-dfm --lower-with-dylan over all fixtures); the curated gate
+can be green while the broader invariant (0 mismatches = never a wrong dump) is
+violated. That's how the unknown→DirectCall trap was caught."* — but there was
+**no committed survey**; it was re-run ad-hoc each session.
+
+Codified it as `dump_dfm_lower_with_dylan_whole_corpus_survey` (in
+`sema_topnames.rs`). It enumerates **every** `*.dylan` fixture (no curated list),
+and asserts `dump-dfm --lower-with-dylan` byte-equals plain `dump-dfm` for each:
+a bail falls back to Rust (⇒ identical), a covered fixture must match Rust (⇒
+identical), so the only way they differ is a Dylan lowering bug emitting a
+*wrong* DFM. Fixtures whose Rust `dump-dfm` itself fails (no baseline — only
+`dylan-lex-shim`, not a dump fixture) are skipped, not failed.
+
+Current state captured by the gate: **61 compared, 1 skipped, 0 mismatches**;
+the standalone bail survey shows **27/62 fixtures actively lowered** by the
+Dylan path, 35 still bailing (the big `dylan-*` compiler sources, the macro
+fixtures, `%`-prim repros like `gap-007-repro`, `#(…)` list literals like
+`stdlib-size-call`, and the rope/IDE family). Those bails are the axis-1
+body-lowering grind; this gate is the standing safety net that each unlock must
+keep green.

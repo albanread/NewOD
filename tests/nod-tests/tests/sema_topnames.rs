@@ -689,6 +689,98 @@ fn dump_dfm_lower_with_dylan_byte_match() {
     );
 }
 
+/// Sprint 56 — the WHOLE-CORPUS lowering-flip soundness survey, codified as a
+/// gate. Where `dump_dfm_lower_with_dylan_byte_match` proves a *curated* set of
+/// fixtures is actively lowered by the Dylan path (non-empty, byte-identical),
+/// this asserts the broader **invariant the journal keeps invoking**: over
+/// EVERY `*.dylan` fixture, `dump-dfm --lower-with-dylan` is byte-identical to
+/// plain `dump-dfm`. A fixture the Dylan lowering doesn't cover bails to "" and
+/// falls back to Rust (⇒ identical); a covered fixture must match Rust (⇒
+/// identical). The ONLY way they can differ is a Dylan lowering BUG that emits
+/// a *wrong* DFM — exactly the unknown→DirectCall trap a curated gate missed
+/// (see docs/journal/2026-06-07-sprint-55b-call-path-soundness.md). "0
+/// mismatches = never a wrong dump." This makes the previously-ad-hoc survey a
+/// standing regression net to run after any widening of the Dylan lowering.
+///
+/// Fixtures whose *Rust* `dump-dfm` already fails (no baseline — e.g.
+/// `dylan-lex-shim`, not a dump fixture) are skipped, not failed. Skips the
+/// whole gate cleanly when the shim isn't statically linked.
+#[test]
+#[ignore]
+#[serial]
+fn dump_dfm_lower_with_dylan_whole_corpus_survey() {
+    let ws = workspace_root();
+
+    // Probe: no shim ⇒ --lower-with-dylan warns + falls back to Rust, so skip
+    // rather than pass vacuously.
+    let probe = fixtures_dir().join("hello.dylan");
+    let (_, probe_err, probe_ok) = run_dump_dfm_lower_with_dylan(&ws, &probe);
+    if !probe_ok || probe_err.contains("not statically linked") {
+        eprintln!(
+            "SKIP dump_dfm_lower_with_dylan_whole_corpus_survey: shim not linked.\n{probe_err}"
+        );
+        return;
+    }
+
+    // Enumerate every fixture deterministically (no curation — that's the point).
+    let mut fixtures: Vec<PathBuf> = std::fs::read_dir(fixtures_dir())
+        .expect("read fixtures dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("dylan"))
+        .collect();
+    fixtures.sort();
+
+    let mut mismatches: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+    let mut skipped_no_baseline = 0usize;
+    for input in &fixtures {
+        let name = input.file_stem().unwrap().to_string_lossy().to_string();
+        let (rust_out, _, rust_ok) = run_dump_dfm(&ws, input, false);
+        if !rust_ok {
+            // No Rust baseline (not a dump-dfm fixture) — nothing to compare.
+            skipped_no_baseline += 1;
+            continue;
+        }
+        let (dyl_out, dyl_err, dyl_ok) = run_dump_dfm_lower_with_dylan(&ws, input);
+        // Rust handled it, so the flip must at least fall back to Rust and
+        // succeed; a failure here is the flip breaking an otherwise-working
+        // fixture — a real regression, not a skip.
+        assert!(
+            dyl_ok,
+            "{name}: dump-dfm --lower-with-dylan failed though plain dump-dfm \
+             succeeded:\nstderr:\n{dyl_err}"
+        );
+        compared += 1;
+        let r = normalize(&rust_out);
+        let d = normalize(&dyl_out);
+        if r != d {
+            let first = r
+                .lines()
+                .zip(d.lines())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| format!("  line {i}:\n    rust : {a}\n    dylan: {b}"))
+                .unwrap_or_else(|| "  (length differs)".to_string());
+            mismatches.push(format!(
+                "FIXTURE {name} DFM MISMATCH (rust vs --lower-with-dylan)\n{first}"
+            ));
+        }
+    }
+
+    eprintln!(
+        "whole-corpus lowering-flip survey: {compared} compared, \
+         {skipped_no_baseline} skipped (no Rust baseline), {} fixtures total",
+        fixtures.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "Dylan lowering produced a WRONG DFM for {} fixture(s) — the flip is \
+         unsound on the broader corpus (the curated gate missed it):\n\n{}",
+        mismatches.len(),
+        mismatches.join("\n\n")
+    );
+}
+
 #[test]
 #[ignore]
 #[serial]
