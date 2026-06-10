@@ -842,6 +842,21 @@ define function make-ast-vector-lit () => (v :: <ast-vector-lit>)
   v
 end function;
 
+// Sprint 56 — construct a synthetic `<ast-statement>` (used by the lowering's
+// elseif desugaring, which builds a nested `if` from elseif clauses). Lives
+// here because `<ast-statement>` is defined in this file; dylan-lower.dylan
+// calls this rather than `make(<ast-statement>, …)` directly, so it stays
+// standalone-compilable (a `make(<class>)` would force class resolution,
+// while a plain function call is tolerated when the class isn't in scope).
+define function make-if-statement (word :: <token>, body :: <ast-body>,
+                                   clauses :: <object>) => (s :: <ast-statement>)
+  let s = make(<ast-statement>, word: word, body: body);
+  if (instance?(clauses, <stretchy-vector>))
+    stmt-clauses(s) := clauses;
+  end;
+  s
+end function;
+
 define function make-ast-param-list () => (p :: <ast-param-list>)
   make(<ast-param-list>,
        required: make(<stretchy-vector>),

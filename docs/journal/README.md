@@ -28,6 +28,14 @@ architecture is shaped the way it is.
 
 ## Entries
 
+- [2026-06-10 — Sprint 56 (axis-1): `if / elseif / else` in Dylan lowering](2026-06-10-sprint-56-elseif-nested-if.md)
+  — `elseif` (ubiquitous) desugars to NESTED ifs, reusing the byte-matched single-if
+  machinery: the elseif clause becomes a synthetic nested `if` for the else-arm.
+  Gotcha caught by the whole-corpus survey: `make(<ast-statement>)` in the lowering
+  broke `dylan-lower`'s own standalone dump-dfm (class out of scope) — fixed with a
+  `make-if-statement` factory in the parser (a function call is tolerated, a class
+  ref isn't). Unlocks `gc_loop_accum`; 0 mismatches; lowered 31→32. The survey's
+  first real catch.
 - [2026-06-10 — Sprint 56 (axis-1): `#(…)` list literals in Dylan lowering](2026-06-10-sprint-56-list-literals.md)
   — `#(a,b,c)` lowers to the `%nil`/`%pair-alloc` cons chain (elements source-order,
   then nil, then pairs reverse — `<class>` dsts). Unlocks `stdlib-size-call` (PHASE0).

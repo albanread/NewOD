@@ -982,21 +982,48 @@ define function lower-if-expr (b :: <fn-builder>, stmt :: <ast-statement>,
   if (size(scs) < 1)
     #f
   else
-    // Resolve the else arm: no clauses → none; one `else` clause → its body;
-    // elseif / multiple → bail.
+    // Resolve the else arm. `if (c) … end` -> no else; `… else B end` -> B;
+    // `… elseif (c2) B2 <rest…> end` -> desugar to a NESTED `if` statement
+    // (mirrors Rust's nested-if lowering of if/elseif/else): the else arm
+    // becomes the single synthetic statement `if (c2) B2 <rest…> end`, lowered
+    // recursively by the SAME machinery — so block ids / temps / merge sets
+    // nest exactly as Rust's. An elseif clause's body already carries its cond
+    // as the first constituent (the same shape as a leading `if` body), so it
+    // transplants directly; we reuse the original `if` word token (lower-expr
+    // routes the synthetic node on its "if" text).
     let clauses = stmt-clauses(stmt);
     let else-cs = #f;
     let bail? = #f;
     if (instance?(clauses, <stretchy-vector>))
-      if (size(clauses) = 1)
-        let cl = clauses[0];
-        if (token-source-text(clause-word(cl), source) = "else")
-          else-cs := body-constituents(clause-body(cl));
+      let nc = size(clauses);
+      if (nc >= 1)
+        let cl0 = clauses[0];
+        let w0 = token-source-text(clause-word(cl0), source);
+        if (w0 = "else")
+          if (nc = 1)
+            else-cs := body-constituents(clause-body(cl0));
+          else
+            bail? := #t;            // `else` with trailing clauses — malformed
+          end;
+        elseif (w0 = "elseif")
+          // Build the nested `if` via a factory in dylan-parser (where
+          // <ast-statement> is defined) — calling `make(<ast-statement>)` here
+          // would make dylan-lower.dylan reference a class out of its own
+          // standalone scope. `rest` (#f or the remaining clauses) becomes the
+          // nested if's clauses.
+          let rest = #f;
+          if (nc > 1)
+            let r = make(<stretchy-vector>);
+            let ri = 1;
+            until (ri >= nc) add!(r, clauses[ri]); ri := ri + 1; end;
+            rest := r;
+          end;
+          let nested = make-if-statement(stmt-word(stmt), clause-body(cl0), rest);
+          else-cs := make(<stretchy-vector>);
+          add!(else-cs, nested);
         else
-          bail? := #t;
+          bail? := #t;              // case / exception / … — later
         end;
-      elseif (size(clauses) > 1)
-        bail? := #t;
       end;
     end;
     if (bail?)

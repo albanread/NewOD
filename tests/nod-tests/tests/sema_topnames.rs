@@ -400,6 +400,7 @@ const PHASE0_LOWER_FIXTURES: &[&str] = &[
     "lower-instance",        // 55b: instance? -> TypeCheck (builtins + user class)
     "kernel-arith",          // 55a-tail: define constant (init fn) + unary -x (NegInt)
     "stdlib-size-call",      // 56: `#(…)` list literal (%nil/%pair-alloc chain) + size Dispatch
+    "lower-elseif",          // 56: if/elseif/else -> nested ifs (multi-arm + assign threading)
 ];
 
 /// Sprint 55 — fixtures the Dylan lowering covers but whose `dump-dfm` carries
@@ -433,6 +434,7 @@ const FLIP_ONLY_LOWER_FIXTURES: &[&str] = &[
     "gap-007-repro",         // %make/size/element/push stretchy-vector prims + loops
     "gap-007-repro-ir",      // same prims, the -ir reference shape
     "dylan-macro-file",      // %-prim(s) were the last blocker; now lowers end-to-end
+    "gc_loop_accum",         // 56: if/elseif/else + concatenate dispatch + loops (safepoints)
 ];
 
 /// Sprint 55 Phase 0 — `nod-driver dump-dylan-dfm <fx>` (in-process Dylan
